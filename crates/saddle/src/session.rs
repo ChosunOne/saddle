@@ -15,27 +15,6 @@ use crate::config::UserConfig;
 use crate::paths::{Paths, find_workspace};
 
 /// What a workspace's own policy file starts as (D43): a comment saying what it is for, and nothing
-/// else. An empty file and no file mean the same thing — the global policy alone.
-pub const WORKSPACE_POLICY_HEADER: &str = r#"# This workspace's own policy, layered on top of the global policy in policy.toml.
-#
-# Anything not written here is taken from the global policy, so a change there reaches this
-# workspace. What is written here replaces that grant for this scope, and it may grant more or
-# less than the global policy does: this file is the authority for this directory. It is safe to
-# let it widen because it lives in the config directory, which no root contains, so nothing the
-# agent runs can write it -- only you can.
-"#;
-
-/// Whether a workspace's own file says anything beyond the header, which is only used to word a
-/// note: the policy itself is layered either way (D43).
-fn workspace_policy_has_grants(path: &Path) -> bool {
-    std::fs::read_to_string(path)
-        .map(|text| {
-            text.lines()
-                .any(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
-        })
-        .unwrap_or(false)
-}
-
 /// The roots a policy edit is validated against, without opening a session: the same set
 /// `Setup::load` resolves, so a change that would not load is caught before it is written (D45).
 pub fn roots_for_validation() -> Result<Roots> {
@@ -68,16 +47,21 @@ pub struct Setup {
     pub merged: Vec<String>,
     /// The global policy this workspace's file was layered on, for the same reason.
     pub global_sha256: String,
+    /// The base grants as TOML, so a policy reload re-layers without reading the file twice.
+    pub global_text: String,
     /// Notes for the session intro, such as a workspace `saddle.toml` that is no longer read.
     pub notes: Vec<String>,
+    /// This run's grant overrides, kept so a policy reload does not silently drop them (D63).
+    pub overrides: crate::config::Overrides,
     /// The sensitive directories this workspace puts in reach, which is what the person is asked
     /// about before the session opens (D60). Empty for an ordinary project.
     pub exposed: Vec<String>,
 }
 
 impl Setup {
-    /// `tmp` is the directory to use as the `tmp` root.
-    pub fn load(start: &Path, tmp: &Path) -> Result<Self> {
+    /// `tmp` is the directory to use as the `tmp` root. `overrides` are this run's `--grant` and
+    /// `--revoke`, which are not stored (D63).
+    pub fn load(start: &Path, tmp: &Path, overrides: &crate::config::Overrides) -> Result<Self> {
         let paths = Paths::from_env()?;
         let start = start
             .canonicalize()
@@ -97,61 +81,74 @@ impl Setup {
         // what a child may reach is a list rather than a pattern (D62).
         let extras = user.sandbox_extras(&roots, &paths.protected())?;
 
-        // The global policy is the base, and a workspace's own file is layered on top of it rather
-        // than copied from it (D43), so a change to the global policy reaches every workspace that
-        // does not override the key. Both live in the config directory, which no root contains, so
-        // the kernel protects them (D42).
-        let own = paths.workspace_policy(&workspace);
+        // One file holds everything (D63): `[agent]` is the base every workspace inherits, and
+        // `[workspaces.<key>]` is this workspace's own grants, layered on top of it rather than
+        // copied from it, so a change to the base reaches every workspace that does not override
+        // that key. It lives in the config directory, which no root contains, so the kernel
+        // protects it (D42).
+        let config_path = paths.user_config();
         let mut notes = Vec::new();
-        let global = match std::fs::read_to_string(paths.default_policy()) {
-            Ok(text) => text,
-            Err(e) => {
-                notes.push(format!(
-                    "{} is unreadable ({e}); using the built-in default policy",
-                    paths.default_policy().display()
-                ));
-                crate::defaults::default_policy_text()
-            }
-        };
-        // A workspace override is created empty rather than as a copy: its absence and an empty
-        // file mean the same thing, and an empty file is an invitation to write a key in it.
-        if own.symlink_metadata().is_err() {
-            if let Some(dir) = own.parent() {
-                std::fs::create_dir_all(dir)
-                    .with_context(|| format!("creating {}", dir.display()))?;
-            }
-            std::fs::write(&own, WORKSPACE_POLICY_HEADER)
-                .with_context(|| format!("creating {}", own.display()))?;
+        let user = UserConfig::load(&config_path)?;
+        let key = crate::paths::workspace_key(&workspace);
+        let mut own = user.workspace_policy(&key);
+        let global = user.global_policy();
+        if !overrides.is_empty() {
+            // Applied to the *merged* grants, not to the workspace's own: `--revoke exec` has to
+            // remove a grant that came from the base, and a workspace-level edit could only
+            // shadow it (D63).
+            let merged_doc = saddle_cap::policy::merge(
+                global.clone(),
+                own.unwrap_or_else(|| crate::config::policy_document_pub(None)),
+            );
+            let mut agent = match merged_doc.get("agent") {
+                Some(toml::Value::Table(t)) => t.clone(),
+                _ => toml::Table::new(),
+            };
+            overrides.apply(&mut agent)?;
+            let mut doc = toml::Table::new();
+            doc.insert("version".into(), toml::Value::Integer(1));
+            doc.insert("agent".into(), toml::Value::Table(agent));
+            own = Some(toml::Value::Table(doc));
             notes.push(format!(
-                "created {} for this workspace's own grants; it adds to {}",
-                own.display(),
-                paths.default_policy().display()
+                "grants changed for this session only: {}",
+                overrides.describe()
             ));
         }
+        let global = user.global_policy();
+        let global_text = toml::to_string(&global).context("reading the grants")?;
+        let policy_text = match &own {
+            Some(doc) => toml::to_string(doc).context("reading this workspace's grants")?,
+            None => String::new(),
+        };
         // A tree-level policy is not authority, and silently ignoring one would be worse than
         // saying so.
         let in_tree = workspace.join(POLICY_FILE);
         if in_tree.symlink_metadata().is_ok() {
             notes.push(format!(
-                "{} is not read: this workspace's policy is {}{}",
+                "{} is not read: this workspace's grants are in {}{}",
                 in_tree.display(),
-                paths.default_policy().display(),
-                if workspace_policy_has_grants(&own) {
-                    format!(" with {}", own.display())
+                config_path.display(),
+                if user.workspace_has_grants(&key) {
+                    format!(" under [workspaces.\"{key}\"]")
                 } else {
                     String::new()
                 }
             ));
         }
-        let policy_path = own;
-        let policy_text = std::fs::read_to_string(&policy_path)
-            .with_context(|| format!("reading {}", policy_path.display()))?;
-        // Layered here rather than in `parse_policy`, so a project file that would widen a global
-        // grant is refused before a session opens rather than on the first tool call.
-        let merged = Policy::layer(&global, &policy_text, &roots)
-            .with_context(|| format!("reading {}", policy_path.display()))?;
+        let policy_path = config_path;
+        // With overrides the workspace document already holds the merged result, so the base is
+        // not layered a second time (D63). This is what is stored, because `parse_policy` layers
+        // from it: the engine has to be built from the same document `check` describes.
+        let global_text = if overrides.is_empty() {
+            global_text
+        } else {
+            String::new()
+        };
+        let merged = Policy::layer(&global_text, &policy_text, &roots)
+            .with_context(|| format!("reading the grants in {}", policy_path.display()))?;
         let merged_lines = merged.describe();
-        let policy_sha256 = sha256_hex(policy_text.as_bytes());
+        // The hash names the grants, not the file: a provider change is not a policy change.
+        let policy_sha256 = sha256_hex(format!("{global_text}\n---\n{policy_text}").as_bytes());
         Ok(Self {
             paths,
             start: start.clone(),
@@ -162,16 +159,16 @@ impl Setup {
             policy_text,
             policy_sha256,
             merged: merged_lines,
-            global_sha256: sha256_hex(global.as_bytes()),
+            global_sha256: sha256_hex(global_text.as_bytes()),
+            global_text,
             notes,
             exposed,
+            overrides: overrides.clone(),
         })
     }
 
     pub fn parse_policy(&self) -> Result<Policy> {
-        let global = std::fs::read_to_string(self.paths.default_policy())
-            .unwrap_or_else(|_| crate::defaults::default_policy_text());
-        Policy::layer(&global, &self.policy_text, &self.roots)
+        Policy::layer(&self.global_text, &self.policy_text, &self.roots)
             .with_context(|| format!("{}", self.policy_path.display()))
     }
 }
@@ -218,11 +215,16 @@ impl Session {
     /// and the private temporary directory belong to a *run* rather than to the id, so they get a
     /// token of their own: two processes sharing one id must not fight over one file, and a reused
     /// id must not append to a chain that a previous process already closed.
-    pub fn open(start: &Path, id: Option<&str>) -> Result<Self> {
+    /// Opens a session with this run's grant overrides applied (D63).
+    pub fn open_with(
+        start: &Path,
+        id: Option<&str>,
+        overrides: &crate::config::Overrides,
+    ) -> Result<Self> {
         let id = id.map(str::to_owned).unwrap_or_else(session_id);
         let run = format!("{id}-{}", session_id());
         let tmp = PrivateTmp::create(&run)?;
-        let setup = Setup::load(start, tmp.path())?;
+        let setup = Setup::load(start, tmp.path(), overrides)?;
         let policy = setup.parse_policy()?;
         let sandbox = saddle_sandbox::availability();
 
@@ -268,7 +270,7 @@ impl Session {
     /// (D47). The new file is parsed and layered exactly as at open, so a change that would not load
     /// stops the reload and leaves the session on the grants it had.
     pub fn reload_policy(&mut self) -> Result<()> {
-        let fresh = Setup::load(&self.setup.start, self._tmp.path())?;
+        let fresh = Setup::load(&self.setup.start, self._tmp.path(), &self.setup.overrides)?;
         let policy = fresh.parse_policy()?;
         let before = self.setup.policy_sha256.clone();
         self.setup = fresh;

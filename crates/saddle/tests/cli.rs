@@ -36,17 +36,56 @@ impl Env {
         env
     }
 
-    /// The global policy: the base every workspace inherits (D43). Tests write here when they want
-    /// a grant that applies everywhere.
+    /// The one config file, holding both the base grants and each workspace's own (D63).
     fn policy_path(&self) -> PathBuf {
-        self.xdg.path().join("config/saddle/policy.toml")
+        self.xdg.path().join("config/saddle/config.toml")
     }
 
-    /// This workspace's own file, which starts empty and is layered on the global policy.
-    fn override_path(&self) -> PathBuf {
+    /// Folds a policy-shaped document into `config.toml` as this workspace's own grants.
+    fn write_override(&self, text: &str) {
+        let agent = agent_of(text);
+        let key = self.workspace_key();
+        let path = self.policy_path();
+        let base = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut doc: toml::Table = base.parse().unwrap_or_default();
+        let workspaces = doc
+            .entry("workspaces")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let workspaces = workspaces.as_table_mut().unwrap();
+        let mut entry = toml::Table::new();
+        entry.insert("agent".into(), agent);
+        workspaces.insert(key, toml::Value::Table(entry));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+    }
+
+    /// The base grants: `[agent]` in the one file (D63).
+    fn write_policy(&self, text: impl AsRef<str>) {
+        let agent = agent_of(text.as_ref());
+        let path = self.policy_path();
+        let base = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut doc: toml::Table = base.parse().unwrap_or_default();
+        doc.insert("agent".into(), agent);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+    }
+
+    /// Changes the base grants in place, so a test does not have to spell the serialised TOML.
+    fn edit_agent(&self, change: impl FnOnce(&mut toml::Table)) {
+        let path = self.policy_path();
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut doc: toml::Table = text.parse().unwrap_or_default();
+        let agent = doc
+            .entry("agent")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        change(agent.as_table_mut().unwrap());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+    }
+
+    fn workspace_key(&self) -> String {
         let ws = self.ws.path().canonicalize().unwrap();
-        let key: String = ws
-            .to_string_lossy()
+        ws.to_string_lossy()
             .trim_start_matches('/')
             .chars()
             .map(|c| match c {
@@ -54,24 +93,7 @@ impl Env {
                 c if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '%') => c,
                 _ => '_',
             })
-            .collect();
-        self.xdg
-            .path()
-            .join("config/saddle/policies")
-            .join(format!("{key}.toml"))
-    }
-
-    fn write_override(&self, text: &str) {
-        let path = self.override_path();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, text).unwrap();
-    }
-
-    fn write_policy(&self, text: impl AsRef<str>) {
-        let text = text.as_ref();
-        let path = self.policy_path();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, text).unwrap();
+            .collect()
     }
 
     fn policy(&self) -> String {
@@ -116,6 +138,14 @@ impl Env {
     }
 }
 
+/// The `[agent]` table of a policy-shaped document, which is what the merged file stores.
+fn agent_of(text: &str) -> toml::Value {
+    let doc: toml::Table = text.parse().unwrap_or_default();
+    doc.get("agent")
+        .cloned()
+        .unwrap_or_else(|| toml::Value::Table(toml::Table::new()))
+}
+
 fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
@@ -125,35 +155,30 @@ fn ready() -> Env {
 }
 
 #[test]
-fn a_workspace_policy_is_layered_on_the_global_one_not_copied_from_it() {
-    // D43: the global policy is the base, the workspace file holds only what differs, and a
-    // change to the global file reaches a workspace that does not override that key.
+fn a_workspace_layers_its_own_grants_on_the_base_in_one_file() {
+    // D63: one `config.toml`. `[agent]` is the base every workspace inherits, and
+    // `[workspaces."<key>"]` is this workspace's own, replacing a key it lists and inheriting the
+    // rest.
     let env = Env::new();
-    std::fs::remove_file(env.override_path()).ok();
-
     let out = env.saddle(&["check"]);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert!(env.override_path().exists(), "first use creates it: {text}");
-    assert!(text.contains("policy     layered: "), "{text}");
-    // The new file is a header, not a copy, so the global grants show up without being duplicated.
-    let own = std::fs::read_to_string(env.override_path()).unwrap();
+    assert!(text.contains("grants     "), "{text}");
     assert!(
-        own.lines()
-            .all(|l| l.trim_start().starts_with('#') || l.trim().is_empty()),
-        "the workspace file starts empty: {own}"
+        text.contains("no [workspaces] entry for this directory"),
+        "it inherits everything until it has an entry: {text}"
     );
     assert!(text.contains("agent.exec = timeout 20s"), "{text}");
 
-    // Editing only the global policy changes the effective grants here.
+    // Editing the base changes the effective grants here.
     env.write_policy(POLICY.replace("timeout-secs = 20", "timeout-secs = 45"));
     let out = env.saddle(&["check"]);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
         text.contains("agent.exec = timeout 45s"),
-        "the global change reached this workspace: {text}"
+        "the base change reached this workspace: {text}"
     );
 
-    // A workspace file that narrows one scope leaves the others inherited.
+    // An entry that narrows one scope leaves the others inherited.
     env.write_override(
         "version = 1\n[agent]\nfs-write = [{ root = \"workspace\", exclude = [\".env*\", \"/secrets\"] }]\n",
     );
@@ -165,8 +190,8 @@ fn a_workspace_policy_is_layered_on_the_global_one_not_copied_from_it() {
         "still inherited: {text}"
     );
 
-    // A workspace file may widen: it is the authority for this directory, and it lives where
-    // nothing the agent runs can write it (D42, D43).
+    // It may widen too: it is the authority for this directory, and it lives where nothing the
+    // agent runs can write it (D42, D43).
     env.write_override(
         "version = 1\n[agent]\nnet = [{ host = \"api.example.com\" }]\nexec = { timeout-secs = 5 }\n",
     );
@@ -436,12 +461,18 @@ fn fetch_needs_a_net_grant_and_says_which_one() {
 fn a_wildcard_net_grant_allows_any_host_but_not_the_local_machine() {
     // `*` covers every public host without naming one, which is the point of it (D40).
     let env = Env::new();
-    let policy = env.policy();
-    env.write_policy(policy.replace(
-        "exec     = { why = \"runs builds and tests\", timeout-secs = 20 }",
-        "exec     = { why = \"runs builds and tests\", timeout-secs = 20 }\n\
-             net      = [{ host = \"*\", why = \"reaches whatever the task needs\" }]",
-    ));
+    env.edit_agent(|agent| {
+        agent.insert(
+            "net".into(),
+            toml::from_str::<toml::Value>(
+                "net = [{ host = \"*\", why = \"reaches whatever the task needs\" }]",
+            )
+            .unwrap()
+            .get("net")
+            .cloned()
+            .unwrap(),
+        );
+    });
 
     // A public host passes the gate. It cannot be reached here (this sandbox has no sockets), so
     // the failure is the lookup, not a denial: that is what proves the grant allowed it.
@@ -456,13 +487,18 @@ fn a_wildcard_net_grant_allows_any_host_but_not_the_local_machine() {
     );
 
     // Loopback is not opened by a wildcard: only a grant that spells the address out may (D28).
-    let policy = env.policy();
-    env.write_policy(
-        policy.replace(
-            "net      = [{ host = \"*\", why = \"reaches whatever the task needs\" }]",
-            "net      = [{ host = \"*\", scheme = \"http\", why = \"reaches whatever the task needs\" }]",
-        ),
-    );
+    env.edit_agent(|agent| {
+        agent.insert(
+            "net".into(),
+            toml::from_str::<toml::Value>(
+                "net = [{ host = \"*\", scheme = \"http\", why = \"reaches whatever the task needs\" }]",
+            )
+            .unwrap()
+            .get("net")
+            .cloned()
+            .unwrap(),
+        );
+    });
     let (ok, text) = env.tool(
         "fetch",
         serde_json::json!({"url": "http://127.0.0.1:80/v1/models"}),
@@ -476,13 +512,19 @@ fn a_wildcard_net_grant_allows_any_host_but_not_the_local_machine() {
     assert!(text.contains("policy file"), "{text}");
 
     // Naming the address does open it, which is the escape hatch the rule is built around.
-    let policy = env.policy();
-    env.write_policy(
-        policy.replace(
-            "net      = [{ host = \"*\", scheme = \"http\", why = \"reaches whatever the task needs\" }]",
-            "net      = [{ host = \"*\", scheme = \"http\", why = \"anything\" }, { host = \"127.0.0.1\", scheme = \"http\", why = \"a local server\" }]",
-        ),
-    );
+    env.edit_agent(|agent| {
+        agent.insert(
+            "net".into(),
+            toml::from_str::<toml::Value>(
+                "net = [{ host = \"*\", scheme = \"http\", why = \"anything\" }, \
+                 { host = \"127.0.0.1\", scheme = \"http\", why = \"a local server\" }]",
+            )
+            .unwrap()
+            .get("net")
+            .cloned()
+            .unwrap(),
+        );
+    });
     let (ok, text) = env.tool(
         "fetch",
         serde_json::json!({"url": "http://127.0.0.1:80/v1/models"}),
@@ -845,4 +887,108 @@ except = ["^notes/private$"]
         !read(&h.join("notes/private/a.txt")),
         "the excluded one does not"
     );
+}
+
+#[test]
+fn a_session_override_changes_the_grants_for_one_run_and_writes_nothing() {
+    // D63: `--grant` and `--revoke` are the per-session half of one config file. They are folded
+    // into the merged grants before parsing, so they are validated and audited like any other.
+    let env = Env::new();
+    let before = env.policy();
+
+    // A write is allowed normally, and refused when the scope is revoked for the run.
+    let (ok, _) = env.tool(
+        "write",
+        serde_json::json!({"path": "a.txt", "content": "x"}),
+    );
+    assert!(ok, "the base grants write");
+    let out = env.saddle(&[
+        "--revoke",
+        "fs-write",
+        "tool",
+        "write",
+        r#"{"path":"b.txt","content":"x"}"#,
+    ]);
+    let text = stderr(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("no fs-write grant"), "{text}");
+
+    // The listing shows the grants of the run, not the file's.
+    let out = env.saddle(&["--revoke", "fs-write", "check"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        !text.contains("agent.fs-write"),
+        "revoked in the listing: {text}"
+    );
+    assert!(
+        text.contains("grants changed for this session only: -fs-write"),
+        "the note says what changed: {text}"
+    );
+
+    // Nothing was written: the file is byte for byte what it was.
+    assert_eq!(env.policy(), before, "an override is not stored");
+
+    // A scope the file does not have is still revoked cleanly, and an unknown form is refused.
+    let out = env.saddle(&["--grant", "nonsense:thing", "check"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("does not know how to build"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn the_old_two_file_layout_is_migrated_once() {
+    // D63, temporary: an install from before the merge keeps grants in `policy.toml` and
+    // `policies/<key>.toml`. They are folded into `config.toml` and the originals renamed, so a
+    // second run does nothing.
+    let env = Env::new();
+    let key = env.workspace_key();
+    let config = env.policy_path();
+    // Recreate the old layout: a config with no grants of its own, and a `policy.toml` beside it.
+    std::fs::write(&config, "provider = \"synthetic\"\n").unwrap();
+    let dir = config.parent().unwrap();
+    std::fs::write(
+        dir.join("policy.toml"),
+        "version = 1\n[agent]\nexec = { why = \"old base\", timeout-secs = 42 }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("policies")).unwrap();
+    std::fs::write(
+        dir.join("policies").join(format!("{key}.toml")),
+        "version = 1\n[agent]\nfs-write = [{ root = \"workspace\" }]\n",
+    )
+    .unwrap();
+
+    let out = env.saddle(&["check"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // The "moved" line is a first-run notice, so it goes to stderr like the others.
+    let notice = stderr(&out);
+    assert!(notice.contains("moved 2 grants file"), "{notice}");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        text.contains("timeout 42s"),
+        "the old base was taken: {text}"
+    );
+    assert!(
+        text.contains("agent.fs-write"),
+        "the old override too: {text}"
+    );
+
+    // The originals are kept under a name nothing reads, and a second run is a no-op.
+    assert!(dir.join("policy.toml.imported").exists());
+    assert!(
+        dir.join("policies")
+            .join(format!("{key}.toml.imported"))
+            .exists()
+    );
+    let out = env.saddle(&["check"]);
+    assert!(
+        !stderr(&out).contains("moved"),
+        "migration runs once: {}",
+        stderr(&out)
+    );
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("timeout 42s"), "and the grants stay: {text}");
 }

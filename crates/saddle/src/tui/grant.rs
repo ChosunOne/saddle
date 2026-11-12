@@ -1,9 +1,10 @@
-//! Writing one change into a workspace's policy file (D45).
+//! Writing one change into a workspace's grants (D45).
 //!
 //! The edit is made on the parsed TOML document and the result is validated before it is written,
-//! so a change from the menu either lands as a policy that loads or does not land at all. Only the
-//! workspace's own file is touched: the global policy is the base, and a change made while working
-//! in a project is a change to that project.
+//! so a change from the menu either lands as grants that load or does not land at all. Only this
+//! workspace's own entry is touched, `[workspaces."<key>".agent]` in `config.toml`: the `[agent]`
+//! table is the base, and a change made while working in a project is a change to that project
+//! (D63).
 
 use std::path::Path;
 
@@ -14,7 +15,12 @@ use super::permissions::Change;
 
 /// Applies `change` to the policy at `path`, refusing anything that would not load afterwards.
 /// `roots` is the set the session would resolve, so the check is the session's own.
-pub fn edit(path: &Path, change: &Change, roots: &saddle_cap::Roots) -> Result<()> {
+pub fn edit(
+    path: &Path,
+    key: Option<&str>,
+    change: &Change,
+    roots: &saddle_cap::Roots,
+) -> Result<()> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut doc: DocumentMut = text
@@ -22,28 +28,51 @@ pub fn edit(path: &Path, change: &Change, roots: &saddle_cap::Roots) -> Result<(
         .with_context(|| format!("{}", path.display()))?;
 
     match change {
-        Change::Exclude { rule, patterns } => exclude(&mut doc, rule, patterns)?,
-        Change::Toggle { rule, on } => toggle(&mut doc, rule, *on)?,
+        Change::Exclude { rule, patterns } => exclude(&mut doc, key, rule, patterns)?,
+        Change::Toggle { rule, on } => toggle(&mut doc, key, rule, *on)?,
         // Adding goes through its own entry point, which returns what it added.
         Change::Add(what) => bail!("`{what}` is added with `grant::add`"),
     }
 
     let out = doc.to_string();
-    // The same check a session makes, so the file cannot be left unloadable (D43).
-    saddle_cap::Policy::parse(&out, roots)
+    validate(&out, key, roots)
         .with_context(|| format!("the change would leave {} unloadable", path.display()))?;
     std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
-/// The `[agent]` table, created if the file has none.
-fn agent(doc: &mut DocumentMut) -> Result<&mut Table> {
-    if doc.get("agent").is_none() {
-        doc.insert("agent", Item::Table(Table::new()));
+/// The `[agent]` table the change belongs in (D63).
+///
+/// With a key it is this workspace's entry, `[workspaces."<key>".agent]`, which is what a session
+/// writes; without one it is a policy-shaped document's root `[agent]`, which keeps the mechanics
+/// testable without a whole `config.toml`.
+fn agent<'a>(doc: &'a mut DocumentMut, key: Option<&str>) -> Result<&'a mut Table> {
+    let Some(key) = key else {
+        if doc.get("agent").is_none() {
+            doc.insert("agent", Item::Table(Table::new()));
+        }
+        return doc["agent"]
+            .as_table_mut()
+            .context("`agent` is not a table");
+    };
+    if doc.get("workspaces").is_none() {
+        doc.insert("workspaces", Item::Table(Table::new()));
     }
-    doc["agent"]
+    let workspaces = doc["workspaces"]
         .as_table_mut()
-        .context("`agent` is not a table in the policy file")
+        .context("`workspaces` is not a table in config.toml")?;
+    if workspaces.get(key).is_none() {
+        workspaces.insert(key, Item::Table(Table::new()));
+    }
+    let entry = workspaces[key]
+        .as_table_mut()
+        .context("a [workspaces] entry is not a table")?;
+    if entry.get("agent").is_none() {
+        entry.insert("agent", Item::Table(Table::new()));
+    }
+    entry["agent"]
+        .as_table_mut()
+        .context("a [workspaces] entry's `agent` is not a table")
 }
 
 /// `agent.fs-read[0]` names the first entry of the `fs-read` list.
@@ -62,9 +91,14 @@ fn fs_key(rule: &str) -> Result<(&'static str, usize)> {
     Ok((scope, index))
 }
 
-fn exclude(doc: &mut DocumentMut, rule: &str, patterns: &[String]) -> Result<()> {
+fn exclude(
+    doc: &mut DocumentMut,
+    key: Option<&str>,
+    rule: &str,
+    patterns: &[String],
+) -> Result<()> {
     let (scope, index) = fs_key(rule)?;
-    let table = agent(doc)?;
+    let table = agent(doc, key)?;
     // A policy can write a list either as `[[fs-read]]` sections or inline as `[{ root = "…" }]`,
     // and both have to be editable.
     let item = table
@@ -113,34 +147,58 @@ fn set_exclude(entry: &mut Table, patterns: &[String]) {
 
 /// Adds one grant to this workspace's policy (D46). `what` is what a person typed, one line:
 /// `net api.example.com`, `root ~/.cargo`, `exec`, `tokens 200000`.
-pub fn add(path: &Path, what: &str, roots: &saddle_cap::Roots) -> Result<String> {
+pub fn add(
+    path: &Path,
+    key: Option<&str>,
+    what: &str,
+    roots: &saddle_cap::Roots,
+) -> Result<String> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut doc: DocumentMut = text
         .parse()
         .with_context(|| format!("{}", path.display()))?;
-    // A file of nothing but comments is valid; a policy needs its version line.
-    if doc.get("version").is_none() {
-        doc.insert("version", value(POLICY_VERSION as i64));
+    // A policy-shaped document needs its version line; `config.toml` must not have one, because
+    // it is not a policy and would be an unknown field there (D63).
+    if key.is_none() && doc.get("version").is_none() {
+        doc.insert("version", value(1));
     }
-    let summary = append(&mut doc, what, roots)?;
+    let summary = append(&mut doc, what, key, roots)?;
     let out = doc.to_string();
-    saddle_cap::Policy::parse(&out, roots)
+    validate(&out, key, roots)
         .with_context(|| format!("the change would leave {} unloadable", path.display()))?;
     std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
     Ok(summary)
 }
 
-/// The version line `Policy::parse` requires.
-const POLICY_VERSION: u32 = 1;
+/// The same checks a session makes: the file is still a config, and this workspace's grants still
+/// parse as a policy (D43, D63).
+fn validate(out: &str, key: Option<&str>, roots: &saddle_cap::Roots) -> Result<()> {
+    let Some(key) = key else {
+        saddle_cap::Policy::parse(out, roots)?;
+        return Ok(());
+    };
+    let user: crate::config::UserConfig = toml::from_str(out)?;
+    let doc = user
+        .workspace_policy(key)
+        .unwrap_or_else(|| user.global_policy());
+    let text = toml::to_string(&doc)?;
+    saddle_cap::Policy::parse(&text, roots)?;
+    Ok(())
+}
 
 /// Appends the grant `what` describes, and answers with what it added.
-fn append(doc: &mut DocumentMut, what: &str, roots: &saddle_cap::Roots) -> Result<String> {
+fn append(
+    doc: &mut DocumentMut,
+    what: &str,
+    key: Option<&str>,
+    roots: &saddle_cap::Roots,
+) -> Result<String> {
     let (kind, argument) = match what.trim().split_once(char::is_whitespace) {
         Some((k, a)) => (k.to_ascii_lowercase(), a.trim().to_owned()),
         None => (what.trim().to_ascii_lowercase(), String::new()),
     };
-    let table = agent(doc)?;
+    let table = agent(doc, key)?;
     match kind.as_str() {
         "net" => {
             if argument.is_empty() {
@@ -307,7 +365,7 @@ fn set_last_port(table: &mut Table, scope: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
-fn toggle(doc: &mut DocumentMut, rule: &str, on: bool) -> Result<()> {
+fn toggle(doc: &mut DocumentMut, key: Option<&str>, rule: &str, on: bool) -> Result<()> {
     // Only scopes with no parameters can be switched from here; everything else is a table or a
     // list that needs arguments, which is what the file is for.
     let scope = rule
@@ -316,7 +374,7 @@ fn toggle(doc: &mut DocumentMut, rule: &str, on: bool) -> Result<()> {
     if scope.contains('[') || matches!(scope, "exec" | "net" | "model-invoke") {
         bail!("`{rule}` needs arguments, so it is edited in the file rather than from here");
     }
-    let table = agent(doc)?;
+    let table = agent(doc, key)?;
     if on {
         if table.get(scope).is_none() {
             table.insert(scope, Item::Table(Table::new()));
@@ -350,6 +408,7 @@ mod tests {
         );
         edit(
             &path,
+            None,
             &Change::Exclude {
                 rule: "agent.fs-read[0]".into(),
                 patterns: vec![".env*".into(), "/secrets".into()],
@@ -371,6 +430,7 @@ mod tests {
         // Emptying it removes the key rather than writing `exclude = []`.
         edit(
             &path,
+            None,
             &Change::Exclude {
                 rule: "agent.fs-read[0]".into(),
                 patterns: Vec::new(),
@@ -388,6 +448,7 @@ mod tests {
             temp("version = 1\n\n[agent]\nfs-read = [{ root = \"workspace\" }]\n");
         let e = edit(
             &path,
+            None,
             &Change::Exclude {
                 rule: "agent.fs-read[3]".into(),
                 patterns: vec![".env".into()],
@@ -409,6 +470,7 @@ mod tests {
         let (_d, path, roots) = temp("# only comments so far\n");
         let added = add(
             &path,
+            None,
             "net api.example.com:8443 # reads the catalogue",
             &roots,
         )
@@ -425,7 +487,7 @@ mod tests {
         saddle_cap::Policy::parse(&text, &roots).unwrap();
 
         // A second host appends rather than replacing.
-        add(&path, "net *.other.test", &roots).unwrap();
+        add(&path, None, "net *.other.test", &roots).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.matches("[[agent.net]]").count(), 2, "{text}");
         assert!(!text.contains("port = 8443\nport"), "{text}");
@@ -434,12 +496,14 @@ mod tests {
     #[test]
     fn adding_a_root_that_the_session_does_not_have_is_refused_with_the_list() {
         let (_d, path, roots) = temp("version = 1\n");
-        let e = add(&path, "root ~/.cargo", &roots).unwrap_err().to_string();
+        let e = add(&path, None, "root ~/.cargo", &roots)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("is not a root in this session"), "{e}");
         assert!(e.contains("workspace"), "the list is shown: {e}");
 
         // A root the session does have is written as a grant.
-        add(&path, "write workspace # scratch space", &roots).unwrap();
+        add(&path, None, "write workspace # scratch space", &roots).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("[[agent.fs-write]]"), "{text}");
         assert!(text.contains(r#"root = "workspace""#), "{text}");
@@ -448,20 +512,20 @@ mod tests {
     #[test]
     fn adding_exec_or_a_budget_is_one_line_each() {
         let (_d, path, roots) = temp("version = 1\n");
-        add(&path, "exec", &roots).unwrap();
-        add(&path, "tokens 250000", &roots).unwrap();
+        add(&path, None, "exec", &roots).unwrap();
+        add(&path, None, "tokens 250000", &roots).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("[agent.exec]"), "{text}");
         assert!(text.contains("tokens-per-session = 250000"), "{text}");
         // Both would be a second grant of the same scope.
-        assert!(add(&path, "exec", &roots).is_err());
-        assert!(add(&path, "tokens 1", &roots).is_err());
+        assert!(add(&path, None, "exec", &roots).is_err());
+        assert!(add(&path, None, "tokens 1", &roots).is_err());
     }
 
     #[test]
     fn an_unknown_form_lists_the_ones_that_work() {
         let (_d, path, roots) = temp("version = 1\n");
-        let e = add(&path, "allow everything", &roots)
+        let e = add(&path, None, "allow everything", &roots)
             .unwrap_err()
             .to_string();
         assert!(
@@ -477,6 +541,7 @@ mod tests {
         for rule in ["agent.exec", "agent.net", "agent.model-invoke"] {
             let e = edit(
                 &path,
+                None,
                 &Change::Toggle {
                     rule: rule.into(),
                     on: false,
@@ -497,6 +562,7 @@ mod tests {
         let before = std::fs::read_to_string(&path).unwrap();
         let e = edit(
             &path,
+            None,
             &Change::Exclude {
                 rule: "agent.fs-read[0]".into(),
                 patterns: vec!["a[".into()],

@@ -288,7 +288,7 @@ pub enum PolicyError {
 
 /// A TOML value as a document, which is what `Policy::parse` reads. `toml::to_string` on a `Value`
 /// writes an inline `{...}`, which is not a document.
-fn document(value: &toml::Value) -> Result<String, PolicyError> {
+pub fn document(value: &toml::Value) -> Result<String, PolicyError> {
     let table = match value {
         toml::Value::Table(t) => t.clone(),
         other => {
@@ -304,7 +304,7 @@ fn document(value: &toml::Value) -> Result<String, PolicyError> {
 ///
 /// Tables merge, so a grant the project leaves alone keeps the global value. Grants are lists, and
 /// a project's list replaces the global one for that scope — the whole point of overriding.
-fn merge(global: toml::Value, project: toml::Value) -> toml::Value {
+pub fn merge(global: toml::Value, project: toml::Value) -> toml::Value {
     match (global, project) {
         (toml::Value::Table(mut g), toml::Value::Table(p)) => {
             for (key, value) in p {

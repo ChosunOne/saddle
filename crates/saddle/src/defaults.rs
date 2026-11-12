@@ -9,14 +9,9 @@ use anyhow::{Context, Result};
 
 use crate::paths::Paths;
 
-pub const DEFAULT_POLICY: &str = r#"# The global policy. Every workspace gets its own copy of this file the first time a session
-# opens there, under policies/ in this directory, and that copy is what applies (D42).
-#
-# Both live in your config directory, which no root contains, so neither the agent nor a
-# sandboxed command can write them, so a change to either takes effect in the next session.
-version = 1
-
-[agent]
+/// The grants applied when a config has no `[agent]` table at all. A present table, even an empty
+/// one, is taken as written: that is how a person says "no grants" rather than "not yet" (D63).
+pub const DEFAULT_AGENT: &str = r#"
 fs-read  = [{ root = "workspace", exclude = [".env*"], why = "reads the project" }]
 fs-write = [{ root = "workspace", exclude = [".env*"], why = "edits the project" }]
 exec     = { why = "runs builds, tests and git" }
@@ -56,6 +51,17 @@ pub fn config_text(home: Option<&Path>) -> String {
 
 # Model requests per prompt before the loop stops and waits for you. /settings changes it.
 # max-steps = 50          # model requests one prompt may take; unset means no limit
+
+# Grants: what the agent may do in every workspace. A workspace can override a key under
+# [workspaces."<key>"] -- the key is the directory with / written as %, as `saddle check` prints
+# it -- and what a workspace lists replaces the value here for that key, narrower or wider.
+#
+# `saddle --grant fs-read:scratch` and `saddle --revoke net` change this for one run without
+# writing anything.
+[agent]
+fs-read  = [{{ root = "workspace", exclude = [".env*"], why = "reads the project" }}]
+fs-write = [{{ root = "workspace", exclude = [".env*"], why = "edits the project" }}]
+exec     = {{ why = "runs builds, tests and git" }}
 
 # Directories outside the workspace, by name, so a policy can grant them. Nothing is here by
 # default: a toolchain directory must not be one, because a root is something any policy in a
@@ -127,22 +133,14 @@ write = [{write}]
 /// never touched.
 /// The policy text a workspace's file is seeded with when it has none: the global policy, or this
 /// built-in one when the global file is missing or unreadable (D42).
-pub fn default_policy_text() -> String {
-    DEFAULT_POLICY.to_owned()
-}
-
 pub fn ensure(paths: &Paths) -> Result<Vec<PathBuf>> {
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from);
     let mut created = Vec::new();
-    for (path, text) in [
-        (paths.user_config(), config_text(home.as_deref())),
-        (paths.default_policy(), DEFAULT_POLICY.to_owned()),
-    ] {
-        if create_new(&path, &text)? {
-            created.push(path);
-        }
+    let path = paths.user_config();
+    if create_new(&path, &config_text(home.as_deref()))? {
+        created.push(path);
     }
     Ok(created)
 }
@@ -383,22 +381,22 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_parses_and_files_are_never_overwritten() {
+    fn the_generated_config_is_valid_and_never_overwritten() {
+        // One file now (D63), so the check is that its [agent] table parses as a policy.
         let ws = tempfile::tempdir().unwrap();
         let roots = Roots::resolve([(RootName::workspace(), ws.path().into())], &[]).unwrap();
-        Policy::parse(DEFAULT_POLICY, &roots).unwrap();
+        let cfg: UserConfig = toml::from_str(&config_text(None)).unwrap();
+        let text = toml::to_string(&cfg.global_policy()).unwrap();
+        Policy::parse(&text, &roots).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths {
             state: dir.path().join("state"),
             config: dir.path().join("config"),
         };
-        assert_eq!(ensure(&paths).unwrap().len(), 2);
-        fs::write(paths.default_policy(), "# mine\n").unwrap();
+        assert_eq!(ensure(&paths).unwrap().len(), 1, "one file is written");
+        fs::write(paths.user_config(), "# mine\n").unwrap();
         assert!(ensure(&paths).unwrap().is_empty());
-        assert_eq!(
-            fs::read_to_string(paths.default_policy()).unwrap(),
-            "# mine\n"
-        );
+        assert_eq!(fs::read_to_string(paths.user_config()).unwrap(), "# mine\n");
     }
 }

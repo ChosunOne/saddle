@@ -40,6 +40,13 @@ struct Cli {
     /// Directory to start from; the workspace is the git toplevel above it.
     #[arg(long, short = 'C', global = true, default_value = ".")]
     dir: PathBuf,
+    /// Add a grant for this run only, as `scope` or `scope:what`: `--grant fs-read:scratch`,
+    /// `--grant exec`. Nothing is written, so it is gone when the session ends (D63).
+    #[arg(long, global = true)]
+    grant: Vec<String>,
+    /// Drop a scope's grants for this run only, as in `--revoke net` (D63).
+    #[arg(long, global = true)]
+    revoke: Vec<String>,
     /// Name the session, so an allowance made with `saddle session allow` can be used by it. One is
     /// generated and printed when the workspace needs approving (D60).
     #[arg(long, global = true)]
@@ -157,18 +164,33 @@ fn run(cli: Cli) -> Result<ExitCode> {
     {
         return verify(log);
     }
-    // First run: write the default config and policy (D30).
+    // First run: write the default config (D30).
     let paths = paths::Paths::from_env()?;
-    let created: Vec<String> = defaults::ensure(&paths)?
+    // Before the defaults are written, so a config created here does not shadow the grants an
+    // older install still keeps in `policy.toml` (D63).
+    let migrated: Vec<std::path::PathBuf> =
+        config::migrate(&paths.user_config(), &paths.policies_dir()).unwrap_or_default();
+    let mut created: Vec<String> = defaults::ensure(&paths)?
         .iter()
         .map(|p| format!("created {} with defaults; edit it freely", p.display()))
         .collect();
+    if !migrated.is_empty() {
+        created.push(format!(
+            "moved {} grants file(s) into {}; the originals are kept as .imported",
+            migrated.len(),
+            paths.user_config().display()
+        ));
+    }
     // The agent shows these itself (the TUI's intro, or line mode's header).
     if !matches!(cli.cmd, None | Some(Cmd::Run { .. })) {
         for line in &created {
             eprintln!("saddle: {line}");
         }
     }
+    let overrides = config::Overrides {
+        grant: cli.grant,
+        revoke: cli.revoke,
+    };
     // One id for the whole invocation: it names the session in the audit log, and it is what an
     // allowance is written against (D60).
     let session = match cli.session {
@@ -186,12 +208,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
         None => session_id(),
     };
     match cli.cmd {
-        None => run_agent(&cli.dir, None, cli.agent, paths, created, &session),
-        Some(Cmd::Run { prompt, agent }) => {
-            run_agent(&cli.dir, prompt, agent, paths, created, &session)
+        None => run_agent(
+            &cli.dir, None, cli.agent, paths, created, &session, &overrides,
+        ),
+        Some(Cmd::Run { prompt, agent }) => run_agent(
+            &cli.dir, prompt, agent, paths, created, &session, &overrides,
+        ),
+        Some(Cmd::Check) => check(&cli.dir, &overrides),
+        Some(Cmd::Tool { name, input }) => {
+            tool(&cli.dir, &name, &input, &session, &paths, &overrides)
         }
-        Some(Cmd::Check) => check(&cli.dir),
-        Some(Cmd::Tool { name, input }) => tool(&cli.dir, &name, &input, &session, &paths),
         Some(Cmd::Session { cmd }) => session_cmd(cmd, &paths),
         Some(Cmd::Audit { .. }) => unreachable!("handled above"),
     }
@@ -204,6 +230,7 @@ fn run_agent(
     paths: paths::Paths,
     created: Vec<String>,
     session: &str,
+    overrides: &config::Overrides,
 ) -> Result<ExitCode> {
     let user = UserConfig::load(&paths.user_config())?;
     // Before a provider is chosen and before anything is opened, so a refusal costs nothing: no
@@ -256,7 +283,7 @@ fn run_agent(
         },
     };
 
-    let mut session = Session::open(dir, Some(session))?;
+    let mut session = Session::open_with(dir, Some(session), overrides)?;
     let secrets = provider::secret_env_names(&user.providers);
     session.host_env.retain(|(k, _)| !secrets.contains(k));
     let (context, refused) = context::load(&mut session, &user.context, &paths)?;
@@ -653,9 +680,9 @@ fn session_cmd(cmd: SessionCmd, paths: &paths::Paths) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn check(dir: &std::path::Path) -> Result<ExitCode> {
+fn check(dir: &std::path::Path, overrides: &config::Overrides) -> Result<ExitCode> {
     let tmp = PrivateTmp::create(&session_id())?;
-    let setup = Setup::load(dir, tmp.path())?;
+    let setup = Setup::load(dir, tmp.path(), overrides)?;
     // The layering happens in `Setup::load`, so an invalid project file is reported here rather
     // than on the first tool call.
     println!("workspace  {}", setup.workspace.display());
@@ -674,22 +701,26 @@ fn check(dir: &std::path::Path) -> Result<ExitCode> {
         println!("  {:<12} {}{note}", name.as_str(), path.display());
     }
     // Both files, in the order they apply, since a grant can come from either (D43).
+    // One file now (D63): the base grants and this workspace's own, with the hash of each so a
+    // change is visible.
     println!(
-        "policy     layered: {} (sha256 {})",
-        setup.paths.default_policy().display(),
+        "grants     {} (sha256 {})",
+        setup.policy_path.display(),
         &setup.global_sha256[..16]
     );
-    println!(
-        "           then    {} (sha256 {})",
-        setup.policy_path.display(),
-        &setup.policy_sha256[..16]
-    );
-    println!("grants");
+    if setup.policy_text.is_empty() {
+        println!("           no [workspaces] entry for this directory: it inherits the base");
+    } else {
+        println!(
+            "           then this workspace's own entry (sha256 {})",
+            &setup.policy_sha256[..16]
+        );
+    }
+    println!("effective");
     for line in &setup.merged {
         println!("  {line}");
     }
-    // A pattern is an input; this list is the authority a command actually runs under, so it is
-    // what `check` shows (D62).
+    // A pattern is an input; this list is the authority a command actually runs under (D62).
     if !setup.extras.include.is_empty() {
         println!("exec reads");
         for path in &setup.extras.include {
@@ -839,6 +870,7 @@ fn tool(
     input: &str,
     session: &str,
     paths: &paths::Paths,
+    overrides: &config::Overrides,
 ) -> Result<ExitCode> {
     if !tools::NAMES.contains(&name) {
         bail!("unknown tool `{name}` (known: {})", tools::NAMES.join(", "));
@@ -851,7 +883,7 @@ fn tool(
         .unwrap_or_else(|_| dir.to_path_buf());
     let picked = gate_workspace(paths, &workspace, session)?;
     let session = picked.as_deref().unwrap_or(session);
-    let mut session = Session::open(dir, Some(session))?;
+    let mut session = Session::open_with(dir, Some(session), overrides)?;
     let log = session.audit.path().to_path_buf();
     let result = tools::call(&mut session, name, &input);
     session.close()?;

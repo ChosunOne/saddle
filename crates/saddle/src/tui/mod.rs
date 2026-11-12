@@ -568,7 +568,8 @@ fn event_loop(
                         control.after_config_edit(app);
                     }
                     Some(Action::Apply(Change::EditPolicy)) => {
-                        let path = control.paths.default_policy();
+                        // One file now: the grants are the `[agent]` table in config.toml (D63).
+                        let path = control.paths.user_config();
                         edit_file(terminal, &path, app.header.mouse)?;
                         control.after_policy_edit(app);
                     }
@@ -847,7 +848,7 @@ impl Controller {
             show_reasoning: app.show_thinking,
             expand_tools: app.expand_tools,
             config_path: render::home_relative(&self.paths.user_config()),
-            policy_path: render::home_relative(&self.paths.default_policy()),
+            policy_path: render::home_relative(&self.paths.user_config()),
         })
     }
 
@@ -881,11 +882,20 @@ impl Controller {
     }
 
     fn apply_grant(&self, app: &mut App, change: &permissions::Change) -> Result<()> {
-        let setup = Setup::load(&app.header.workspace, &std::env::temp_dir())?;
+        let setup = Setup::load(
+            &app.header.workspace,
+            &std::env::temp_dir(),
+            &crate::config::Overrides::default(),
+        )?;
         // The roots the session would resolve, so the write is validated as a session would.
         let roots = crate::session::roots_for_validation()?;
         if let permissions::Change::Add(what) = change {
-            let added = grant::add(&setup.policy_path, what, &roots)?;
+            let added = grant::add(
+                &setup.policy_path,
+                Some(&crate::paths::workspace_key(&setup.workspace)),
+                what,
+                &roots,
+            )?;
             app.note(
                 NoteKind::Info,
                 &format!(
@@ -895,7 +905,12 @@ impl Controller {
             );
             return Ok(());
         }
-        grant::edit(&setup.policy_path, change, &roots)
+        grant::edit(
+            &setup.policy_path,
+            Some(&crate::paths::workspace_key(&setup.workspace)),
+            change,
+            &roots,
+        )
     }
 
     fn open_settings(&self, app: &mut App) -> Result<()> {
@@ -1066,15 +1081,15 @@ impl Controller {
     }
 
     fn after_policy_edit(&self, app: &mut App) {
-        let path = self.paths.default_policy();
+        let path = self.paths.user_config();
         let checked = std::fs::read_to_string(&path)
             .map_err(anyhow::Error::from)
             .and_then(|text| Ok(text.parse::<toml::Table>()?));
         match checked {
             Ok(_) => app.note(
                 NoteKind::Info,
-                "the default policy applies from the next session; this one keeps the policy it \
-                 started with",
+                "the grants apply from the next session; this one keeps the grants it started \
+                 with",
             ),
             Err(e) => app.note(
                 NoteKind::Error,
@@ -1111,7 +1126,11 @@ impl Controller {
     /// still listed: seeing that `exec` is on, and that it is not changed from a menu, is the point
     /// of showing it.
     fn permission_rows(&self, app: &App) -> Result<Vec<Row>> {
-        let setup = Setup::load(&app.header.workspace, &std::env::temp_dir())?;
+        let setup = Setup::load(
+            &app.header.workspace,
+            &std::env::temp_dir(),
+            &crate::config::Overrides::default(),
+        )?;
         let policy = setup.parse_policy()?;
         let Some(grants) = policy.grants(&saddle_cap::Principal::Agent) else {
             return Ok(Vec::new());
@@ -1190,11 +1209,15 @@ impl Controller {
 
     fn open_permissions(&self, app: &mut App) -> Result<()> {
         let rows = self.permission_rows(app)?;
-        let setup = Setup::load(&app.header.workspace, &std::env::temp_dir())?;
+        let setup = Setup::load(
+            &app.header.workspace,
+            &std::env::temp_dir(),
+            &crate::config::Overrides::default(),
+        )?;
         app.permissions = Some(Permissions::new(
             rows,
             render::home_relative(&setup.policy_path),
-            render::home_relative(&self.paths.default_policy()),
+            render::home_relative(&self.paths.user_config()),
         ));
         Ok(())
     }

@@ -46,22 +46,11 @@ impl Paths {
         self.config.join("config.toml")
     }
 
-    /// The global policy: the base every workspace inherits from (D30, D42).
-    pub fn default_policy(&self) -> PathBuf {
-        self.config.join("policy.toml")
-    }
-
-    /// Every workspace's own policy. Inside the config directory, so no root contains it and no
-    /// sandboxed command can write it (D16, D42).
+    /// Every workspace's own grants used to live in one file per workspace here. Nothing reads
+    /// this directory any more: it is folded into `config.toml` once, then the files are renamed
+    /// `.imported` (D63).
     pub fn policies_dir(&self) -> PathBuf {
         self.config.join("policies")
-    }
-
-    /// The policy that applies in `workspace`, keyed by its canonical path. One file per
-    /// workspace, named so a person can read the directory list (D42).
-    pub fn workspace_policy(&self, workspace: &Path) -> PathBuf {
-        self.policies_dir()
-            .join(format!("{}.toml", workspace_key(workspace)))
     }
 
     /// Saved conversations (D31).

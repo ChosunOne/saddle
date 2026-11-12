@@ -35,6 +35,14 @@ use crate::provider::ProviderEntry;
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {
+    /// The grants every workspace inherits (D63). This was `policy.toml`; it is the same TOML,
+    /// under `[agent]` here.
+    #[serde(default)]
+    pub agent: Option<toml::Value>,
+    /// Per-workspace grants, keyed the way the policy file was named, replacing the global value
+    /// for a key that is listed (D63). This was `policies/<key>.toml`.
+    #[serde(default)]
+    pub workspaces: BTreeMap<String, WorkspaceConfig>,
     #[serde(default)]
     pub roots: BTreeMap<String, String>,
     #[serde(default)]
@@ -58,6 +66,14 @@ pub struct UserConfig {
     pub compaction: CompactionConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderEntry>,
+}
+
+/// One workspace's own grants.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceConfig {
+    #[serde(default)]
+    pub agent: Option<toml::Value>,
 }
 
 /// How the TUI starts; ctrl+t and ctrl+o change these for the session only.
@@ -116,6 +132,24 @@ pub struct SandboxConfig {
     /// directory to exclude" means. Set false to have only the rules written here (D62).
     #[serde(default = "yes", rename = "include-defaults")]
     pub include_defaults: bool,
+}
+
+/// A policy document from an `[agent]` table: the `version` line the parser requires, and the
+/// grants as written. `None` is an empty `[agent]`, which inherits everything (D63).
+pub fn policy_document_pub(agent: Option<toml::Value>) -> toml::Value {
+    policy_document(agent)
+}
+
+fn policy_document(agent: Option<toml::Value>) -> toml::Value {
+    let mut doc = toml::Table::new();
+    doc.insert("version".into(), toml::Value::Integer(1));
+    let agent = match agent {
+        Some(toml::Value::Table(t)) => toml::Value::Table(t),
+        Some(other) => other,
+        None => toml::Value::Table(toml::Table::new()),
+    };
+    doc.insert("agent".into(), agent);
+    toml::Value::Table(doc)
 }
 
 fn yes() -> bool {
@@ -313,6 +347,35 @@ impl UserConfig {
             .collect()
     }
 
+    /// The grant document every workspace inherits, as the policy parser reads it (D63).
+    pub fn global_policy(&self) -> toml::Value {
+        // No `[agent]` at all is "not configured yet", so the built-in grants apply. An `[agent]`
+        // table that is present and empty is a decision, and is taken as written (D63).
+        let agent = match self.agent.clone() {
+            Some(agent) => Some(agent),
+            None => toml::from_str::<toml::Value>(crate::defaults::DEFAULT_AGENT)
+                .ok()
+                .map(|v| toml::Value::Table(v.as_table().cloned().unwrap_or_default())),
+        };
+        policy_document(agent)
+    }
+
+    /// One workspace's own grant document. Absent when the workspace overrides nothing.
+    pub fn workspace_policy(&self, key: &str) -> Option<toml::Value> {
+        self.workspaces
+            .get(key)
+            .and_then(|w| w.agent.clone())
+            .map(|agent| policy_document(Some(agent)))
+    }
+
+    /// Whether a workspace lists any grant of its own, which is only used to word a note.
+    pub fn workspace_has_grants(&self, key: &str) -> bool {
+        self.workspaces
+            .get(key)
+            .and_then(|w| w.agent.as_ref())
+            .is_some_and(|v| v.as_table().is_some_and(|t| !t.is_empty()))
+    }
+
     /// The extras every child gets: named roots, plus the directories the include rules work out
     /// (D62). Enumeration happens here because the protected directories are known here, and the
     /// result is a plain list of paths, so the lowering itself stays a mapping.
@@ -471,4 +534,192 @@ mod tests {
         assert!(bad.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
+}
+
+/// Grants changed for one run, from `--grant` and `--revoke` (D63).
+///
+/// They are folded into the workspace's own document before it is parsed, so a session override
+/// goes through exactly the same validation and the same audit record as a grant written in the
+/// file. Nothing is stored: the session ends and they are gone.
+#[derive(Debug, Clone, Default)]
+pub struct Overrides {
+    /// `scope` or `scope:root`, as in `--grant fs-read:scratch` or `--grant exec`.
+    pub grant: Vec<String>,
+    /// A scope whose grants are dropped for this session, as in `--revoke net`.
+    pub revoke: Vec<String>,
+}
+
+impl Overrides {
+    pub fn is_empty(&self) -> bool {
+        self.grant.is_empty() && self.revoke.is_empty()
+    }
+
+    /// A phrase for the session intro, so what was changed is visible rather than remembered.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        for g in &self.grant {
+            parts.push(format!("+{g}"));
+        }
+        for r in &self.revoke {
+            parts.push(format!("-{r}"));
+        }
+        parts.join(" ")
+    }
+
+    /// Applies the overrides to an `[agent]` table, in place.
+    pub fn apply(&self, agent: &mut toml::Table) -> Result<()> {
+        for scope in &self.revoke {
+            let (scope, rest) = split_scope(scope);
+            if !rest.is_empty() {
+                bail!("--revoke takes a scope, as in `--revoke net`");
+            }
+            agent.remove(scope);
+        }
+        for spec in &self.grant {
+            let (scope, rest) = split_scope(spec);
+            let table = agent
+                .entry(scope.to_owned())
+                .or_insert_with(|| toml::Value::Array(Vec::new()));
+            match rest {
+                "" => {
+                    // A scope with no parameters: `exec`, `net` is not one of these.
+                    if matches!(scope, "fs-read" | "fs-write" | "net" | "tool") {
+                        bail!(
+                            "--grant {scope} needs what it grants, as in `--grant {scope}:scratch`"
+                        );
+                    }
+                    let mut a = toml::Table::new();
+                    a.insert(
+                        "why".into(),
+                        toml::Value::String("given on the command line".into()),
+                    );
+                    *table = toml::Value::Table(a);
+                }
+                rest => {
+                    let mut grant = toml::Table::new();
+                    let (root, exclude) = match rest.split_once(':') {
+                        Some((root, pats)) => (
+                            root,
+                            pats.split(',')
+                                .map(|p| toml::Value::String(p.trim().to_owned()))
+                                .collect::<Vec<_>>(),
+                        ),
+                        None => (rest, Vec::new()),
+                    };
+                    let value = match scope {
+                        "fs-read" | "fs-write" => {
+                            grant.insert("root".into(), toml::Value::String(root.to_owned()));
+                            if !exclude.is_empty() {
+                                grant.insert("exclude".into(), toml::Value::Array(exclude));
+                            }
+                            toml::Value::Table(grant)
+                        }
+                        "net" => {
+                            grant.insert("host".into(), toml::Value::String(root.to_owned()));
+                            toml::Value::Table(grant)
+                        }
+                        other => bail!("--grant does not know how to build a `{other}` grant"),
+                    };
+                    let entry = table
+                        .as_array_mut()
+                        .with_context(|| format!("`{scope}` in config.toml is not a list"))?;
+                    entry.push(value);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn split_scope(spec: &str) -> (&str, &str) {
+    match spec.split_once(':') {
+        Some((scope, rest)) => (scope.trim(), rest.trim()),
+        None => (spec.trim(), ""),
+    }
+}
+
+/// Folds `policy.toml` and `policies/*.toml` into `config.toml`, once (D63).
+///
+/// **Temporary.** The split between a policy file and a config file is gone, so an older install
+/// has grants in files that are no longer read. This moves them into the one file and renames the
+/// originals `.imported`, the same way the JSON Lines transcripts were imported (D53). It is
+/// written to be deleted in the next version, when only the merged layout exists.
+pub fn migrate(path: &Path, policies: &Path) -> Result<Vec<PathBuf>> {
+    let mut moved = Vec::new();
+    let global = path.with_file_name("policy.toml");
+    let mut text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
+    };
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("{}", path.display()))?;
+    let mut changed = false;
+    // The global grants, if they are still in their own file.
+    if let Ok(policy) = std::fs::read_to_string(&global) {
+        let policy: toml_edit::DocumentMut = policy
+            .parse()
+            .with_context(|| format!("{}", global.display()))?;
+        if doc.get("agent").is_none()
+            && let Some(agent) = policy.get("agent")
+        {
+            doc.insert("agent", agent.clone());
+            changed = true;
+            moved.push(global.clone());
+        }
+    }
+    // Each workspace's own grants.
+    if let Ok(entries) = std::fs::read_dir(policies) {
+        let mut found: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        found.sort();
+        for file in found {
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let Ok(own) = text.parse::<toml_edit::DocumentMut>() else {
+                continue;
+            };
+            let Some(agent) = own.get("agent") else {
+                moved.push(file.clone());
+                continue;
+            };
+            let key = file.file_stem().map(|s| s.to_string_lossy().into_owned());
+            let Some(key) = key else { continue };
+            if doc.get("workspaces").is_none() {
+                doc.insert(
+                    "workspaces",
+                    toml_edit::Item::Table(toml_edit::Table::new()),
+                );
+            }
+            let table = doc["workspaces"]
+                .as_table_mut()
+                .context("`workspaces` is not a table in config.toml")?;
+            if table.get(&key).is_none() {
+                table.insert(&key, toml_edit::Item::Table(toml_edit::Table::new()));
+                table[&key]["agent"] = agent.clone();
+                changed = true;
+            }
+            moved.push(file.clone());
+        }
+    }
+    if !changed {
+        return Ok(moved);
+    }
+    text = doc.to_string();
+    toml::from_str::<UserConfig>(&text)
+        .with_context(|| format!("the migration would leave {} invalid", path.display()))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, &text).with_context(|| format!("{}", path.display()))?;
+    // The originals are kept under a name nothing reads, so a second run is a no-op.
+    for file in &moved {
+        let _ = std::fs::rename(file, file.with_extension("toml.imported"));
+    }
+    Ok(moved)
 }

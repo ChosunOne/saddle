@@ -1140,6 +1140,36 @@ use it.
 - An unreadable or missing base grants nothing rather than failing the session, so a config carried
   between machines does not break one that lacks the directory.
 
+**D63.** One config file, with per-workspace and per-session overrides.
+
+- **`config.toml` is the only file.** `policy.toml` and `policies/<key>.toml` existed for a reason
+  that no longer holds — provider settings and grants were written by different code — and two files
+  whose grant semantics differ is a thing a person has to learn twice. `[agent]` is the base every
+  workspace inherits; `[workspaces."<key>".agent]` is one workspace's own, keyed the way the policy
+  file was named (`/` written as `%`, which `check` prints). The layering rule is unchanged (D43): a
+  key a workspace lists replaces the base value for that key, and an absent key is inherited.
+- **An absent `[agent]` is "not configured yet", and the built-in grants apply.** An `[agent]` table
+  that is present and empty is a decision, and is taken as written. Without that, the first person
+  to write a two-line `config.toml` would silently lose every grant, which is the failure that made
+  the older default-in-the-file look acceptable and was not.
+- **`--grant` and `--revoke` change the grants for one run.** `--grant fs-read:scratch` adds a grant,
+  `--grant exec` sets a scope that takes no parameters, `--grant fs-read:scratch:.env*` carries an
+  exclusion, and `--revoke net` drops a scope. Nothing is written, so there is no file to review and
+  no allowance to withdraw: the override belongs to the process, and the session intro says what
+  changed so it is not invisible either.
+- **An override is applied to the merged grants, not to the workspace's own.** A workspace-level
+  edit can only shadow a key; `--revoke exec` has to remove a grant that came from the base, which
+  means merging first and overriding second. The engine is then built from that document and not
+  re-layered from the file, or `check` and the engine would describe different policies — that was
+  the first version's bug.
+- The hash in the audit record names the **grants**, not the file, so a provider change is not a
+  policy change.
+- **The migration is temporary.** `config::migrate` folds `policy.toml` and `policies/*.toml` into
+  the one file and renames the originals `.imported`, once, before the defaults are written — after
+  them, a freshly created config would shadow the old grants and the migration would silently drop
+  them. It is written to be deleted in the next version: the author is the only user, so there is no
+  installed base to keep it for.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
