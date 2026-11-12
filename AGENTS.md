@@ -205,7 +205,8 @@ rather than loosening it.
   allowance outlives the session so it can be picked again: `saddle session list [filter]` shows
   them and `--session` takes an id, a unique prefix or a list number, so an id is never memorised.
   An allowance is a bearer permission, so session ids are random rather than a clock and a pid.
-  `saddle session pending` lists the ids waiting, `saddle session revoke` removes an allowance,
+  `saddle session pending` lists the ids waiting, `saddle session revoke <number|prefix>` withdraws
+  one,
   `check` reports the same thing without refusing, and
   `allow-sensitive = true` in the user's config skips the check for a machine with no secrets. A
   project inside home is fine. The `[sandbox] read`

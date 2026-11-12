@@ -121,8 +121,12 @@ enum SessionCmd {
         #[arg(default_value = "")]
         filter: String,
     },
-    /// Forget an allowance before its session ends.
-    Revoke { id: String },
+    /// Withdraw an allowance, so that session id can no longer run in the workspace (D61). Takes
+    /// what the list shows: a number, or an id or unique prefix.
+    Revoke {
+        /// A number from `session list`, or an id or unique prefix.
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -595,6 +599,10 @@ fn session_cmd(cmd: SessionCmd, paths: &paths::Paths) -> Result<ExitCode> {
                     entry.workspace.display()
                 );
             }
+            // The command that undoes each line, named where the lines are (D61).
+            println!(
+                "  withdraw one with: saddle session revoke <number>   (or a prefix of the id)"
+            );
         }
         SessionCmd::Pending => {
             let waiting = allowance.waiting();
@@ -618,9 +626,28 @@ fn session_cmd(cmd: SessionCmd, paths: &paths::Paths) -> Result<ExitCode> {
             }
         }
         SessionCmd::Revoke { id } => {
-            allow::check_id(&id)?;
+            // The same short forms as `--session`, because a revocation should not be harder to
+            // type than the permission it removes (D61).
+            let allowed = allowance.allowed();
+            let id = match allow::Allowance::resolve(&id, &allowed)? {
+                Some(id) => id,
+                None => {
+                    if allow::check_id(&id).is_ok() && !allowed.iter().any(|(a, _)| *a == id) {
+                        bail!("no allowance for {id}; `saddle session list` shows them");
+                    }
+                    bail!("nothing matches `{id}`; `saddle session list` shows the allowances");
+                }
+            };
+            let entry = allowance
+                .granted(&id)
+                .map(|e| e.workspace.display().to_string())
+                .unwrap_or_default();
             allowance.revoke(&id);
-            println!("session {id} allowance removed");
+            if entry.is_empty() {
+                println!("session {id} withdrawn");
+            } else {
+                println!("session {id} may no longer use {entry}");
+            }
         }
     }
     Ok(ExitCode::SUCCESS)

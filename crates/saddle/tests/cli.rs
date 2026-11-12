@@ -664,8 +664,9 @@ fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() 
     );
     assert!(reused.status.success(), "{}", stderr(&reused));
 
-    // Revoking is how an allowance goes away.
-    let revoked = saddle(home.path(), &["session", "revoke", &id]);
+    // Revoking is how an allowance goes away for a capability that was only needed briefly, and it
+    // takes the same short forms as `--session` (D61).
+    let revoked = saddle(home.path(), &["session", "revoke", prefix]);
     assert!(revoked.status.success(), "{}", stderr(&revoked));
     let after = saddle(
         home.path(),

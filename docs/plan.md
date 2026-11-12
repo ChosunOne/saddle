@@ -1045,8 +1045,12 @@ use it.
   chain that a previous process closed.
 - The cost is that an allowance accumulates until it is revoked, which is the opposite of what D60
   first did. That is the trade: a permission a person chose once and can see, pick and remove, in
-  exchange for not being expired silently by a process exiting. `saddle session revoke <id>` is
-  complete — it drops the allowance and any pending request.
+  exchange for not being expired silently by a process exiting.
+- **Withdrawing takes the same short forms as using.** `saddle session revoke` accepts a number from
+  `session list`, an id, or a unique prefix, and says what it removed and which workspace it covered;
+  a revocation must not be harder to type than the permission it withdraws. It drops the allowance
+  and any pending request for that id. `session list` prints the revoke command under the list, so
+  the way out is visible where the permissions are.
 
 ## 4. Scope enumeration
 
