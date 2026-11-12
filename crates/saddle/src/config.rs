@@ -45,6 +45,10 @@ pub struct UserConfig {
     /// Model requests per prompt before the loop stops and waits. Unset means no limit (D37).
     #[serde(default, rename = "max-steps")]
     pub max_steps: Option<usize>,
+    /// Whether a session may be rooted at the home directory, or above it (D60). Off unless a
+    /// person turns it on: this file is not writable by anything the agent runs (D42).
+    #[serde(default, rename = "allow-home")]
+    pub allow_home: bool,
     #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]

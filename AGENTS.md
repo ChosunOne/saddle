@@ -126,7 +126,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D59 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D60 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
@@ -199,6 +199,12 @@ rather than loosening it.
 - **State and config directories are outside every root**, so neither the agent nor a sandboxed
   command can read the audit log, `auth.json`, earlier transcripts, or the policy
   files that govern them. A root that contains the state or config directory is refused.
+- **Home is not a workspace** (D60). A session rooted at `$HOME`, or at an ancestor of it, is
+  refused before any file is opened; `allow-home = true` in the user's `config.toml` is the only
+  way to lift it, and that file is outside every root. A project inside home is fine. The
+  `[sandbox] read` lists in `config.toml` (`~/.cargo`, `~/.rustup`, `~/.config/git`) are the
+  directories outside the workspace that children may read *and execute*: exclusions do not bind
+  `exec` (D22), so never add a directory there that holds a token.
 - **`exec` is Linux-only**, needs landlock ABI 3 as a hard requirement, and has no network: seccomp
   blocks `socket()` for `AF_INET`/`AF_INET6`/`AF_UNIX`/`AF_NETLINK`/`AF_PACKET` and the io_uring
   entry points. Do not add hosts or paths to the sandbox allowlist to make a test pass. Network

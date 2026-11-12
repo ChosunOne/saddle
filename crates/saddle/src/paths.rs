@@ -91,6 +91,51 @@ pub fn find_workspace(start: &Path) -> PathBuf {
         .to_path_buf()
 }
 
+/// The home directory, canonical, if the environment names one (D60).
+pub fn home_dir() -> Option<PathBuf> {
+    let home = env::var_os("HOME").filter(|h| !h.is_empty())?;
+    let home = PathBuf::from(home);
+    Some(home.canonicalize().unwrap_or(home))
+}
+
+/// Refuses a workspace that is the home directory or an ancestor of it (D60).
+///
+/// Home is not a directory to hand to an agent: `.ssh`, `.aws`, `.config` and the rest of a person's
+/// credentials live directly beneath it, and a root cannot be narrowed from the inside (D20). The
+/// refusal is lexical and checked before anything is opened, and `allow-home` in the user's config
+/// is the only thing that lifts it — a file no process the agent runs can write (D42).
+pub fn check_home(workspace: &Path, allow_home: bool) -> Result<()> {
+    if allow_home {
+        return Ok(());
+    }
+    let Some(which) = home_conflict(workspace, home_dir().as_deref()) else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "refusing to open a session at {}: it is {which}, and every credential on this machine is \
+         beneath it. Start in a project instead (saddle -C ~/src/project), or set `allow-home = \
+         true` in {} if you really mean it",
+        workspace.display(),
+        Paths::from_env()
+            .map(|p| p.user_config().display().to_string())
+            .unwrap_or_else(|_| "config.toml".into()),
+    )
+}
+
+/// How `workspace` relates to home when that is a problem, or `None` when it is fine (D60).
+///
+/// Split from `check_home` because the environment is process-wide and a test cannot set it
+/// without racing every other test.
+fn home_conflict(workspace: &Path, home: Option<&Path>) -> Option<&'static str> {
+    let home = home?;
+    if workspace == home {
+        return Some("your home directory");
+    }
+    // An ancestor of home contains home, and therefore contains the credentials too.
+    home.starts_with(workspace)
+        .then_some("a directory above your home directory")
+}
+
 /// A workspace path as one filename component: `/` becomes `%`, so
 /// `/home/me/project` is `home%me%project.toml` and the directory listing names the workspaces.
 /// Characters that are awkward in a filename become `_`, which is a lossy but readable fallback;
@@ -123,5 +168,29 @@ mod tests {
         );
         // No separators survive, so nothing can escape the policies directory.
         assert!(!workspace_key(Path::new("/../../etc/passwd")).contains('/'));
+    }
+
+    #[test]
+    fn a_session_may_not_be_rooted_at_home_or_above_it() {
+        // D60: home holds every credential, and a root cannot be narrowed from inside (D20).
+        let home = Path::new("/home/me");
+        assert_eq!(home_conflict(home, Some(home)), Some("your home directory"));
+        // An ancestor of home contains it, and so contains .ssh and .config as well.
+        for above in ["/", "/home"] {
+            assert_eq!(
+                home_conflict(Path::new(above), Some(home)),
+                Some("a directory above your home directory"),
+                "{above}"
+            );
+        }
+        // A project inside home is the ordinary case and is allowed.
+        assert_eq!(
+            home_conflict(Path::new("/home/me/src/proj"), Some(home)),
+            None
+        );
+        // A sibling that merely shares a prefix is not home.
+        assert_eq!(home_conflict(Path::new("/home/melon"), Some(home)), None);
+        // Without a home directory there is nothing to compare against.
+        assert_eq!(home_conflict(home, None), None);
     }
 }

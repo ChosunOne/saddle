@@ -22,7 +22,8 @@ fs-write = [{ root = "workspace", exclude = [".env*"], why = "edits the project"
 exec     = { why = "runs builds, tests and git" }
 "#;
 
-/// A toolchain directory under `$HOME`: its root name, and whether sandboxed commands may write it.
+/// A directory under `$HOME` that confined commands need: its root name, and whether they may
+/// write it.
 struct Toolchain {
     name: &'static str,
     path: &'static str,
@@ -31,6 +32,12 @@ struct Toolchain {
 
 /// Writable entries are caches only. A command that could write `~/.cargo/bin` or
 /// `~/.cargo/config.toml` could plant something that later runs outside the sandbox.
+///
+/// Read-only entries are configuration that is not a toolchain but is needed to work at all, and
+/// they are read **and execute** for the child, with no exclusions applied to it (D19, D22): every
+/// file beneath one must be safe to read. Never add a directory that holds a token (D60). Git's
+/// XDG config is here because a confined `git commit` cannot run without it; the classic
+/// `~/.gitconfig` cannot be a root, since a root is a directory (D60).
 const TOOLCHAINS: &[Toolchain] = &[
     Toolchain {
         name: "cargo",
@@ -50,6 +57,11 @@ const TOOLCHAINS: &[Toolchain] = &[
     Toolchain {
         name: "rustup",
         path: ".rustup",
+        write: false,
+    },
+    Toolchain {
+        name: "git",
+        path: ".config/git",
         write: false,
     },
 ];
@@ -83,6 +95,11 @@ pub fn config_text(home: Option<&Path>) -> String {
 
 # Model requests per prompt before the loop stops and waits for you. /settings changes it.
 # max-steps = 50          # model requests one prompt may take; unset means no limit
+
+# A session may not be opened in your home directory, or above it, because .ssh, .aws and every
+# other credential live beneath it and a root cannot be narrowed from the inside (D60). Set this
+# only if you mean to hand this machine's home directory to the agent.
+# allow-home = false
 
 # Directories outside the workspace, by name. Policies and [sandbox] refer to them by name.
 [roots]

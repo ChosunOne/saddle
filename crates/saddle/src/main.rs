@@ -362,6 +362,12 @@ fn check(dir: &std::path::Path) -> Result<ExitCode> {
     // The layering happens in `Setup::load`, so an invalid project file is reported here rather
     // than on the first tool call.
     println!("workspace  {}", setup.workspace.display());
+    if setup.allow_home {
+        // A security opt-in that cannot be seen is one nobody reviews (D44, D60).
+        println!(
+            "           caught by allow-home = true in config.toml: this session may reach home"
+        );
+    }
     println!("roots");
     for (name, path) in setup.roots.iter() {
         let note = if name.as_str() == "tmp" {

@@ -966,6 +966,37 @@ works offline, so it reports what a session would open with.
 - Nothing here decodes pixels: the terminal scales the picture to the cell box. Saddle therefore
   needs no image library, which is the reason this is a feasible feature at all.
 
+**D60.** Home is not a workspace, and the credentials are not in one.
+
+- A session may not be rooted at `$HOME`, or at an ancestor of it, unless the user's `config.toml`
+  says `allow-home = true`. Home holds `.ssh`, `.aws`, `.config` and the rest of a person's
+  credentials directly beneath it, and a grant cannot be narrowed from the inside (D20), so "work in
+  home" is "hand over the machine's credentials". The check is lexical and runs before any root is
+  resolved or any file is opened; `check` prints
+  `caught by allow-home = true` so the opt-in is visible to whoever reviews the policy (D44).
+  The approval has to live in the user's config, which is outside every root and outside the
+  workspace (D42) — an override file in the tree could widen it, and the point of this decision is
+  that it cannot.
+- The refusal covers ancestors, not just home: a root at `/home` or `/` contains home and therefore
+  contains the same credentials, so the paths look different while the exposure does not.
+- A project *inside* home is the ordinary case and is allowed: `saddle -C ~/src/project` is fine, and
+  so is a git toplevel there. A `.git` directly in home makes home the workspace from anywhere
+  beneath it, which is refused; that is the one surprising case, and the error says why.
+- The provider keys saddle uses are the first thing a hijacked session would go looking for, and they
+  are kept out of reach by two different layers. `auth.json` lives in the state directory, which no
+  root may contain (D16), so the `read` tool is refused by the policy before a file is opened, and a
+  sandboxed child is refused by landlock, because the state directory is not in its ruleset. A test
+  in `tests/cli.rs` asserts both, and asserts the key is never echoed in the refusal.
+- Most tools still work, because a few directories outside the workspace are read **and execute** for
+  children by default: `~/.cargo` and `~/.rustup` for the toolchain, and `~/.config/git` for git's
+  XDG config, since a confined `git commit` cannot run without it. This is the `[sandbox] read` list
+  in `config.toml`, generated on first run from the directories that exist. Two consequences, and
+  they are the reason the list is short:
+  - An entry is read for the *whole* child, and exclusions do not bind `exec` (D22). A directory in
+    this list must be safe to read in its entirety; never add one that holds a token.
+  - Only directories can be roots, so the classic `~/.gitconfig` cannot be granted this way. A
+    confined git that needs it gets `GIT_CONFIG_GLOBAL` pointed inside the workspace.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
