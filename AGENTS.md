@@ -215,7 +215,11 @@ rather than loosening it.
   takes a directory out of reach for `exec` as well — which a grant-level `exclude` cannot do
   (D22). Two rules make it honest: a directory that **contains** a withheld one is expanded rather
   than granted, because a rule covers everything beneath it; and the state and config directories
-  are withheld whatever the pattern says (D16).
+  are withheld whatever the pattern says (D16). Rules over the same base are **merged**, so adding
+  an `except` narrows; two separate rules would union and defeat each other. A toolchain directory
+  is never a `[roots]` entry: a root is nameable by any policy, so `fs-write = [{ root = "cargo" }]`
+  in a workspace file could plant a program in `~/.cargo/bin`. `[sandbox] read`/`write` take paths
+  for exactly that reason.
 - **`exec` is Linux-only**, needs landlock ABI 3 as a hard requirement, and has no network: seccomp
   blocks `socket()` for `AF_INET`/`AF_INET6`/`AF_UNIX`/`AF_NETLINK`/`AF_PACKET` and the io_uring
   entry points. Do not add hosts or paths to the sandbox allowlist to make a test pass. Network

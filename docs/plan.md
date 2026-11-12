@@ -1103,6 +1103,19 @@ use it.
   because a secret pasted on a command line is kept there; and browser and mail profiles
   (`.mozilla`, `.thunderbird`, `.config/google-chrome`, `.config/chromium`), because a session
   cookie is a credential.
+- **A toolchain directory is not a root.** Roots are nameable: any policy in a workspace can write
+  `fs-read` or `fs-write = [{ root = "cargo" }]`, and that is how a workspace could grant itself
+  write on `~/.cargo` and plant a program in `~/.cargo/bin`, which runs outside the sandbox the
+  next time it is called. `[sandbox] read`/`write` used to accept only root names, which is the only
+  reason `cargo`, `cargo-registry` and `rustup` were ever roots; they now accept a path, so the
+  default config declares no roots at all and the writable caches are named directly
+  (`~/.cargo/registry`, `~/.cargo/git`). A policy naming `cargo` now fails to parse, which is the
+  point.
+- **Rules over one base are merged, not enumerated separately.** Two rules that both walk `~` would
+  otherwise *union*: the built-in rule grants `~/.config/jj`, and a person's `except` for the same
+  directory in a second rule would do nothing, because landlock grants when any rule does. The
+  `except` lists of every rule sharing a base are combined and enumerated once, so adding a pattern
+  narrows rather than adds.
 - `depth` is three rather than two because the stores that matter are not all near the top:
   `.local/share/keyrings` is three levels down, and a walk that stops at `~/.local/share` never
   enumerates it, so the pattern matches nothing and the keyring is reachable through the granted

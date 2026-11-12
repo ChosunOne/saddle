@@ -46,8 +46,10 @@ pub struct SandboxSpec {
 /// toolchains that live outside the workspace.
 #[derive(Debug, Clone, Default)]
 pub struct SandboxExtras {
-    pub read: Vec<RootName>,
-    pub write: Vec<RootName>,
+    /// Resolved paths, not root names: a toolchain directory must not be nameable by a policy
+    /// (D62).
+    pub read: Vec<PathBuf>,
+    pub write: Vec<PathBuf>,
     /// Directories worked out at startup from an `[[sandbox.include]]` rule, already enumerated
     /// (D62).
     pub include: Vec<PathBuf>,
@@ -245,16 +247,18 @@ pub fn lower_exec(
 
     let tmp = path(&RootName::tmp())?;
     let mut read: Vec<PathBuf> = SYSTEM_READ.iter().map(PathBuf::from).collect();
-    for name in grants.fs_read.iter().map(|g| &g.root).chain(&extras.read) {
+    for name in grants.fs_read.iter().map(|g| &g.root) {
         read.push(path(name)?);
     }
+    read.extend(extras.read.iter().cloned());
     // Enumerated by an `[[sandbox.include]]` rule at startup; already a list of directories, so
     // nothing here has to know what a toolchain is (D62).
     read.extend(extras.include.iter().cloned());
     let mut write: Vec<PathBuf> = SYSTEM_WRITE.iter().map(PathBuf::from).collect();
-    for name in grants.fs_write.iter().map(|g| &g.root).chain(&extras.write) {
+    for name in grants.fs_write.iter().map(|g| &g.root) {
         write.push(path(name)?);
     }
+    write.extend(extras.write.iter().cloned());
     write.push(tmp.clone());
     read.sort();
     read.dedup();

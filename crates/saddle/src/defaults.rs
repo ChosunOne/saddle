@@ -24,67 +24,23 @@ exec     = { why = "runs builds, tests and git" }
 
 /// A directory under `$HOME` that confined commands need: its root name, and whether they may
 /// write it.
-struct Toolchain {
-    name: &'static str,
-    path: &'static str,
-    write: bool,
-}
+/// Cache directories a command may write, as paths. Not roots: a root is nameable by every policy
+/// in the tree, so `fs-write` on a `cargo` root would let a workspace policy plant a program in
+/// `~/.cargo/bin` — which runs outside the sandbox the next time it is called. These are caches
+/// only, and `~/.cargo/bin` is deliberately absent (D62).
+const WRITABLE_CACHES: &[&str] = &[".cargo/registry", ".cargo/git"];
 
-/// Writable entries are caches only. A command that could write `~/.cargo/bin` or
-/// `~/.cargo/config.toml` could plant something that later runs outside the sandbox.
-///
-/// Read-only entries are configuration that is not a toolchain but is needed to work at all, and
-/// they are read **and execute** for the child, with no exclusions applied to it (D19, D22): every
-/// file beneath one must be safe to read. Never add a directory that holds a token (D60). Git's
-/// XDG config is here because a confined `git commit` cannot run without it; the classic
-/// `~/.gitconfig` cannot be a root, since a root is a directory (D60).
-const TOOLCHAINS: &[Toolchain] = &[
-    Toolchain {
-        name: "cargo",
-        path: ".cargo",
-        write: false,
-    },
-    Toolchain {
-        name: "cargo-registry",
-        path: ".cargo/registry",
-        write: true,
-    },
-    Toolchain {
-        name: "cargo-git",
-        path: ".cargo/git",
-        write: true,
-    },
-    Toolchain {
-        name: "rustup",
-        path: ".rustup",
-        write: false,
-    },
-    Toolchain {
-        name: "git",
-        path: ".config/git",
-        write: false,
-    },
-];
-
-/// The default config.toml for a home directory: roots and sandbox grants for the toolchains
-/// present there.
+/// The default config.toml for a home directory.
 pub fn config_text(home: Option<&Path>) -> String {
-    let found: Vec<&Toolchain> = TOOLCHAINS
+    // Only the caches that exist, and only those, are writable. Nothing is a root: what a command
+    // may read is the include rule below, and what it may write is these two caches (D62).
+    let write = WRITABLE_CACHES
         .iter()
-        .filter(|t| home.is_some_and(|h| h.join(t.path).is_dir()))
-        .collect();
-    let list = |write: bool| {
-        found
-            .iter()
-            .filter(|t| t.write == write)
-            .map(|t| format!("\"{}\"", t.name))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let mut roots = String::new();
-    for t in &found {
-        roots.push_str(&format!("{} = \"~/{}\"\n", t.name, t.path));
-    }
+        .copied()
+        .filter(|p| home.is_some_and(|h| h.join(p).is_dir()))
+        .map(|p| format!("\"~/{p}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         r#"# saddle's user configuration. saddle created it on first run; edit it freely. /login and
 # /model in the TUI update the provider settings and keep these comments.
@@ -101,59 +57,40 @@ pub fn config_text(home: Option<&Path>) -> String {
 # Model requests per prompt before the loop stops and waits for you. /settings changes it.
 # max-steps = 50          # model requests one prompt may take; unset means no limit
 
-# Directories outside the workspace, by name. Policies and [sandbox] refer to them by name.
-[roots]
-{roots}
+# Directories outside the workspace, by name, so a policy can grant them. Nothing is here by
+# default: a toolchain directory must not be one, because a root is something any policy in a
+# workspace can name, and `cargo` as a root meant a workspace policy could grant write to it and
+# plant a program in ~/.cargo/bin. Use a path in [sandbox] instead (D62).
+# [roots]
+# notes = "~/notes"
 # Roots every sandboxed command gets on top of its policy's grants. Make only caches writable:
 # a command that can write ~/.cargo/bin could plant a program you later run outside the sandbox.
 [sandbox]
 write = [{write}]
 
-# Sandboxed commands get what they need without saddle knowing about each tool: this walks the base
-# directory at startup, keeps every directory that does not match `except`, and hands the list to
-# the kernel. A directory that contains an exclusion is not granted itself, because a rule covers
-# everything beneath it; its children are granted instead (D62).
+# Sandboxed commands get what they need without saddle knowing about each tool: saddle walks your
+# home directory at startup, withholds the usual credential stores below, and hands the kernel the
+# list of what is left. So a toolchain works without being named, and a directory added later stays
+# out of reach until the next start (D62).
 #
-# Add `except` lines for anything that must stay out of reach for a command, or extra
-# [[sandbox.include]] rules for other bases. Saddle's own state and config directories are always
-# excluded and cannot be re-enabled here.
-[[sandbox.include]]
-base = "~"
-depth = 3
-# Patterns are matched against each entry's path relative to `base`. One that never matches is
-# harmless, so this list errs towards naming stores a particular machine may not have. Delete a
-# line to allow that directory; add one for a store that is not here.
-except = [
-  # keys and secret managers
-  "^\\.ssh$", "^\\.gnupg$", "^\\.pki$", "^\\.password-store$",
-  "^\\.local/share/keyrings$", "^\\.local/share/kwalletd$",
-  "^\\.config/op$", "^\\.vault-token$",
-  # cloud and containers: a provider token, or a kubeconfig that carries one
-  "^\\.aws$", "^\\.azure$", "^\\.config/gcloud$", "^\\.kube$",
-  "^\\.docker$", "^\\.config/containers$", "^\\.terraform\\.d$",
-  "^\\.oci$", "^\\.s3cfg$", "^\\.boto$", "^\\.config/rclone$",
-  "^\\.config/doctl$", "^\\.config/hcloud$",
-  # forges and git credential helpers
-  "^\\.config/gh$", "^\\.config/glab-cli$", "^\\.config/hub$",
-  "^\\.config/tea$", "^\\.netrc$", "^\\.git-credentials$",
-  "^\\.config/git/credentials$",
-  # package registries: a token for publishing, or for a private index
-  "^\\.npmrc$", "^\\.yarnrc$", "^\\.yarnrc\\.yml$", "^\\.pypirc$",
-  "^\\.config/pip$", "^\\.pip$", "^\\.gem/credentials$", "^\\.nuget$",
-  "^\\.m2/settings\\.xml$", "^\\.gradle/gradle\\.properties$",
-  "^\\.composer$", "^\\.config/composer$", "^\\.hex$",
-  "^\\.cargo/credentials$", "^\\.cargo/credentials\\.toml$",
-  # databases
-  "^\\.pgpass$", "^\\.my\\.cnf$", "^\\.mylogin\\.cnf$",
-  # mail
-  "^\\.msmtprc$", "^\\.offlineimaprc$", "^\\.fetchmailrc$", "^\\.authinfo$",
-  # shell and repl history: a secret pasted on a command line is kept here
-  "^\\.bash_history$", "^\\.zsh_history$", "^\\.python_history$",
-  "^\\.node_repl_history$", "^\\.psql_history$", "^\\.mysql_history$",
-  # browser and mail profiles: a session cookie is a credential
-  "^\\.mozilla$", "^\\.thunderbird$", "^\\.config/google-chrome$",
-  "^\\.config/chromium$",
-]
+# This rule is built in and is not written here, so there is one place to read it: the list below is
+# what it withholds. Add your own [[sandbox.include]] rule to exclude more, or set
+# `include-defaults = false` to use only the rules you write.
+#
+#   [[sandbox.include]]
+#   base = "~"
+#   depth = 3
+#   except = ["^\\.ssh$", "^\\.aws$", ...]
+#
+# Withheld by default: .ssh .gnupg .pki .password-store .local/share/keyrings
+# .local/share/kwalletd .config/op .vault-token .aws .azure .config/gcloud .kube .docker
+# .config/containers .terraform.d .oci .s3cfg .boto .config/rclone .config/doctl .config/hcloud
+# .config/gh .config/glab-cli .config/hub .config/tea .netrc .git-credentials
+# .config/git/credentials .npmrc .yarnrc .yarnrc.yml .pypirc .config/pip .pip .gem/credentials
+# .nuget .m2/settings.xml .gradle/gradle.properties .composer .config/composer .hex
+# .cargo/credentials .cargo/credentials.toml .pgpass .my.cnf .mylogin.cnf .msmtprc .offlineimaprc
+# .fetchmailrc .authinfo .bash_history .zsh_history .python_history .node_repl_history
+# .psql_history .mysql_history .mozilla .thunderbird .config/google-chrome .config/chromium
 
 # How the TUI starts. /settings changes these; ctrl+t and ctrl+o change them for one session.
 # [ui]
@@ -182,7 +119,7 @@ except = [
 # output = 15.00
 # cache-read = 0.30
 "#,
-        write = list(true),
+        write = write,
     )
 }
 
@@ -236,27 +173,29 @@ mod tests {
     fn config_lists_only_toolchains_that_exist() {
         let home = tempfile::tempdir().unwrap();
         fs::create_dir_all(home.path().join(".cargo/registry")).unwrap();
+        fs::create_dir_all(home.path().join(".cargo/git")).unwrap();
         fs::create_dir_all(home.path().join(".rustup")).unwrap();
         let text = config_text(Some(home.path()));
         let cfg: UserConfig = toml::from_str(&text).unwrap();
         assert_eq!(cfg.provider, None, "first run asks instead of assuming");
-        assert_eq!(
-            cfg.roots.keys().collect::<Vec<_>>(),
-            ["cargo", "cargo-registry", "rustup"]
-        );
-        // D62: the default no longer names toolchains for reading. The include rule walks home,
-        // so a toolchain saddle has never heard of works and a credential directory does not.
+        // D62: no toolchain directory is a root. A root is nameable by every policy, so `cargo`
+        // as a root let a workspace policy grant write to it and plant a program in ~/.cargo/bin.
+        assert!(cfg.roots.is_empty(), "{:?}", cfg.roots);
         assert!(cfg.sandbox.read.is_empty());
-        assert_eq!(cfg.sandbox.write, ["cargo-registry"]);
-        assert_eq!(cfg.sandbox.include.len(), 1, "one include rule by default");
-        assert_eq!(cfg.sandbox.include[0].base, "~");
+        assert_eq!(
+            cfg.sandbox.write,
+            ["~/.cargo/registry", "~/.cargo/git"],
+            "caches by path, not by name"
+        );
+        // The built-in rule rather than one written into the file (D62).
+        assert!(cfg.sandbox.include_defaults);
         assert!(
-            cfg.sandbox.include[0]
-                .except
-                .iter()
-                .any(|p| regex::Regex::new(p).unwrap().is_match(".ssh")),
-            "ssh is withheld by default: {:?}",
-            cfg.sandbox.include[0].except
+            cfg.sandbox.include.is_empty(),
+            "nothing is written into the file"
+        );
+        assert!(
+            !text.contains("[[sandbox.include]]\nbase"),
+            "not an active rule: {text}"
         );
 
         let empty: UserConfig = toml::from_str(&config_text(None)).unwrap();
@@ -270,8 +209,7 @@ mod tests {
         // keyrings` is three levels down, was never enumerated, and its pattern matched nothing —
         // so the keyring was readable (D62).
         let home = tempfile::tempdir().unwrap();
-        let cfg: UserConfig = toml::from_str(&config_text(None)).unwrap();
-        let rule = &cfg.sandbox.include[0];
+        let rule = crate::config::default_include();
         let include = saddle_cap::sandbox::Include {
             base: home.path().to_path_buf(),
             depth: rule.depth,
@@ -385,8 +323,7 @@ mod tests {
     fn every_default_except_pattern_matches_the_store_it_names() {
         // A pattern that never matches is silent: the directory is simply granted. So each one is
         // pinned to the path it is meant to withhold (D62).
-        let cfg: UserConfig = toml::from_str(&config_text(None)).unwrap();
-        let rule = &cfg.sandbox.include[0];
+        let rule = crate::config::default_include();
         let patterns: Vec<regex::Regex> = rule
             .except
             .iter()

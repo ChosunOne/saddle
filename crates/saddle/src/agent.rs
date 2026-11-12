@@ -1101,9 +1101,17 @@ pub fn grants_section(session: &Session) -> String {
         }
     }
     let extras = &session.setup.extras;
-    let names = |list: &[saddle_cap::RootName]| {
+    // Paths, shown as written when they are inside home so the prompt stays readable.
+    let names = |list: &[std::path::PathBuf]| {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         list.iter()
-            .map(|n| n.as_str().to_owned())
+            .map(|p| match &home {
+                Some(home) => match p.strip_prefix(home) {
+                    Ok(rest) => format!("~/{}", rest.display()),
+                    Err(_) => p.display().to_string(),
+                },
+                None => p.display().to_string(),
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };

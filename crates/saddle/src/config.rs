@@ -111,6 +111,99 @@ pub struct SandboxConfig {
     /// it needs without saddle knowing about each tool (D62).
     #[serde(default)]
     pub include: Vec<IncludeConfig>,
+    /// Whether the rule below is applied. On by default, so an unconfigured machine works: the
+    /// rules in this file are added to it rather than replacing it, which is what "add a
+    /// directory to exclude" means. Set false to have only the rules written here (D62).
+    #[serde(default = "yes", rename = "include-defaults")]
+    pub include_defaults: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// The credential stores every machine is assumed to have (D62). A pattern that never matches is
+/// harmless, so this errs towards naming stores a particular machine may not have.
+pub const DEFAULT_EXCEPTS: &[&str] = &[
+    // keys and secret managers
+    r"^\.ssh$",
+    r"^\.gnupg$",
+    r"^\.pki$",
+    r"^\.password-store$",
+    r"^\.local/share/keyrings$",
+    r"^\.local/share/kwalletd$",
+    r"^\.config/op$",
+    r"^\.vault-token$",
+    // cloud and containers: a provider token, or a kubeconfig that carries one
+    r"^\.aws$",
+    r"^\.azure$",
+    r"^\.config/gcloud$",
+    r"^\.kube$",
+    r"^\.docker$",
+    r"^\.config/containers$",
+    r"^\.terraform\.d$",
+    r"^\.oci$",
+    r"^\.s3cfg$",
+    r"^\.boto$",
+    r"^\.config/rclone$",
+    r"^\.config/doctl$",
+    r"^\.config/hcloud$",
+    // forges and git credential helpers
+    r"^\.config/gh$",
+    r"^\.config/glab-cli$",
+    r"^\.config/hub$",
+    r"^\.config/tea$",
+    r"^\.netrc$",
+    r"^\.git-credentials$",
+    r"^\.config/git/credentials$",
+    // package registries: a token for publishing, or for a private index
+    r"^\.npmrc$",
+    r"^\.yarnrc$",
+    r"^\.yarnrc\.yml$",
+    r"^\.pypirc$",
+    r"^\.config/pip$",
+    r"^\.pip$",
+    r"^\.gem/credentials$",
+    r"^\.nuget$",
+    r"^\.m2/settings\.xml$",
+    r"^\.gradle/gradle\.properties$",
+    r"^\.composer$",
+    r"^\.config/composer$",
+    r"^\.hex$",
+    r"^\.cargo/credentials$",
+    r"^\.cargo/credentials\.toml$",
+    // databases
+    r"^\.pgpass$",
+    r"^\.my\.cnf$",
+    r"^\.mylogin\.cnf$",
+    // mail
+    r"^\.msmtprc$",
+    r"^\.offlineimaprc$",
+    r"^\.fetchmailrc$",
+    r"^\.authinfo$",
+    // shell and repl history: a secret pasted on a command line is kept here
+    r"^\.bash_history$",
+    r"^\.zsh_history$",
+    r"^\.python_history$",
+    r"^\.node_repl_history$",
+    r"^\.psql_history$",
+    r"^\.mysql_history$",
+    // browser and mail profiles: a session cookie is a credential
+    r"^\.mozilla$",
+    r"^\.thunderbird$",
+    r"^\.config/google-chrome$",
+    r"^\.config/chromium$",
+];
+
+/// The rule applied when `include-defaults` is on: walk `~` three levels, withhold the usual
+/// credential stores (D62). Not written into `config.toml`, because a copy in the file would be a
+/// second source of truth that drifts from this one.
+pub fn default_include() -> IncludeConfig {
+    IncludeConfig {
+        base: "~".to_owned(),
+        depth: default_depth(),
+        except: DEFAULT_EXCEPTS.iter().map(|p| (*p).to_owned()).collect(),
+    }
 }
 
 /// One `[[sandbox.include]]` rule, before it is resolved.
@@ -224,17 +317,6 @@ impl UserConfig {
     /// (D62). Enumeration happens here because the protected directories are known here, and the
     /// result is a plain list of paths, so the lowering itself stays a mapping.
     pub fn sandbox_extras(&self, roots: &Roots, protected: &[PathBuf]) -> Result<SandboxExtras> {
-        let names = |list: &[String]| -> Result<Vec<RootName>> {
-            list.iter()
-                .map(|n| {
-                    let name = RootName::new(n)?;
-                    if !roots.contains(&name) {
-                        bail!("config.toml: [sandbox] names unknown root `{name}`");
-                    }
-                    Ok(name)
-                })
-                .collect()
-        };
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let expand = |path: &str| -> Result<PathBuf> {
             // `~` is home itself, and `~/x` is a path in it; anything else is taken as written.
@@ -250,8 +332,46 @@ impl UserConfig {
                 (None, _) => Ok(PathBuf::from(path)),
             }
         };
-        let mut include = Vec::new();
-        for rule in &self.sandbox.include {
+        // An entry is a root name, or a path. A path is what a toolchain directory should be:
+        // making one a root makes it nameable by every policy in the tree, and a workspace policy
+        // could then grant `fs-write` on `~/.cargo` and plant a program in `~/.cargo/bin` that runs
+        // outside the sandbox later (D62).
+        let names = |list: &[String]| -> Result<Vec<PathBuf>> {
+            list.iter()
+                .map(|n| match RootName::new(n) {
+                    Ok(name) if roots.contains(&name) => roots
+                        .get(&name)
+                        .map(Path::to_path_buf)
+                        .ok_or_else(|| anyhow::anyhow!("config.toml: unknown root `{name}`")),
+                    _ => {
+                        let path = expand(n)?;
+                        if !path.is_absolute() {
+                            bail!(
+                                "config.toml: [sandbox] entry `{n}` is neither a root nor an \
+                                 absolute path (use ~/... for a path in your home directory)"
+                            );
+                        }
+                        Ok(path)
+                    }
+                })
+                .collect()
+        };
+        // The built-in rule first, so a machine with nothing configured still works (D62).
+        let built_in = default_include();
+        let rules: Vec<&IncludeConfig> = if self.sandbox.include_defaults {
+            std::iter::once(&built_in)
+                .chain(self.sandbox.include.iter())
+                .collect()
+        } else {
+            self.sandbox.include.iter().collect()
+        };
+        // Rules are combined per base rather than enumerated separately, and their `except` lists
+        // are merged. Two rules over the same base would otherwise *union*: the broader one grants
+        // a directory the narrower one excluded, so a person's extra pattern would do nothing.
+        // Adding an exclusion has to narrow (D62).
+        let mut by_base: std::collections::BTreeMap<PathBuf, (usize, Vec<regex::Regex>)> =
+            std::collections::BTreeMap::new();
+        for rule in rules {
             // A root name is accepted so a rule can follow the same names as everything else.
             let base = match RootName::new(&rule.base) {
                 Ok(name) if roots.contains(&name) => roots.get(&name).map(Path::to_path_buf),
@@ -274,15 +394,22 @@ impl UserConfig {
                         .with_context(|| format!("config.toml: [[sandbox.include]] except `{p}`"))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let resolved = saddle_cap::sandbox::enumerate(
+            // Canonical, so `~` and `/home/me` are one base rather than two that overlap.
+            let key = base.canonicalize().unwrap_or_else(|_| base.clone());
+            let slot = by_base.entry(key).or_insert((0, Vec::new()));
+            slot.0 = slot.0.max(rule.depth);
+            slot.1.extend(except);
+        }
+        let mut include = Vec::new();
+        for (base, (depth, except)) in by_base {
+            include.extend(saddle_cap::sandbox::enumerate(
                 &saddle_cap::sandbox::Include {
                     base,
-                    depth: rule.depth,
+                    depth,
                     except,
                 },
                 protected,
-            );
-            include.extend(resolved);
+            ));
         }
         include.sort();
         include.dedup();
