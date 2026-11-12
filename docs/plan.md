@@ -1,0 +1,1067 @@
+# Saddle: design plan
+
+## 1. What this is
+
+A coding-agent harness in Rust. The distinguishing feature is the plugin boundary: plugins are WASI
+components, they run in an instance whose authority comes from a declared scope set, and the host
+refuses to instantiate a component that imports a scope which was not granted to it.
+
+pi and opencode are the parity benchmarks. They define the feature inventory, not the architecture.
+Extensions in both run in-process with the agent's own authority, so neither has a security model for
+extensions. That gap is the reason this project exists.
+
+Security rests on declared scopes rather than per-use approval prompts. A human reviews a policy file.
+The agent does not get to negotiate.
+
+## 2. Status
+
+v0 is in place: the capability crate, the policy engine with its audit log, the exec sandbox, and a
+model loop that sends every built-in tool call through the gate. `saddle` opens it in a full-screen
+terminal UI, and `saddle run "<prompt>"` runs one turn without it. The plugin loader starts v1. Sections 3 to 6 are settled and can be built against. Section 8 lists work that was
+considered and deferred.
+
+## 3. Settled decisions
+
+### Model
+
+**D1.** Rust host, WASI component model for plugins. A component declares its imports, and the import
+set is the authority declaration.
+
+**D2.** Parity means the extension-point inventory of pi and opencode, mapped one-to-one onto scopes.
+The extension API and the capability taxonomy are the same artifact.
+
+**D3.** No per-use approvals. Policy is declared, versioned in the repository, and reviewed like code.
+
+**D4.** Scopes are a small closed enumeration. Each hook a plugin can register is a grant.
+
+**D5.** `exec` runs commands in a kernel sandbox derived from the principal's other grants (D18, D19).
+The child sees the principal's filesystem roots and has no network, so `exec` lets a principal run
+programs without widening its reach over files or hosts. A manifest pairing `exec` with `fs-read` or
+`fs-write` is the normal case.
+
+**D6.** The host has no subagent feature. A plugin builds subagents from `model-invoke` plus the tool
+scopes already granted. An agent started through `exec` cannot exceed `exec`.
+
+**D7.** Plugin output enters the context as tagged data. It never becomes policy. Writing the system
+prompt is root, held by the host alone.
+
+**D8.** A produced tool result is immutable. A plugin may append a correction as a new fact carrying
+provenance, never rewrite the original.
+
+**D9.** Two tiers. The manifest sets a ceiling, and the policy file grants a subset of it.
+
+**D10.** Every allow and every deny is logged with the resolved arguments and the rule that fired.
+
+### ABI and loading
+
+**D11.** Scopes are WIT interfaces. Abilities a plugin calls are imports from `saddle:host@0.1.0`.
+Hooks the host calls are exports in `saddle:plugin@0.1.0`. Before instantiation the loader checks both
+sets against the table below and refuses anything the table does not list. Each plugin's Linker is
+also built from its grant set, so an import the check missed still fails to link.
+
+| in the component | treatment |
+| --- | --- |
+| `saddle:host/{exec, fs-read, fs-write, transcript-read, context-contribute, model-invoke, persist}` import | needs that scope |
+| `saddle:plugin/tool` export | needs `tool` |
+| `saddle:plugin/observer` export | needs `transcript-read` |
+| `saddle:plugin/veto` export | needs `veto` |
+| `saddle:plugin/ui` export | needs `ui` |
+| `wasi:http/outgoing-handler` import | needs `net` |
+| `wasi:http/types` import | ambient |
+| `wasi:sockets/*` import | refused |
+| `wasi:filesystem/{types, preopens}` import | ambient; the preopen list is always empty |
+| `wasi:cli/environment` import | ambient; environment and arguments are empty |
+| `wasi:cli/{exit, stdin, stdout, stderr, terminal-*}`, `wasi:io/*`, `wasi:clocks/{monotonic-clock, wall-clock}`, `wasi:random/*` imports | ambient; stdout and stderr go to the debug log |
+
+`saddle:*` interfaces must carry a `0.1.x` version and `wasi:*` interfaces a `0.2.x` version.
+
+**D12.** Plugins reach files only through `saddle:host/fs-read` and `saddle:host/fs-write`. These are
+path operations on named roots (`read-file`, `list-dir`, `write-file`, …), and each call passes the
+policy engine. `wasi:filesystem` cannot carry the two scopes for three reasons: it puts reads and
+writes in one interface, std-based guests import it without opening files, and calls through
+wasmtime's implementation never reach the policy engine, which makes D10 logging impossible. Plugin
+authors use the SDK wrappers in place of `std::fs`.
+
+**D13.** A plugin instance lives for one call. The host prepares one `InstancePre` per plugin per
+session and creates a fresh `Store` and instance for every call. The call's model budget and epoch
+deadline live in the store and are dropped with it. State a plugin keeps between calls goes through
+`persist`. A `lifetime = "session"` manifest field is the planned addition if a parity feature, such
+as an LSP client, needs a long-lived instance.
+
+**D14.** The host pins `wasmtime`, `wasmtime-wasi` and `wasmtime-wasi-http` to one exact version
+(`=X.Y.Z`) and upgrades on purpose. Rust plugins build for the `wasm32-wasip2` target with the
+`wit-bindgen` macro; any toolchain that emits a component works, because the host reads only the
+component's type. WASI 0.2 is the target unless 0.3 is final in the pinned wasmtime. Every import name
+contains its package version, so the D11 check also checks the ABI version, and an unsupported version
+is refused with a message naming the supported one. Before 1.0 the host supports one minor line at a
+time.
+
+**D15.** Crates:
+
+- `saddle-cap`: scopes, roots, grants, policy and manifest parsing, validation, the import check, and
+  the exec lowering. The import check is `check_component(granted, imports, exports)` over
+  interface-name strings. No wasmtime dependency.
+- `saddle-policy`: per-call decisions and the audit log.
+- `saddle-sandbox`: applies a sandbox spec to the current process and execs the target; runs a
+  sandboxed child from the host side and enforces its timeout. It also builds a standalone
+  `saddle-sandbox` binary, which its own tests use as the helper.
+- `saddle`: the binary, built-in tools, trust store, model providers, the model loop and the TUI.
+- `saddle-wit`, `saddle-loader`, `saddle-sdk`: added at v1 for the WIT files and host bindings,
+  component loading, and the guest-side crate.
+
+### Principals and files
+
+**D16.** Policy names roots, never paths. The host owns the name→path table and resolves each name to
+a canonical path once per session, and the audit log records the resolution. Built-in roots:
+
+- `workspace`: the git toplevel above the start directory, or the start directory;
+- `tmp`: a per-session directory the host creates;
+- `config` and `data`: per-plugin directories under the XDG directories (v1).
+
+Extra roots, such as toolchain directories, are defined in `$XDG_CONFIG_HOME/saddle/config.toml` and
+never in the repository policy. A root that contains the saddle state directory or config directory is
+refused. Callers address files as `(root, relative-path)`. The host resolves the relative path beneath
+the root with no `..` and no symlink escape, using cap-std, which uses `openat2` with
+`RESOLVE_BENEATH`. Built-in tools receive absolute paths from the model; the host maps each to its
+containing root and denies paths outside every root.
+
+A symlink can still point at another path inside the same root, such as `innocent` pointing at
+`.git/hooks/pre-commit`. The host follows the link one component at a time, including a dangling link
+whose target does not exist yet, and decides on both the requested path and the resolved one. Either
+denial refuses the call. A link to an absolute path is refused.
+
+**D17.** The agent is a principal named `agent`, with its own section in the policy file. Built-in
+tools pass through the same policy engine, audit log and exec sandbox as plugins. The import check
+does not apply to native code.
+
+### exec
+
+**D18.** The host runs every command through a helper process. It starts itself as `saddle __sandbox`
+and writes a sandbox spec to the helper's stdin. The helper reopens stdin as `/dev/null`, sets
+`no_new_privs`, applies landlock and a seccomp filter to itself, and calls `execve`. A helper process
+avoids the async-signal-safety limits of `pre_exec`. Landlock ABI 3 (Linux 6.2) is a hard requirement,
+because earlier ABIs cannot restrict `truncate(2)`; on an older kernel every exec request fails with
+that reason. The `landlock` crate runs with `CompatLevel::HardRequirement`, since its default
+best-effort mode drops rules on older kernels without reporting it. ABI 6 signal scoping is applied
+when the kernel supports it. `exec` is unavailable on macOS in v1.
+
+**D19.** The child sandbox contains:
+
+- Filesystem: the principal's `fs-read` roots read-only, its `fs-write` roots read-write, the extra
+  sandbox roots from the user's `config.toml`, `/usr`, `/bin`, `/sbin`, `/lib*`, `/etc` and `/proc`
+  read and execute, and a few `/dev` nodes. `$HOME` is not granted. `TMPDIR` points at the `tmp` root.
+- Network: none. seccomp blocks `socket()` for `AF_INET`, `AF_INET6`, `AF_UNIX`, `AF_NETLINK` and
+  `AF_PACKET`, and blocks `io_uring_setup`, `io_uring_enter` and `io_uring_register`, since io_uring
+  can open sockets without calling `socket`. `socketpair` stays allowed. Blocking `AF_UNIX` keeps the
+  child away from `/var/run/docker.sock` and `$SSH_AUTH_SOCK`; the child also can't reach gpg-agent or
+  ssh-agent.
+- Environment: an allowlist of `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LANGUAGE`, `LC_*`, `TERM`
+  and `TZ`, plus the names the `exec` grant lists. The host sets `TMPDIR`. The provider API key held
+  by the host is never passed.
+- uid: the user's own. Landlock blocks ptrace of processes outside the sandbox, and ABI 6 blocks
+  signals to them.
+- Process: cwd is the workspace root, stdin is `/dev/null`, the child leads its own process group, and
+  the host kills the group when the command exits, when its wall-clock timeout passes, or when the
+  user cancels the turn.
+
+**D20.** Landlock grants cannot exclude a path beneath a granted root. Two consequences follow for a
+command run under `exec`:
+
+- It can write the paths that D23 reserves. Until mount namespaces are in use, the host snapshots the
+  reserved paths in the workspace before each `exec`, compares them afterwards, restores any change,
+  and logs each restored path as a denial.
+- It can read and write paths that an `exclude` pattern removes from a grant. Exclusions bind the
+  built-in tools and plugin host calls only. A secret that must stay unreadable belongs outside every
+  root.
+
+### Policy
+
+**D21.** `intercept` is removed. Observing messages and tool results as they arrive is a push form of
+`transcript-read`, delivered through the `saddle:plugin/observer` export. A plugin responds to what it
+saw through `context-contribute`, which appends a new fact with provenance beside the original. The
+`veto` scope lets a plugin deny a pending tool call with a reason; the denial is logged and shown to
+the model as a tagged fact. A veto can only narrow what happens, so it is compatible with D7. Changing
+a pending call's arguments is a rewrite and is forbidden.
+
+**D22.** The policy is a TOML file whose location is D42's concern; it contains grants only:
+no deny rules, no ordering, no expressions. Anything not granted is denied. A grant may carry a `why`
+saying what it is for; it is optional (D41). Exclusions sit inside the grant they narrow, so no rule
+overrides another.
+
+```toml
+version = 1
+
+[agent]
+fs-read  = [{ root = "workspace", why = "reads the repo" }]
+fs-write = [{ root = "workspace", exclude = [".env*"], why = "edits the repo" }]
+exec     = { why = "runs builds and tests", env = ["CARGO_TERM_COLOR"] }
+
+[plugin.web-search]
+net          = [{ host = "api.search.example", why = "search backend" }]
+model-invoke = { tokens-per-session = 200000, why = "summarises results" }
+```
+
+- A decision is a lookup, so evaluation is total.
+- An allow is explained by the grant's TOML path and its `why`, as in
+  `plugin.web-search.net[0]: search backend`. That path is the rule recorded under D10.
+- A deny is explained by a generated sentence, as in "plugin.web-search has no net grant covering
+  evil.example".
+- Loading resolves every root, rejects unknown keys, and checks each plugin's grants against its
+  manifest ceiling (D9).
+
+**D23.** Superseded by D44. It was the human gate: the host kept the SHA-256 of the policy file and
+of every plugin component and manifest in `$XDG_STATE_HOME/saddle/trust.json`, and no session started
+until a hash matched one the user had approved with `saddle trust`, which printed the change in
+effective grants. That covered a cloned repository shipping its own grants, and the agent editing the
+policy through its `fs-write` grant. Both of those are gone: the policy is no longer in the tree
+(D42), and nothing the agent runs can write it, so there was no gate left to keep. D44 records the
+deletion. What survives from this decision is the reserved-path list below.
+
+The host reserves `.git/config` and anything under `.git/hooks`, including the same paths under
+`.git/modules`, and refuses writes to them under every grant. (The policy file was on this list until
+D42 moved it out of the tree, at which point the kernel took over.) Git
+hooks and settings such as `core.fsmonitor` and `core.sshCommand` run later as the user, outside any
+sandbox. D20 covers writes from `exec`.
+
+Rewriting instructions cannot be granted (D7), and `exec` with network cannot be granted in v1 (D19),
+so neither needs a runtime gate.
+
+**D24.** The audit log is JSON Lines at `$XDG_STATE_HOME/saddle/audit/<session-id>.jsonl`. Each record
+holds `seq`, timestamp, session, kind, principal, scope, resolved arguments, decision, rule,
+explanation, and `prev`, the SHA-256 of the previous line. On close, the session's final hash is
+appended to `$XDG_STATE_HOME/saddle/sessions.jsonl`. Plugins and sandboxed children cannot reach the
+log, because D16 keeps the state directory outside every root. Records hold arguments, not payloads: a write
+records path, byte count and content hash, and a request records method and URL with query values
+redacted. `saddle audit verify` walks the chain and detects edits and truncation of a session log. The
+chain does not stop the user's own account from rewriting a whole log.
+
+### Context and presentation
+
+**D25.** The host stores full provenance (principal, scope, call id, and the fact being corrected, if
+any) as metadata on each transcript entry. The model sees an inline wrapper only on content that came
+from a plugin: tool results, contributions and veto reasons. User messages and built-in tool results
+are untagged. The wrapper's delimiter includes a random per-session value, as in
+`<plugin-output-7f3a plugin="web-search">`, and the host strips that delimiter from the content so a
+plugin cannot close the tag early.
+
+**D26.** Contribution slots, as WIT records:
+
+- tool spec, through the `tool` scope: an identifier rendered with a plugin prefix
+  (`web-search__query`), a description capped at about 1,000 characters, and a JSON parameter schema.
+  Tool descriptions are the known MCP poisoning channel, which is why they get the cap and a tag.
+- `note`, through `context-contribute`: length-capped text, appended as a tagged fact in a section
+  after the system prompt, never inside it.
+- `diagnostic`, through `context-contribute`: `(root, path)`, a line range, a severity enum and a
+  message, for cases such as LSP errors after an edit.
+
+Plugins cannot add constraints to the policy engine. The narrowing case is `veto` (D21).
+
+**D27.** `ui` grants rendering a fixed set of widgets into a frame the host draws and labels with the
+plugin's name: text spans with styles from a closed enum, list, key-value table, progress bar and
+status line. All text passes through an escape stripper, since raw ANSI would let a plugin move the
+cursor over host output, write the clipboard (OSC 52) or plant links (OSC 8). v1 has no input widgets:
+with no approval prompts in the product (D3), a prompt-shaped widget could only be impersonating one.
+When parity brings in dialogs, they render inside the labelled frame.
+
+**D28.** A `net` grant names a hostname, a `*.suffix`, or `*` for any public host (D40), allows https
+only unless the grant sets `scheme = "http"`, and may restrict the port. The host enforces it in its own send function behind
+`wasmtime-wasi-http`'s outgoing-request hook, so the host makes every connection and logs every
+request. Raw `wasi:sockets` is not offered (D11). The host resolves DNS itself, refuses loopback,
+RFC 1918, link-local and `169.254.169.254` unless a grant names that address, and connects to the
+address it checked, which closes DNS rebinding. Grants do not take CIDR ranges. Child processes have no
+network (D19).
+
+### Model providers
+
+**D29.** Providers are configured in the user's `config.toml`, never in the repository policy, so a
+cloned repository cannot point the session at another endpoint or pick which key it sends. The
+built-in providers are Synthetic and OpenAI, both over OpenAI-compatible chat completions; a provider
+defined in `config.toml` can use that format or the Anthropic Messages API. There is no default
+provider: the first run opens the provider list, and `/login` checks the key by listing the
+provider's models, then saves the chosen provider and model. The host holds the conversation in one
+neutral form and renders it for each request. A block the loop does not interpret, such as an
+Anthropic thinking block, is kept and sent back unchanged in its original position. Reasoning from
+an OpenAI-compatible thinking model goes back as `reasoning_content` within the turn that produced
+it and is dropped after.
+
+- A key comes from the provider's environment variable or, without one, from
+  `$XDG_STATE_HOME/saddle/auth.json` (mode 0600), which `/login` in the TUI writes. The state
+  directory is outside every root, so neither the agent nor a sandboxed command can read the store.
+  Every variable that may hold a provider key is removed from the environment a sandboxed child
+  inherits, even when an `exec` grant lists it.
+- `/login` and `/model` edit `config.toml` in place and keep its comments. An edit that would leave
+  the file invalid is refused.
+- A tool call in a reply that hit the output limit or was declined may be incomplete. The host does
+  not run it and returns an error result in its place.
+- Each model request is logged with its model, stop reason and token counts, or with its error.
+
+**D30.** The first run writes two files into `$XDG_CONFIG_HOME/saddle`. `config.toml` names the
+toolchain directories it finds as roots, and grants sandboxed commands write access only to caches
+such as `~/.cargo/registry`; write access to `~/.cargo/bin` would let a command plant a program that
+later runs outside the sandbox. `policy.toml` is the policy for any workspace without a
+`saddle.toml`. It needs no trust: the config directory sits outside every root (D16), so neither a
+cloned repository nor the agent can supply or change it. A workspace's `saddle.toml` replaces the
+default entirely and must be trusted. The session-start record names the policy file used and its
+hash.
+
+**D31.** Each conversation is saved, in `$XDG_STATE_HOME/saddle` (**superseded by D53**: it was JSON
+Lines under `sessions/`, and it is now a SQLite tree; the intent below is unchanged): a record naming
+the workspace, the conversation items in order, and a turn record before each
+prompt naming the audit log that covers it. The state directory is outside every root (D16), so the
+agent cannot read earlier conversations through its tools. A conversation can span several runs of
+saddle and so several audit logs; the turn records tie them together. `/resume` and `saddle -c`
+continue a conversation from the current workspace. On load, a tool call left without a result by
+a crash gets an error result, so the history is valid to send again.
+
+**D34.** The window compaction and the status line use is the model's real context limit, not a
+default: a guess of 128k is wrong for most models served over these APIs, and being wrong is
+expensive in both directions — too small compacts a conversation that still fits, too large lets the
+request fail. The number comes from, in order:
+
+- `context-window` under `[providers.<name>]`, the user's own answer, which beats everything;
+- what this endpoint stated for this model in its `/models` listing;
+- a table of windows published for well-known model families, matched on the longest family name in
+  the lowercased model id, so a fresh login is not wrong by default;
+- `DEFAULT_CONTEXT_WINDOW` (128k), only when nothing knows the model.
+
+The listing is the only place a server states its own limits, so it is the source, and asking for it
+is not tied to `/login`: a session asks when it opens. Its answers are cached in
+`$XDG_STATE_HOME/saddle/models.json`, keyed by base URL and then model id, because one model id can
+mean different things at two endpoints. The state directory is outside every root (D16), so the cache
+is neither readable nor writable by the agent or a sandboxed command. A listing replaces what that
+endpoint said before; an entry it omits this time keeps its earlier window, and an entry stating no
+window (or a placeholder such as 0) adds nothing rather than answering zero. Servers disagree on the
+field name, so all the ones seen in use are read (`context_length`, `context_window`,
+`max_model_len`, `max_input_tokens`, `top_provider.context_length`, `meta.n_ctx`).
+
+A session that never lists models would otherwise open on nothing but the cache or the default, so
+it asks for itself: the TUI spawns the request when it opens and settles the window again when the
+answer lands, updating the header and the loop together; a headless `saddle run` asks before the
+first request, where there is no dialog to keep live. Only `context-window` in `config.toml` can
+outrank the answer, and both paths re-settle through the same function, so a config that sets one
+keeps it. `/login` and `/model` still list, so a fresh login is right in the same way.
+
+The window is settled when the provider is built, and read from there by the loop, the header and
+`saddle check`, so no two of them can disagree. The provider remembers which of the sources answered
+and `saddle check` prints both the number and the source, which is the quickest way to see why a
+session opened on the window it did. `saddle check` does not itself list models: it stays cheap and
+works offline, so it reports what a session would open with.
+
+**D35.** A session keeps its own accounting, and selecting in the transcript is saddle's job.
+
+- Saddle handles the mouse itself, so it captures it (`[ui] mouse = false` hands it back to the
+  terminal, which brings back its own selection and loses the wheel, the drag and the "more lines"
+  badge). Capturing is the only way to have both scrolling and selecting, because a terminal that
+  reports the mouse stops selecting on a drag. So the selection is saddle's: a drag anchors on a
+  character of the drawn transcript and extends with it, the selected characters are drawn on a
+  background of their own, and the button coming up copies the text. Coordinates are in transcript
+  space rather than screen space, so a selection survives scrolling, and a drag pulled past an edge
+  scrolls a line at a time, which is how a selection grows past one screen. The copy is OSC 52,
+  which needs no X or Wayland connection; a terminal that refuses it leaves the highlight as the
+  only feedback, and shift+drag still reaches the terminal's own selection in most of them.
+- Text is copied per line with trailing padding trimmed, because transcript lines are padded to the
+  frame's width for their shaded blocks, and a copy full of spaces is not what was selected.
+- A transcript records what each reply cost, as a `usage` record in the same file as its items
+  (D31). Loading sums them, so a resumed session opens on the tokens it has already spent rather
+  than on zero, and takes the estimate of what its next request would carry from the same function
+  compaction uses, so the status line and the compaction trigger agree (D33). A transcript written
+  before this record existed has none and opens on zero, which is the truth for it.
+- The status line shows `cache <read>/<write>` only where the provider counts writes, which is
+  Anthropic's cache creation tokens. A provider that reports reads alone — OpenAI, DeepSeek and the
+  local servers, which cache without asking — shows `cache <read>`, because a denominator that can
+  never move is noise rather than information.
+
+**D36.** A session shows what it has spent and what is left, and the status line is the user's.
+
+- **Prices** come from, in order: a `[providers.<name>.pricing]` table, in dollars per million
+  tokens as model cards publish them; then the `/models` listing, where the server states one
+  (OpenRouter publishes `pricing.prompt` and `pricing.completion` as decimal strings per token);
+  then nothing. Nothing is not zero: a model nobody priced shows no cost rather than a free one, and
+  the config's table exists because most servers state no prices at all. A cache price the server
+  leaves out is charged at the input price, so an unpriced cache errs high instead of pretending
+  those tokens were free. Prices are stored per token and never rounded until they are displayed.
+- A **usage endpoint** is the other place a provider states what is left, and where a credit-based
+  provider keeps the balance that headers never carry. It is named by `usage-url` under
+  `[providers.<name>]`, fetched at the start of a session and again after each turn, and read into
+  the same `{quota}` field as the headers. There is no standard shape, so the JSON is walked and a
+  figure is recognised by the words in its path — `remaining_tokens`, `tokens_left`, `total_cost`,
+  `credits.remaining` — and a figure that is not found stays absent instead of becoming a zero.
+  `saddle check` prints what the page said, or says that it held nothing recognisable, which is the
+  way to find out whether a provider's shape is one this reads.
+- **Price units.** A listing states a price per token or per million tokens, a million apart, so the
+  unit is taken from a stated one (`unit`, `per`, or a `per_million` object) and otherwise from the
+  magnitude: no real model charges more than a thousandth of a dollar per token or less than a
+  hundredth of a dollar per million. A `[providers.<name>.pricing]` table is per million, as model
+  cards publish, unless it says `unit = "token"`. Synthetic writes prices per token as strings with
+  a currency symbol (`"$0.0000006"`) and names the cache prices in the plural
+  (`input_cache_reads`), so a symbol and a thousands separator are stripped and both spellings are
+  read. A model that states zeros is free, which is no price rather than a price of zero.
+- When a usage page holds nothing the parser recognises, `saddle check` prints the paths its numbers
+  are at rather than the numbers themselves: the field names are what teaches the parser a new shape,
+  and the figures are the user's business.
+- **Quota** comes from the response headers of the request that was just answered, because that is
+  the only place a provider states what is left: `x-ratelimit-*` (OpenAI-compatible, which names a
+  limit beside the remainder) and `anthropic-ratelimit-*` (which names the resource, then the field,
+  and often states only one of the pair). Whichever parts a server sent are shown; a server that
+  sends none never calls the sink, and the status line keeps its length. The headers are read before
+  the body is taken, on the request thread, and handed to the sink that already carries notes, so
+  the quota arrives while the reply streams rather than after it.
+- **Cost** is accumulated per reply from the price in force, and recorded in the transcript's usage
+  record (D35) so a resumed session keeps the total it had. It is the price times the tokens the
+  server reported, which is the provider's own arithmetic, not a local guess at tokenisation.
+- A figure nobody can answer is left out entirely rather than guessed, and that is silent by design:
+  the field renders as nothing and its separator goes with it, so a provider that prices nothing
+  produces the line that existed before these fields did. `{cost}` shows `$0.00` as soon as a price
+  is known, which is what makes "nothing spent yet" distinguishable from "no price", and `saddle
+  check` reports which source answered the price or that none did. No note is printed in a session
+  for either gap: the default template names both fields, so a note would fire in every session with
+  a provider that states neither, and the fix is a line of config that `check` names exactly.
+- **The status line is a template**, `[ui] status`, of `{field}` placeholders: `{provider}`,
+  `{model}`, `{input}`, `{output}`, `{cache}`, `{cachehit}`, `{ctx}`, `{window}`, `{percent}`,
+  `{cost}`, `{quota}`, `{workspace}`, with `{{` and `}}` for literal braces. It is parsed when the config is read and
+  again when `/settings` saves it, so a typo is reported rather than drawn. A field with no answer
+  renders as nothing and the separator before it is held: if a later field has a value the separator
+  moves in front of that one, which is why the default line reads the same whether the cost, the
+  quota, both or neither are known. The default is the line the UI has always drawn, and two fields
+  added to it.
+
+**D37.** A prompt runs until the model stops calling tools. There is no request limit by default.
+
+- The loop's cap was 50 model requests, which is a guess about how long a task takes, and it fails
+  at the wrong moment: a refactor that needs 60 requests stopped mid-way and asked the user to send
+  another message to continue. A limit the user wants is a limit the user sets, through `--max-steps`,
+  `max-steps` in `config.toml`, or `/settings`, and one that is set still stops the loop and says so
+  rather than looping in silence.
+- The loop is bounded in the ways that actually matter and were already there: the turn ends when a
+  reply calls no tool, `esc` cancels between requests, compaction keeps the context inside the
+  window (D33), and an answer that would exceed the window is retried once after compacting. A
+  model stuck repeating one call is therefore bounded by the user's attention and the audit log, not
+  by a number in the config.
+- `max-steps = 0` and an emptied `/settings` field both mean no limit, since a prompt allowed zero
+  requests could not do anything at all.
+
+**D38.** A turn stops when the model keeps asking the same question and getting the same answer.
+
+- With the request cap gone (D37) the loop relies on the model making progress, so it is the loop
+  that notices when none is made. A call is the same when its tool and its serialised arguments
+  match; an answer is the same when its success flag and its content match, by hash. A batch that
+  repeats the previous batch on both counts `REPEATS` (three) times running stops the turn with a
+  note, and the conversation is left valid to continue.
+- Both halves are needed. Comparing calls alone would cut short the legitimate case: polling a build,
+  or listing a directory that is filling up, issues one identical call until it changes. Comparing
+  the answers means the detector only fires when the model cannot learn anything new from repeating
+  itself, which is the definition of the loop worth stopping.
+- The comparison is deliberately blunt — no argv or path semantics, nothing that inspects a tool's
+  arguments — so it cannot become a second, half-right implementation of a tool's meaning, and a new
+  tool is covered the day it is added. A diff is not part of the answer, because the model never
+  sees one (D24).
+- Stopping is not a denial and is not audited as one: the note goes to the UI, and the turn ends
+  like any other that did not answer, so a queued prompt returns to the editor. The user sees the
+  count and can send something different.
+
+**D39.** The agent reaches the network through a tool the host runs, never through `exec`.
+
+- Giving `exec` sockets would hand network access to every program a command can start, and to every
+  Makefile a plugin can write — the failure D19 exists to prevent. So the capability is a tool:
+  `fetch`, one GET, where the **host** makes the connection after the engine has decided, and the
+  decision and the redacted URL go to the audit log like any other call (D10, D24).
+- It is the eighth built-in tool and it is not privileged: it passes the same engine, the same audit
+  log, and it is denied by default because a policy without a `net` grant denies everything. A
+  `net` grant names a hostname or `*.suffix`, and `https` only unless the grant sets a scheme, so
+  reaching the network is something a person wrote down per host.
+- D28's address rules are enforced in the tool rather than the engine, because they are about the
+  address and only the tool resolves one: loopback, RFC 1918, link-local, unique-local, CGNAT, the
+  unspecified address and `169.254.0.0/16` are refused unless the URL is a literal address that a
+  grant named. DNS rebinding is closed by giving ureq a resolver that returns only the addresses
+  that were checked, so the address approved is the address dialled.
+- A URL is parsed here rather than by a library, because the parts are what a grant matches on:
+  userinfo is refused rather than stripped (`https://user@host/` reads as one host and means
+  another), an IPv6 literal keeps its brackets and its colons are not a port, and any scheme other
+  than http or https is refused before anything is sent.
+- This does not give the *harness* network access. A sandboxed agent already runs under seccomp with
+  no sockets (D19), so implementing this tool changes what saddle can do, not what the agent running
+  inside a sandbox can do; that needs a grant in the harness's own profile, which is a human's file.
+
+**D40.** A `net` grant may name every host as `*`, and filtering stays the preferred form.
+
+- `host = "*"` matches any host at all, on the grant's scheme and port like any other grant: https
+  and 443 unless the grant says otherwise, so a wildcard does not open plain http or an odd port by
+  accident. It exists because a task often cannot know its hosts in advance — a package registry, a
+  documentation site, whatever a build prints — and a policy that must be re-trusted for each one
+  teaches people to paste grants without reading them, which is worse than one grant that says what
+  it means.
+- The reason a wildcard is tolerable is that the address rules are not in the grant (D28, D39): the
+  `fetch` tool still refuses loopback, RFC 1918, link-local, unique-local, CGNAT and the metadata
+  address, and a wildcard **does not exempt them**. The exemption for a private address is decided
+  from the grants rather than from the shape of the URL — a grant has to spell the address out — so
+  `*` reaches the public internet and not the machine the agent is running on. That distinction is
+  why the check moved from "the URL is an IP literal" to "a grant names this host": the first form
+  would have made `*` mean the local network the moment someone typed `http://127.0.0.1/`.
+- `*.example.com` remains the better grant wherever the hosts are known, because it bounds the
+  damage of a prompt injection to one domain. `saddle check` prints a wildcard as
+  `https://*:443`, so it is visible where a person reads the policy.
+- A refusal for a local server says so in its own words, before the ordinary denial: a wildcard
+  grant can cover the scheme and the port, so "no net grant covering http://127.0.0.1:8080" would
+  leave the actual reason unsaid. The tool prints the grant that would allow it, with the host as
+  written, the port when it is not the scheme's default, and the scheme when it is http. `localhost`
+  is recognised without a lookup, and any other name is only resolved once the policy has allowed
+  the request, so a denied host is never looked up.
+
+**D41.** A grant's `why` is optional.
+
+- It was required (D22), on the argument that a person approving a policy should see why each grant
+  exists. Writing one for every grant of a large policy is also the kind of friction that produces
+  `why = "needed"`, which carries no more information than an empty field and looks authoritative
+  while doing so.
+- So a grant without one is accepted, an empty or whitespace-only one counts as absent, and nothing
+  prints a dangling marker for it: `saddle check` shows `agent.net[0] = https://*:443` with no `#`,
+  and an allow is explained by its rule alone (`agent.exec`) rather than by `agent.exec: `. A deny
+  is unaffected, since denials are generated sentences and never quoted a `why`.
+- It stays worth writing, and it shows where the policy is read: in the grants `saddle check`
+  prints, and beside each allow in the audit log (D10). A policy
+  with reasons is easier to re-review months later; a policy without them is still enforceable, and
+  the decision is not to make that the tool's problem.
+
+**D42.** A workspace's policy lives in the config directory, never in the tree.
+
+- `$XDG_CONFIG_HOME/saddle/policies/<key>.toml`, where the key is the workspace's canonical path
+  with `/` written as `%`. The first session in a workspace creates it empty, as a header; it is
+  layered on the global policy rather than replacing it (D43), so it holds only what differs for
+  this directory.
+- This replaces "a `saddle.toml` at the workspace root, gated by a trust hash" (D22, D23). The
+  reason is the hole D20 was compensating for: landlock grants a subtree and cannot carve a path out
+  of one, so a workspace file is writable by any command the agent runs, and the snapshot/restore
+  that guarded it is a race a `setsid` child wins by writing after the restore. The config directory
+  is outside every root (D16), so the kernel refuses those writes outright — demonstrated, not
+  argued: a command writing the policy gets `Permission denied` and the file is unchanged. The
+  protection moved from a compensating control to an enforcement boundary.
+- A `saddle.toml` in the tree is therefore not read. It is reported once, naming the file that does
+  apply, because silently ignoring a file that looks authoritative is worse than either reading it
+  or refusing.
+- The trust gate is gone (D44): nothing the agent runs can write the file, so there is nothing for a
+  hash to detect. `saddle check` prints what is in force, which is what a person reads before
+  changing a grant.
+- The cost is that a policy is no longer declared in the repository, so it cannot be reviewed in the
+  same diff as the code and is not shared by copying the tree. That is the trade: authority may not
+  live where the governed process can write.
+
+**D43.** A workspace's policy is layered on the global one, and is the authority for that directory.
+
+- The global `policy.toml` is the base for every workspace. A workspace's file under `policies/`
+  holds what differs: a grant it does not mention keeps the global value, and one it does mention
+  replaces that grant for the scope — whether that makes it **narrower or wider**. It is created as a
+  header with no grants, and an empty file and no file mean the same thing.
+- Widening is deliberate, and safe for one reason: the file is in the config directory (D42), which
+  no root contains, so nothing the agent can run writes it — the kernel refuses. It is a person's
+  declaration about one directory, the same trust level as the global file, so there is no reason to
+  let it only subtract. A check that refuses a wider grant would be enforcing a rule about a
+  document no governed process can author.
+- The first version of this decision did refuse widening, on the argument that a project file is
+  written by whoever clones the repository. That was true of the pre-D42 design, where the policy
+  sat in the tree; after D42 the premise was gone and the check only made the workspace file a
+  second-class citizen. It was removed rather than left as a reassuring-looking no-op.
+- What is still refused is a grant that cannot be resolved for the session at all — an unknown root,
+  a malformed host, a bad plugin id — exactly as in a single-file policy. Layering changes which
+  file a grant comes from, not what a grant may say.
+- `saddle check` prints both files in the order they apply and the layered result, so a change to
+  either file shows up as what it does, and reading it is the moment a wider grant is meant to be
+  considered.
+
+**D44.** `saddle trust` and the trust store are deleted.
+
+- D23's gate stopped being a gate during D42/D43 and did not say so: the session stopped consulting
+  the store, so `saddle trust` printed a diff and recorded a timestamp while refusing nothing. A
+  security feature that looks like a gate and is not one is worse than none, because it invites
+  reliance it cannot bear.
+- What it used to defend is now defended by construction: the policy file is in the config directory,
+  which no root contains (D42), so the kernel refuses every write from the agent, from a sandboxed
+  command and from a `setsid` survivor. There is no hash to compare because there is nothing to
+  detect, and a review step that changes no outcome is ceremony.
+- The review itself survives as `saddle check`: it prints both policy files with their hashes, the
+  roots, and the effective layered grants, which is what a person needs to read before editing a
+  grant. `trust.json` is simply no longer read; an existing file is left alone, and deleting it is
+  harmless.
+- Changing a grant means editing the file; a running session reads it again when a grant is changed
+  from `/permissions` (D47), and the next one reads it at open.
+
+**D45.** There is a permissions editor, and the agent cannot open it.
+
+- `/permissions`, or the `Permissions for this project` row in `/settings`, lists the grants the
+  session is running with and edits two things: the exclusion list of a filesystem grant, and
+  whether a scope with no arguments is on. Everything else is listed and locked, with a sentence
+  saying where it is changed: `exec`, a `net` host, a `token` budget and the plain scopes have
+  arguments, and a menu cannot ask for them without becoming a form as fiddly as the file.
+- The line is deliberate: a keypress that hands over `exec` or a host is indistinguishable from an
+  accidental one, and the file is where a grant is written down where a person can read it. The
+  editor does the routine work — excluding a path — and leaves the capability decisions to the file.
+- It is a human's tool. No tool exposes it, nothing the model can call reaches it, and the system
+  prompt tells the model not to ask for a grant as part of a task (D17). The editor writes the
+  workspace's own policy file (D42) and never the global one: a change made while working in a
+  project is a change to that project.
+- Every change is validated with the same `Policy::parse` a session uses before it is written, so a
+  bad pattern leaves the file as it was and the message in the dialog rather than a policy that will
+  not load. Exclusion patterns are also checked for the mistakes worth catching early: `..`, a bare
+  `/`, and an unbalanced `[`.
+- A change takes effect at once: the session reads the policy again and the model is told (D47).
+
+**D46.** A grant is added from inside the application by typing it, not by opening the file.
+
+- `a` in the permissions editor opens a one-line prompt; what it accepts is on screen while it is
+  typed: `net <host>[:port]`, `root <name>`, `read <name>`, `write <name>`, `exec`, `tokens <n>`,
+  with an optional `# why` that becomes the grant's reason (D41). Nothing is added by a keypress
+  alone: the line is typed, which is the difference between choosing a grant and happening to press
+  a key on a screen.
+- The forms are validated before anything is written, and each refusal names the fix: a root that
+  this session does not have is refused with the list of roots it does have, since adding a root is a
+  `config.toml` change and not a policy one (D30); a host goes through the same `HostPattern` the
+  policy parser uses; a second `exec` or a second budget is refused rather than silently doubled. The
+  result is then parsed with the same `Policy::parse` a session uses, so a file is never left
+  unloadable.
+- A file of nothing but comments gets its `version = 1` line when the first grant is added, which is
+  what makes the created-but-empty workspace policy (D43) usable without opening it.
+- This is the deliberate answer to "how do I add a network grant from inside": type `net
+  api.example.com` and read the line `saddle check` shows. The editor still does not offer a menu of
+  capabilities to toggle (D45); it offers a prompt in which the person states the grant, which is the
+  smallest thing that removes the need to hunt for the file without making a capability a keypress.
+
+**D47.** A grant changed from the editor takes effect at once, and the model is told.
+
+- The permissions editor writes the file, then the agent thread reads the policy again, rebuilds the
+  engine, and regenerates the grants section of the system prompt. The prompt is sent with **every**
+  request, so replacing that section is the notification: the next request carries the new grants,
+  and a call refused under the old ones may now be allowed. Nothing is injected into the conversation
+  as a fake user message.
+- This is why the prompt is split into a base and a grants section: `system_prompt` is
+  `base_prompt` followed by `grants_section`, and a reload replaces only the second. The base is
+  everything about the workspace, the roots and the instruction files, none of which changes here.
+- The reload happens on the agent thread, in the same queue as `SetProvider` and `SetMaxCompaction`,
+  so a change made during a turn waits for the turn to end. A policy is never swapped underneath a
+  request that is already in flight.
+- The new file is parsed and layered exactly as at open, so a reload of a broken file fails and the
+  session keeps the grants it had, saying so rather than running on a policy half read. The audit log
+  gets a `policy` record with the path and both hashes, which is what makes the change part of the
+  record instead of a silent mutation of the session's authority.
+- The system prompt's own sentence about this was updated with it: it used to say the policy could
+  not change during a session, which was true until this decision.
+
+**D48.** `fetch` may send headers, and a header value never leaves the request.
+
+- The tool takes an optional `headers` object of name to value, so a keyed endpoint is reachable —
+  the provider allowance (`/v2/quotas`) needs an `Authorization` header and no amount of URL
+  rewriting gets around that. Values are carried to the request and nowhere else: not into the audit
+  log, not into the tool result, and not into the conversation.
+- The audit record carries the header **names** only (`"headers":["authorization"]`). That answers
+  the question a record should answer — what kind of request was this — without writing a secret into
+  a file that outlives the session. The same reasoning as the existing query redaction (D24).
+- What a header may not do is change where the request goes: `host`, `forwarded`,
+  `x-forwarded-for`, `x-forwarded-host`, `x-real-ip` and `via` are refused, because the grant was
+  checked against the URL and a header that redirects it would make that check theatre. A name must
+  be a token, a value may not carry a control character (a newline would split the request), and a
+  value is bounded at 8 KiB.
+- The redirect that follows is explicit: a secret belongs in a header, never in a query string,
+  because a query string is part of the URL and the URL is recorded. `saddle check`'s diagnostic
+  prints the *paths* of the numbers in a usage page and not the numbers for the same reason.
+
+**D49.** A usage page shows one figure: the allowance that governs the work.
+
+- Synthetic's `/v2/quotas` reports three pools at once: `planWeeklyLimit` (the plan's percentage),
+  `subscription` (500 chat requests per five-hour window) and `search.hourly` (web searches). Only
+  the first decides whether a week of work is possible; the other two are refilled faster than they
+  can be spent and are noise on a status line. The page is read for the weekly figure, and the pools
+  it does not show are left absent rather than shown as zero.
+- The shape is read at its exact paths. A word-matching reader would take whichever pool sorts
+  first, and here that is `search` — so a status bar built on words would have shown the *web-search*
+  allowance as the chat allowance, with a figure plausible enough that nobody would question it.
+  Word matching stays as the fallback for a provider nobody has described yet.
+- When a plan states no weekly figure, the request pool is used: `subscription.requests` is what has
+  been *spent* of `subscription.limit`, not what is left, because it reads 0 against a cap of 500
+  with a refill hours away — had it meant what is left, the account would be locked out at the moment
+  the page reports it working (D49).
+- The fallback path derives the same way when it can: `requests_used` with `requests_limit` and no
+  `requests_remaining` gives the difference, and usage with no cap states nothing rather than zero.
+  That is why `limit` and `cap` are matched bare: that is what a cap is called next to its pool.
+- `Quota` keeps fields for a token count, a request pool, a money balance and a percentage because
+  the source decides which are filled: the headers of some providers state one, an endpoint another.
+  A figure that is absent is not a figure of zero.
+- A weekly plan states a percentage rather than a count, so `Quota` carries `percent`.
+- The status bar shows the allowance as `94% ↺1h` — the figure, then a countdown marked `↺`. The bar
+  has one row for everything, so a figure that needs a sentence belongs in `saddle check`, which
+  prints `94% of the plan left, resets in 1h`. A refill is counted from the clock the frame is drawn
+  with, which is passed into the renderer rather than read inside it, so the same state renders the
+  same line twice. Rounding is up, so the last minute reads `1m` while there is still time rather
+  than `0m`. A provider that spells the reset as a duration (`6m0s`) is not converted: it is already
+  short, and turning it into an instant would mean guessing when it was measured.
+
+**D50.** A cache miss is the user's news, not the model's.
+
+- A provider that caches the prompt prefix bills the reused part at a fraction of the input price.
+  When the prefix changes — the system prompt is reloaded (D47), the tool list moves, an earlier
+  message is rewritten — every request of that turn reads the whole prompt again at full price.
+  That is several times the cost of the same turn and it is invisible: the token counts are similar,
+  the answer is similar, and only the bill says anything. So a turn whose reply reads nothing from a
+  cache that has demonstrably been working says so: `cache miss: 10.0k tokens read at full price`.
+- It goes through `Sink::note`, which reaches the transcript in the TUI and stderr in line mode, and
+  never through `Item`, which is what a request is built from. The model is not told that its prompt
+  was re-read, any more than it is told what the status bar says: a notice is a remark to the person
+  at the terminal, and putting it in the conversation would both waste tokens and invite the model to
+  comment on infrastructure it cannot change.
+- A cold start is not a miss. The first request writes the cache it will read next time, so it reads
+  nothing and nothing is wrong; only a request that reads nothing *after* caching has been seen
+  working is worth a line. A provider that never caches (`warm` never set) is never warned about,
+  and a prompt below the 1024-token floor providers cache is not either.
+- One line per turn. A turn that misses at every step is one story, not ten: the rest of the turn's
+  requests almost always miss for the same reason, and the hit rate on the status bar carries the
+  ongoing shape of it.
+- No new audit record. Each reply's usage is already in the log, so a miss is in the record by
+  arithmetic; an extra record would say the same thing twice and give a second place to keep in step.
+- `{cachehit}` on the status bar is `hit 96%`, the cached share of everything sent, computed from the
+  session totals. It is left out while nothing has been cached at all, rather than claiming `hit 0%`
+  on every request of a provider that does not cache, and rounded down so the line never claims a
+  better share than was measured.
+
+**D51.** `read` returns a page, not a file.
+
+- An uncapped `read` is a hole in the context budget: a 4 MB generated file or a log went into the
+  conversation verbatim, cost real money, and could end the turn. So a page is at most 2000 lines
+  **and** at most 50 KiB, whichever comes first, and `offset`/`limit` page through the rest. The line
+  cap alone would not do, because one line can be a minified bundle; the byte budget alone would cut
+  off a long file at an arbitrary place with no way to ask for the next part.
+- The note that ends a cut page is the instruction: `[showing lines 1-2000 of 5000; call read again
+  with offset=2001 for more]`. `offset` is 1-based, which is what `grep` reports, so a match and a
+  page are in the same coordinates.
+- Lines are not numbered in the body, unlike the other agents. The model edits by matching text
+  exactly, and a column of numbers in front of every line is an invitation to copy one into `edit`'s
+  `old` and fail. The trade is that a page does not say where it starts; the note does.
+- A file that fits on one page comes back byte for byte, trailing newline included. Splitting it
+  into lines would drop that newline, and `edit` matches exactly, so the file would be read without
+  the character it ends with and then never match.
+- One line longer than the whole budget is handed over truncated with a note saying how long it is,
+  rather than refused: the point is to bound the context, and a minified file still has an answer in
+  it. A page never ends mid-character.
+
+**D52.** `saddle run --json` writes one JSON object per line on stdout.
+
+- It is the machine-readable form of the same events the TUI gets: `session` first, then `text` as
+  the answer streams, `call` with the arguments as the model sent them, `result` with `ok` and the
+  content, `reply` with the usage and the cost, `note`, `quota`, `compaction`, `usage` for the turn's
+  totals, and `turn_end` naming how it ended. A caller that embeds saddle — which is the point of
+  `saddle-sdk` (D15) — parses that instead of prose.
+- Nothing else goes to stdout, and the host's own errors keep the `saddle:` prefix on stderr with a
+  non-zero exit, so a stream of valid objects plus a clean exit is the success signal. `--json`
+  implies line mode even on a terminal: a caller that asks for JSON does not want a full-screen UI.
+- The encoder escapes control characters, so model text cannot move a cursor or write a clipboard
+  (D27), and the stream stays one object per line whatever the model sends.
+- `end` is a fixed word per outcome (`answered`, `cancelled`, `failed`, `cut`, `step_limit`,
+  `repeating`, `declined`), because a caller switches on it and a reworded string would silently
+  break that.
+
+**D53.** Conversations are saved in SQLite, as a tree.
+
+- A conversation is not a list. `/tree` continues from an earlier prompt, which means the message it
+  branched at has more than one continuation, and a JSON Lines file cannot say that without copying
+  everything. So the store is one SQLite database in the state directory: `sessions` rows, and
+  `nodes` rows with a `parent` pointer, each node being one item, one usage record, one turn marker
+  or one compaction. The conversation is the path from the root to the session's current leaf; the
+  other branches stay in the table.
+- One database file, not one per session: a fork and the session it came from are then in the same
+  place, and `list` is a query rather than a directory scan. The workspace is a column, so a listing
+  is still per workspace and one workspace's conversations are not offered in another.
+- A fork copies the nodes it keeps into a new session and leaves the original alone, so both can be
+  resumed and neither edits the other's history. Copying rather than sharing also means the tree
+  cannot grow a node with two parents.
+- `/clone` is the case with no point to choose: it copies the whole active branch into a new
+  session. `/tree` covers the other case, continuing from a point inside the session (D54).
+- What the copied branch spent comes with it. It really was spent, and a resumed session that opened
+  on zero would understate the cost of the conversation it is continuing.
+- SQLite is bundled, so building or running saddle needs no system library, and a message is
+  committed or it is not — where a torn last line used to be possible. Two connections are open in a
+  process (the agent thread appends, the UI thread lists), which is what WAL and a busy timeout are
+  for.
+- The JSON Lines files earlier builds wrote are imported once, on first open, and renamed
+  `.jsonl.imported` rather than deleted: an import that got something wrong must not be the thing
+  that loses a conversation. A body that does not parse is skipped on load for the same reason.
+- The database is in the state directory, outside every root (D16), so the agent still cannot read
+  earlier conversations with its own tools. Nothing about the move widens what the agent can reach.
+
+**D54.** `/tree` moves within the session, and escape twice opens it.
+
+- The tree lists **every message** in the session, not just the prompts, in the order they were
+  made, and dims the ones the next request would not carry. Listing only the active branch is the
+  tempting implementation and it strands work: after a rewind to the start the active branch is
+  empty, so that view shows nothing at all and the conversation has no way back. Everything stays
+  listed, so everything stays reachable.
+- Choosing a **prompt** puts its full text back in the editor and moves the conversation to the
+  message *before* it. Sending it again — edited or not — then makes another branch, which is the
+  point of the feature. Choosing anything else (a reply, a tool result, a summary) continues after
+  it with an empty editor.
+- Nothing is deleted by a rewind. The nodes after the new leaf stay in the database, marked as not
+  active, and choosing one puts the conversation back onto that branch. Losing work to a
+  navigation key is the failure this rule exists to prevent.
+- Two escapes on an **empty** editor open it, as in pi. With text in the editor escape is not a
+  gesture, so a half-written prompt is never lost; while a turn runs escape is cancel, as before;
+  and any other key breaks the pair. There is no setting for it: pi needs `doubleEscapeAction`
+  because it has a configurable keybinding layer, and saddle does not. `/tree` is the same door.
+- A row says what the message did, and a reply that only calls tools is the common case rather than
+  an edge: in a working session there is one per tool round trip, and every one of them has no text
+  part at all. So a reply with no text reads `calls read`, or `calls edit, bash` — the tool names,
+  up to three — and tool results read `2 tool results, 1 failed`. A thinking model that answered
+  with reasoning and nothing else reads `thought, said nothing`. `(no text)` on all of them would
+  make the tree a wall of identical rows that say nothing, which is the state this replaced.
+- The controls are pi's: up/down, page up/page down, home/end, enter, escape and ctrl+c to close,
+  ctrl+u for the prompts only and ctrl+a for everything, ctrl+left and alt+left for the previous
+  prompt and ctrl+right and alt+right for the next, ctrl+x to copy the whole selected message.
+- `/clone` is the separate thing: it copies the active branch into a new session, so the copy can
+  be worked on independently. A branch point inside one session and a second session are different
+  answers to "I want to try something else", and both are cheap to keep.
+
+**D55.** A conversation can be named and deleted; the schema migrates rather than resetting.
+
+- `/name [name]` names the conversation, and with no argument clears the name. A name replaces the
+  first prompt as the title in `/resume`, because that is what a person recognises their own work
+  by once there are thirty conversations. Clearing it puts the prompt back rather than leaving an
+  empty row.
+- The picker renames with ctrl+r and deletes with ctrl+d **twice**, the second press confirming:
+  deleting is not undoable, and a single key is one slip away. Any other key cancels the pending
+  delete. The rename is edited in the prompt, which already has an editor, rather than growing the
+  picker one.
+- Deleting refuses the conversation this session is writing to. `/clear` first, then delete: the
+  alternative is a session appending to a session that no longer exists.
+- `/session` reports the id, the name, how many messages are on the branch, the tokens and the cost.
+  That is what makes an id in an audit log or a bug report mean something.
+- The schema is versioned and migrated in place. Version 2 adds `sessions.name` with an
+  `ALTER TABLE`, run only when the file is older than the build, and written so a second run cannot
+  fail. A database from a **newer** build is still refused rather than guessed at: a wrong guess
+  here costs a conversation. Nothing is ever recreated, because the file on disk is the user's work.
+
+**D56.** `patch` changes several files in one call, and one denial refuses all of them.
+
+- The format is apply-patch's — `*** Begin Patch`, `*** Add File:`, `*** Update File:` (with
+  `*** Move to:`), `*** Delete File:`, `*** End Patch` — because models already know it. A rename and
+  its call sites become one request rather than one per file, which is what the round-trip cost was
+  actually paying for.
+- Authority is unchanged and unreduced. Every path is resolved and **decided** before anything is
+  written, each through the same engine as `write`, and a rename is decided on both ends. One denial
+  refuses the whole patch, and the tool says so: a half-applied change is a state the user did not
+  ask for and the model cannot reason about. Verified through the binary: a patch whose second file
+  is excluded creates nothing at all.
+- Matching is strict. A hunk's `-` and context lines must appear exactly once in the file; zero
+  matches and two matches both fail, with the `@@` marker in the message and nothing written. A hunk
+  that removes nothing is refused, since it would match anywhere.
+- The new contents of every file are computed in memory first, then written. Two operations on one
+  path are refused rather than ordered.
+
+**D57.** The reasoning effort is a live setting, not a line of config.
+
+- `/thinking [level]` sets `default`, `low`, `medium` or `high`, and with no argument cycles; shift+tab
+  cycles too, as in pi. `default` sends nothing at all, so a provider that has no such field is not
+  sent one it would reject.
+- It applies to this session. It is not written to `config.toml`: a change of mind while working is
+  not necessarily a preference, and `/settings` is where a preference is saved.
+- The list that cycles and the list `/thinking` accepts are the same constant, so the two cannot
+  drift apart and leave a level that can be set but never reached by cycling.
+
+**D58.** Images are attached to a prompt, and their type comes from their bytes.
+
+- `@path` on an image attaches it as a picture rather than failing as text. The media type is
+  decided by the magic bytes — PNG, JPEG, GIF, WebP — not by the extension, because a `.png` that is
+  really a JPEG would otherwise be sent as a PNG and rejected by the provider. The pixel size is read
+  out of the header the same way, so the transcript can say what it is.
+- An attachment is an `Item::Attached { text, images }`, its own variant rather than a flag, so every
+  place that matches on an item has to decide what a picture means there: the two renderers send it,
+  compaction describes it in one line, the store previews it, `/tree` marks it. A flag would have
+  been one `if` in the renderers and a silent omission everywhere else.
+- The same carries through a **tool result**: `read` on a PNG hands the picture to the model, so
+  looking at a screenshot is one call rather than a detour. `ToolResult` has `images`, and it is the
+  renderers that deal with the two APIs disagreeing:
+  - Anthropic accepts an image block inside `tool_result`, so it travels with the text. But it
+    rejects an **error** result whose content is not text, so the images of a failed call are moved
+    after the results in the same user message, captioned with the call id.
+  - A Chat Completions `role: "tool"` message has no image field at all, so the picture travels in a
+    user message right after it, headed `Image(s) from the tool result:`. The tool message gets
+    `"(see the attached image)"` when the call produced no words, since the API requires content.
+- An attachment to a *prompt* is still its own item variant rather than a flag, so every place that
+  matches on an item has to decide what a picture means there.
+- Anthropic gets `{"type":"image","source":{"type":"base64",…}}` beside the text block; OpenAI gets a
+  second content part with a `data:` URL. Both are the wire shapes those APIs document.
+- One image is limited to 5 MiB before base64, and the refusal says the size: a request the provider
+  will reject is better refused where the message can be specific.
+- Images are kept in the transcript as base64 in the row's JSON. That is larger than a file
+  reference and needs no path to still exist later, which matters because the state directory is the
+  only thing saddle owns.
+
+**D59.** A picture is drawn where the terminal can, and described where it cannot.
+
+- Two protocols are implemented: the Kitty graphics protocol and iTerm2's OSC 1337. Sixel is not:
+  it needs the image quantised to a palette, which is a decoder, and the two implemented protocols
+  cover the terminals people actually run.
+- The protocol is detected once, at startup, from `[ui] images` if set and otherwise from the
+  environment (`KITTY_WINDOW_ID`, `TERM`, `TERM_PROGRAM`). Detection is allowed to be wrong in one
+  direction only: anything unrecognised gets the text fallback rather than an escape that would print
+  garbage into the transcript.
+- The picture is drawn **after** the frame, at the row its marker line was drawn on. Ratatui cannot
+  express "the terminal draws this rectangle itself", so the layout reserves blank rows and the
+  escapes are written to stdout afterwards. The marker line `[image shot.png 1280×720]` stays either
+  way: it is the fallback, it is what a copy of the transcript contains, and it is what the model was
+  told about.
+- Each image carries an id so the terminal caches the data rather than receiving it every frame. A
+  kitty image larger than 4096 base64 characters is continued across several escapes, which is what
+  the protocol requires.
+- **A large picture is retransmitted when its band changes**, because every placement is `a=T`,
+  which transmits and displays in one action. The cost is the whole file again each time: a 45 KiB
+  screenshot is 60 KB of base64 in 15 escapes and is unnoticeable, while a 4.5 MiB photograph is
+  6.3 MB in 1549 escapes for every row it scrolls. Kitty's cheaper way is to transmit once and then
+  re-place with `a=p,i=<id>` and a new source rectangle; that is the optimisation to reach for if
+  large pictures feel slow over a remote connection, and it is not done yet because it depends on
+  the terminal keeping the data under that id.
+- **No cell box for kitty when the picture fits.** Without `c`/`r` kitty draws at the image's own
+  pixel size, so one pixel of the file is one pixel of screen. The layout still reserves rows, but
+  from the picture's height rather than a fixed number, and as a hint only: the terminal decides the
+  real size when it paints. iTerm2 does take a cell size, with `preserveAspectRatio`, because its
+  protocol has no pixel-size mode.
+- The spec says what `c`/`r` do, and it is not what an earlier draft of this record claimed. Kitty:
+  "The image will be scaled (enlarged/shrunk) as needed to fit the specified area … If only one of
+  either `r` or `c` is specified, the other one is computed based on the source image aspect ratio …
+  When both are specified the image is **letterboxed/pillarboxed** to prevent distortion"
+  (`docs/graphics-protocol.rst`, *Controlling displayed image layout*). Kitty does not stretch. The
+  64×64 icon smeared across eighty columns that made us drop the cell box was observed in WezTerm,
+  which implements the protocol itself; whatever it does with a box, the box is still the wrong tool
+  for a picture that already fits. What the letterboxing rule does mean is that the **assumed cell
+  size is load-bearing**: a source band and the cell box it is placed in must have the same shape, or
+  kitty leaves a margin and the picture looks like it has slipped against the text. `tui/image.rs`
+  asserts that equality in a test rather than trusting the arithmetic.
+- **A picture is erased before it is redrawn.** Kitty keeps an image at the cell it was drawn on,
+  and ratatui only rewrites characters — it has no idea a picture is under them. So a scroll moved
+  the text but not the image, and the next frame drew a second copy at the new position: smearing.
+  Each frame now deletes the ids it drew last time (`a=d,d=i`) and draws again, which is cheap
+  because the ids are stable per transcript entry. A frame where nothing moved sends nothing, so an
+  ordinary keystroke does not flicker.
+- A picture is drawn only inside the transcript area, because the terminal would happily paint it
+  over the editor and the status line — the other half of the smearing. Its rows are reserved in the
+  layout, so the boundary is decided there and not by the escape.
+- **A picture is placed while any of its rows is on screen, not while its marker line is.** The
+  marker is a caption, and the first version of this had the layout skip any picture whose marker was
+  outside the view, which meant scrolling a picture's caption off the top made the picture vanish
+  although nearly all of it was still visible — the crop worked downwards and not upwards. The
+  geometry now lives in one function, `image::band`, which both the layout and the drawing pass call:
+  the picture occupies the line after its marker and `rows` lines following, and the band is the
+  intersection with the visible lines.
+- **A picture is shown in part, like text.** The rule "the whole picture must fit, or it is not
+  drawn" is what made a second image vanish: two 320×200 screenshots need 23 transcript rows and a
+  real transcript has 16, so the one below the fold was never drawn even though it was in the model's
+  context. Now the picture occupies its rows and the drawing pass shows the intersection with the
+  window: kitty is sent the source band (`y` and `h` in pixels) for the rows that are on screen, and
+  scrolls through the rest as it comes into view. iTerm2 has no source rectangle, so it is given the
+  visible rows and shrinks the whole picture into them, which is honest rather than cropped.
+- It *fits* by being scaled, not by being dropped. `c`/`r` are sent only when the picture is too big
+  for the room it has, with the box computed from the aspect ratio. A picture that fits is drawn one
+  pixel to one pixel; a 1920×1080
+  screenshot is shrunk to the transcript instead of vanishing. Dropping it instead is what made two
+  large images look like "only one renders": two 320×200 pictures need 23 transcript rows, and a
+  real transcript has 16.
+- Cell sizes are assumed (10×20 pixels) because no terminal reports them. That decides the layout and
+  the scale factor, and the terminal decides the final pixels when it paints.
+- `saddle check` reports which protocol was chosen and what decided it. A terminal that draws nothing
+  and a terminal that was never asked look identical on screen, so the answer has to be somewhere a
+  person can read it.
+- Nothing here decodes pixels: the terminal scales the picture to the cell box. Saddle therefore
+  needs no image library, which is the reason this is a feasible feature at all.
+
+## 4. Scope enumeration
+
+| scope | grants | declared by | enforced at |
+| --- | --- | --- | --- |
+| `exec` | running commands | `saddle:host/exec` import | sandbox helper (D18, D19) |
+| `fs-read` | reading files under granted roots | `saddle:host/fs-read` import | policy per call |
+| `fs-write` | writing files under granted roots | `saddle:host/fs-write` import | policy per call, reserved paths (D23) |
+| `net` | HTTP requests to granted hosts | `wasi:http/outgoing-handler` import, `fetch` tool | host HTTP client, policy per request (D28, D39) |
+| `transcript-read` | reading session messages and observing them as they arrive | `saddle:host/transcript-read` import, `saddle:plugin/observer` export | policy per call |
+| `context-contribute` | adding notes and diagnostics to the context | `saddle:host/context-contribute` import | policy per call, slot schemas (D26) |
+| `tool` | registering tools the model can call | `saddle:plugin/tool` export | load-time check, catalogue rendering (D26) |
+| `veto` | denying a pending tool call | `saddle:plugin/veto` export | policy per call (D21) |
+| `model-invoke` | spending tokens on the session provider | `saddle:host/model-invoke` import | policy per call, against a budget |
+| `ui` | rendering widgets in the terminal | `saddle:plugin/ui` export | widget vocabulary (D27) |
+| `persist` | storing state between calls | `saddle:host/persist` import | per-plugin storage namespace |
+
+## 5. Enforcement architecture
+
+One capability representation, in `saddle-cap`, lowered three ways:
+
+1. to the set of interfaces a component may import and export, checked before instantiation;
+2. to per-call decisions in the policy engine, for every host function a plugin or built-in tool calls;
+3. to a sandbox spec for child processes, applied at `exec`.
+
+The WASI layer is closed the same way for every plugin: no preopens, empty environment, no sockets.
+Authority arrives only through `saddle:host` interfaces and `wasi:http`, and both reach the policy
+engine.
+
+- A component can reach only the scopes its imports and exports name. That set is a static property
+  of the component and is checked before any plugin bytecode runs.
+- The policy engine decides each call with resolved arguments: which path under which root, which
+  host, how many tokens, which storage namespace.
+- The sandbox spec gives child processes the same roots, because the policy engine cannot see inside a
+  child.
+
+A denormalized design where the three draw from separate sources is the failure case. Deriving the
+sandbox spec from the same grants as the policy decisions stops a plugin without `net` from reaching
+the network through `curl` in a child process.
+
+## 6. Extension surface, from the parity benchmarks
+
+Roughly the union of what pi and opencode let an extension do, with the scope each maps to:
+
+| extension point | scope |
+| --- | --- |
+| register a tool, whose body runs with the plugin's authority and whose output becomes agent input | `tool` |
+| execute commands | `exec` |
+| read and write files | `fs-read`, `fs-write` |
+| reach the network | `net` |
+| read the transcript | `transcript-read` |
+| contribute text into the context | `context-contribute` |
+| observe messages and tool results | `transcript-read` |
+| block a pending tool call | `veto` |
+| invoke the model | `model-invoke` |
+| render UI | `ui` |
+| persist state | `persist` |
+
+## 7. Milestones
+
+**v0.** Harness with built-in tools and no plugin loader. Every tool invocation passes the policy gate.
+Deliverable is the gate, with a session that can read, edit and run commands under a policy file. The
+trust gate (D23) and the audit log (D24) ship in v0, because without them nobody can review what the
+gate allowed.
+
+**v1.** One plugin, one scope, one load-time refusal. Deliverable is a hostile plugin that imports
+`saddle:host/fs-read` without the grant and fails to instantiate, plus a test asserting the failure.
+The test runs at two levels: against `saddle_cap::component::check_component` with a hand-written
+import list, and end to end with the compiled component.
+
+**v2.** Remaining scopes and their host interfaces, `veto`, the D25 provenance wrapper, then
+presentation.
+
+The v1 test is the whole thesis. If a plugin that imports `fs-read` without the grant still loads, the
+model is decorative.
+
+## 8. Deferred
+
+- Long-lived plugin instances (`lifetime = "session"`, D13).
+- `exec` on macOS through Seatbelt.
+- Network for child processes: a network namespace that routes only to the host's HTTP client, which
+  enforces the same per-host grants.
+- A mount namespace with read-only bind mounts for reserved paths and empty mounts over excluded
+  paths, replacing the D20 snapshot and making `exclude` bind `exec`.
+- Tracking child processes by cgroup. A child that calls `setsid` leaves its process group and
+  survives the group kill in D19.
+- An external append-only sink for the audit log.
+- Input widgets in `ui`.
+
+## 9. Known risks
+
+- The policy engine and the WIT world are one design. Getting them out of step produces a system that
+  looks enforced and is not.
+- Building an argv matcher for `exec` first is the tempting shortcut. It works until a plugin writes a
+  Makefile.
+- Parity pressure will pull toward extension points that have no scope yet, and the easy answer will be
+  a generic escape hatch.
+- The component model toolchain moves. A pinned version is a schedule dependency, not a detail.
+- The sandbox depends on a list of system paths (D19). A tool that needs a path outside the list fails
+  with a permission error that looks like a bug in the tool.
