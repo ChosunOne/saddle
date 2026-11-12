@@ -1146,8 +1146,12 @@ use it.
   for a reason that no longer holds — provider settings and grants were written by different code —
   and two files whose grant semantics differ is a thing a person has to learn twice. `[agent]` in
   `config.toml` is the base every workspace inherits.
-- **A workspace's own grants are their own file**, `policies/<key>.toml`, keyed the way the policy
-  file always was (`/` written as `%`, which `check` prints). They are *not* a table keyed by path
+- **A workspace's own grants are their own file**, `policies/--<path>--.toml`, named the way pi
+  named a session directory: the leading and trailing `--` wrap the encoded path and its separators
+  become `-`, so `/home/me/source/saddle` is `--home-me-source-saddle--.toml` and a directory listing
+  reads like a list of paths. `%` as the separator was tried first and was unreadable. The encoding
+  is lossy (`a-b` and `a/b` collide) so the file records the path it is for, and `check` prints the
+  one in force. They are *not* a table keyed by path
   inside the global file: that was the first attempt and it is wrong in two ways. The global file
   would accrue a key for every directory ever opened, growing without bound and mixing one
   directory's authority into a file named after nothing; and the authority for a directory belongs in

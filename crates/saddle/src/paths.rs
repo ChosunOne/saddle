@@ -129,22 +129,20 @@ pub fn exposed(workspace: &Path, sensitive: &[(&str, PathBuf)]) -> Vec<String> {
         .collect()
 }
 
-/// A workspace path as one filename component: `/` becomes `%`, so
-/// `/home/me/project` is `home%me%project.toml` and the directory listing names the workspaces.
-/// Characters that are awkward in a filename become `_`, which is a lossy but readable fallback;
-/// the file itself records the path it is for, so a collision is caught rather than guessed at.
+/// A workspace path as one filename component, the way pi names a session directory:
+/// `/home/me/project` becomes `--home-me-project--` (D63).
+///
+/// The leading and trailing `--` wrap the encoded path, and the separators inside become `-`, so a
+/// directory listing reads like a list of paths. A `%` separator was tried first and it was
+/// unreadable: `home%local_ai%source%saddle.toml` says nothing to someone looking at the directory.
+///
+/// The encoding is lossy on purpose — `/home/me/a-b` and `/home/me/a/b` name the same key — and
+/// each file records the path it is for. A collision is therefore detected when two directories
+/// claim one file, and reported rather than silently shared.
 pub fn workspace_key(workspace: &Path) -> String {
     let shown = workspace.to_string_lossy();
-    let key: String = shown
-        .trim_start_matches('/')
-        .chars()
-        .map(|c| match c {
-            '/' => '%',
-            c if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '%') => c,
-            _ => '_',
-        })
-        .collect();
-    if key.is_empty() { "root".into() } else { key }
+    let inner = shown.trim_start_matches('/').replace(['/', '\\', ':'], "-");
+    format!("--{inner}--")
 }
 
 #[cfg(test)]
@@ -152,15 +150,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_workspace_key_names_the_workspace() {
-        assert_eq!(workspace_key(Path::new("/home/me/proj")), "home%me%proj");
-        assert_eq!(workspace_key(Path::new("/")), "root");
+    fn a_workspace_key_reads_like_the_path_it_names() {
+        // pi's scheme (D63): the separators become `-` and the whole is wrapped in `--`.
+        assert_eq!(
+            workspace_key(Path::new("/home/me/proj")),
+            "--home-me-proj--"
+        );
+        assert_eq!(workspace_key(Path::new("/")), "----");
         assert_eq!(
             workspace_key(Path::new("/home/me/with space")),
-            "home%me%with_space"
+            "--home-me-with space--"
         );
-        // No separators survive, so nothing can escape the policies directory.
-        assert!(!workspace_key(Path::new("/../../etc/passwd")).contains('/'));
+        // No separator survives, so nothing can escape the policies directory.
+        for path in ["/../../etc/passwd", "/a\\b", "/c:d"] {
+            let key = workspace_key(Path::new(path));
+            assert!(!key.contains('/'), "{key}");
+            assert!(!key.contains('\\'), "{key}");
+            assert!(!key.contains(':'), "{key}");
+        }
     }
 
     #[test]

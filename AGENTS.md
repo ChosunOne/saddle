@@ -174,7 +174,7 @@ Treat these as load-bearing, not stylistic. If a task appears to require changin
 rather than loosening it.
 
 - **The policy is not in the tree.** The base grants are `[agent]` in
-  `$XDG_CONFIG_HOME/saddle/config.toml`, and a workspace's own are `policies/<key>.toml` beside it
+  `$XDG_CONFIG_HOME/saddle/config.toml`, and a workspace's own are `policies/--<path>--.toml` beside it
   (D63), layered on the base (D42, D43). A `saddle.toml` in the repository is not read and a session
   says so once. A workspace file may narrow or widen a base grant: it is the authority for that
   directory, and only a person can write it. `--grant` and `--revoke` change the grants for one run

@@ -81,16 +81,13 @@ impl Env {
     }
 
     fn workspace_key(&self) -> String {
+        // pi's scheme, as `paths::workspace_key` (D63).
         let ws = self.ws.path().canonicalize().unwrap();
-        ws.to_string_lossy()
+        let inner = ws
+            .to_string_lossy()
             .trim_start_matches('/')
-            .chars()
-            .map(|c| match c {
-                '/' => '%',
-                c if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '%') => c,
-                _ => '_',
-            })
-            .collect()
+            .replace(['/', '\\', ':'], "-");
+        format!("--{inner}--")
     }
 
     fn policy(&self) -> String {

@@ -675,6 +675,38 @@ pub fn migrate(path: &Path, policies: &Path) -> Result<Vec<PathBuf>> {
         changed = true;
     }
 
+    // 3. Workspace files named with the old `%` separator. The key reads like a path now (D63), so
+    // an override written under the old name would silently stop applying.
+    if let Ok(entries) = std::fs::read_dir(policies) {
+        let mut found: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        found.sort();
+        for file in found {
+            let Some(stem) = file.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            if !stem.contains('%') {
+                continue;
+            }
+            let renamed = policies.join(format!(
+                "{}.toml",
+                crate::paths::workspace_key(Path::new(&stem.replacen('%', "/", 1).replacen(
+                    '%',
+                    "/",
+                    usize::MAX
+                )))
+            ));
+            if renamed.exists() {
+                continue;
+            }
+            std::fs::rename(&file, &renamed).with_context(|| format!("{}", file.display()))?;
+            touched.push(renamed);
+        }
+    }
+
     if !changed {
         return Ok(touched);
     }
