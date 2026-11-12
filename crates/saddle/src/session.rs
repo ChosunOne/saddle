@@ -206,12 +206,16 @@ pub struct Session {
     /// `Ok(landlock ABI)` or the reason exec is unavailable.
     pub sandbox: Result<i32, String>,
     pub host_env: Vec<(String, String)>,
+    /// This session's id (D53, D60).
+    pub id: String,
     _tmp: PrivateTmp,
 }
 
 impl Session {
-    pub fn open(start: &Path) -> Result<Self> {
-        let id = session_id();
+    /// Opens the session named `id`, or one generated here. The id is what an allowance is written
+    /// against (D60) and what the audit log is named for.
+    pub fn open(start: &Path, id: Option<&str>) -> Result<Self> {
+        let id = id.map(str::to_owned).unwrap_or_else(session_id);
         let tmp = PrivateTmp::create(&id)?;
         let setup = Setup::load(start, tmp.path())?;
         let policy = setup.parse_policy()?;
@@ -246,6 +250,7 @@ impl Session {
             audit,
             sandbox,
             host_env: std::env::vars().collect(),
+            id,
             _tmp: tmp,
         })
     }
@@ -324,8 +329,12 @@ impl Session {
         Ok(Err(explanation))
     }
 
+    /// Closes the audit log and drops this session's allowance, so a permission to use a sensitive
+    /// workspace cannot outlive the session it was granted for (D60).
     pub fn close(self) -> Result<String> {
-        Ok(self.audit.close(&self.setup.paths.sessions_index())?)
+        let closed = self.audit.close(&self.setup.paths.sessions_index())?;
+        crate::allow::Allowance::new(&self.setup.paths.state).revoke(&self.id);
+        Ok(closed)
     }
 }
 

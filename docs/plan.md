@@ -966,35 +966,48 @@ works offline, so it reports what a session would open with.
 - Nothing here decodes pixels: the terminal scales the picture to the cell box. Saddle therefore
   needs no image library, which is the reason this is a feasible feature at all.
 
-**D60.** A workspace that puts credentials in reach is reported, and entering it takes a deliberate
-act.
+**D60.** A workspace that puts credentials in reach needs an allowance for the session id that will
+use it.
 
-- **No directory is declared invalid.** Nothing in saddle says where a workspace may be: the check
-  reports what a workspace would put in reach and the person decides. That is the difference between
-  this and a policy — a policy is a rule, and a rule about paths would be one more hardcoded guess
-  about how someone organises their machine.
+- **No directory is declared invalid.** Saddle does not decide where a workspace may be. It reports
+  what a workspace puts in reach and asks the person to allow the session, by id, that wants to use
+  it. A rule about paths would be one more hardcoded guess about how someone organises a machine.
 - Two directories are named, because they are where credentials live on every Unix: the home
   directory, and the config directory (`$XDG_CONFIG_HOME`, or `~/.config`). A workspace is reported
   when it **is** one of them or **contains** one — a root at `/`, `/home` or `~/src` (with
-  `XDG_CONFIG_HOME` unset) contains them just as surely as home itself, so an ancestor is reported
-  for the same reason an exact match is. A project inside home is not reported, because it contains
-  neither.
-- The report is not a warning to dismiss. There is no keypress, no `--force`, and **no stored
-  permission**: the answer has to be the workspace path typed out, so approving is a deliberate act
-  and not a reflex. Saying no leaves nothing behind — no session, no audit record, no state — and the
-  next session asks again, because the approval belongs to the session that was approved. A global
-  `allow-home` was written first and thrown away: a permanent whitelist is exactly the thing that
-  stops being read, and it cannot be consulted at the point that matters, since the session does not
-  exist until the root has been chosen.
-- With no terminal there is nobody to ask, so the session is not started and the error says how to
-  proceed. This is the one place the mechanism is a refusal, and it is a refusal to *guess*.
-- The check runs before the provider is chosen and before a session is opened, so a "no" costs
-  nothing and touches nothing. `check` prints the same report and succeeds: it is the review tool.
-  `saddle tool` and the model loop are inside a session the person already approved.
+  `XDG_CONFIG_HOME` unset) contains them just as surely as home itself. A project inside home is not
+  reported, because it contains neither.
+- **The warning cannot be answered where it is printed.** There is no keypress, no `--force` and no
+  prompt at the refusal: it names the session id and prints the exact command, and the allowance is
+  written by a separate invocation — `saddle session allow <id> --workspace <path>` — run by a person
+  in their own terminal. Anything that can be answered at the point of refusal is answered by reflex;
+  an allowance costs a second command and a copy of an id, which is the whole mechanism.
+- **The allowance is for one session id and one workspace.** `--session <id>` names a session, the
+  allowance records that id and workspace (canonical paths, so `/home/me/` is the same permission),
+  and it is **deleted when that session closes**. It is not a property of the workspace and does not
+  accumulate: the next session has a new id and is asked again. A global `allow-home` flag was tried
+  first and discarded — a permanent whitelist stops being read, and it cannot be consulted at the
+  point that matters anyway, since the session does not exist until the root has been chosen.
+- **An id has to be findable**, which is why the refusal records the request before it exits.
+  `saddle session pending` lists the ids, how long ago each asked, and the workspace, so a message
+  that has scrolled away is recoverable. The request is a record, not a live process: a refused
+  session exits.
+- The cost of saying no is nothing: the check runs before the provider is chosen and before a
+  session is opened, so a refusal leaves no session, no audit log and no network call. `check` prints
+  the same report and succeeds, because it is the review tool rather than the gate. `saddle tool`
+  is gated too, since it runs as the agent (D17).
+- Nothing the agent runs can grant itself an allowance, and that is load-bearing: the allowance
+  directory is in the state directory, which no root may contain (D16), so `write` is refused by the
+  policy and a child is refused by landlock. A child that runs a copy of `saddle` from inside its
+  workspace fails at the first file it needs — `XDG_STATE_HOME` is not passed to children at all
+  (D19), and `$HOME/.local/state` is outside the sandbox.
+- `allow-sensitive = true` in the user's config skips the check entirely, for a machine where the
+  home directory holds nothing secret — a disposable container, say. It is the user's file, outside
+  every root and outside the workspace (D42), so nothing the agent runs can set it.
 - The provider keys get the same treatment by construction rather than by asking: `auth.json` is in
-  the state directory, which no root may contain (D16), so the `read` tool is refused by the policy
-  before a file is opened and a sandboxed child is refused by landlock. `tests/cli.rs` asserts both
-  layers, and that the key never appears in either refusal.
+  the state directory, so the `read` tool is refused by the policy before a file is opened and a
+  sandboxed child is refused by landlock. `tests/cli.rs` asserts both layers, and that the key never
+  appears in either refusal.
 - Most tools keep working, because a few directories outside the workspace are read **and execute**
   for children by default: `~/.cargo` and `~/.rustup` for the toolchain, and `~/.config/git` for
   git's XDG config, since a confined `git commit` cannot run without it. This is the `[sandbox] read`
@@ -1004,8 +1017,8 @@ act.
     this list must be safe to read in its entirety; never add one that holds a token.
   - Only directories can be roots, so the classic `~/.gitconfig` cannot be granted this way. A
     confined git that needs it gets `GIT_CONFIG_GLOBAL` pointed inside the workspace.
-- This is why the report exists at all: with `.config` or home as the root, the agent's rules about
-  exclusions stop helping, because a root cannot be narrowed from the inside (D20).
+- This is why the report exists at all: with `.config` or home as the root, exclusion rules stop
+  helping, because a root cannot be narrowed from the inside (D20).
 
 ## 4. Scope enumeration
 

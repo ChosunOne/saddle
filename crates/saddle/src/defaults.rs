@@ -93,6 +93,11 @@ pub fn config_text(home: Option<&Path>) -> String {
 # Built in: synthetic, openai.
 # provider = "synthetic"
 
+# A workspace that is, or contains, your home or config directory puts every credential on this
+# machine in reach, so saddle asks you to allow that session id before it opens (D60). Set this on a
+# machine where that is not true -- a disposable container, say -- to skip the question.
+# allow-sensitive = false
+
 # Model requests per prompt before the loop stops and waits for you. /settings changes it.
 # max-steps = 50          # model requests one prompt may take; unset means no limit
 

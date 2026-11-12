@@ -528,16 +528,15 @@ fn workspace_containing_the_state_dir_is_refused() {
 }
 
 #[test]
-fn a_workspace_holding_credentials_is_reported_and_needs_approval() {
-    // D60: not a rule about what a workspace may be, and not a dismissible warning either.
-    // `check` reports what is in reach and still succeeds; a session has to be approved by typing
-    // the path, so with no terminal it refuses and leaves nothing behind.
+fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() {
+    // D60. Nothing is refused from the warning itself: the refusal names the session id and a
+    // command a person runs in their own terminal, and the allowance is written outside every root.
     let home = tempfile::tempdir().unwrap();
     let xdg = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
     let sub = home.path().join("src/proj");
     std::fs::create_dir_all(sub.join(".git")).unwrap();
-    let run = |dir: &std::path::Path, args: &[&str]| {
+    let saddle = |dir: &std::path::Path, args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_saddle"))
             .arg("-C")
             .arg(dir)
@@ -550,8 +549,8 @@ fn a_workspace_holding_credentials_is_reported_and_needs_approval() {
             .unwrap()
     };
 
-    // A project inside home exposes nothing, so it is not reported at all.
-    let project = run(&sub, &["check"]);
+    // A project inside home exposes nothing, so it needs no allowance at all.
+    let project = saddle(&sub, &["check"]);
     assert!(project.status.success(), "{}", stderr(&project));
     assert!(
         !String::from_utf8_lossy(&project.stdout).contains("in reach"),
@@ -559,30 +558,140 @@ fn a_workspace_holding_credentials_is_reported_and_needs_approval() {
         String::from_utf8_lossy(&project.stdout)
     );
 
-    // Home itself: `check` succeeds and says what is in reach.
-    let checked = run(home.path(), &["check"]);
-    assert!(
-        checked.status.success(),
-        "a report, not a refusal: {}",
-        stderr(&checked)
-    );
+    // `check` reports and succeeds: it is the review tool, not the gate.
+    let checked = saddle(home.path(), &["check"]);
+    assert!(checked.status.success(), "{}", stderr(&checked));
     let text = String::from_utf8_lossy(&checked.stdout).into_owned();
     assert!(
         text.contains("in reach: your home directory itself"),
         "{text}"
     );
 
-    // A session there is not started, because there is no terminal to ask on.
-    let refused = run(home.path(), &["run", "--json", "-m", "hello"]);
+    // A session there is refused, and says which session id to allow.
+    let refused = saddle(home.path(), &["tool", "read", r#"{"path":"README"}"#]);
     assert_eq!(refused.status.code(), Some(2), "{}", stderr(&refused));
     let text = stderr(&refused);
-    assert!(text.contains("not approved"), "{text}");
     assert!(text.contains("would be rooted at"), "{text}");
-    // Nothing was created in the state directory: no session ran, so no audit log either.
+    assert!(text.contains("session allow"), "{text}");
+    let id = text
+        .split("this session (")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .expect("the message names the session id")
+        .to_owned();
+    assert!(!id.is_empty(), "{text}");
+
+    // The id is findable afterwards, which is the whole reason the request is recorded.
+    let pending = saddle(home.path(), &["session", "pending"]);
+    assert!(pending.status.success(), "{}", stderr(&pending));
+    let listed = String::from_utf8_lossy(&pending.stdout).into_owned();
+    assert!(listed.contains(&id), "{listed}");
     assert!(
-        !xdg.path().join("state/saddle/audit").exists(),
-        "a refused approval must not leave an audit log"
+        listed.contains("ago"),
+        "the age tells a person which message it was: {listed}"
     );
+
+    // Allowing another workspace does not allow this one.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let wrong = saddle(
+        home.path(),
+        &[
+            "session",
+            "allow",
+            &id,
+            "--workspace",
+            &elsewhere.path().display().to_string(),
+        ],
+    );
+    assert!(wrong.status.success(), "{}", stderr(&wrong));
+    let still = saddle(
+        home.path(),
+        &["--session", &id, "tool", "read", r#"{"path":"README"}"#],
+    );
+    assert_eq!(
+        still.status.code(),
+        Some(2),
+        "the allowance names another workspace"
+    );
+
+    // Allowing this workspace for this id lets that session, and only that session, in.
+    let allow = saddle(home.path(), &["session", "allow", &id]);
+    assert!(allow.status.success(), "{}", stderr(&allow));
+    std::fs::write(home.path().join("README"), "hello\n").unwrap();
+    let other_id = "0123456789abcdef";
+    let wrong_session = saddle(
+        home.path(),
+        &[
+            "--session",
+            other_id,
+            "tool",
+            "read",
+            r#"{"path":"README"}"#,
+        ],
+    );
+    assert_eq!(
+        wrong_session.status.code(),
+        Some(2),
+        "an allowance belongs to one session id"
+    );
+    let allowed = saddle(
+        home.path(),
+        &["--session", &id, "tool", "read", r#"{"path":"README"}"#],
+    );
+    assert!(allowed.status.success(), "{}", stderr(&allowed));
+    assert!(
+        String::from_utf8_lossy(&allowed.stdout).contains("hello"),
+        "{}",
+        String::from_utf8_lossy(&allowed.stdout)
+    );
+
+    // The allowance is dropped when the session ends, so it cannot outlive what it was for: the
+    // id is no longer listed as waiting, and the same id is refused again.
+    let left = saddle(home.path(), &["session", "pending"]);
+    assert!(
+        !String::from_utf8_lossy(&left.stdout).contains(&id),
+        "the allowance went with the session: {}",
+        String::from_utf8_lossy(&left.stdout)
+    );
+    let after = saddle(
+        home.path(),
+        &["--session", &id, "tool", "read", r#"{"path":"README"}"#],
+    );
+    assert_eq!(after.status.code(), Some(2), "{}", stderr(&after));
+}
+
+#[test]
+fn allow_sensitive_in_the_users_config_skips_the_question() {
+    // The escape hatch for a machine where home holds no secrets. It is the user's file, outside
+    // every root, so nothing the agent runs can set it (D42, D60).
+    let home = tempfile::tempdir().unwrap();
+    let xdg = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
+    std::fs::write(home.path().join("README"), "hello\n").unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_saddle"))
+            .arg("-C")
+            .arg(home.path())
+            .args(["tool", "read", r#"{"path":"README"}"#])
+            .env("HOME", home.path())
+            .env("XDG_STATE_HOME", xdg.path().join("state"))
+            .env("XDG_CONFIG_HOME", xdg.path().join("config"))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    };
+    assert_eq!(
+        run().status.code(),
+        Some(2),
+        "refused while the flag is off"
+    );
+    std::fs::write(
+        xdg.path().join("config/saddle/config.toml"),
+        "allow-sensitive = true\n",
+    )
+    .unwrap();
+    let out = run();
+    assert!(out.status.success(), "{}", stderr(&out));
 }
 
 #[test]

@@ -133,21 +133,6 @@ pub fn exposed(workspace: &Path, sensitive: &[(&str, PathBuf)]) -> Vec<String> {
         .collect()
 }
 
-/// Whether what the person typed at the prompt is an approval of `workspace` (D60).
-///
-/// The friction is the point: a stray return, a `y`, or a path copied from the wrong window does
-/// not match, so approving costs a deliberate act rather than a reflex. Nothing is remembered
-/// afterwards — the approval belongs to this session, and the next one has to ask again.
-pub fn approval_matches(typed: &str, workspace: &Path) -> bool {
-    let typed = typed.trim();
-    if typed.is_empty() {
-        return false;
-    }
-    let typed = Path::new(typed);
-    let typed = typed.canonicalize().unwrap_or_else(|_| typed.to_path_buf());
-    typed == workspace
-}
-
 /// A workspace path as one filename component: `/` becomes `%`, so
 /// `/home/me/project` is `home%me%project.toml` and the directory listing names the workspaces.
 /// Characters that are awkward in a filename become `_`, which is a lossy but readable fallback;
@@ -210,33 +195,5 @@ mod tests {
         assert!(exposed(&home.join("src/proj"), &sensitive).is_empty());
         // A sibling sharing a prefix is not home either.
         assert!(exposed(Path::new("/home/melon"), &sensitive).is_empty());
-    }
-
-    #[test]
-    fn approval_needs_the_path_typed_out_not_a_keystroke() {
-        // The friction is the mechanism: a reflex answer must not approve anything.
-        let ws = Path::new("/home/me");
-        assert!(approval_matches("/home/me", ws));
-        assert!(
-            approval_matches("  /home/me\n", ws),
-            "surrounding space is forgiven"
-        );
-        for reflex in [
-            "",
-            "\n",
-            "y",
-            "yes",
-            "Y",
-            "ok",
-            "/home",
-            "/home/me/sub",
-            "/home/melon",
-        ] {
-            assert!(!approval_matches(reflex, ws), "{reflex:?} must not approve");
-        }
-        // A trailing slash names the same directory, so it is the same approval.
-        assert!(approval_matches("/home/me/", ws));
-        // A relative path that does not resolve to the workspace is not an approval either.
-        assert!(!approval_matches(".", ws));
     }
 }

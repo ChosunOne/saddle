@@ -45,6 +45,11 @@ pub struct UserConfig {
     /// Model requests per prompt before the loop stops and waits. Unset means no limit (D37).
     #[serde(default, rename = "max-steps")]
     pub max_steps: Option<usize>,
+    /// Whether a workspace that holds credentials may be entered without an allowance (D60). For a
+    /// machine where the home directory has no secrets; off unless a person turns it on, and this
+    /// file is outside every root, so nothing the agent runs can set it (D42).
+    #[serde(default, rename = "allow-sensitive")]
+    pub allow_sensitive: bool,
     #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]

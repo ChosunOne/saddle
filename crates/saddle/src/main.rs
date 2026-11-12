@@ -1,4 +1,5 @@
 mod agent;
+mod allow;
 mod auth;
 mod cache;
 mod cancel;
@@ -16,7 +17,7 @@ mod term;
 mod tools;
 mod tui;
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -39,6 +40,10 @@ struct Cli {
     /// Directory to start from; the workspace is the git toplevel above it.
     #[arg(long, short = 'C', global = true, default_value = ".")]
     dir: PathBuf,
+    /// Name the session, so an allowance made with `saddle session allow` can be used by it. One is
+    /// generated and printed when the workspace needs approving (D60).
+    #[arg(long, global = true)]
+    session: Option<String>,
     /// With no command, saddle opens the terminal UI.
     #[command(flatten)]
     agent: AgentArgs,
@@ -85,11 +90,33 @@ enum Cmd {
         /// The tool input as JSON, e.g. '{"path": "src/main.rs"}'.
         input: String,
     },
+    /// Session allowances: letting one session id use a workspace that holds credentials (D60).
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
+    },
     /// Audit log commands.
     Audit {
         #[command(subcommand)]
         cmd: AuditCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum SessionCmd {
+    /// Allow one session id to use a workspace. Run this as yourself, in a terminal: the file it
+    /// writes is outside every root, so nothing the agent runs can write it (D60).
+    Allow {
+        /// The session id, as printed by the session that was refused.
+        id: String,
+        /// The workspace to allow. Taken from the waiting request when not given.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// List the session ids waiting for an allowance, with their workspaces.
+    Pending,
+    /// Forget an allowance before its session ends.
+    Revoke { id: String },
 }
 
 #[derive(Subcommand)]
@@ -132,11 +159,23 @@ fn run(cli: Cli) -> Result<ExitCode> {
             eprintln!("saddle: {line}");
         }
     }
+    // One id for the whole invocation: it names the session in the audit log, and it is what an
+    // allowance is written against (D60).
+    let session = match cli.session {
+        Some(id) => {
+            allow::check_id(&id)?;
+            id
+        }
+        None => session_id(),
+    };
     match cli.cmd {
-        None => run_agent(&cli.dir, None, cli.agent, paths, created),
-        Some(Cmd::Run { prompt, agent }) => run_agent(&cli.dir, prompt, agent, paths, created),
+        None => run_agent(&cli.dir, None, cli.agent, paths, created, &session),
+        Some(Cmd::Run { prompt, agent }) => {
+            run_agent(&cli.dir, prompt, agent, paths, created, &session)
+        }
         Some(Cmd::Check) => check(&cli.dir),
-        Some(Cmd::Tool { name, input }) => tool(&cli.dir, &name, &input),
+        Some(Cmd::Tool { name, input }) => tool(&cli.dir, &name, &input, &session, &paths),
+        Some(Cmd::Session { cmd }) => session_cmd(cmd, &paths),
         Some(Cmd::Audit { .. }) => unreachable!("handled above"),
     }
 }
@@ -147,21 +186,17 @@ fn run_agent(
     args: AgentArgs,
     paths: paths::Paths,
     created: Vec<String>,
+    session: &str,
 ) -> Result<ExitCode> {
     let user = UserConfig::load(&paths.user_config())?;
-    // Before a provider is chosen and before anything is opened: the workspace is reported, and a
-    // workspace that puts credentials in reach is not entered until the person types it out (D60).
-    // This runs here rather than inside `Session::open` so that no session, audit log or network
-    // call exists if the answer is no.
+    // Before a provider is chosen and before anything is opened, so a refusal costs nothing: no
+    // session, no audit log, no network call (D60).
     {
         let workspace = dir
             .canonicalize()
             .map(|abs| paths::find_workspace(&abs))
             .unwrap_or_else(|_| dir.to_path_buf());
-        confirm_exposure(
-            &workspace,
-            &paths::exposed(&workspace, &paths::sensitive_dirs()),
-        )?;
+        gate_workspace(&paths, &workspace, session)?;
     }
     let auth = auth::AuthStore::load(&paths.auth_store())?;
     let mut reported = provider::Reported::stored(&paths.reported_windows());
@@ -202,7 +237,7 @@ fn run_agent(
         },
     };
 
-    let mut session = Session::open(dir)?;
+    let mut session = Session::open(dir, Some(session))?;
     let secrets = provider::secret_env_names(&user.providers);
     session.host_env.retain(|(k, _)| !secrets.contains(k));
     let (context, refused) = context::load(&mut session, &user.context, &paths)?;
@@ -370,41 +405,121 @@ fn line_turn(
     Ok(end)
 }
 
-/// Asks the person to approve a workspace that puts credentials in reach (D60).
+/// Refuses to open a session in a workspace that puts credentials in reach, unless a person has
+/// allowed this session id to use it (D60).
 ///
-/// The warning is not dismissible with a keypress: the answer has to be the workspace path typed
-/// out. That is the whole mechanism — no flag, no stored whitelist, nothing a script or a habit can
-/// supply by accident — and it is asked again next session, because the approval belongs to this
-/// one. Saying no leaves nothing behind: no session, no audit record, no state.
-fn confirm_exposure(workspace: &Path, exposed: &[String]) -> Result<()> {
+/// The warning cannot be answered where it is printed: there is no keypress and no `--force`. It
+/// names the session id and the command that allows it, and the allowance is written by a separate
+/// invocation, from a person's terminal, into the state directory — outside every root, so the agent
+/// cannot grant itself anything (D16). The allowance covers this id and that workspace and is
+/// removed when the session ends. `allow-sensitive` in the user's config skips the check entirely
+/// for machines where the home directory holds nothing secret.
+fn gate_workspace(paths: &paths::Paths, workspace: &Path, id: &str) -> Result<()> {
+    let user = UserConfig::load(&paths.user_config())?;
+    if user.allow_sensitive {
+        return Ok(());
+    }
+    let exposed = paths::exposed(workspace, &paths::sensitive_dirs());
     if exposed.is_empty() {
         return Ok(());
     }
-    eprintln!(
-        "saddle: this session would be rooted at {}",
+    let allowance = allow::Allowance::new(&paths.state);
+    if allowance.allows(id, workspace) {
+        // A session that was allowed before it started: the allowance is consumed at the end.
+        return Ok(());
+    }
+    // Record the request, so the id stays findable after this message has scrolled away.
+    allowance.request(id, workspace)?;
+    let chosen = std::env::current_exe()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "saddle".into());
+    let mut message = format!(
+        "this session ({id}) would be rooted at {}\n",
         workspace.display()
     );
     for what in exposed {
-        eprintln!("  in reach: {what}");
+        message.push_str(&format!("  in reach: {what}\n"));
     }
-    // Two lines because the point is easy to miss: this is not "the agent may look at these
-    // files", it is everything under the root, for the whole session (D20).
-    eprintln!("  a root cannot be narrowed from the inside, so everything beneath it is");
-    eprintln!("  readable and writable by the agent and by any command it runs");
-    if !std::io::stdin().is_terminal() {
-        bail!(
-            "not approved: there is no terminal to ask on. Start in a project directory instead, \
-             or run saddle from a terminal and type the path to approve it"
-        );
+    message.push_str(
+        "  a root cannot be narrowed from the inside, so everything beneath it is readable and\n  \
+         writable by the agent and by any command it runs\n",
+    );
+    message.push_str(
+        "  nothing was opened. To allow this session id to use that workspace, run in your own\n  \
+         terminal, outside saddle:\n",
+    );
+    message.push_str(&format!(
+        "      {chosen} session allow {id} --workspace {}\n",
+        workspace.display()
+    ));
+    message.push_str(&format!(
+        "  then start it again with:  {chosen} --session {id} ...\n"
+    ));
+    message.push_str(
+        "  or set `allow-sensitive = true` in config.toml if this machine's home holds no secrets",
+    );
+    bail!("{message}")
+}
+
+/// `saddle session`: the allowance commands, which are a person's tool and never a tool the agent
+/// can call (D45, D46). The files are in the state directory, so a sandboxed child cannot write
+/// them either.
+fn session_cmd(cmd: SessionCmd, paths: &paths::Paths) -> Result<ExitCode> {
+    let allowance = allow::Allowance::new(&paths.state);
+    match cmd {
+        SessionCmd::Allow { id, workspace } => {
+            allow::check_id(&id)?;
+            let workspace = match workspace {
+                Some(p) => p,
+                None => {
+                    let waiting = allowance.waiting();
+                    match waiting.iter().find(|(waiting, _)| *waiting == id) {
+                        Some((_, entry)) => entry.workspace.clone(),
+                        None => bail!(
+                            "session {id} is not waiting; pass --workspace to name the workspace to \
+                             allow it for"
+                        ),
+                    }
+                }
+            };
+            let workspace = workspace
+                .canonicalize()
+                .with_context(|| format!("{}", workspace.display()))?;
+            allowance.allow(&id, &workspace)?;
+            println!(
+                "session {id} may use {} until it ends; the allowance is removed when it does",
+                workspace.display()
+            );
+        }
+        SessionCmd::Pending => {
+            let waiting = allowance.waiting();
+            if waiting.is_empty() {
+                println!("no session is waiting for an allowance");
+            }
+            for (id, entry) in waiting {
+                // A refused session exits, so its request is a record of what was asked for
+                // rather than a live process. The age is what tells a person whether it is the
+                // message still on their screen.
+                let allowed = if allowance.allows(&id, &entry.workspace) {
+                    "  (allowed)"
+                } else {
+                    ""
+                };
+                println!(
+                    "{id}  {}{allowed}  {}",
+                    allow::ago(entry.when),
+                    entry.workspace.display()
+                );
+            }
+        }
+        SessionCmd::Revoke { id } => {
+            allow::check_id(&id)?;
+            allowance.revoke(&id);
+            println!("session {id} allowance removed");
+        }
     }
-    eprint!("  type the path to continue, or press enter to stop: ");
-    let _ = std::io::stderr().flush();
-    let mut typed = String::new();
-    if std::io::stdin().read_line(&mut typed)? == 0 || !paths::approval_matches(&typed, workspace) {
-        bail!("not approved: the path was not typed, so no session was opened");
-    }
-    eprintln!("  approved for this session only");
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn check(dir: &std::path::Path) -> Result<ExitCode> {
@@ -579,12 +694,24 @@ fn usage_line(quota: &provider::Quota, spent: Option<f64>, now: std::time::Syste
     }
 }
 
-fn tool(dir: &std::path::Path, name: &str, input: &str) -> Result<ExitCode> {
+fn tool(
+    dir: &std::path::Path,
+    name: &str,
+    input: &str,
+    session: &str,
+    paths: &paths::Paths,
+) -> Result<ExitCode> {
     if !tools::NAMES.contains(&name) {
         bail!("unknown tool `{name}` (known: {})", tools::NAMES.join(", "));
     }
     let input: serde_json::Value = serde_json::from_str(input).context("tool input is not JSON")?;
-    let mut session = Session::open(dir)?;
+    // The same gate as the model loop: `saddle tool` runs as the agent (D17, D60).
+    let workspace = dir
+        .canonicalize()
+        .map(|abs| paths::find_workspace(&abs))
+        .unwrap_or_else(|_| dir.to_path_buf());
+    gate_workspace(paths, &workspace, session)?;
+    let mut session = Session::open(dir, Some(session))?;
     let log = session.audit.path().to_path_buf();
     let result = tools::call(&mut session, name, &input);
     session.close()?;
