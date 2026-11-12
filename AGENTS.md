@@ -210,8 +210,8 @@ rather than loosening it.
   config skips the check for a machine with no secrets. A project inside home is fine.
 - **A command's file access is an enumerated list, not a fixed set of roots** (D62). The default
   `[[sandbox.include]]` rule walks `~` at startup, withholds what matches `except` (`.ssh`, `.aws`,
-  and the rest of the usual credential stores), and hands landlock the **list**, which `check`
-  prints under `exec reads`. So a toolchain saddle has never heard of works, and adding one pattern
+  `.local/share/keyrings`, the package-registry and history files, and the rest of the usual
+  credential stores), and hands landlock the **list**, which `check` prints under `exec reads`. So a toolchain saddle has never heard of works, and adding one pattern
   takes a directory out of reach for `exec` as well — which a grant-level `exclude` cannot do
   (D22). Two rules make it honest: a directory that **contains** a withheld one is expanded rather
   than granted, because a rule covers everything beneath it; and the state and config directories

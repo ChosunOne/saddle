@@ -1088,15 +1088,38 @@ use it.
   (D16). A pattern that would name one is not an error, it is ignored — the user's `except` list is
   not a place to lose a security property.
 - Defaults are chosen so an unconfigured machine works and its credentials do not: `base = "~"`,
-  `depth = 2`, and `except` covering the usual credential stores — keys and secret managers
-  (`.ssh`, `.gnupg`, `.pki`, `.password-store`, `.local/share/keyrings`, `.config/op`,
-  `.vault-token`), cloud and containers (`.aws`, `.azure`, `.config/gcloud`, `.kube`, `.docker`,
-  `.config/containers`, `.terraform.d`), forges and git credential helpers (`.config/gh`,
-  `.config/glab-cli`, `.config/hub`, `.netrc`, `.git-credentials`, `.config/git/credentials`), and
-  package registries (`.npmrc`, `.pypirc`, `.gem/credentials`, `.m2/settings.xml`,
-  `.gradle/gradle.properties`, `.cargo/credentials`, `.cargo/credentials.toml`). A pattern that
-  never matches is harmless, so the list errs towards naming stores a particular machine may not
-  have, and a test pins every pattern to the path it must match so a typo cannot fail silently. **These are a starting point, not a
+  `depth = 3`, and `except` covering the usual credential stores — keys and secret managers
+  (`.ssh`, `.gnupg`, `.pki`, `.password-store`, `.local/share/keyrings`, `.local/share/kwalletd`,
+  `.config/op`, `.vault-token`); cloud and containers (`.aws`, `.azure`, `.config/gcloud`, `.kube`,
+  `.docker`, `.config/containers`, `.terraform.d`, `.oci`, `.s3cfg`, `.boto`, `.config/rclone`,
+  `.config/doctl`, `.config/hcloud`); forges and git credential helpers (`.config/gh`,
+  `.config/glab-cli`, `.config/hub`, `.config/tea`, `.netrc`, `.git-credentials`,
+  `.config/git/credentials`); package registries (`.npmrc`, `.yarnrc`, `.yarnrc.yml`, `.pypirc`,
+  `.config/pip`, `.pip`, `.gem/credentials`, `.nuget`, `.m2/settings.xml`,
+  `.gradle/gradle.properties`, `.composer`, `.config/composer`, `.hex`, `.cargo/credentials`,
+  `.cargo/credentials.toml`); databases (`.pgpass`, `.my.cnf`, `.mylogin.cnf`); mail (`.msmtprc`,
+  `.offlineimaprc`, `.fetchmailrc`, `.authinfo`); shell and repl history (`.bash_history`,
+  `.zsh_history`, `.python_history`, `.node_repl_history`, `.psql_history`, `.mysql_history`),
+  because a secret pasted on a command line is kept there; and browser and mail profiles
+  (`.mozilla`, `.thunderbird`, `.config/google-chrome`, `.config/chromium`), because a session
+  cookie is a credential.
+- `depth` is three rather than two because the stores that matter are not all near the top:
+  `.local/share/keyrings` is three levels down, and a walk that stops at `~/.local/share` never
+  enumerates it, so the pattern matches nothing and the keyring is reachable through the granted
+  `.local`. A pattern that matches nothing is silent in both directions, so a test builds a tree
+  containing **every** path the defaults name, runs the walk, and asserts each one is unreachable —
+  which also asserts that the toolchain paths stay reachable. A regex-only test passed while that
+  bug was live.
+- The list errs towards naming stores a machine may not have, because an unmatched pattern is
+  harmless and a missing one is not. It is a **starting point**, not a boundary: a machine keeps
+  tokens wherever it likes, and the only place a secret is truly out of reach is outside the base.
+  `.gitconfig` is deliberately readable — git cannot run without it — and it can hold a
+  credential helper or a token embedded in a URL, which is the argument for keeping a token in a
+  helper rather than in the file.
+- Not withheld, and why: `.bashrc`/`.zshrc`/`.profile` can export a key, but they are also what makes
+  a shell usable, and a blocked one breaks commands in ways that look like bugs; `.config/Code` and
+  other editor state hold a sync token but are large and often needed by extensions. Both are one
+  line away for a person who wants them. **These are a starting point, not a
   security boundary** — a machine keeps its secrets in whatever directory it likes, and the honest
   place for a secret is outside every base. A person can add a pattern in one line, and that
   exclusion is real for `exec` as well, which is what D22 could not offer when grants were a fixed

@@ -129,8 +129,11 @@ pub struct IncludeConfig {
     pub except: Vec<String>,
 }
 
+/// How far below the base to enumerate. Three, because the credential stores that matter are not
+/// all at the top: `.local/share/keyrings` and `.config/git/credentials` are three levels down, and
+/// a walk that stops short of them leaves the pattern matching nothing (D62).
 fn default_depth() -> usize {
-    2
+    3
 }
 
 /// Applies `change` to config.toml, keeping its comments and layout, and writes the result only if

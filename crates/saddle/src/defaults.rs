@@ -119,23 +119,40 @@ write = [{write}]
 # excluded and cannot be re-enabled here.
 [[sandbox.include]]
 base = "~"
-depth = 2
+depth = 3
 # Patterns are matched against each entry's path relative to `base`. One that never matches is
-# harmless, so this list errs towards naming stores that a particular machine does not have.
+# harmless, so this list errs towards naming stores a particular machine may not have. Delete a
+# line to allow that directory; add one for a store that is not here.
 except = [
-  # keys and secrets
+  # keys and secret managers
   "^\\.ssh$", "^\\.gnupg$", "^\\.pki$", "^\\.password-store$",
-  "^\\.local/share/keyrings$", "^\\.config/op$", "^\\.vault-token$",
-  # cloud and containers
+  "^\\.local/share/keyrings$", "^\\.local/share/kwalletd$",
+  "^\\.config/op$", "^\\.vault-token$",
+  # cloud and containers: a provider token, or a kubeconfig that carries one
   "^\\.aws$", "^\\.azure$", "^\\.config/gcloud$", "^\\.kube$",
   "^\\.docker$", "^\\.config/containers$", "^\\.terraform\\.d$",
+  "^\\.oci$", "^\\.s3cfg$", "^\\.boto$", "^\\.config/rclone$",
+  "^\\.config/doctl$", "^\\.config/hcloud$",
   # forges and git credential helpers
-  "^\\.config/gh$", "^\\.config/glab-cli$", "^\\.config/hub$", "^\\.netrc$",
-  "^\\.git-credentials$", "^\\.config/git/credentials$",
+  "^\\.config/gh$", "^\\.config/glab-cli$", "^\\.config/hub$",
+  "^\\.config/tea$", "^\\.netrc$", "^\\.git-credentials$",
+  "^\\.config/git/credentials$",
   # package registries: a token for publishing, or for a private index
-  "^\\.npmrc$", "^\\.pypirc$", "^\\.gem/credentials$", "^\\.m2/settings\\.xml$",
-  "^\\.gradle/gradle\\.properties$", "^\\.cargo/credentials$",
-  "^\\.cargo/credentials\\.toml$",
+  "^\\.npmrc$", "^\\.yarnrc$", "^\\.yarnrc\\.yml$", "^\\.pypirc$",
+  "^\\.config/pip$", "^\\.pip$", "^\\.gem/credentials$", "^\\.nuget$",
+  "^\\.m2/settings\\.xml$", "^\\.gradle/gradle\\.properties$",
+  "^\\.composer$", "^\\.config/composer$", "^\\.hex$",
+  "^\\.cargo/credentials$", "^\\.cargo/credentials\\.toml$",
+  # databases
+  "^\\.pgpass$", "^\\.my\\.cnf$", "^\\.mylogin\\.cnf$",
+  # mail
+  "^\\.msmtprc$", "^\\.offlineimaprc$", "^\\.fetchmailrc$", "^\\.authinfo$",
+  # shell and repl history: a secret pasted on a command line is kept here
+  "^\\.bash_history$", "^\\.zsh_history$", "^\\.python_history$",
+  "^\\.node_repl_history$", "^\\.psql_history$", "^\\.mysql_history$",
+  # browser and mail profiles: a session cookie is a credential
+  "^\\.mozilla$", "^\\.thunderbird$", "^\\.config/google-chrome$",
+  "^\\.config/chromium$",
 ]
 
 # How the TUI starts. /settings changes these; ctrl+t and ctrl+o change them for one session.
@@ -244,6 +261,124 @@ mod tests {
 
         let empty: UserConfig = toml::from_str(&config_text(None)).unwrap();
         assert!(empty.roots.is_empty() && empty.sandbox.write.is_empty());
+    }
+
+    #[test]
+    fn the_default_rule_withholds_every_path_it_names_in_a_real_tree() {
+        // The regex test below only proves the patterns match a string. This one builds the tree
+        // and runs the walk, which is what actually decides: with `depth = 2`, `.local/share/
+        // keyrings` is three levels down, was never enumerated, and its pattern matched nothing —
+        // so the keyring was readable (D62).
+        let home = tempfile::tempdir().unwrap();
+        let cfg: UserConfig = toml::from_str(&config_text(None)).unwrap();
+        let rule = &cfg.sandbox.include[0];
+        let include = saddle_cap::sandbox::Include {
+            base: home.path().to_path_buf(),
+            depth: rule.depth,
+            except: rule
+                .except
+                .iter()
+                .map(|p| regex::Regex::new(p).unwrap())
+                .collect(),
+        };
+        // Everything the default list names, created so the walk has to find it.
+        let withheld = [
+            ".ssh/id_rsa",
+            ".gnupg/private-keys-v1.d",
+            ".password-store/x.gpg",
+            ".local/share/keyrings/login.keyring",
+            ".local/share/kwalletd/k.kwl",
+            ".config/op/1password.json",
+            ".vault-token",
+            ".aws/credentials",
+            ".azure/accessTokens.json",
+            ".config/gcloud/credentials.db",
+            ".kube/config",
+            ".docker/config.json",
+            ".config/containers/auth.json",
+            ".terraform.d/x",
+            ".oci/config",
+            ".s3cfg",
+            ".boto",
+            ".config/rclone/rclone.conf",
+            ".config/doctl/config.yaml",
+            ".config/hcloud/config.yaml",
+            ".config/gh/hosts.yml",
+            ".config/glab-cli/config.yml",
+            ".config/hub",
+            ".config/tea/config.yml",
+            ".netrc",
+            ".git-credentials",
+            ".config/git/credentials",
+            ".npmrc",
+            ".yarnrc",
+            ".yarnrc.yml",
+            ".pypirc",
+            ".config/pip/pip.conf",
+            ".pip/pip.conf",
+            ".gem/credentials",
+            ".nuget/NuGet/NuGet.Config",
+            ".m2/settings.xml",
+            ".gradle/gradle.properties",
+            ".composer/auth.json",
+            ".config/composer/auth.json",
+            ".hex/hex.config",
+            ".cargo/credentials",
+            ".cargo/credentials.toml",
+            ".pgpass",
+            ".my.cnf",
+            ".mylogin.cnf",
+            ".msmtprc",
+            ".offlineimaprc",
+            ".fetchmailrc",
+            ".authinfo",
+            ".bash_history",
+            ".zsh_history",
+            ".python_history",
+            ".node_repl_history",
+            ".psql_history",
+            ".mysql_history",
+            ".mozilla/profiles.ini",
+            ".thunderbird/x",
+            ".config/google-chrome/Default/Cookies",
+            ".config/chromium/Default/Cookies",
+        ];
+        for rel in withheld {
+            let path = home.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "secret\n").unwrap();
+        }
+        let granted = [
+            ".cargo/registry/index",
+            ".cargo/bin/cargo",
+            ".cargo/config.toml",
+            ".rustup/toolchains/stable",
+            ".config/git/config",
+            ".config/jj/config.toml",
+            ".gitconfig",
+            "src/main.rs",
+            "notes.txt",
+        ];
+        for rel in granted {
+            let path = home.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "fine\n").unwrap();
+        }
+        let out = saddle_cap::sandbox::enumerate(&include, &[]);
+        let got: Vec<&std::path::Path> = out.iter().map(|p| p.as_path()).collect();
+        for rel in withheld {
+            let path = home.path().join(rel);
+            // A rule on the file, or on a directory above it, would both reach it.
+            let reachable = got.iter().any(|g| path == *g || path.starts_with(g));
+            assert!(!reachable, "{rel} is reachable through {:?}", got);
+        }
+        for rel in granted {
+            let path = home.path().join(rel);
+            assert!(
+                got.iter().any(|g| path == *g || path.starts_with(g)),
+                "{rel} should stay readable; rules were {got:?}"
+            );
+        }
     }
 
     #[test]
