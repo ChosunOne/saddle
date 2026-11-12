@@ -126,7 +126,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D61 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D62 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
@@ -201,18 +201,21 @@ rather than loosening it.
   files that govern them. A root that contains the state or config directory is refused.
 - **No workspace is invalid, but some need an allowance** (D60). A workspace that is, or contains,
   the home or config directory puts every credential in reach, so a session there is refused until
-  `saddle session allow <id> --workspace <path>` has been run for that session id by a person; the
+  `saddle session allow <id> --workspace <path>` has been run for that session id by a person. The
   allowance outlives the session so it can be picked again: `saddle session list [filter]` shows
   them and `--session` takes an id, a unique prefix or a list number, so an id is never memorised.
   An allowance is a bearer permission, so session ids are random rather than a clock and a pid.
   `saddle session pending` lists the ids waiting, `saddle session revoke <number|prefix>` withdraws
-  one,
-  `check` reports the same thing without refusing, and
-  `allow-sensitive = true` in the user's config skips the check for a machine with no secrets. A
-  project inside home is fine. The `[sandbox] read`
-  lists in `config.toml` (`~/.cargo`, `~/.rustup`, `~/.config/git`) are the directories outside the
-  workspace that children may read *and execute*: exclusions do not bind `exec` (D22), so never add a
-  directory there that holds a token.
+  one, `check` reports the same thing without refusing, and `allow-sensitive = true` in the user's
+  config skips the check for a machine with no secrets. A project inside home is fine.
+- **A command's file access is an enumerated list, not a fixed set of roots** (D62). The default
+  `[[sandbox.include]]` rule walks `~` at startup, withholds what matches `except` (`.ssh`, `.aws`,
+  and the rest of the usual credential stores), and hands landlock the **list**, which `check`
+  prints under `exec reads`. So a toolchain saddle has never heard of works, and adding one pattern
+  takes a directory out of reach for `exec` as well — which a grant-level `exclude` cannot do
+  (D22). Two rules make it honest: a directory that **contains** a withheld one is expanded rather
+  than granted, because a rule covers everything beneath it; and the state and config directories
+  are withheld whatever the pattern says (D16).
 - **`exec` is Linux-only**, needs landlock ABI 3 as a hard requirement, and has no network: seccomp
   blocks `socket()` for `AF_INET`/`AF_INET6`/`AF_UNIX`/`AF_NETLINK`/`AF_PACKET` and the io_uring
   entry points. Do not add hosts or paths to the sandbox allowlist to make a test pass. Network

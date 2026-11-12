@@ -107,8 +107,23 @@ pub fn config_text(home: Option<&Path>) -> String {
 # Roots every sandboxed command gets on top of its policy's grants. Make only caches writable:
 # a command that can write ~/.cargo/bin could plant a program you later run outside the sandbox.
 [sandbox]
-read = [{read}]
 write = [{write}]
+
+# Sandboxed commands get what they need without saddle knowing about each tool: this walks the base
+# directory at startup, keeps every directory that does not match `except`, and hands the list to
+# the kernel. A directory that contains an exclusion is not granted itself, because a rule covers
+# everything beneath it; its children are granted instead (D62).
+#
+# Add `except` lines for anything that must stay out of reach for a command, or extra
+# [[sandbox.include]] rules for other bases. Saddle's own state and config directories are always
+# excluded and cannot be re-enabled here.
+[[sandbox.include]]
+base = "~"
+depth = 2
+except = [
+  "^\\.ssh$", "^\\.aws$", "^\\.gnupg$", "^\\.kube$", "^\\.docker$",
+  "^\\.config/gh$", "^\\.netrc$", "^\\.git-credentials$",
+]
 
 # How the TUI starts. /settings changes these; ctrl+t and ctrl+o change them for one session.
 # [ui]
@@ -137,7 +152,6 @@ write = [{write}]
 # output = 15.00
 # cache-read = 0.30
 "#,
-        read = list(false),
         write = list(true),
     )
 }
@@ -200,8 +214,20 @@ mod tests {
             cfg.roots.keys().collect::<Vec<_>>(),
             ["cargo", "cargo-registry", "rustup"]
         );
-        assert_eq!(cfg.sandbox.read, ["cargo", "rustup"]);
+        // D62: the default no longer names toolchains for reading. The include rule walks home,
+        // so a toolchain saddle has never heard of works and a credential directory does not.
+        assert!(cfg.sandbox.read.is_empty());
         assert_eq!(cfg.sandbox.write, ["cargo-registry"]);
+        assert_eq!(cfg.sandbox.include.len(), 1, "one include rule by default");
+        assert_eq!(cfg.sandbox.include[0].base, "~");
+        assert!(
+            cfg.sandbox.include[0]
+                .except
+                .iter()
+                .any(|p| regex::Regex::new(p).unwrap().is_match(".ssh")),
+            "ssh is withheld by default: {:?}",
+            cfg.sandbox.include[0].except
+        );
 
         let empty: UserConfig = toml::from_str(&config_text(None)).unwrap();
         assert!(empty.roots.is_empty() && empty.sandbox.write.is_empty());

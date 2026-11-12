@@ -93,7 +93,9 @@ impl Setup {
         ];
         entries.extend(user.root_entries()?);
         let roots = Roots::resolve(entries, &paths.protected())?;
-        let extras = user.sandbox_extras(&roots)?;
+        // The include rules are enumerated here, where the protected directories are known, so
+        // what a child may reach is a list rather than a pattern (D62).
+        let extras = user.sandbox_extras(&roots, &paths.protected())?;
 
         // The global policy is the base, and a workspace's own file is layered on top of it rather
         // than copied from it (D43), so a change to the global policy reaches every workspace that

@@ -107,6 +107,30 @@ pub struct SandboxConfig {
     pub read: Vec<String>,
     #[serde(default)]
     pub write: Vec<String>,
+    /// Directories worked out by walking a base and excluding what matches, so a command gets what
+    /// it needs without saddle knowing about each tool (D62).
+    #[serde(default)]
+    pub include: Vec<IncludeConfig>,
+}
+
+/// One `[[sandbox.include]]` rule, before it is resolved.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct IncludeConfig {
+    /// The directory to walk: a root name, or a path, `~` allowed.
+    pub base: String,
+    /// How deep to look for exclusions. A landlock rule is recursive, so this bounds the search,
+    /// not what is granted (D62).
+    #[serde(default = "default_depth")]
+    pub depth: usize,
+    /// Regular expressions matched against each directory's path relative to the base. A match
+    /// excludes that directory and everything under it.
+    #[serde(default)]
+    pub except: Vec<String>,
+}
+
+fn default_depth() -> usize {
+    2
 }
 
 /// Applies `change` to config.toml, keeping its comments and layout, and writes the result only if
@@ -193,7 +217,10 @@ impl UserConfig {
             .collect()
     }
 
-    pub fn sandbox_extras(&self, roots: &Roots) -> Result<SandboxExtras> {
+    /// The extras every child gets: named roots, plus the directories the include rules work out
+    /// (D62). Enumeration happens here because the protected directories are known here, and the
+    /// result is a plain list of paths, so the lowering itself stays a mapping.
+    pub fn sandbox_extras(&self, roots: &Roots, protected: &[PathBuf]) -> Result<SandboxExtras> {
         let names = |list: &[String]| -> Result<Vec<RootName>> {
             list.iter()
                 .map(|n| {
@@ -205,9 +232,61 @@ impl UserConfig {
                 })
                 .collect()
         };
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let expand = |path: &str| -> Result<PathBuf> {
+            // `~` is home itself, and `~/x` is a path in it; anything else is taken as written.
+            if path == "~" {
+                return match &home {
+                    Some(home) => Ok(home.clone()),
+                    None => bail!("config.toml: `~` needs HOME to be set"),
+                };
+            }
+            match (path.strip_prefix("~/"), &home) {
+                (Some(rest), Some(home)) => Ok(home.join(rest)),
+                (Some(_), None) => bail!("config.toml: `{path}` uses ~ but HOME is not set"),
+                (None, _) => Ok(PathBuf::from(path)),
+            }
+        };
+        let mut include = Vec::new();
+        for rule in &self.sandbox.include {
+            // A root name is accepted so a rule can follow the same names as everything else.
+            let base = match RootName::new(&rule.base) {
+                Ok(name) if roots.contains(&name) => roots.get(&name).map(Path::to_path_buf),
+                _ => None,
+            };
+            let base = match base {
+                Some(path) => path,
+                None => expand(&rule.base)?,
+            };
+            if !base.is_dir() {
+                // Nothing to walk. A missing base grants nothing rather than failing the session,
+                // so a rule for a toolchain on another machine is harmless (D62).
+                continue;
+            }
+            let except = rule
+                .except
+                .iter()
+                .map(|p| {
+                    regex::Regex::new(p)
+                        .with_context(|| format!("config.toml: [[sandbox.include]] except `{p}`"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let resolved = saddle_cap::sandbox::enumerate(
+                &saddle_cap::sandbox::Include {
+                    base,
+                    depth: rule.depth,
+                    except,
+                },
+                protected,
+            );
+            include.extend(resolved);
+        }
+        include.sort();
+        include.dedup();
         Ok(SandboxExtras {
             read: names(&self.sandbox.read)?,
             write: names(&self.sandbox.write)?,
+            include,
         })
     }
 }

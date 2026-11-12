@@ -734,3 +734,115 @@ fn the_directory_above_home_is_reported_too() {
         "{text}"
     );
 }
+
+#[test]
+fn the_default_include_rule_gives_a_child_what_it_needs_and_withholds_credentials() {
+    // D62: no rule names cargo, rustup or git. The default walks home, keeps what does not match
+    // the except patterns, and hands that list to the kernel — so a toolchain works on a machine
+    // saddle has never seen, while the credentials beside it stay out of reach.
+    let home = tempfile::tempdir().unwrap();
+    let xdg = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
+    let h = home.path();
+    std::fs::create_dir_all(h.join(".cargo/registry")).unwrap();
+    std::fs::create_dir_all(h.join(".config/git")).unwrap();
+    std::fs::create_dir_all(h.join(".ssh")).unwrap();
+    std::fs::create_dir_all(h.join("proj/.git")).unwrap();
+    std::fs::write(h.join(".config/git/config"), "gitconfig\n").unwrap();
+    std::fs::write(h.join(".ssh/id_rsa"), "sk-live-private\n").unwrap();
+    let auth = xdg.path().join("state/saddle/auth.json");
+    std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
+    // The shape `AuthStore` reads, so the file is a real store rather than a parse error.
+    std::fs::write(&auth, r#"{"synthetic":{"api-key":"sk-live-api"}}"#).unwrap();
+    let saddle = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_saddle"))
+            .arg("-C")
+            .arg(h.join("proj"))
+            .args(args)
+            .env("HOME", h)
+            .env("XDG_STATE_HOME", xdg.path().join("state"))
+            .env("XDG_CONFIG_HOME", xdg.path().join("config"))
+            .output()
+            .unwrap()
+    };
+    // `check` names the directories a command may read, because the list is the authority.
+    let checked = saddle(&["check"]);
+    assert!(checked.status.success(), "{}", stderr(&checked));
+    let text = String::from_utf8_lossy(&checked.stdout).into_owned();
+    assert!(text.contains("exec reads"), "{text}");
+    assert!(text.contains(".cargo"), "{text}");
+    assert!(
+        !text.contains(".ssh"),
+        "the exclusion is not in the list: {text}"
+    );
+
+    let read = |path: &std::path::Path| -> bool {
+        let out = saddle(&[
+            "tool",
+            "bash",
+            &serde_json::json!({
+                "command": format!("cat {} >/dev/null 2>&1", path.display())
+            })
+            .to_string(),
+        ]);
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("exit code 0")
+    };
+    assert!(
+        read(&h.join(".config/git/config")),
+        "a tool config is readable"
+    );
+    assert!(!read(&h.join(".ssh/id_rsa")), "the key is not");
+    assert!(!read(&auth), "saddle's own key is never in reach");
+}
+
+#[test]
+fn an_extra_except_line_takes_one_more_directory_out_of_reach() {
+    // The point of the shape: a person adds one pattern and the exclusion is real for children,
+    // because the directory never reaches the kernel in the first place (D62).
+    let home = tempfile::tempdir().unwrap();
+    let xdg = tempfile::tempdir().unwrap();
+    let h = home.path();
+    std::fs::create_dir_all(h.join("proj/.git")).unwrap();
+    std::fs::create_dir_all(h.join(".config/git")).unwrap();
+    std::fs::create_dir_all(h.join("notes/private")).unwrap();
+    std::fs::write(h.join("notes/private/a.txt"), "secret\n").unwrap();
+    std::fs::write(h.join("notes/public.txt"), "fine\n").unwrap();
+    std::fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
+    std::fs::write(
+        xdg.path().join("config/saddle/config.toml"),
+        r#"
+[[sandbox.include]]
+base = "~"
+depth = 2
+except = ["^notes/private$"]
+"#,
+    )
+    .unwrap();
+    let read = |path: &std::path::Path| -> bool {
+        let out = Command::new(env!("CARGO_BIN_EXE_saddle"))
+            .arg("-C")
+            .arg(h.join("proj"))
+            .args([
+                "tool",
+                "bash",
+                &serde_json::json!({
+                    "command": format!("cat {} >/dev/null 2>&1", path.display())
+                })
+                .to_string(),
+            ])
+            .env("HOME", h)
+            .env("XDG_STATE_HOME", xdg.path().join("state"))
+            .env("XDG_CONFIG_HOME", xdg.path().join("config"))
+            .output()
+            .unwrap();
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("exit code 0")
+    };
+    assert!(
+        read(&h.join("notes/public.txt")),
+        "the sibling stays readable"
+    );
+    assert!(
+        !read(&h.join("notes/private/a.txt")),
+        "the excluded one does not"
+    );
+}

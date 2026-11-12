@@ -1052,6 +1052,46 @@ use it.
   and any pending request for that id. `session list` prints the revoke command under the list, so
   the way out is visible where the permissions are.
 
+**D62.** A rule is an input; the enumerated list is the authority.
+
+- A sandboxed command should not need saddle to know the name of every tool. The default is an
+  `[[sandbox.include]]` rule: walk a base directory at startup, keep every directory that does not
+  match an `except` pattern, and give landlock the **list**. A toolchain saddle has never heard of
+  works, and a directory that was not there at startup is withheld rather than granted.
+- **A directory that contains a withheld directory is not granted itself.** A landlock rule covers
+  everything beneath its directory, so granting `~/.config` grants `~/.config/saddle` however the
+  pattern reads, and `~/.config/gh` would be reachable again. Such a directory is *expanded*
+  instead: its children are considered in its place. This is the rule that makes the pattern
+  honest, and it is the one place a bug would be silent, so it has its own tests.
+- **Files are enumerated too.** Expanding a directory to honour an exclusion would otherwise take
+  its regular files with it — `~/.gitconfig` would stop being readable the moment anything else in
+  home is excluded. Landlock accepts a rule on a regular file, so each file directly in an expanded
+  directory gets its own rule. Files beneath a withheld directory are withheld with it; the walk
+  decides parents first, so a file cannot be granted inside something excluded.
+- The decision needs **two passes**: a directory is only known to contain an exclusion after the
+  whole walk has been read. The first pass collects what is withheld, the second emits the rules.
+  One pass granted `~/.config` before it had seen `~/.config/saddle`.
+- `depth` bounds the **search**, not the grant: a rule on a directory is recursive, so a deeper
+  walk only finds more exclusions. Two levels is the default, which covers `~/.cargo`,
+  `~/.config/git` and `~/.config/jj` at that depth.
+- **The list is what `check` prints**, under `exec reads`. A pattern that says "everything under
+  home except these" is not something a person can review; the resolved set is, and it is the thing
+  the kernel enforces. The audit log's session record still names the grants rather than this list,
+  which is a gap worth closing if a rule ever expands to something surprising.
+- The state and config directories are withheld whatever the pattern says: they are passed to the
+  enumeration as `protected` and cannot be re-enabled by a rule, because no root may contain them
+  (D16). A pattern that would name one is not an error, it is ignored — the user's `except` list is
+  not a place to lose a security property.
+- Defaults are chosen so an unconfigured machine works and its credentials do not: `base = "~"`,
+  `depth = 2`, and `except` covering the usual credential stores (`.ssh`, `.aws`, `.gnupg`, `.kube`,
+  `.docker`, `.config/gh`, `.netrc`, `.git-credentials`). **These are a starting point, not a
+  security boundary** — a machine keeps its secrets in whatever directory it likes, and the honest
+  place for a secret is outside every base. A person can add a pattern in one line, and that
+  exclusion is real for `exec` as well, which is what D22 could not offer when grants were a fixed
+  list of roots.
+- An unreadable or missing base grants nothing rather than failing the session, so a config carried
+  between machines does not break one that lacks the directory.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

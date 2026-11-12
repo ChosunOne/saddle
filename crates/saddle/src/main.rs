@@ -688,6 +688,14 @@ fn check(dir: &std::path::Path) -> Result<ExitCode> {
     for line in &setup.merged {
         println!("  {line}");
     }
+    // A pattern is an input; this list is the authority a command actually runs under, so it is
+    // what `check` shows (D62).
+    if !setup.extras.include.is_empty() {
+        println!("exec reads");
+        for path in &setup.extras.include {
+            println!("  {}", path.display());
+        }
+    }
     for note in &setup.notes {
         println!("note       {note}");
     }
