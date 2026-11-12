@@ -982,16 +982,18 @@ use it.
   written by a separate invocation — `saddle session allow <id> --workspace <path>` — run by a person
   in their own terminal. Anything that can be answered at the point of refusal is answered by reflex;
   an allowance costs a second command and a copy of an id, which is the whole mechanism.
-- **The allowance is for one session id and one workspace.** `--session <id>` names a session, the
-  allowance records that id and workspace (canonical paths, so `/home/me/` is the same permission),
-  and it is **deleted when that session closes**. It is not a property of the workspace and does not
-  accumulate: the next session has a new id and is asked again. A global `allow-home` flag was tried
-  first and discarded — a permanent whitelist stops being read, and it cannot be consulted at the
-  point that matters anyway, since the session does not exist until the root has been chosen.
+- **The allowance is for one session id and one workspace.** `--session <id>` names a session, and
+  the allowance records that id and workspace (canonical paths, so `/home/me/` is the same
+  permission). It is not a property of the workspace: a different id is still asked, so nothing is
+  allowed merely because some other session was. It outlives the process that used it, so it can be
+  picked again later (D61), and `saddle session revoke` is how it is removed. A global `allow-home`
+  flag was tried first and discarded — a permanent whitelist keyed to nothing stops being read, and
+  it cannot be consulted at the point that matters anyway, since the session does not exist until
+  the root has been chosen.
 - **An id has to be findable**, which is why the refusal records the request before it exits.
   `saddle session pending` lists the ids, how long ago each asked, and the workspace, so a message
   that has scrolled away is recoverable. The request is a record, not a live process: a refused
-  session exits.
+  session exits. Picking an existing allowance is D61.
 - The cost of saying no is nothing: the check runs before the provider is chosen and before a
   session is opened, so a refusal leaves no session, no audit log and no network call. `check` prints
   the same report and succeeds, because it is the review tool rather than the gate. `saddle tool`
@@ -1019,6 +1021,32 @@ use it.
     confined git that needs it gets `GIT_CONFIG_GLOBAL` pointed inside the workspace.
 - This is why the report exists at all: with `.config` or home as the root, exclusion rules stop
   helping, because a root cannot be narrowed from the inside (D20).
+
+**D61.** An allowance can be picked instead of remembered, and an id is a secret.
+
+- Copying a 16-character id between two terminals is the kind of friction that makes a person keep a
+  text file of ids, which is worse than the problem. So an allowance **outlives the process** that
+  used it, `saddle session list [filter]` shows them (id, age, workspace, filtered by substring on
+  either), and `--session` accepts an id, a **unique prefix**, or a number from the list. An
+  ambiguous prefix is an error naming the candidates rather than a guess, so a typo cannot silently
+  select the wrong session.
+- The refusal lists the ids that already cover the workspace, and where a person is at a terminal it
+  *asks*: the answer is a number, an id, or a prefix. An empty answer stops, as the refusal would
+  have. This is not answering the warning — nothing is approved here. Every id offered was allowed
+  earlier by a person with `saddle session allow`, and the prompt only saves copying one. A picker is
+  never shown when stdin is not a terminal, because reading a line there would eat a prompt.
+- Because an allowance now survives the process, the id is a **bearer permission**, not a label: it
+  has to be unguessable. Ids were `{millis:x}-{pid:x}`, which is a few thousand candidates from the
+  clock alone; they are now 16 hex characters from `/dev/urandom` (and a `time…` fallback, marked as
+  such, if there is no random source).
+- An id can be reused, so it can no longer name the things that belong to one run. The audit log and
+  the private temporary directory are named `{id}-{run}` with a fresh random run token each time:
+  two processes sharing an id must not fight over one file, and a reused id must not append to a
+  chain that a previous process closed.
+- The cost is that an allowance accumulates until it is revoked, which is the opposite of what D60
+  first did. That is the trade: a permission a person chose once and can see, pick and remove, in
+  exchange for not being expired silently by a process exiting. `saddle session revoke <id>` is
+  complete — it drops the allowance and any pending request.
 
 ## 4. Scope enumeration
 

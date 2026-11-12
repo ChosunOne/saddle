@@ -90,8 +90,78 @@ impl Allowance {
         write(&self.allow_path(id), &entry)
     }
 
-    /// Forgets everything about `id`: its allowance and its pending request. A session calls this
-    /// when it ends, so an allowance cannot outlive the session it was made for.
+    /// Every allowance, most recently made first, so a person can pick one instead of remembering
+    /// an id (D61).
+    pub fn allowed(&self) -> Vec<(String, Entry)> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, Entry)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                if path.extension().is_some_and(|x| x == "allow") {
+                    let id = path.file_stem()?.to_str()?.to_owned();
+                    Some((id, read(&path)?))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        out.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.when));
+        out
+    }
+
+    /// The allowances that cover `workspace`, which is what the picker offers when a session in a
+    /// sensitive workspace is refused (D61).
+    pub fn for_workspace(&self, workspace: &Path) -> Vec<(String, Entry)> {
+        let mut out: Vec<(String, Entry)> = self
+            .allowed()
+            .into_iter()
+            .filter(|(_, entry)| entry.covers(workspace))
+            .collect();
+        out.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.when));
+        out
+    }
+
+    /// Resolves what a person typed to one of `candidates`: a 1-based number from the list, or an
+    /// id or unique id prefix. `None` when nothing matches, and an error when a prefix is
+    /// ambiguous, so a typo cannot silently pick the wrong session.
+    pub fn resolve(typed: &str, candidates: &[(String, Entry)]) -> Result<Option<String>> {
+        let typed = typed.trim();
+        if typed.is_empty() {
+            return Ok(None);
+        }
+        if let Ok(n) = typed.parse::<usize>()
+            && n >= 1
+            && let Some((id, _)) = candidates.get(n - 1)
+        {
+            return Ok(Some(id.clone()));
+        }
+        if let Some((id, _)) = candidates.iter().find(|(id, _)| id == typed) {
+            return Ok(Some(id.clone()));
+        }
+        let matches: Vec<&String> = candidates
+            .iter()
+            .map(|(id, _)| id)
+            .filter(|id| id.starts_with(typed))
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [one] => Ok(Some((*one).clone())),
+            many => bail!(
+                "`{typed}` matches {} sessions ({}); type more of the id",
+                many.len(),
+                many.iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    /// Forgets everything about `id`: its allowance and its pending request, so an allowance is
+    /// gone when a person says so rather than when a process exits (D61).
     pub fn revoke(&self, id: &str) {
         let _ = std::fs::remove_file(self.allow_path(id));
         let _ = std::fs::remove_file(self.pending_path(id));
@@ -217,6 +287,38 @@ mod tests {
         assert_eq!(id, "19c4f3a2-3f9b");
         assert_eq!(entry.workspace, ws.path());
         assert_eq!(entry.pid, std::process::id());
+    }
+
+    #[test]
+    fn an_allowance_is_picked_by_number_or_by_prefix() {
+        // D61: the point of persisting an allowance is not having to copy a 16-character id.
+        let state = temp();
+        let ws = temp();
+        let allowance = Allowance::new(state.path());
+        allowance.allow("9f2c1a4b7e0d3355", ws.path()).unwrap();
+        allowance.allow("9f2c2b0000000000", ws.path()).unwrap();
+        let candidates = allowance.for_workspace(ws.path());
+        assert_eq!(candidates.len(), 2);
+
+        // A number picks by position, which the printed list shows.
+        let by_number = Allowance::resolve("2", &candidates).unwrap();
+        assert_eq!(by_number.as_deref(), Some(candidates[1].0.as_str()));
+        // An exact id and a unique prefix both work.
+        let exact = Allowance::resolve("9f2c2b0000000000", &candidates).unwrap();
+        assert_eq!(exact.as_deref(), Some("9f2c2b0000000000"));
+        let unique = Allowance::resolve("9f2c2b", &candidates).unwrap();
+        assert_eq!(unique.as_deref(), Some("9f2c2b0000000000"));
+        // An ambiguous prefix is an error rather than a guess, so a typo cannot pick a session.
+        let ambiguous = Allowance::resolve("9f2c", &candidates);
+        assert!(ambiguous.is_err(), "{ambiguous:?}");
+        // Nothing, out of range, and no match are all "nothing chosen".
+        for none in ["", "0", "3", "deadbeef"] {
+            assert_eq!(
+                Allowance::resolve(none, &candidates).unwrap(),
+                None,
+                "{none:?}"
+            );
+        }
     }
 
     #[test]

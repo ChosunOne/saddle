@@ -645,14 +645,28 @@ fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() 
         String::from_utf8_lossy(&allowed.stdout)
     );
 
-    // The allowance is dropped when the session ends, so it cannot outlive what it was for: the
-    // id is no longer listed as waiting, and the same id is refused again.
-    let left = saddle(home.path(), &["session", "pending"]);
+    // The allowance outlives the session so it can be picked again without copying the id (D61),
+    // which makes it something to revoke rather than something that expires by itself.
+    let listed = saddle(home.path(), &["session", "list"]);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    let text = String::from_utf8_lossy(&listed.stdout).into_owned();
+    assert!(text.contains(&id), "{text}");
     assert!(
-        !String::from_utf8_lossy(&left.stdout).contains(&id),
-        "the allowance went with the session: {}",
-        String::from_utf8_lossy(&left.stdout)
+        text.contains("README") || text.contains(home.path().to_str().unwrap()),
+        "{text}"
     );
+
+    // A prefix is enough, and a later session reuses the allowance instead of being refused.
+    let prefix = &id[..8];
+    let reused = saddle(
+        home.path(),
+        &["--session", prefix, "tool", "read", r#"{"path":"README"}"#],
+    );
+    assert!(reused.status.success(), "{}", stderr(&reused));
+
+    // Revoking is how an allowance goes away.
+    let revoked = saddle(home.path(), &["session", "revoke", &id]);
+    assert!(revoked.status.success(), "{}", stderr(&revoked));
     let after = saddle(
         home.path(),
         &["--session", &id, "tool", "read", r#"{"path":"README"}"#],

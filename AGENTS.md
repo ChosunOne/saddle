@@ -126,7 +126,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D60 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D61 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
@@ -202,8 +202,11 @@ rather than loosening it.
 - **No workspace is invalid, but some need an allowance** (D60). A workspace that is, or contains,
   the home or config directory puts every credential in reach, so a session there is refused until
   `saddle session allow <id> --workspace <path>` has been run for that session id by a person; the
-  allowance is deleted when the session ends and `--session <id>` names the session. `saddle session
-  pending` lists the ids waiting, `check` reports the same thing without refusing, and
+  allowance outlives the session so it can be picked again: `saddle session list [filter]` shows
+  them and `--session` takes an id, a unique prefix or a list number, so an id is never memorised.
+  An allowance is a bearer permission, so session ids are random rather than a clock and a pid.
+  `saddle session pending` lists the ids waiting, `saddle session revoke` removes an allowance,
+  `check` reports the same thing without refusing, and
   `allow-sensitive = true` in the user's config skips the check for a machine with no secrets. A
   project inside home is fine. The `[sandbox] read`
   lists in `config.toml` (`~/.cargo`, `~/.rustup`, `~/.config/git`) are the directories outside the

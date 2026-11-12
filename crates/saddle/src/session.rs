@@ -206,22 +206,25 @@ pub struct Session {
     /// `Ok(landlock ABI)` or the reason exec is unavailable.
     pub sandbox: Result<i32, String>,
     pub host_env: Vec<(String, String)>,
-    /// This session's id (D53, D60).
-    pub id: String,
     _tmp: PrivateTmp,
 }
 
 impl Session {
-    /// Opens the session named `id`, or one generated here. The id is what an allowance is written
-    /// against (D60) and what the audit log is named for.
+    /// Opens the session named `id`, or one generated here.
+    ///
+    /// The id names the permission (D60), so it can be reused by a later run (D61). The audit log
+    /// and the private temporary directory belong to a *run* rather than to the id, so they get a
+    /// token of their own: two processes sharing one id must not fight over one file, and a reused
+    /// id must not append to a chain that a previous process already closed.
     pub fn open(start: &Path, id: Option<&str>) -> Result<Self> {
         let id = id.map(str::to_owned).unwrap_or_else(session_id);
-        let tmp = PrivateTmp::create(&id)?;
+        let run = format!("{id}-{}", session_id());
+        let tmp = PrivateTmp::create(&run)?;
         let setup = Setup::load(start, tmp.path())?;
         let policy = setup.parse_policy()?;
         let sandbox = saddle_sandbox::availability();
 
-        let mut audit = AuditLog::create(&setup.paths.audit_dir(), &id)?;
+        let mut audit = AuditLog::create(&setup.paths.audit_dir(), &run)?;
         let roots: serde_json::Map<String, serde_json::Value> = setup
             .roots
             .iter()
@@ -250,7 +253,6 @@ impl Session {
             audit,
             sandbox,
             host_env: std::env::vars().collect(),
-            id,
             _tmp: tmp,
         })
     }
@@ -329,19 +331,31 @@ impl Session {
         Ok(Err(explanation))
     }
 
-    /// Closes the audit log and drops this session's allowance, so a permission to use a sensitive
-    /// workspace cannot outlive the session it was granted for (D60).
+    /// Closes the audit log. An allowance is *not* dropped here: it outlives the session so it can
+    /// be picked again later, and is removed with `saddle session revoke` (D61).
     pub fn close(self) -> Result<String> {
-        let closed = self.audit.close(&self.setup.paths.sessions_index())?;
-        crate::allow::Allowance::new(&self.setup.paths.state).revoke(&self.id);
-        Ok(closed)
+        Ok(self.audit.close(&self.setup.paths.sessions_index())?)
     }
 }
 
+/// A session id: 16 hex characters from the kernel's random source (D61).
+///
+/// It used to be a timestamp and a pid, which was fine while an id only named an audit log. Now an
+/// allowance is a permission held by whoever knows the id, so it has to be unguessable: a
+/// time-and-pid id can be narrowed to a few thousand candidates from the clock alone.
 pub fn session_id() -> String {
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    format!("{ms:x}-{:x}", std::process::id())
+    let mut bytes = [0u8; 8];
+    let ok = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
+        .is_ok();
+    if !ok {
+        // No random source: fall back to the clock rather than refusing to start, and say so in
+        // the id so an id of this shape is visibly weaker.
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        return format!("time{ms:x}");
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

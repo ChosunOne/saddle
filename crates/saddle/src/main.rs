@@ -17,7 +17,7 @@ mod term;
 mod tools;
 mod tui;
 
-use std::io::{BufRead, IsTerminal};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -115,6 +115,12 @@ enum SessionCmd {
     },
     /// List the session ids waiting for an allowance, with their workspaces.
     Pending,
+    /// List the workspaces a session id is already allowed to use, so one can be picked instead of
+    /// remembered (D61). `filter` matches the id or the workspace path, ignoring case.
+    List {
+        #[arg(default_value = "")]
+        filter: String,
+    },
     /// Forget an allowance before its session ends.
     Revoke { id: String },
 }
@@ -164,7 +170,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let session = match cli.session {
         Some(id) => {
             allow::check_id(&id)?;
-            id
+            // A prefix is enough when it names exactly one allowance, so an id does not have to be
+            // copied in full (D61). Without a match the id is used as given, which is what an
+            // allowance is then made for.
+            let allowance = allow::Allowance::new(&paths.state);
+            match allow::Allowance::resolve(&id, &allowance.allowed())? {
+                Some(full) => full,
+                None => id,
+            }
         }
         None => session_id(),
     };
@@ -191,13 +204,15 @@ fn run_agent(
     let user = UserConfig::load(&paths.user_config())?;
     // Before a provider is chosen and before anything is opened, so a refusal costs nothing: no
     // session, no audit log, no network call (D60).
-    {
+    let picked = {
         let workspace = dir
             .canonicalize()
             .map(|abs| paths::find_workspace(&abs))
             .unwrap_or_else(|_| dir.to_path_buf());
-        gate_workspace(&paths, &workspace, session)?;
-    }
+        gate_workspace(&paths, &workspace, session)?
+    };
+    let session = picked.unwrap_or_else(|| session.to_owned());
+    let session = session.as_str();
     let auth = auth::AuthStore::load(&paths.auth_store())?;
     let mut reported = provider::Reported::stored(&paths.reported_windows());
     let interactive = prompt.is_none()
@@ -414,20 +429,22 @@ fn line_turn(
 /// cannot grant itself anything (D16). The allowance covers this id and that workspace and is
 /// removed when the session ends. `allow-sensitive` in the user's config skips the check entirely
 /// for machines where the home directory holds nothing secret.
-fn gate_workspace(paths: &paths::Paths, workspace: &Path, id: &str) -> Result<()> {
+fn gate_workspace(paths: &paths::Paths, workspace: &Path, id: &str) -> Result<Option<String>> {
     let user = UserConfig::load(&paths.user_config())?;
     if user.allow_sensitive {
-        return Ok(());
+        return Ok(None);
     }
     let exposed = paths::exposed(workspace, &paths::sensitive_dirs());
     if exposed.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let allowance = allow::Allowance::new(&paths.state);
     if allowance.allows(id, workspace) {
-        // A session that was allowed before it started: the allowance is consumed at the end.
-        return Ok(());
+        return Ok(None);
     }
+    // Sessions already allowed for this workspace. Picking one is how a person avoids remembering
+    // an id (D61); it does not approve anything new, because a person made those allowances.
+    let reusable = allowance.for_workspace(workspace);
     // Record the request, so the id stays findable after this message has scrolled away.
     allowance.request(id, workspace)?;
     let chosen = std::env::current_exe()
@@ -445,10 +462,28 @@ fn gate_workspace(paths: &paths::Paths, workspace: &Path, id: &str) -> Result<()
         "  a root cannot be narrowed from the inside, so everything beneath it is readable and\n  \
          writable by the agent and by any command it runs\n",
     );
-    message.push_str(
-        "  nothing was opened. To allow this session id to use that workspace, run in your own\n  \
-         terminal, outside saddle:\n",
-    );
+    message.push_str("  nothing was opened.\n");
+    if !reusable.is_empty() {
+        let plural = if reusable.len() == 1 { "" } else { "s" };
+        message.push_str(&format!(
+            "  {} session id{plural} may already use this workspace; pass one with --session\n  \
+             (a prefix is enough), or see `session list`:\n",
+            reusable.len()
+        ));
+        for (n, (old, entry)) in reusable.iter().enumerate() {
+            message.push_str(&format!(
+                "      {}  {old}  {}\n",
+                n + 1,
+                allow::ago(entry.when)
+            ));
+        }
+        message.push_str("  or allow this new session id, in your own terminal outside saddle:\n");
+    } else {
+        message.push_str(
+            "  To allow this session id to use that workspace, run in your own terminal, outside\n  \
+             saddle:\n",
+        );
+    }
     message.push_str(&format!(
         "      {chosen} session allow {id} --workspace {}\n",
         workspace.display()
@@ -459,7 +494,43 @@ fn gate_workspace(paths: &paths::Paths, workspace: &Path, id: &str) -> Result<()
     message.push_str(
         "  or set `allow-sensitive = true` in config.toml if this machine's home holds no secrets",
     );
+    // Only where a person is sitting: a picker that read from a pipe would eat a prompt.
+    if !reusable.is_empty() && std::io::stdin().is_terminal() {
+        return pick_allowed(&reusable, workspace);
+    }
     bail!("{message}")
+}
+
+/// Asks which already-allowed session id to use, and returns it (D61).
+///
+/// This is not approving anything: the allowances listed were made by a person with
+/// `saddle session allow`. Picking one just saves copying an id, and an empty answer stops as the
+/// refusal would have.
+fn pick_allowed(candidates: &[(String, allow::Entry)], workspace: &Path) -> Result<Option<String>> {
+    eprintln!("saddle: pick one of these, or press enter to stop:");
+    for (n, (id, entry)) in candidates.iter().enumerate() {
+        eprintln!(
+            "  {}  {id}  {}  {}",
+            n + 1,
+            allow::ago(entry.when),
+            entry.workspace.display()
+        );
+    }
+    eprint!("  number or id: ");
+    let _ = std::io::stderr().flush();
+    let mut typed = String::new();
+    if std::io::stdin().read_line(&mut typed)? == 0 {
+        bail!("not approved: no session was opened");
+    }
+    match allow::Allowance::resolve(&typed, candidates)? {
+        Some(id) => {
+            eprintln!("  using session {id}");
+            let _ = workspace;
+            Ok(Some(id))
+        }
+        None if typed.trim().is_empty() => bail!("not approved: no session was opened"),
+        None => bail!("not approved: nothing matched `{}`", typed.trim()),
+    }
 }
 
 /// `saddle session`: the allowance commands, which are a person's tool and never a tool the agent
@@ -491,6 +562,39 @@ fn session_cmd(cmd: SessionCmd, paths: &paths::Paths) -> Result<ExitCode> {
                 "session {id} may use {} until it ends; the allowance is removed when it does",
                 workspace.display()
             );
+        }
+        SessionCmd::List { filter } => {
+            let needle = filter.trim().to_lowercase();
+            let rows: Vec<(String, allow::Entry)> = allowance
+                .allowed()
+                .into_iter()
+                .filter(|(id, entry)| {
+                    needle.is_empty()
+                        || id.to_lowercase().contains(&needle)
+                        || entry
+                            .workspace
+                            .to_string_lossy()
+                            .to_lowercase()
+                            .contains(&needle)
+                })
+                .collect();
+            if rows.is_empty() {
+                let hint = if needle.is_empty() {
+                    "no session is allowed to use a sensitive workspace"
+                } else {
+                    "no allowance matches that"
+                };
+                println!("{hint}");
+                return Ok(ExitCode::SUCCESS);
+            }
+            for (n, (id, entry)) in rows.iter().enumerate() {
+                println!(
+                    "  {}  {id}  {}  {}",
+                    n + 1,
+                    allow::ago(entry.when),
+                    entry.workspace.display()
+                );
+            }
         }
         SessionCmd::Pending => {
             let waiting = allowance.waiting();
@@ -710,7 +814,8 @@ fn tool(
         .canonicalize()
         .map(|abs| paths::find_workspace(&abs))
         .unwrap_or_else(|_| dir.to_path_buf());
-    gate_workspace(paths, &workspace, session)?;
+    let picked = gate_workspace(paths, &workspace, session)?;
+    let session = picked.as_deref().unwrap_or(session);
     let mut session = Session::open(dir, Some(session))?;
     let log = session.audit.path().to_path_buf();
     let result = tools::call(&mut session, name, &input);
