@@ -98,42 +98,54 @@ pub fn home_dir() -> Option<PathBuf> {
     Some(home.canonicalize().unwrap_or(home))
 }
 
-/// Refuses a workspace that is the home directory or an ancestor of it (D60).
-///
-/// Home is not a directory to hand to an agent: `.ssh`, `.aws`, `.config` and the rest of a person's
-/// credentials live directly beneath it, and a root cannot be narrowed from the inside (D20). The
-/// refusal is lexical and checked before anything is opened, and `allow-home` in the user's config
-/// is the only thing that lifts it — a file no process the agent runs can write (D42).
-pub fn check_home(workspace: &Path, allow_home: bool) -> Result<()> {
-    if allow_home {
-        return Ok(());
+/// The directories that hold credentials: what each is called, and where it is (D60).
+pub fn sensitive_dirs() -> Vec<(&'static str, PathBuf)> {
+    let mut out = Vec::new();
+    if let Some(home) = home_dir() {
+        out.push(("your home directory", home.clone()));
+        // The default config directory is inside home; XDG_CONFIG_HOME may move it out.
+        if let Ok(paths) = Paths::from_env()
+            && let Some(config) = paths.config.parent()
+        {
+            out.push(("your config directory", config.to_path_buf()));
+        }
     }
-    let Some(which) = home_conflict(workspace, home_dir().as_deref()) else {
-        return Ok(());
-    };
-    anyhow::bail!(
-        "refusing to open a session at {}: it is {which}, and every credential on this machine is \
-         beneath it. Start in a project instead (saddle -C ~/src/project), or set `allow-home = \
-         true` in {} if you really mean it",
-        workspace.display(),
-        Paths::from_env()
-            .map(|p| p.user_config().display().to_string())
-            .unwrap_or_else(|_| "config.toml".into()),
-    )
+    out
 }
 
-/// How `workspace` relates to home when that is a problem, or `None` when it is fine (D60).
+/// What a workspace would put in reach, for the warning before a session opens (D60).
 ///
-/// Split from `check_home` because the environment is process-wide and a test cannot set it
-/// without racing every other test.
-fn home_conflict(workspace: &Path, home: Option<&Path>) -> Option<&'static str> {
-    let home = home?;
-    if workspace == home {
-        return Some("your home directory");
+/// This is deliberately not a rule about what a workspace may be: nothing here refuses anything,
+/// and no directory is named as invalid. It reports the sensitive directories the workspace *is*
+/// or *contains*, so the person starting the session can decide with the facts in front of them.
+/// A project inside home is reported only if it actually contains one of them.
+pub fn exposed(workspace: &Path, sensitive: &[(&str, PathBuf)]) -> Vec<String> {
+    sensitive
+        .iter()
+        .filter(|(_, path)| path == workspace || path.starts_with(workspace))
+        .map(|(what, path)| {
+            if path == workspace {
+                format!("{what} itself ({})", path.display())
+            } else {
+                format!("{what}, and it is inside ({})", path.display())
+            }
+        })
+        .collect()
+}
+
+/// Whether what the person typed at the prompt is an approval of `workspace` (D60).
+///
+/// The friction is the point: a stray return, a `y`, or a path copied from the wrong window does
+/// not match, so approving costs a deliberate act rather than a reflex. Nothing is remembered
+/// afterwards — the approval belongs to this session, and the next one has to ask again.
+pub fn approval_matches(typed: &str, workspace: &Path) -> bool {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return false;
     }
-    // An ancestor of home contains home, and therefore contains the credentials too.
-    home.starts_with(workspace)
-        .then_some("a directory above your home directory")
+    let typed = Path::new(typed);
+    let typed = typed.canonicalize().unwrap_or_else(|_| typed.to_path_buf());
+    typed == workspace
 }
 
 /// A workspace path as one filename component: `/` becomes `%`, so
@@ -171,26 +183,60 @@ mod tests {
     }
 
     #[test]
-    fn a_session_may_not_be_rooted_at_home_or_above_it() {
-        // D60: home holds every credential, and a root cannot be narrowed from inside (D20).
-        let home = Path::new("/home/me");
-        assert_eq!(home_conflict(home, Some(home)), Some("your home directory"));
-        // An ancestor of home contains it, and so contains .ssh and .config as well.
-        for above in ["/", "/home"] {
-            assert_eq!(
-                home_conflict(Path::new(above), Some(home)),
-                Some("a directory above your home directory"),
-                "{above}"
-            );
-        }
-        // A project inside home is the ordinary case and is allowed.
-        assert_eq!(
-            home_conflict(Path::new("/home/me/src/proj"), Some(home)),
-            None
+    fn a_workspace_is_reported_for_the_credentials_it_puts_in_reach() {
+        // D60: nothing is refused. What the person is told is which sensitive directory the
+        // workspace is, or contains, so that approving it is a decision rather than a guess.
+        let home = PathBuf::from("/home/me");
+        let config = home.join(".config");
+        let sensitive = vec![
+            ("your home directory", home.clone()),
+            ("your config directory", config.clone()),
+        ];
+
+        // Home itself, and anything above it, puts both in reach.
+        assert_eq!(exposed(&home, &sensitive).len(), 2);
+        assert_eq!(exposed(Path::new("/home"), &sensitive).len(), 2);
+        assert_eq!(exposed(Path::new("/"), &sensitive).len(), 2);
+        // The config directory alone is enough to report.
+        let only_config = exposed(&config, &sensitive);
+        assert_eq!(only_config.len(), 1);
+        assert!(
+            only_config[0].contains("your config directory"),
+            "{only_config:?}"
         );
-        // A sibling that merely shares a prefix is not home.
-        assert_eq!(home_conflict(Path::new("/home/melon"), Some(home)), None);
-        // Without a home directory there is nothing to compare against.
-        assert_eq!(home_conflict(home, None), None);
+        assert!(only_config[0].contains("itself"), "{only_config:?}");
+
+        // An ordinary project inside home is not a warning: it contains none of them.
+        assert!(exposed(&home.join("src/proj"), &sensitive).is_empty());
+        // A sibling sharing a prefix is not home either.
+        assert!(exposed(Path::new("/home/melon"), &sensitive).is_empty());
+    }
+
+    #[test]
+    fn approval_needs_the_path_typed_out_not_a_keystroke() {
+        // The friction is the mechanism: a reflex answer must not approve anything.
+        let ws = Path::new("/home/me");
+        assert!(approval_matches("/home/me", ws));
+        assert!(
+            approval_matches("  /home/me\n", ws),
+            "surrounding space is forgiven"
+        );
+        for reflex in [
+            "",
+            "\n",
+            "y",
+            "yes",
+            "Y",
+            "ok",
+            "/home",
+            "/home/me/sub",
+            "/home/melon",
+        ] {
+            assert!(!approval_matches(reflex, ws), "{reflex:?} must not approve");
+        }
+        // A trailing slash names the same directory, so it is the same approval.
+        assert!(approval_matches("/home/me/", ws));
+        // A relative path that does not resolve to the workspace is not an approval either.
+        assert!(!approval_matches(".", ws));
     }
 }

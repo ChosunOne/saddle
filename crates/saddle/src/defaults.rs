@@ -96,11 +96,6 @@ pub fn config_text(home: Option<&Path>) -> String {
 # Model requests per prompt before the loop stops and waits for you. /settings changes it.
 # max-steps = 50          # model requests one prompt may take; unset means no limit
 
-# A session may not be opened in your home directory, or above it, because .ssh, .aws and every
-# other credential live beneath it and a root cannot be narrowed from the inside (D60). Set this
-# only if you mean to hand this machine's home directory to the agent.
-# allow-home = false
-
 # Directories outside the workspace, by name. Policies and [sandbox] refer to them by name.
 [roots]
 {roots}

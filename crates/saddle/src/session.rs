@@ -12,7 +12,7 @@ use saddle_policy::{AuditLog, Decision, Engine, Kind, Request};
 use serde_json::json;
 
 use crate::config::UserConfig;
-use crate::paths::{Paths, check_home, find_workspace};
+use crate::paths::{Paths, find_workspace};
 
 /// What a workspace's own policy file starts as (D43): a comment saying what it is for, and nothing
 /// else. An empty file and no file mean the same thing — the global policy alone.
@@ -43,7 +43,6 @@ pub fn roots_for_validation() -> Result<Roots> {
     let user = UserConfig::load(&paths.user_config())?;
     let cwd = std::env::current_dir().context("reading the working directory")?;
     let workspace = find_workspace(&cwd);
-    check_home(&workspace, user.allow_home)?;
     let mut entries = vec![
         (RootName::workspace(), workspace),
         (RootName::tmp(), std::env::temp_dir()),
@@ -71,8 +70,9 @@ pub struct Setup {
     pub global_sha256: String,
     /// Notes for the session intro, such as a workspace `saddle.toml` that is no longer read.
     pub notes: Vec<String>,
-    /// Whether the user's config allows a session rooted at home (D60), so `check` can say so.
-    pub allow_home: bool,
+    /// The sensitive directories this workspace puts in reach, which is what the person is asked
+    /// about before the session opens (D60). Empty for an ordinary project.
+    pub exposed: Vec<String>,
 }
 
 impl Setup {
@@ -84,8 +84,8 @@ impl Setup {
             .with_context(|| format!("{}", start.display()))?;
         let workspace = find_workspace(&start);
         let user = UserConfig::load(&paths.user_config())?;
-        // Before a root is resolved or anything is opened: home is not a workspace (D60).
-        check_home(&workspace, user.allow_home)?;
+        // Reported before a root is resolved: this is a warning, not a rule about workspaces (D60).
+        let exposed = crate::paths::exposed(&workspace, &crate::paths::sensitive_dirs());
 
         let mut entries = vec![
             (RootName::workspace(), workspace.clone()),
@@ -162,7 +162,7 @@ impl Setup {
             merged: merged_lines,
             global_sha256: sha256_hex(global.as_bytes()),
             notes,
-            allow_home: user.allow_home,
+            exposed,
         })
     }
 

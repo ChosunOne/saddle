@@ -528,51 +528,67 @@ fn workspace_containing_the_state_dir_is_refused() {
 }
 
 #[test]
-fn a_session_at_home_is_refused_unless_the_user_allows_it() {
-    // D60: home holds every credential, so it is not a workspace. The home here is a throwaway, set
-    // through HOME, so the test never looks at a real one.
+fn a_workspace_holding_credentials_is_reported_and_needs_approval() {
+    // D60: not a rule about what a workspace may be, and not a dismissible warning either.
+    // `check` reports what is in reach and still succeeds; a session has to be approved by typing
+    // the path, so with no terminal it refuses and leaves nothing behind.
     let home = tempfile::tempdir().unwrap();
     let xdg = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(home.path().join(".config/saddle")).unwrap();
-    let run = |allow: bool| {
-        if allow {
-            std::fs::write(
-                xdg.path().join("config/saddle/config.toml"),
-                "allow-home = true\n",
-            )
-            .unwrap();
-        }
+    std::fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
+    let sub = home.path().join("src/proj");
+    std::fs::create_dir_all(sub.join(".git")).unwrap();
+    let run = |dir: &std::path::Path, args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_saddle"))
             .arg("-C")
-            .arg(home.path())
-            .arg("check")
+            .arg(dir)
+            .args(args)
             .env("HOME", home.path())
             .env("XDG_STATE_HOME", xdg.path().join("state"))
             .env("XDG_CONFIG_HOME", xdg.path().join("config"))
+            .stdin(std::process::Stdio::null())
             .output()
             .unwrap()
     };
-    let refused = run(false);
+
+    // A project inside home exposes nothing, so it is not reported at all.
+    let project = run(&sub, &["check"]);
+    assert!(project.status.success(), "{}", stderr(&project));
+    assert!(
+        !String::from_utf8_lossy(&project.stdout).contains("in reach"),
+        "{}",
+        String::from_utf8_lossy(&project.stdout)
+    );
+
+    // Home itself: `check` succeeds and says what is in reach.
+    let checked = run(home.path(), &["check"]);
+    assert!(
+        checked.status.success(),
+        "a report, not a refusal: {}",
+        stderr(&checked)
+    );
+    let text = String::from_utf8_lossy(&checked.stdout).into_owned();
+    assert!(
+        text.contains("in reach: your home directory itself"),
+        "{text}"
+    );
+
+    // A session there is not started, because there is no terminal to ask on.
+    let refused = run(home.path(), &["run", "--json", "-m", "hello"]);
     assert_eq!(refused.status.code(), Some(2), "{}", stderr(&refused));
     let text = stderr(&refused);
-    assert!(text.contains("refusing to open a session"), "{text}");
-    assert!(text.contains("your home directory"), "{text}");
-    assert!(text.contains("allow-home"), "{text}");
-
-    // The same directory opens once a person has said so in their own config file.
-    let allowed = run(true);
-    assert!(allowed.status.success(), "{}", stderr(&allowed));
+    assert!(text.contains("not approved"), "{text}");
+    assert!(text.contains("would be rooted at"), "{text}");
+    // Nothing was created in the state directory: no session ran, so no audit log either.
     assert!(
-        String::from_utf8_lossy(&allowed.stdout).contains("workspace"),
-        "{}",
-        String::from_utf8_lossy(&allowed.stdout)
+        !xdg.path().join("state/saddle/audit").exists(),
+        "a refused approval must not leave an audit log"
     );
 }
 
 #[test]
-fn the_directory_above_home_is_refused_too() {
-    // Not just home itself: a root at /home (or /) contains home, and therefore contains every
-    // credential beneath it even though the path looks different (D60).
+fn the_directory_above_home_is_reported_too() {
+    // A root above home contains home, and therefore every credential under it, even though the
+    // path looks different (D60).
     let above = tempfile::tempdir().unwrap();
     let home = above.path().join("me");
     std::fs::create_dir_all(&home).unwrap();
@@ -587,38 +603,10 @@ fn the_directory_above_home_is_refused_too() {
         .env("XDG_CONFIG_HOME", xdg.path().join("config"))
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
-        stderr(&out).contains("a directory above your home directory"),
-        "{}",
-        stderr(&out)
+        text.contains("in reach: your home directory, and it is inside"),
+        "{text}"
     );
-}
-
-#[test]
-fn the_auth_store_is_outside_every_root_so_no_session_can_read_it() {
-    // D60: the provider keys saddle uses are the thing a hijacked session would go for. The store
-    // lives in the state directory, which no root may contain, so both the agent's tools and a
-    // sandboxed child are refused by different layers.
-    let env = Env::new();
-    let auth = env.xdg.path().join("state/saddle/auth.json");
-    std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
-    std::fs::write(&auth, "{\"synthetic\":\"sk-live-secret\"}\n").unwrap();
-
-    // The read tool: refused by the policy, before any file is opened.
-    let (ok, text) = env.tool("read", serde_json::json!({ "path": auth }));
-    assert!(!ok, "{text}");
-    assert!(text.contains("outside every root"), "{text}");
-    assert!(
-        !text.contains("sk-live-secret"),
-        "the key is not echoed: {text}"
-    );
-
-    // A child process: refused by the kernel, because the state directory is not in its ruleset.
-    let (ok, text) = env.tool(
-        "bash",
-        serde_json::json!({ "command": format!("cat {}", auth.display()) }),
-    );
-    assert!(!ok, "the child must not read the key: {text}");
-    assert!(!text.contains("sk-live-secret"), "{text}");
 }

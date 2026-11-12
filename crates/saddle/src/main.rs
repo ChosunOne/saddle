@@ -16,7 +16,7 @@ mod term;
 mod tools;
 mod tui;
 
-use std::io::{BufRead, IsTerminal};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -149,6 +149,20 @@ fn run_agent(
     created: Vec<String>,
 ) -> Result<ExitCode> {
     let user = UserConfig::load(&paths.user_config())?;
+    // Before a provider is chosen and before anything is opened: the workspace is reported, and a
+    // workspace that puts credentials in reach is not entered until the person types it out (D60).
+    // This runs here rather than inside `Session::open` so that no session, audit log or network
+    // call exists if the answer is no.
+    {
+        let workspace = dir
+            .canonicalize()
+            .map(|abs| paths::find_workspace(&abs))
+            .unwrap_or_else(|_| dir.to_path_buf());
+        confirm_exposure(
+            &workspace,
+            &paths::exposed(&workspace, &paths::sensitive_dirs()),
+        )?;
+    }
     let auth = auth::AuthStore::load(&paths.auth_store())?;
     let mut reported = provider::Reported::stored(&paths.reported_windows());
     let interactive = prompt.is_none()
@@ -356,17 +370,53 @@ fn line_turn(
     Ok(end)
 }
 
+/// Asks the person to approve a workspace that puts credentials in reach (D60).
+///
+/// The warning is not dismissible with a keypress: the answer has to be the workspace path typed
+/// out. That is the whole mechanism — no flag, no stored whitelist, nothing a script or a habit can
+/// supply by accident — and it is asked again next session, because the approval belongs to this
+/// one. Saying no leaves nothing behind: no session, no audit record, no state.
+fn confirm_exposure(workspace: &Path, exposed: &[String]) -> Result<()> {
+    if exposed.is_empty() {
+        return Ok(());
+    }
+    eprintln!(
+        "saddle: this session would be rooted at {}",
+        workspace.display()
+    );
+    for what in exposed {
+        eprintln!("  in reach: {what}");
+    }
+    // Two lines because the point is easy to miss: this is not "the agent may look at these
+    // files", it is everything under the root, for the whole session (D20).
+    eprintln!("  a root cannot be narrowed from the inside, so everything beneath it is");
+    eprintln!("  readable and writable by the agent and by any command it runs");
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "not approved: there is no terminal to ask on. Start in a project directory instead, \
+             or run saddle from a terminal and type the path to approve it"
+        );
+    }
+    eprint!("  type the path to continue, or press enter to stop: ");
+    let _ = std::io::stderr().flush();
+    let mut typed = String::new();
+    if std::io::stdin().read_line(&mut typed)? == 0 || !paths::approval_matches(&typed, workspace) {
+        bail!("not approved: the path was not typed, so no session was opened");
+    }
+    eprintln!("  approved for this session only");
+    Ok(())
+}
+
 fn check(dir: &std::path::Path) -> Result<ExitCode> {
     let tmp = PrivateTmp::create(&session_id())?;
     let setup = Setup::load(dir, tmp.path())?;
     // The layering happens in `Setup::load`, so an invalid project file is reported here rather
     // than on the first tool call.
     println!("workspace  {}", setup.workspace.display());
-    if setup.allow_home {
-        // A security opt-in that cannot be seen is one nobody reviews (D44, D60).
-        println!(
-            "           caught by allow-home = true in config.toml: this session may reach home"
-        );
+    for what in &setup.exposed {
+        // `check` is the review tool, so it reports what a session here would put in reach and
+        // still succeeds: no directory is invalid, the person decides (D60).
+        println!("           in reach: {what}");
     }
     println!("roots");
     for (name, path) in setup.roots.iter() {
