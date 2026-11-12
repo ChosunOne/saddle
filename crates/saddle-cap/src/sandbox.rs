@@ -88,32 +88,35 @@ pub fn enumerate(include: &Include, protected: &[PathBuf]) -> Vec<PathBuf> {
     // Two passes, because a directory must not be granted when *anything* below it is withheld,
     // and that is not known until the whole walk has been read.
     //
-    // First: which directories are withheld, and with them everything beneath them.
-    let mut dead: Vec<String> = Vec::new();
+    // First: what is withheld. Everything withheld counts, but only a withheld *directory* takes
+    // its descendants with it — a withheld file has none. Both lists are needed: `~/.cargo` must be
+    // expanded because `~/.cargo/credentials.toml` is withheld, and `.ssh` must take `id_rsa` with
+    // it.
+    let mut withheld: Vec<String> = Vec::new();
+    let mut withheld_dirs: Vec<String> = Vec::new();
     for entry in &found {
-        let withheld = entry.rel.is_empty()
-            || dead.iter().any(|d| is_below(&entry.rel, d))
-            || entry.is_excluded(&include.except, &protected);
-        if withheld && entry.is_dir && !entry.rel.is_empty() {
-            dead.push(entry.rel.clone());
+        if entry.rel.is_empty() || withheld_dirs.iter().any(|d| is_below(&entry.rel, d)) {
+            continue;
+        }
+        if entry.is_excluded(&include.except, &protected) {
+            withheld.push(entry.rel.clone());
+            if entry.is_dir {
+                withheld_dirs.push(entry.rel.clone());
+            }
         }
     }
-    // Second: the rules. A directory above a withheld one is expanded rather than granted, and a
+    // Second: the rules. A directory above anything withheld is expanded rather than granted, and a
     // directory already covered by a kept rule adds nothing, because landlock rules are recursive.
     let mut kept: Vec<PathBuf> = Vec::new();
     let mut kept_rel: Vec<String> = Vec::new();
     for entry in &found {
-        if entry.rel.is_empty()
-            || dead
-                .iter()
-                .any(|d| d == &entry.rel || is_below(&entry.rel, d))
-        {
+        if entry.rel.is_empty() || withheld_dirs.iter().any(|d| is_below(&entry.rel, d)) {
             continue;
         }
         if entry.is_excluded(&include.except, &protected) {
             continue;
         }
-        if entry.is_dir && dead.iter().any(|d| is_below(d, &entry.rel)) {
+        if entry.is_dir && withheld.iter().any(|w| is_below(w, &entry.rel)) {
             continue;
         }
         if kept_rel.iter().any(|k| is_below(&entry.rel, k)) {
@@ -354,6 +357,26 @@ mod tests {
         assert!(!got.iter().any(|p| p == ".ssh"), "{got:?}");
         // Its siblings still are, so the tool configs that live there keep working.
         assert_eq!(got, [".config/git", ".config/other", "README"], "{got:?}");
+    }
+
+    #[test]
+    fn a_withheld_file_expands_its_directory_too() {
+        // The bug: only withheld *directories* forced their parent to expand, so withholding a
+        // file inside a granted directory was silently undone — a crates.io token in ~/.cargo,
+        // which is granted for the toolchain, stayed readable (D62).
+        let dir = tree(&["cargo/registry"]);
+        std::fs::write(dir.path().join("cargo/credentials.toml"), "token\n").unwrap();
+        std::fs::write(dir.path().join("cargo/config.toml"), "[net]\n").unwrap();
+        let got = rel(
+            dir.path(),
+            &enumerate(&rule(dir.path(), 2, &[r"^cargo/credentials\.toml$"]), &[]),
+        );
+        // The directory is not a rule, so the token cannot be reached through it.
+        assert!(!got.iter().any(|p| p == "cargo"), "{got:?}");
+        assert!(!got.iter().any(|p| p.contains("credentials")), "{got:?}");
+        // Everything else in it still is, which is why the toolchain keeps working.
+        assert!(got.iter().any(|p| p == "cargo/config.toml"), "{got:?}");
+        assert!(got.iter().any(|p| p == "cargo/registry"), "{got:?}");
     }
 
     #[test]

@@ -120,9 +120,22 @@ write = [{write}]
 [[sandbox.include]]
 base = "~"
 depth = 2
+# Patterns are matched against each entry's path relative to `base`. One that never matches is
+# harmless, so this list errs towards naming stores that a particular machine does not have.
 except = [
-  "^\\.ssh$", "^\\.aws$", "^\\.gnupg$", "^\\.kube$", "^\\.docker$",
-  "^\\.config/gh$", "^\\.netrc$", "^\\.git-credentials$",
+  # keys and secrets
+  "^\\.ssh$", "^\\.gnupg$", "^\\.pki$", "^\\.password-store$",
+  "^\\.local/share/keyrings$", "^\\.config/op$", "^\\.vault-token$",
+  # cloud and containers
+  "^\\.aws$", "^\\.azure$", "^\\.config/gcloud$", "^\\.kube$",
+  "^\\.docker$", "^\\.config/containers$", "^\\.terraform\\.d$",
+  # forges and git credential helpers
+  "^\\.config/gh$", "^\\.config/glab-cli$", "^\\.config/hub$", "^\\.netrc$",
+  "^\\.git-credentials$", "^\\.config/git/credentials$",
+  # package registries: a token for publishing, or for a private index
+  "^\\.npmrc$", "^\\.pypirc$", "^\\.gem/credentials$", "^\\.m2/settings\\.xml$",
+  "^\\.gradle/gradle\\.properties$", "^\\.cargo/credentials$",
+  "^\\.cargo/credentials\\.toml$",
 ]
 
 # How the TUI starts. /settings changes these; ctrl+t and ctrl+o change them for one session.
@@ -231,6 +244,70 @@ mod tests {
 
         let empty: UserConfig = toml::from_str(&config_text(None)).unwrap();
         assert!(empty.roots.is_empty() && empty.sandbox.write.is_empty());
+    }
+
+    #[test]
+    fn every_default_except_pattern_matches_the_store_it_names() {
+        // A pattern that never matches is silent: the directory is simply granted. So each one is
+        // pinned to the path it is meant to withhold (D62).
+        let cfg: UserConfig = toml::from_str(&config_text(None)).unwrap();
+        let rule = &cfg.sandbox.include[0];
+        let patterns: Vec<regex::Regex> = rule
+            .except
+            .iter()
+            .map(|p| regex::Regex::new(p).expect("a default pattern compiles"))
+            .collect();
+        let withheld = |rel: &str| patterns.iter().any(|re| re.is_match(rel));
+        for rel in [
+            ".ssh",
+            ".gnupg",
+            ".password-store",
+            ".local/share/keyrings",
+            ".config/op",
+            ".vault-token",
+            ".aws",
+            ".azure",
+            ".config/gcloud",
+            ".kube",
+            ".docker",
+            ".config/containers",
+            ".terraform.d",
+            ".config/gh",
+            ".config/glab-cli",
+            ".config/hub",
+            ".netrc",
+            ".git-credentials",
+            ".config/git/credentials",
+            ".npmrc",
+            ".pypirc",
+            ".gem/credentials",
+            ".m2/settings.xml",
+            ".gradle/gradle.properties",
+            // The one this list nearly missed: a crates.io token, in a directory granted for the
+            // toolchain itself.
+            ".cargo/credentials.toml",
+            ".cargo/credentials",
+        ] {
+            assert!(
+                withheld(rel),
+                "{rel} is not withheld by any default pattern"
+            );
+        }
+        // And the things that have to keep working are not withheld.
+        for rel in [
+            ".cargo",
+            ".cargo/registry",
+            ".cargo/bin",
+            ".cargo/config.toml",
+            ".rustup",
+            ".config/git/config",
+            ".config/jj",
+            ".gitconfig",
+            "src",
+            "proj",
+        ] {
+            assert!(!withheld(rel), "{rel} must stay readable");
+        }
     }
 
     #[test]

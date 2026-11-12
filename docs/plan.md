@@ -1063,11 +1063,16 @@ use it.
   pattern reads, and `~/.config/gh` would be reachable again. Such a directory is *expanded*
   instead: its children are considered in its place. This is the rule that makes the pattern
   honest, and it is the one place a bug would be silent, so it has its own tests.
-- **Files are enumerated too.** Expanding a directory to honour an exclusion would otherwise take
-  its regular files with it — `~/.gitconfig` would stop being readable the moment anything else in
-  home is excluded. Landlock accepts a rule on a regular file, so each file directly in an expanded
-  directory gets its own rule. Files beneath a withheld directory are withheld with it; the walk
-  decides parents first, so a file cannot be granted inside something excluded.
+- **Files are enumerated too, and a withheld file expands its directory.** Expanding a directory to
+  honour an exclusion would otherwise take its regular files with it — `~/.gitconfig` would stop
+  being readable the moment anything else in home is excluded. Landlock accepts a rule on a regular
+  file, so each file directly in an expanded directory gets its own rule. The converse matters just
+  as much and was the first version's bug: only withheld *directories* were forcing their parent to
+  expand, so withholding a file inside a granted directory was silently undone. `~/.cargo` is
+  granted for the toolchain, and `cargo login` writes a crates.io token to
+  `~/.cargo/credentials.toml` — withholding the file without expanding the directory left the token
+  readable through the directory's rule. Two lists, therefore: everything withheld, and the subset
+  of it that is a directory.
 - The decision needs **two passes**: a directory is only known to contain an exclusion after the
   whole walk has been read. The first pass collects what is withheld, the second emits the rules.
   One pass granted `~/.config` before it had seen `~/.config/saddle`.
@@ -1083,8 +1088,15 @@ use it.
   (D16). A pattern that would name one is not an error, it is ignored — the user's `except` list is
   not a place to lose a security property.
 - Defaults are chosen so an unconfigured machine works and its credentials do not: `base = "~"`,
-  `depth = 2`, and `except` covering the usual credential stores (`.ssh`, `.aws`, `.gnupg`, `.kube`,
-  `.docker`, `.config/gh`, `.netrc`, `.git-credentials`). **These are a starting point, not a
+  `depth = 2`, and `except` covering the usual credential stores — keys and secret managers
+  (`.ssh`, `.gnupg`, `.pki`, `.password-store`, `.local/share/keyrings`, `.config/op`,
+  `.vault-token`), cloud and containers (`.aws`, `.azure`, `.config/gcloud`, `.kube`, `.docker`,
+  `.config/containers`, `.terraform.d`), forges and git credential helpers (`.config/gh`,
+  `.config/glab-cli`, `.config/hub`, `.netrc`, `.git-credentials`, `.config/git/credentials`), and
+  package registries (`.npmrc`, `.pypirc`, `.gem/credentials`, `.m2/settings.xml`,
+  `.gradle/gradle.properties`, `.cargo/credentials`, `.cargo/credentials.toml`). A pattern that
+  never matches is harmless, so the list errs towards naming stores a particular machine may not
+  have, and a test pins every pattern to the path it must match so a typo cannot fail silently. **These are a starting point, not a
   security boundary** — a machine keeps its secrets in whatever directory it likes, and the honest
   place for a secret is outside every base. A person can add a pattern in one line, and that
   exclusion is real for `exec` as well, which is what D22 could not offer when grants were a fixed
