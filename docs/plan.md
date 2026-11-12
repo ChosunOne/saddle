@@ -1140,18 +1140,22 @@ use it.
 - An unreadable or missing base grants nothing rather than failing the session, so a config carried
   between machines does not break one that lacks the directory.
 
-**D63.** One config file, with per-workspace and per-session overrides.
+**D63.** One file for the base, a file per workspace for overrides, and a flag for one run.
 
-- **`config.toml` is the only file.** `policy.toml` and `policies/<key>.toml` existed for a reason
-  that no longer holds — provider settings and grants were written by different code — and two files
-  whose grant semantics differ is a thing a person has to learn twice. `[agent]` is the base every
-  workspace inherits; `[workspaces."<key>".agent]` is one workspace's own, keyed the way the policy
-  file was named (`/` written as `%`, which `check` prints). The layering rule is unchanged (D43): a
-  key a workspace lists replaces the base value for that key, and an absent key is inherited.
+- **`config.toml` is the only file that holds the base.** `policy.toml` and `config.toml` existed
+  for a reason that no longer holds — provider settings and grants were written by different code —
+  and two files whose grant semantics differ is a thing a person has to learn twice. `[agent]` in
+  `config.toml` is the base every workspace inherits.
+- **A workspace's own grants are their own file**, `policies/<key>.toml`, keyed the way the policy
+  file always was (`/` written as `%`, which `check` prints). They are *not* a table keyed by path
+  inside the global file: that was the first attempt and it is wrong in two ways. The global file
+  would accrue a key for every directory ever opened, growing without bound and mixing one
+  directory's authority into a file named after nothing; and the authority for a directory belongs in
+  a file a person can find, name and delete. The layering rule is unchanged (D43): a key the
+  workspace lists replaces the base value for that key, and an absent key is inherited.
 - **An absent `[agent]` is "not configured yet", and the built-in grants apply.** An `[agent]` table
   that is present and empty is a decision, and is taken as written. Without that, the first person
-  to write a two-line `config.toml` would silently lose every grant, which is the failure that made
-  the older default-in-the-file look acceptable and was not.
+  to write a two-line `config.toml` would silently lose every grant.
 - **`--grant` and `--revoke` change the grants for one run.** `--grant fs-read:scratch` adds a grant,
   `--grant exec` sets a scope that takes no parameters, `--grant fs-read:scratch:.env*` carries an
   exclusion, and `--revoke net` drops a scope. Nothing is written, so there is no file to review and
@@ -1164,11 +1168,13 @@ use it.
   the first version's bug.
 - The hash in the audit record names the **grants**, not the file, so a provider change is not a
   policy change.
-- **The migration is temporary.** `config::migrate` folds `policy.toml` and `policies/*.toml` into
-  the one file and renames the originals `.imported`, once, before the defaults are written — after
+- **The migration is temporary.** `config::migrate` moves `policy.toml`'s `[agent]` into
+  `config.toml` and renames the original `.imported`, once, before the defaults are written — after
   them, a freshly created config would shadow the old grants and the migration would silently drop
-  them. It is written to be deleted in the next version: the author is the only user, so there is no
-  installed base to keep it for.
+  them. It also splits a legacy `[workspaces]` table back into `policies/<key>.toml` files, for a
+  config written while the wrong shape existed. Files it writes are the layout and are never
+  renamed. It is written to be deleted in the next version: the author is the only user, so there is
+  no installed base to keep it for.
 
 ## 4. Scope enumeration
 

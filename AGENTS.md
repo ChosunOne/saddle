@@ -90,9 +90,9 @@ cheapest way to see the resolved roots, the grants in force for the working dire
 effective grants, whether that policy has been reviewed, whether `exec` is available on this kernel,
 and the context window and price in force for the configured model.
 
-To change what every workspace allows, edit `[agent]` in `config.toml`; to change one workspace, add
-a `[workspaces."<key>"]` entry — what it sets replaces the base grant for that scope, narrower or
-wider, and takes effect in the next session. `--grant`/`--revoke` do it for one run. `/permissions` in the TUI edits the same file, and `a`
+To change what every workspace allows, edit `[agent]` in `config.toml`; to change one workspace, edit
+its file under `policies/` — what it sets replaces the base grant for that scope, narrower or wider,
+and takes effect in the next session. `--grant`/`--revoke` do it for one run. `/permissions` in the TUI edits the same file, and `a`
 there adds a grant by typing what it is (`net <host>`, `root <name>`, `exec`, …); it is a person's
 tool and no tool exposes it (D45, D46), and a change there applies at once, with the model told on
 its next request (D47). Editing `saddle.toml` in a repository has no effect (D42, D43). `/thinking` (or shift+tab) changes the reasoning effort for the session (D57), `/name` and
@@ -173,12 +173,12 @@ nearly every module header names the ones it implements, for example:
 Treat these as load-bearing, not stylistic. If a task appears to require changing one, stop and ask
 rather than loosening it.
 
-- **The policy is not in the tree.** There is one file, `$XDG_CONFIG_HOME/saddle/config.toml`
-  (D63): `[agent]` is the base every workspace inherits and `[workspaces."<key>".agent]` is one
-  workspace's own, layered on it (D42, D43). A `saddle.toml` in the repository is not read and a
-  session says so once. A workspace entry may narrow or widen a base grant: it is the authority for
-  that directory, and only a person can write it. `--grant` and `--revoke` change the grants for one
-  run without writing anything. Never move authority back into the workspace: landlock cannot carve
+- **The policy is not in the tree.** The base grants are `[agent]` in
+  `$XDG_CONFIG_HOME/saddle/config.toml`, and a workspace's own are `policies/<key>.toml` beside it
+  (D63), layered on the base (D42, D43). A `saddle.toml` in the repository is not read and a session
+  says so once. A workspace file may narrow or widen a base grant: it is the authority for that
+  directory, and only a person can write it. `--grant` and `--revoke` change the grants for one run
+  without writing anything. Never move authority back into the workspace: landlock cannot carve
   a path out of a granted root, so a policy file there is writable by any command, and the
   snapshot/restore that guarded it (D20) is a race a `setsid` child wins.
 - **Reserved paths.** Writes to `.git/config` and anything under `.git/hooks` (including

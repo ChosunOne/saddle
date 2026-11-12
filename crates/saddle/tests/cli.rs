@@ -41,25 +41,22 @@ impl Env {
         self.xdg.path().join("config/saddle/config.toml")
     }
 
-    /// Folds a policy-shaped document into `config.toml` as this workspace's own grants.
-    fn write_override(&self, text: &str) {
-        let agent = agent_of(text);
-        let key = self.workspace_key();
-        let path = self.policy_path();
-        let base = std::fs::read_to_string(&path).unwrap_or_default();
-        let mut doc: toml::Table = base.parse().unwrap_or_default();
-        let workspaces = doc
-            .entry("workspaces")
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        let workspaces = workspaces.as_table_mut().unwrap();
-        let mut entry = toml::Table::new();
-        entry.insert("agent".into(), agent);
-        workspaces.insert(key, toml::Value::Table(entry));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+    /// This workspace's own grant file, one per workspace (D63).
+    fn override_path(&self) -> PathBuf {
+        self.xdg
+            .path()
+            .join("config/saddle/policies")
+            .join(format!("{}.toml", self.workspace_key()))
     }
 
-    /// The base grants: `[agent]` in the one file (D63).
+    /// Writes this workspace's own grants, as a policy-shaped document.
+    fn write_override(&self, text: &str) {
+        let path = self.override_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+    }
+
+    /// The base grants: `[agent]` in `config.toml` (D63).
     fn write_policy(&self, text: impl AsRef<str>) {
         let agent = agent_of(text.as_ref());
         let path = self.policy_path();
@@ -155,7 +152,7 @@ fn ready() -> Env {
 }
 
 #[test]
-fn a_workspace_layers_its_own_grants_on_the_base_in_one_file() {
+fn a_workspace_layers_its_own_file_on_the_base() {
     // D63: one `config.toml`. `[agent]` is the base every workspace inherits, and
     // `[workspaces."<key>"]` is this workspace's own, replacing a key it lists and inheriting the
     // rest.
@@ -164,8 +161,8 @@ fn a_workspace_layers_its_own_grants_on_the_base_in_one_file() {
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(text.contains("grants     "), "{text}");
     assert!(
-        text.contains("no [workspaces] entry for this directory"),
-        "it inherits everything until it has an entry: {text}"
+        text.contains("has no grants for this directory: it inherits the base"),
+        "a fresh workspace inherits everything: {text}"
     );
     assert!(text.contains("agent.exec = timeout 20s"), "{text}");
 
@@ -205,7 +202,7 @@ fn a_workspace_layers_its_own_grants_on_the_base_in_one_file() {
     assert!(text.contains("agent.exec = timeout 5s"), "{text}");
 
     // A tree-level file is reported and not read.
-    env.write_override("");
+    env.write_override("version = 1\n");
     std::fs::write(
         env.path("saddle.toml"),
         "version = 1\n\n[agent]\nnet = [{ host = \"*\" }]\n",
@@ -939,14 +936,12 @@ fn a_session_override_changes_the_grants_for_one_run_and_writes_nothing() {
 }
 
 #[test]
-fn the_old_two_file_layout_is_migrated_once() {
-    // D63, temporary: an install from before the merge keeps grants in `policy.toml` and
-    // `policies/<key>.toml`. They are folded into `config.toml` and the originals renamed, so a
-    // second run does nothing.
+fn the_old_policy_file_is_migrated_once() {
+    // D63, temporary: `policy.toml` held the base grants and is no longer read. They are moved
+    // into `config.toml` and the original renamed, so a second run does nothing.
     let env = Env::new();
-    let key = env.workspace_key();
     let config = env.policy_path();
-    // Recreate the old layout: a config with no grants of its own, and a `policy.toml` beside it.
+    // The old layout: a config with machine settings only, and a `policy.toml` beside it.
     std::fs::write(&config, "provider = \"synthetic\"\n").unwrap();
     let dir = config.parent().unwrap();
     std::fs::write(
@@ -954,35 +949,20 @@ fn the_old_two_file_layout_is_migrated_once() {
         "version = 1\n[agent]\nexec = { why = \"old base\", timeout-secs = 42 }\n",
     )
     .unwrap();
-    std::fs::create_dir_all(dir.join("policies")).unwrap();
-    std::fs::write(
-        dir.join("policies").join(format!("{key}.toml")),
-        "version = 1\n[agent]\nfs-write = [{ root = \"workspace\" }]\n",
-    )
-    .unwrap();
 
     let out = env.saddle(&["check"]);
     assert!(out.status.success(), "{}", stderr(&out));
     // The "moved" line is a first-run notice, so it goes to stderr like the others.
     let notice = stderr(&out);
-    assert!(notice.contains("moved 2 grants file"), "{notice}");
+    assert!(notice.contains("moved 1 grants file"), "{notice}");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
         text.contains("timeout 42s"),
         "the old base was taken: {text}"
     );
-    assert!(
-        text.contains("agent.fs-write"),
-        "the old override too: {text}"
-    );
 
-    // The originals are kept under a name nothing reads, and a second run is a no-op.
+    // The original is kept under a name nothing reads, and a second run is a no-op.
     assert!(dir.join("policy.toml.imported").exists());
-    assert!(
-        dir.join("policies")
-            .join(format!("{key}.toml.imported"))
-            .exists()
-    );
     let out = env.saddle(&["check"]);
     assert!(
         !stderr(&out).contains("moved"),

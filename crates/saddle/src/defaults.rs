@@ -1,5 +1,5 @@
 //! Files saddle writes on first run so it works without setup (D30): a user config with the
-//! toolchains it finds, and a default policy for workspaces that have no `saddle.toml`.
+//! toolchains it finds (D30). The grants live in the same file, under `[agent]` (D63).
 
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -52,12 +52,12 @@ pub fn config_text(home: Option<&Path>) -> String {
 # Model requests per prompt before the loop stops and waits for you. /settings changes it.
 # max-steps = 50          # model requests one prompt may take; unset means no limit
 
-# Grants: what the agent may do in every workspace. A workspace can override a key under
-# [workspaces."<key>"] -- the key is the directory with / written as %, as `saddle check` prints
-# it -- and what a workspace lists replaces the value here for that key, narrower or wider.
+# Grants: what the agent may do in every workspace. This is the base. A workspace's own grants
+# live in their own file, policies/<key>.toml next to this one, and what that file lists replaces
+# the value here for that key, narrower or wider. `saddle check` prints both.
 #
-# `saddle --grant fs-read:scratch` and `saddle --revoke net` change this for one run without
-# writing anything.
+# `saddle --grant fs-read:scratch` and `saddle --revoke net` change the grants for one run and
+# write nothing.
 [agent]
 fs-read  = [{{ root = "workspace", exclude = [".env*"], why = "reads the project" }}]
 fs-write = [{{ root = "workspace", exclude = [".env*"], why = "edits the project" }}]

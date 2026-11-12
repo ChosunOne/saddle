@@ -709,10 +709,14 @@ fn check(dir: &std::path::Path, overrides: &config::Overrides) -> Result<ExitCod
         &setup.global_sha256[..16]
     );
     if setup.policy_text.is_empty() {
-        println!("           no [workspaces] entry for this directory: it inherits the base");
+        println!(
+            "           {} has no grants for this directory: it inherits the base",
+            setup.workspace_policy_path.display()
+        );
     } else {
         println!(
-            "           then this workspace's own entry (sha256 {})",
+            "           then {} (sha256 {})",
+            setup.workspace_policy_path.display(),
             &setup.policy_sha256[..16]
         );
     }

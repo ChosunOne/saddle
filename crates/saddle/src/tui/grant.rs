@@ -178,12 +178,8 @@ fn validate(out: &str, key: Option<&str>, roots: &saddle_cap::Roots) -> Result<(
         saddle_cap::Policy::parse(out, roots)?;
         return Ok(());
     };
-    let user: crate::config::UserConfig = toml::from_str(out)?;
-    let doc = user
-        .workspace_policy(key)
-        .unwrap_or_else(|| user.global_policy());
-    let text = toml::to_string(&doc)?;
-    saddle_cap::Policy::parse(&text, roots)?;
+    let _ = key;
+    saddle_cap::Policy::parse(out, roots)?;
     Ok(())
 }
 

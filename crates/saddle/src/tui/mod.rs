@@ -568,7 +568,7 @@ fn event_loop(
                         control.after_config_edit(app);
                     }
                     Some(Action::Apply(Change::EditPolicy)) => {
-                        // One file now: the grants are the `[agent]` table in config.toml (D63).
+                        // One base file: the grants are its `[agent]` table (D63).
                         let path = control.paths.user_config();
                         edit_file(terminal, &path, app.header.mouse)?;
                         control.after_policy_edit(app);
@@ -890,27 +890,17 @@ impl Controller {
         // The roots the session would resolve, so the write is validated as a session would.
         let roots = crate::session::roots_for_validation()?;
         if let permissions::Change::Add(what) = change {
-            let added = grant::add(
-                &setup.policy_path,
-                Some(&crate::paths::workspace_key(&setup.workspace)),
-                what,
-                &roots,
-            )?;
+            let added = grant::add(&setup.workspace_policy_path, None, what, &roots)?;
             app.note(
                 NoteKind::Info,
                 &format!(
                     "added {added} to {}; it applies from the next session",
-                    setup.policy_path.display()
+                    setup.workspace_policy_path.display()
                 ),
             );
             return Ok(());
         }
-        grant::edit(
-            &setup.policy_path,
-            Some(&crate::paths::workspace_key(&setup.workspace)),
-            change,
-            &roots,
-        )
+        grant::edit(&setup.workspace_policy_path, None, change, &roots)
     }
 
     fn open_settings(&self, app: &mut App) -> Result<()> {

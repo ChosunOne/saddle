@@ -39,10 +39,13 @@ pub struct UserConfig {
     /// under `[agent]` here.
     #[serde(default)]
     pub agent: Option<toml::Value>,
-    /// Per-workspace grants, keyed the way the policy file was named, replacing the global value
-    /// for a key that is listed (D63). This was `policies/<key>.toml`.
+    /// Accepted and ignored: one version briefly kept workspace grants here as a table, and a
+    /// config written then is split back into `policies/<key>.toml` by `migrate` (D63). Read by
+    /// `migrate` through the raw document rather than through this field, which exists only so a
+    /// file containing the table still parses.
     #[serde(default)]
-    pub workspaces: BTreeMap<String, WorkspaceConfig>,
+    #[allow(dead_code)]
+    pub workspaces: BTreeMap<String, toml::Value>,
     #[serde(default)]
     pub roots: BTreeMap<String, String>,
     #[serde(default)]
@@ -66,14 +69,6 @@ pub struct UserConfig {
     pub compaction: CompactionConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderEntry>,
-}
-
-/// One workspace's own grants.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceConfig {
-    #[serde(default)]
-    pub agent: Option<toml::Value>,
 }
 
 /// How the TUI starts; ctrl+t and ctrl+o change these for the session only.
@@ -360,22 +355,6 @@ impl UserConfig {
         policy_document(agent)
     }
 
-    /// One workspace's own grant document. Absent when the workspace overrides nothing.
-    pub fn workspace_policy(&self, key: &str) -> Option<toml::Value> {
-        self.workspaces
-            .get(key)
-            .and_then(|w| w.agent.clone())
-            .map(|agent| policy_document(Some(agent)))
-    }
-
-    /// Whether a workspace lists any grant of its own, which is only used to word a note.
-    pub fn workspace_has_grants(&self, key: &str) -> bool {
-        self.workspaces
-            .get(key)
-            .and_then(|w| w.agent.as_ref())
-            .is_some_and(|v| v.as_table().is_some_and(|t| !t.is_empty()))
-    }
-
     /// The extras every child gets: named roots, plus the directories the include rules work out
     /// (D62). Enumeration happens here because the protected directories are known here, and the
     /// result is a plain list of paths, so the lowering itself stays a mapping.
@@ -645,9 +624,9 @@ fn split_scope(spec: &str) -> (&str, &str) {
 /// originals `.imported`, the same way the JSON Lines transcripts were imported (D53). It is
 /// written to be deleted in the next version, when only the merged layout exists.
 pub fn migrate(path: &Path, policies: &Path) -> Result<Vec<PathBuf>> {
-    let mut moved = Vec::new();
+    let mut touched = Vec::new();
     let global = path.with_file_name("policy.toml");
-    let mut text = match std::fs::read_to_string(path) {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
@@ -656,7 +635,9 @@ pub fn migrate(path: &Path, policies: &Path) -> Result<Vec<PathBuf>> {
         .parse()
         .with_context(|| format!("{}", path.display()))?;
     let mut changed = false;
-    // The global grants, if they are still in their own file.
+    let mut renamed: Vec<PathBuf> = Vec::new();
+
+    // 1. The base grants, if they are still in `policy.toml`.
     if let Ok(policy) = std::fs::read_to_string(&global) {
         let policy: toml_edit::DocumentMut = policy
             .parse()
@@ -666,60 +647,48 @@ pub fn migrate(path: &Path, policies: &Path) -> Result<Vec<PathBuf>> {
         {
             doc.insert("agent", agent.clone());
             changed = true;
-            moved.push(global.clone());
+            renamed.push(global.clone());
+            touched.push(global);
         }
     }
-    // Each workspace's own grants.
-    if let Ok(entries) = std::fs::read_dir(policies) {
-        let mut found: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
-            .collect();
-        found.sort();
-        for file in found {
-            let Ok(text) = std::fs::read_to_string(&file) else {
+
+    // 2. A config written while workspace grants were a table here. They become the per-workspace
+    // files again, because the authority for a directory belongs in a file named after it (D63).
+    if let Some(table) = doc.get("workspaces").and_then(|w| w.as_table()).cloned() {
+        for (key, entry) in table.iter() {
+            let Some(agent) = entry.get("agent").cloned() else {
                 continue;
             };
-            let Ok(own) = text.parse::<toml_edit::DocumentMut>() else {
+            let file = policies.join(format!("{key}.toml"));
+            if file.exists() {
                 continue;
-            };
-            let Some(agent) = own.get("agent") else {
-                moved.push(file.clone());
-                continue;
-            };
-            let key = file.file_stem().map(|s| s.to_string_lossy().into_owned());
-            let Some(key) = key else { continue };
-            if doc.get("workspaces").is_none() {
-                doc.insert(
-                    "workspaces",
-                    toml_edit::Item::Table(toml_edit::Table::new()),
-                );
             }
-            let table = doc["workspaces"]
-                .as_table_mut()
-                .context("`workspaces` is not a table in config.toml")?;
-            if table.get(&key).is_none() {
-                table.insert(&key, toml_edit::Item::Table(toml_edit::Table::new()));
-                table[&key]["agent"] = agent.clone();
-                changed = true;
-            }
-            moved.push(file.clone());
+            std::fs::create_dir_all(policies)?;
+            let mut own = toml_edit::DocumentMut::new();
+            own.insert("version", toml_edit::value(1));
+            own.insert("agent", agent);
+            std::fs::write(&file, own.to_string())
+                .with_context(|| format!("{}", file.display()))?;
+            touched.push(file);
         }
+        doc.remove("workspaces");
+        changed = true;
     }
+
     if !changed {
-        return Ok(moved);
+        return Ok(touched);
     }
-    text = doc.to_string();
+    let text = doc.to_string();
     toml::from_str::<UserConfig>(&text)
         .with_context(|| format!("the migration would leave {} invalid", path.display()))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(path, &text).with_context(|| format!("{}", path.display()))?;
-    // The originals are kept under a name nothing reads, so a second run is a no-op.
-    for file in &moved {
+    // The file that was read is kept under a name nothing reads, so a second run is a no-op. The
+    // per-workspace files written above are not renamed: they are the layout, not an artefact.
+    for file in &renamed {
         let _ = std::fs::rename(file, file.with_extension("toml.imported"));
     }
-    Ok(moved)
+    Ok(touched)
 }

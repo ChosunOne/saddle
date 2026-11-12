@@ -46,11 +46,18 @@ impl Paths {
         self.config.join("config.toml")
     }
 
-    /// Every workspace's own grants used to live in one file per workspace here. Nothing reads
-    /// this directory any more: it is folded into `config.toml` once, then the files are renamed
-    /// `.imported` (D63).
+    /// One file per workspace, holding the grants that directory overrides (D63). Inside the
+    /// config directory, so no root contains it and no sandboxed command can write it (D16, D42).
     pub fn policies_dir(&self) -> PathBuf {
         self.config.join("policies")
+    }
+
+    /// The grants that apply in `workspace` on top of the base in `config.toml`, keyed by its
+    /// canonical path. One file per workspace, so the authority for a directory is a file named
+    /// after it rather than a sub-table of the global one (D63).
+    pub fn workspace_policy(&self, workspace: &Path) -> PathBuf {
+        self.policies_dir()
+            .join(format!("{}.toml", workspace_key(workspace)))
     }
 
     /// Saved conversations (D31).

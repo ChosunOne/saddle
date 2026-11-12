@@ -12,6 +12,17 @@ use saddle_policy::{AuditLog, Decision, Engine, Kind, Request};
 use serde_json::json;
 
 use crate::config::UserConfig;
+
+/// The header a workspace's own grant file starts with. Empty of grants on purpose: its presence
+/// and an empty file mean the same thing, and an empty file is an invitation to write a key in it.
+pub const WORKSPACE_POLICY_HEADER: &str = r#"# This workspace's own grants, laid over the [agent] table in config.toml.
+#
+# Anything not written here is taken from the base, so a change there reaches this workspace. What
+# is written here replaces that grant for this scope, and it may grant more or less than the base
+# does: this file is the authority for this directory. It lives in the config directory, which no
+# root contains, so nothing the agent runs can write it -- only you can. `saddle check` prints the
+# result, and --grant/--revoke change it for one run without touching this file.
+"#;
 use crate::paths::{Paths, find_workspace};
 
 /// What a workspace's own policy file starts as (D43): a comment saying what it is for, and nothing
@@ -41,6 +52,8 @@ pub struct Setup {
     pub extras: SandboxExtras,
     pub policy_path: PathBuf,
     pub policy_text: String,
+    /// This workspace's own grant file, which the TUI editor writes (D45, D63).
+    pub workspace_policy_path: PathBuf,
     pub policy_sha256: String,
     /// The effective grants of the layered policy, as `Policy::describe` prints them, which is what
     /// `check` shows and the audit log's session record names.
@@ -89,8 +102,38 @@ impl Setup {
         let config_path = paths.user_config();
         let mut notes = Vec::new();
         let user = UserConfig::load(&config_path)?;
-        let key = crate::paths::workspace_key(&workspace);
-        let mut own = user.workspace_policy(&key);
+        // This workspace's own grants are their own file (D63), so a directory's authority is
+        // named after the directory and the global file does not grow a key per workspace.
+        let own_path = paths.workspace_policy(&workspace);
+        let own_text = match std::fs::read_to_string(&own_path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(dir) = own_path.parent() {
+                    std::fs::create_dir_all(dir)
+                        .with_context(|| format!("creating {}", dir.display()))?;
+                }
+                std::fs::write(&own_path, WORKSPACE_POLICY_HEADER)
+                    .with_context(|| format!("creating {}", own_path.display()))?;
+                notes.push(format!(
+                    "created {} for this workspace's own grants; it adds to {}",
+                    own_path.display(),
+                    config_path.display()
+                ));
+                WORKSPACE_POLICY_HEADER.to_owned()
+            }
+            Err(e) => return Err(e).with_context(|| format!("reading {}", own_path.display())),
+        };
+        // A header with no grants is the same as no file: nothing is overridden.
+        let mut own: Option<toml::Value> = {
+            let doc: toml::Table = toml::from_str(&own_text)
+                .with_context(|| format!("reading {}", own_path.display()))?;
+            doc.get("agent").cloned().map(|agent| {
+                let mut out = toml::Table::new();
+                out.insert("version".into(), toml::Value::Integer(1));
+                out.insert("agent".into(), agent);
+                toml::Value::Table(out)
+            })
+        };
         let global = user.global_policy();
         if !overrides.is_empty() {
             // Applied to the *merged* grants, not to the workspace's own: `--revoke exec` has to
@@ -128,14 +171,15 @@ impl Setup {
                 "{} is not read: this workspace's grants are in {}{}",
                 in_tree.display(),
                 config_path.display(),
-                if user.workspace_has_grants(&key) {
-                    format!(" under [workspaces.\"{key}\"]")
+                if own.is_some() {
+                    format!(" and {}", own_path.display())
                 } else {
                     String::new()
                 }
             ));
         }
         let policy_path = config_path;
+        let workspace_policy_path = own_path;
         // With overrides the workspace document already holds the merged result, so the base is
         // not layered a second time (D63). This is what is stored, because `parse_policy` layers
         // from it: the engine has to be built from the same document `check` describes.
@@ -156,6 +200,7 @@ impl Setup {
             roots,
             extras,
             policy_path,
+            workspace_policy_path,
             policy_text,
             policy_sha256,
             merged: merged_lines,
