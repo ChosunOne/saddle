@@ -49,11 +49,17 @@ impl Env {
             .join(format!("{}.toml", self.workspace_key()))
     }
 
-    /// Writes this workspace's own grants, as a policy-shaped document.
+    /// Writes this workspace's own grants, as a policy-shaped document. The `workspace` line is
+    /// what the file is checked against, so it is written here (D63).
     fn write_override(&self, text: &str) {
         let path = self.override_path();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, text).unwrap();
+        let ws = self.ws.path().canonicalize().unwrap();
+        std::fs::write(
+            &path,
+            format!("workspace = {:?}\n{text}", ws.display().to_string()),
+        )
+        .unwrap();
     }
 
     /// The base grants: `[agent]` in `config.toml` (D63).
@@ -968,4 +974,41 @@ fn the_old_policy_file_is_migrated_once() {
     );
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(text.contains("timeout 42s"), "and the grants stay: {text}");
+}
+
+#[test]
+fn a_grants_file_that_names_another_directory_is_refused() {
+    // D63: the file says which directory it governs. The name is a readable encoding and is lossy,
+    // so `~/a-b` and `~/a/b` collide — and applying one directory's grants to another is how a
+    // `net *` written for one project would silently cover a second.
+    let env = Env::new();
+    let key = env.workspace_key();
+    let dir = env.policy_path().parent().unwrap().join("policies");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join(format!("{key}.toml"));
+    std::fs::write(
+        &file,
+        "workspace = \"/somewhere/else\"\nversion = 1\n[agent]\nnet = [{ host = \"*\" }]\n",
+    )
+    .unwrap();
+    let out = env.saddle(&["check"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    let text = stderr(&out);
+    assert!(text.contains("is for /somewhere/else"), "{text}");
+    assert!(text.contains("two directories cannot share"), "{text}");
+
+    // The same file naming this directory is used, which is the ordinary case.
+    let ws = env.ws.path().canonicalize().unwrap();
+    std::fs::write(
+        &file,
+        format!(
+            "workspace = {:?}\nversion = 1\n[agent]\nnet = [{{ host = \"*\" }}]\n",
+            ws.display().to_string()
+        ),
+    )
+    .unwrap();
+    let out = env.saddle(&["check"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("agent.net[0]"), "{text}");
 }

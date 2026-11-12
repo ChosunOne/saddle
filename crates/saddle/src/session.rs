@@ -15,7 +15,19 @@ use crate::config::UserConfig;
 
 /// The header a workspace's own grant file starts with. Empty of grants on purpose: its presence
 /// and an empty file mean the same thing, and an empty file is an invitation to write a key in it.
+pub fn workspace_header(workspace: &Path) -> String {
+    format!(
+        "workspace = {}\n{}",
+        toml::Value::String(workspace.display().to_string()),
+        WORKSPACE_POLICY_HEADER
+    )
+}
+
 pub const WORKSPACE_POLICY_HEADER: &str = r#"# This workspace's own grants, laid over the [agent] table in config.toml.
+#
+# The `workspace` line above is the directory this file governs. The name is only a readable
+# encoding of that path and is allowed to be approximate; this line is what counts, and a session
+# refuses the file if it names a different directory.
 #
 # Anything not written here is taken from the base, so a change there reaches this workspace. What
 # is written here replaces that grant for this scope, and it may grant more or less than the base
@@ -112,14 +124,14 @@ impl Setup {
                     std::fs::create_dir_all(dir)
                         .with_context(|| format!("creating {}", dir.display()))?;
                 }
-                std::fs::write(&own_path, WORKSPACE_POLICY_HEADER)
+                std::fs::write(&own_path, workspace_header(&workspace))
                     .with_context(|| format!("creating {}", own_path.display()))?;
                 notes.push(format!(
                     "created {} for this workspace's own grants; it adds to {}",
                     own_path.display(),
                     config_path.display()
                 ));
-                WORKSPACE_POLICY_HEADER.to_owned()
+                workspace_header(&workspace)
             }
             Err(e) => return Err(e).with_context(|| format!("reading {}", own_path.display())),
         };
@@ -127,6 +139,21 @@ impl Setup {
         let mut own: Option<toml::Value> = {
             let doc: toml::Table = toml::from_str(&own_text)
                 .with_context(|| format!("reading {}", own_path.display()))?;
+            // The file says which directory it governs. The name is a readable encoding of the
+            // path, and it is lossy (`a-b` and `a/b` collide), so the name may not be trusted for
+            // this: applying one directory's grants to another is how a `net *` written for one
+            // project would silently cover a second (D63).
+            if let Some(claimed) = doc.get("workspace").and_then(|w| w.as_str())
+                && Path::new(claimed) != workspace
+            {
+                anyhow::bail!(
+                    "{} is for {}, not {}: two directories cannot share one grants file, so move \
+                     or delete it and start again",
+                    own_path.display(),
+                    claimed,
+                    workspace.display()
+                );
+            }
             doc.get("agent").cloned().map(|agent| {
                 let mut out = toml::Table::new();
                 out.insert("version".into(), toml::Value::Integer(1));

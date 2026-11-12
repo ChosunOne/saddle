@@ -1172,13 +1172,21 @@ use it.
   the first version's bug.
 - The hash in the audit record names the **grants**, not the file, so a provider change is not a
   policy change.
-- **The migration is temporary.** `config::migrate` moves `policy.toml`'s `[agent]` into
-  `config.toml` and renames the original `.imported`, once, before the defaults are written — after
-  them, a freshly created config would shadow the old grants and the migration would silently drop
-  them. It also splits a legacy `[workspaces]` table back into `policies/<key>.toml` files, for a
-  config written while the wrong shape existed. Files it writes are the layout and are never
-  renamed. It is written to be deleted in the next version: the author is the only user, so there is
-  no installed base to keep it for.
+- **A grants file says which directory it governs.** Its first line is
+  `workspace = "/home/me/project"`, written when saddle creates it. The name is only a readable
+  encoding and is lossy — `~/a-b` and `~/a/b` both give `--home-me-a-b--` — so the name may not be
+  trusted for this: a session **refuses** a grants file whose `workspace` names a different
+  directory, describing both paths. Applying one directory's grants to another is how a `net *`
+  written for one project would silently cover a second. A file with no line is treated as claiming
+  nothing and is used as before.
+- **The migration is temporary and deliberately small**, because there is one user and one
+  workspace. `config::migrate` does two things: move `policy.toml`'s `[agent]` into `config.toml`
+  (renaming the original `.imported`) before the defaults are written, and rename a grants file
+  still carrying the old `%` separator to the `--` form **while stamping its `workspace` line in the
+  same step** — the `%` name is the only one that decodes exactly, and doing the rename and the
+  stamp as separate passes is what made the line arrive one run late. It is written to be deleted in
+  the next version; an earlier draft tried to migrate states that only existed in intermediate
+  commits, which was work for no user.
 
 ## 4. Scope enumeration
 

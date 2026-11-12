@@ -468,6 +468,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_old_percent_grants_file_is_renamed_and_stamped_in_one_pass() {
+        // D63: the `%` name is the only one that decodes exactly, so the rename and the
+        // `workspace` line happen together. Doing them as two passes left the line behind, and it
+        // arrived only on the next run.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "provider = \"synthetic\"\n").unwrap();
+        let policies = dir.path().join("policies");
+        std::fs::create_dir_all(&policies).unwrap();
+        let old = policies.join("home%me%my-proj.toml");
+        std::fs::write(&old, "version = 1\n[agent]\nexec = { why = \"x\" }\n").unwrap();
+
+        let touched = migrate(&config, &policies).unwrap();
+        assert_eq!(touched.len(), 1, "{touched:?}");
+        assert!(!old.exists(), "the old name is gone on this run");
+        let new = policies.join("--home-me-my-proj--.toml");
+        let text = std::fs::read_to_string(&new).unwrap();
+        assert!(text.contains("workspace = \"/home/me/my-proj\""), "{text}");
+        assert!(text.contains("exec"), "the grants survive: {text}");
+
+        // Running again changes nothing.
+        assert!(migrate(&config, &policies).unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), text);
+    }
+
+    #[test]
     fn a_config_without_max_steps_means_no_limit() {
         let cfg: UserConfig = toml::from_str("provider = \"local\"\n").unwrap();
         assert_eq!(cfg.max_steps, None, "unset is unlimited, not 50 (D37)");
@@ -625,20 +651,17 @@ fn split_scope(spec: &str) -> (&str, &str) {
 /// written to be deleted in the next version, when only the merged layout exists.
 pub fn migrate(path: &Path, policies: &Path) -> Result<Vec<PathBuf>> {
     let mut touched = Vec::new();
+    // 1. The base grants, if they are still in `policy.toml`.
     let global = path.with_file_name("policy.toml");
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
     };
-    let mut doc: toml_edit::DocumentMut = text
-        .parse()
-        .with_context(|| format!("{}", path.display()))?;
-    let mut changed = false;
-    let mut renamed: Vec<PathBuf> = Vec::new();
-
-    // 1. The base grants, if they are still in `policy.toml`.
     if let Ok(policy) = std::fs::read_to_string(&global) {
+        let mut doc: toml_edit::DocumentMut = text
+            .parse()
+            .with_context(|| format!("{}", path.display()))?;
         let policy: toml_edit::DocumentMut = policy
             .parse()
             .with_context(|| format!("{}", global.display()))?;
@@ -646,37 +669,21 @@ pub fn migrate(path: &Path, policies: &Path) -> Result<Vec<PathBuf>> {
             && let Some(agent) = policy.get("agent")
         {
             doc.insert("agent", agent.clone());
-            changed = true;
-            renamed.push(global.clone());
+            let out = doc.to_string();
+            toml::from_str::<UserConfig>(&out)
+                .with_context(|| format!("the migration would leave {} invalid", path.display()))?;
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(path, &out).with_context(|| format!("{}", path.display()))?;
+            // Kept under a name nothing reads, so a second run is a no-op.
+            let _ = std::fs::rename(&global, global.with_extension("toml.imported"));
             touched.push(global);
         }
     }
-
-    // 2. A config written while workspace grants were a table here. They become the per-workspace
-    // files again, because the authority for a directory belongs in a file named after it (D63).
-    if let Some(table) = doc.get("workspaces").and_then(|w| w.as_table()).cloned() {
-        for (key, entry) in table.iter() {
-            let Some(agent) = entry.get("agent").cloned() else {
-                continue;
-            };
-            let file = policies.join(format!("{key}.toml"));
-            if file.exists() {
-                continue;
-            }
-            std::fs::create_dir_all(policies)?;
-            let mut own = toml_edit::DocumentMut::new();
-            own.insert("version", toml_edit::value(1));
-            own.insert("agent", agent);
-            std::fs::write(&file, own.to_string())
-                .with_context(|| format!("{}", file.display()))?;
-            touched.push(file);
-        }
-        doc.remove("workspaces");
-        changed = true;
-    }
-
-    // 3. Workspace files named with the old `%` separator. The key reads like a path now (D63), so
-    // an override written under the old name would silently stop applying.
+    // 2. Workspace grants files named with the old `%` separator: renamed, and the `workspace`
+    // line stamped in the same step. The `%` form is the only name that decodes exactly, and doing
+    // the two as separate passes is what made the line arrive one run late (D63).
     if let Ok(entries) = std::fs::read_dir(policies) {
         let mut found: Vec<PathBuf> = entries
             .flatten()
@@ -691,36 +698,28 @@ pub fn migrate(path: &Path, policies: &Path) -> Result<Vec<PathBuf>> {
             if !stem.contains('%') {
                 continue;
             }
-            let renamed = policies.join(format!(
+            let claimed = format!("/{}", stem.trim_start_matches('%').replace('%', "/"));
+            let target = policies.join(format!(
                 "{}.toml",
-                crate::paths::workspace_key(Path::new(&stem.replacen('%', "/", 1).replacen(
-                    '%',
-                    "/",
-                    usize::MAX
-                )))
+                crate::paths::workspace_key(Path::new(&claimed))
             ));
-            if renamed.exists() {
+            if target.exists() {
                 continue;
             }
-            std::fs::rename(&file, &renamed).with_context(|| format!("{}", file.display()))?;
-            touched.push(renamed);
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let Ok(mut own) = text.parse::<toml_edit::DocumentMut>() else {
+                continue;
+            };
+            if own.get("workspace").is_none() {
+                own.insert("workspace", toml_edit::value(claimed));
+            }
+            std::fs::write(&target, own.to_string())
+                .with_context(|| format!("{}", target.display()))?;
+            std::fs::remove_file(&file).with_context(|| format!("{}", file.display()))?;
+            touched.push(target);
         }
-    }
-
-    if !changed {
-        return Ok(touched);
-    }
-    let text = doc.to_string();
-    toml::from_str::<UserConfig>(&text)
-        .with_context(|| format!("the migration would leave {} invalid", path.display()))?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, &text).with_context(|| format!("{}", path.display()))?;
-    // The file that was read is kept under a name nothing reads, so a second run is a no-op. The
-    // per-workspace files written above are not renamed: they are the layout, not an artefact.
-    for file in &renamed {
-        let _ = std::fs::rename(file, file.with_extension("toml.imported"));
     }
     Ok(touched)
 }
