@@ -77,7 +77,7 @@ impl sse::Events for EventStream {
 pub fn stream(
     p: &Provider,
     url: String,
-    headers: Vec<(&'static str, String)>,
+    headers: Vec<(String, String)>,
     body: &Value,
 ) -> Result<EventStream> {
     let bytes = serde_json::to_vec(body)?;
@@ -109,7 +109,7 @@ struct Request {
     agent: ureq::Agent,
     name: String,
     url: String,
-    headers: Vec<(&'static str, String)>,
+    headers: Vec<(String, String)>,
     bytes: Vec<u8>,
     tx: Sender<Msg>,
     stop: Arc<AtomicBool>,
@@ -151,7 +151,7 @@ impl Request {
                 .post(url)
                 .header("content-type", "application/json");
             for (k, v) in &self.headers {
-                req = req.header(*k, v);
+                req = req.header(k.as_str(), v.as_str());
             }
             let (status, retry_after, text) = match req.send(&self.bytes[..]) {
                 Ok(resp) if resp.status().is_success() => {

@@ -447,6 +447,14 @@ pub struct ProviderEntry {
     /// The provider's web search, when it serves one (D82). The `websearch` tool asks here before
     /// it looks for a key of its own, so a provider's own credential pays for its own search.
     pub search_url: Option<String>,
+    /// Headers sent with every request, for what a compatible server needs beyond the wire format:
+    /// OpenRouter's `HTTP-Referer` and `X-Title`, a gateway's routing header, an account id (D84).
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// The header the API key goes in, when it is not the one its `api` implies. A JSON body with
+    /// an `Authorization: Bearer` key is the norm; Azure wants `api-key` and no prefix, which is the
+    /// case this exists for (D84).
+    pub key_header: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -464,10 +472,18 @@ pub struct ProviderConfig {
     pub usage_url: Option<String>,
     /// Where to ask the web a question, when the provider searches on its own (D82).
     pub search_url: Option<String>,
+    /// Headers sent with every request (D84).
+    pub headers: BTreeMap<String, String>,
+    /// The header the key goes in, when it is not the default for this `api` (D84).
+    pub key_header: Option<String>,
 }
 
-/// Built-in providers. Anthropic's wire format stays available for providers defined in
-/// config.toml (`api = "anthropic"`), but there is no Anthropic preset.
+/// Built-in providers.
+///
+/// Two wire formats and one preset each, because those are the two that every other service is
+/// compatible with: `openai` speaks `/chat/completions` and `anthropic` speaks `/v1/messages`. Any
+/// other server — a gateway, a local model, a proxy — is a `[providers.<name>]` table with `api`
+/// set to whichever of the two it imitates (D84).
 fn presets() -> BTreeMap<&'static str, ProviderEntry> {
     let entry = |base: &str, key: &str| ProviderEntry {
         api: Some(Api::Openai),
@@ -491,6 +507,15 @@ fn presets() -> BTreeMap<&'static str, ProviderEntry> {
         (
             "openai",
             entry("https://api.openai.com/v1", "OPENAI_API_KEY"),
+        ),
+        (
+            // The Anthropic base carries no `/v1`: its client appends `/v1/messages`, which keeps a
+            // gateway's own prefix intact (D84).
+            "anthropic",
+            ProviderEntry {
+                api: Some(Api::Anthropic),
+                ..entry("https://api.anthropic.com", "ANTHROPIC_API_KEY")
+            },
         ),
     ])
 }
@@ -562,6 +587,11 @@ pub fn endpoint(name: &str, user: &BTreeMap<String, ProviderEntry>) -> Result<Pr
             }),
         usage_url: pick(|e| &e.usage_url).filter(|u| !u.is_empty()),
         search_url: pick(|e| &e.search_url).filter(|u| !u.is_empty()),
+        headers: mine
+            .map(|e| e.headers.clone())
+            .or_else(|| preset.map(|e| e.headers.clone()))
+            .unwrap_or_default(),
+        key_header: pick(|e| &e.key_header).filter(|h| !h.is_empty()),
     })
 }
 
@@ -610,6 +640,12 @@ pub fn catalog(user: &BTreeMap<String, ProviderEntry>) -> Vec<(String, ProviderE
             pricing: m.pricing.clone().or(base.pricing),
             usage_url: m.usage_url.clone().or(base.usage_url),
             search_url: m.search_url.clone().or(base.search_url),
+            headers: if m.headers.is_empty() {
+                base.headers
+            } else {
+                m.headers.clone()
+            },
+            key_header: m.key_header.clone().or(base.key_header),
         }
     };
     let mut out: Vec<(String, ProviderEntry)> = presets
@@ -739,6 +775,44 @@ pub struct Stated {
 }
 
 /// The key a provider would use: its environment variable, else the stored key.
+/// The headers one request carries: the key where this provider says it goes, then the provider's
+/// own (D84).
+///
+/// One function, used by both wire formats, because this is the part that makes a compatible server
+/// usable — a gateway that wants `api-key` rather than a bearer token, an OpenRouter that wants its
+/// own attribution header — and two copies of it would drift the moment one gained a case.
+///
+/// The prefix is decided by the header, not by the wire format: a key in `authorization` is a bearer
+/// token, which is what every OAuth token here is too, and a key in a header the server named is
+/// sent as it is. That is what Azure's `api-key` needs.
+pub fn request_headers(config: &ProviderConfig, key: Option<&str>) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    let default = match config.api {
+        Api::Anthropic => "x-api-key",
+        Api::Openai => "authorization",
+    };
+    let name = config
+        .key_header
+        .as_deref()
+        .filter(|h| !h.is_empty())
+        .unwrap_or(default);
+    if let Some(key) = key.filter(|k| !k.trim().is_empty()) {
+        let value = if name.eq_ignore_ascii_case("authorization") {
+            format!("Bearer {key}")
+        } else {
+            key.to_owned()
+        };
+        headers.push((name.to_owned(), value));
+    }
+    for (name, value) in &config.headers {
+        // A header the config sets explicitly replaces the one derived above, so a provider can
+        // override even the key's own header without a second mechanism.
+        headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+        headers.push((name.clone(), value.clone()));
+    }
+    headers
+}
+
 pub fn available_key(config: &ProviderConfig, stored_key: Option<&str>) -> Option<String> {
     config
         .api_key_env
@@ -871,6 +945,11 @@ impl Provider {
     }
 
     /// Why requests would fail for want of a key, if they would.
+    /// The key this provider sends, when it has one.
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+
     pub fn missing_key(&self) -> Option<String> {
         match (&self.key, &self.config.api_key_env) {
             (None, Some(var)) => Some(format!(
@@ -923,14 +1002,19 @@ model = "qwen"
 
         let e = resolve("openai", &user, None).unwrap_err().to_string();
         assert!(e.contains("--model"), "{e}");
-        let e = resolve("anthropic", &user, None).unwrap_err().to_string();
-        assert!(e.contains("[providers.anthropic]"), "{e}");
+        // `anthropic` used to be the example of an unknown provider, because there was no preset
+        // for it; it is a preset now (D84), so the unknown name is one that really is unknown.
+        let e = resolve("nonesuch", &user, None).unwrap_err().to_string();
+        assert!(e.contains("[providers.nonesuch]"), "{e}");
 
-        assert_eq!(builtin_names(), ["openai", "synthetic"]);
+        assert_eq!(builtin_names(), ["anthropic", "openai", "synthetic"]);
         let names: Vec<String> = catalog(&user).into_iter().map(|(n, _)| n).collect();
-        assert_eq!(names, ["openai", "synthetic", "local"]);
+        assert_eq!(names, ["anthropic", "openai", "synthetic", "local"]);
         let secrets = secret_env_names(&user);
-        assert_eq!(secrets, ["OPENAI_API_KEY", "SYNTHETIC_API_KEY"]);
+        assert_eq!(
+            secrets,
+            ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SYNTHETIC_API_KEY"]
+        );
     }
 
     fn config(model: &str, base_url: &str) -> ProviderConfig {
@@ -945,7 +1029,105 @@ model = "qwen"
             price: None,
             usage_url: None,
             search_url: None,
+            headers: BTreeMap::new(),
+            key_header: None,
         }
+    }
+
+    #[test]
+    fn a_provider_says_where_its_key_and_its_own_headers_go() {
+        // D84: what makes a third-party compatible server usable. The prefix comes from the header,
+        // not from the wire format, because `api-key: <token>` is Azure and `authorization` is
+        // everyone else.
+        let mut headers = BTreeMap::new();
+        headers.insert("HTTP-Referer".to_owned(), "https://example.test".to_owned());
+        headers.insert("X-Title".to_owned(), "saddle".to_owned());
+        let cfg = ProviderConfig {
+            headers: headers.clone(),
+            ..config("m", "https://gateway.test/v1")
+        };
+        let sent = request_headers(&cfg, Some("sk-1"));
+        assert!(sent.contains(&("authorization".to_owned(), "Bearer sk-1".to_owned())));
+        assert!(sent.contains(&("HTTP-Referer".to_owned(), "https://example.test".to_owned())));
+        assert!(sent.contains(&("X-Title".to_owned(), "saddle".to_owned())));
+
+        // Azure: the key in `api-key`, sent raw, and no bearer prefix anywhere.
+        let cfg = ProviderConfig {
+            key_header: Some("api-key".to_owned()),
+            ..config("m", "https://x.test/v1")
+        };
+        let sent = request_headers(&cfg, Some("secret"));
+        assert_eq!(sent, vec![("api-key".to_owned(), "secret".to_owned())]);
+
+        // An Anthropic-shaped server gets the key where Anthropic wants it unless told otherwise.
+        let cfg = ProviderConfig {
+            api: Api::Anthropic,
+            ..config("m", "https://x.test")
+        };
+        assert_eq!(
+            request_headers(&cfg, Some("k")),
+            vec![("x-api-key".to_owned(), "k".to_owned())]
+        );
+
+        // A local server that takes no key sends none.
+        assert!(request_headers(&config("m", "http://localhost:8080"), None).is_empty());
+
+        // A configured header wins over the derived one rather than being sent twice.
+        let mut headers = BTreeMap::new();
+        headers.insert("authorization".to_owned(), "Bearer own".to_owned());
+        let cfg = ProviderConfig {
+            headers,
+            ..config("m", "https://x.test/v1")
+        };
+        let sent = request_headers(&cfg, Some("sk-1"));
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, "Bearer own");
+    }
+
+    #[test]
+    fn a_third_party_provider_is_just_a_table() {
+        // The whole of "generic support": `api` picks the wire format, and everything else is a
+        // field. No code, no preset (D84).
+        let user: BTreeMap<String, ProviderEntry> = [
+            (
+                "gateway".to_owned(),
+                ProviderEntry {
+                    api: Some(Api::Openai),
+                    base_url: Some("https://gateway.test/v1".into()),
+                    api_key_env: Some("GATEWAY_KEY".into()),
+                    model: Some("m1".into()),
+                    headers: [("X-Title".to_owned(), "saddle".to_owned())]
+                        .into_iter()
+                        .collect(),
+                    ..ProviderEntry::default()
+                },
+            ),
+            (
+                "claude-proxy".to_owned(),
+                ProviderEntry {
+                    api: Some(Api::Anthropic),
+                    base_url: Some("https://proxy.test".into()),
+                    api_key_env: Some("PROXY_KEY".into()),
+                    model: Some("c1".into()),
+                    ..ProviderEntry::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let gateway = resolve("gateway", &user, None).unwrap();
+        assert_eq!(gateway.api, Api::Openai);
+        assert_eq!(gateway.base_url, "https://gateway.test/v1");
+        assert_eq!(gateway.headers.len(), 1);
+        let proxy = resolve("claude-proxy", &user, None).unwrap();
+        assert_eq!(proxy.api, Api::Anthropic);
+        // The presets are still there beside them, and `anthropic` is now one of them.
+        let names = builtin_names();
+        assert!(names.iter().any(|n| n == "anthropic"), "{names:?}");
+        let official = endpoint("anthropic", &BTreeMap::new()).unwrap();
+        assert_eq!(official.api, Api::Anthropic);
+        assert_eq!(official.base_url, "https://api.anthropic.com");
+        assert_eq!(official.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
     }
 
     #[test]

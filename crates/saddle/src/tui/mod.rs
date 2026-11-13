@@ -988,6 +988,8 @@ impl Controller {
                 price: None,
                 usage_url: None,
                 search_url: None,
+                headers: Default::default(),
+                key_header: None,
             },
             None => {
                 let user = UserConfig::load(&self.paths.user_config())?;

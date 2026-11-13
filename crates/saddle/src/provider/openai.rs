@@ -13,10 +13,7 @@ use super::{Cancelled, SUMMARY_INTRO, sse};
 
 pub fn complete(p: &Provider, conv: &Conversation<'_>, sink: &mut dyn Sink) -> Result<Reply> {
     let url = format!("{}/chat/completions", p.config.base_url);
-    let mut headers = Vec::new();
-    if let Some(key) = &p.key {
-        headers.push(("authorization", format!("Bearer {key}")));
-    }
+    let headers = super::request_headers(&p.config, p.key());
     let events = http::stream(p, url, headers, &body(&p.config, conv))?;
     read_stream(events, sink)
 }

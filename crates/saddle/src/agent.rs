@@ -1749,6 +1749,8 @@ mod tests {
                 price: None,
                 usage_url: None,
                 search_url: None,
+                headers: Default::default(),
+                key_header: None,
             },
             Some("key"),
             &crate::provider::Reported::default(),

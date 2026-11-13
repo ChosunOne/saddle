@@ -1942,6 +1942,39 @@ of three prose columns is wider than 80 columns by nature.
   alignment from the markdown (`:---:` is still ignored), and collapsing a table that cannot be made
   readable at the width it has into a list.
 
+**D84.** A compatible server is a table, not a code path.
+
+Two wire formats are understood — OpenAI's `/chat/completions` and Anthropic's `/v1/messages` — and
+they are the two that other services imitate. Anything else is a `[providers.<name>]` table naming
+which of the two it imitates, plus the fields that make the difference: a base URL, a model, the
+environment variable holding its key, and now the headers and the key's own header name.
+
+- **`api` chooses the format and nothing else does.** `openai` and `anthropic` are the two values;
+  the preset of each name is the official endpoint, so `[providers.openai]` narrows or re-points a
+  preset instead of replacing the notion of one.
+- **`key-header` exists because the prefix follows the header, not the wire format.** A key in
+  `authorization` is a bearer token; a key in a header the server named is sent raw, which is what
+  Azure's `api-key` wants. Without it, an OpenAI-compatible gateway that authenticates with
+  `api-key` could not be configured at all — and the failure would look like a wrong key.
+- **`headers` is for what the wire format does not cover**: OpenRouter's `HTTP-Referer` and
+  `X-Title`, a gateway's routing or account header. A header set here replaces the derived one of the
+  same name rather than being sent twice, so `authorization` itself can be overridden without a
+  second mechanism.
+- **One function builds the headers for both formats** (`request_headers`). This is the part a
+  third-party server actually depends on, and two copies would drift the moment one gained a case.
+- **The Anthropic preset now exists.** It did not, and `anthropic` was used in a test as the example
+  of an *unknown* provider — the same absence stated twice. Its base URL carries no `/v1`, because
+  its client appends `/v1/messages`, which keeps a gateway's own prefix intact; OpenAI's base does
+  carry `/v1`, because its client appends only `/chat/completions`. The asymmetry is the two
+  projects' own convention and is left as it is.
+- **Verified against a real server, not a mock.** A provider defined only in `config.toml`, pointing
+  at a compatible endpoint with an extra header, completes a turn; moving the key to a header the
+  server does not check makes that server answer `401 Authorization header required`, which is the
+  proof the key went where the config said.
+- **Deferred:** per-provider query parameters (Azure's `api-version`), a headers table that can
+  reference an environment variable for a second secret, and `api = "openai-responses"`, which
+  belongs with the OAuth work because the one endpoint that requires it is the one OAuth reaches.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

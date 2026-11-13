@@ -25,12 +25,10 @@ fn official(cfg: &ProviderConfig) -> bool {
 
 pub fn complete(p: &Provider, conv: &Conversation<'_>, sink: &mut dyn Sink) -> Result<Reply> {
     let url = format!("{}/v1/messages", p.config.base_url);
-    let mut headers = vec![("anthropic-version", VERSION.to_owned())];
-    if let Some(key) = &p.key {
-        headers.push(("x-api-key", key.clone()));
-    }
+    let mut headers = vec![("anthropic-version".to_owned(), VERSION.to_owned())];
+    headers.extend(super::request_headers(&p.config, p.key()));
     if official(&p.config) {
-        headers.push(("anthropic-beta", FALLBACK_BETA.to_owned()));
+        headers.push(("anthropic-beta".to_owned(), FALLBACK_BETA.to_owned()));
     }
     let events = http::stream(p, url, headers, &body(&p.config, conv))?;
     read_stream(events, sink)
@@ -711,6 +709,8 @@ mod tests {
             price: None,
             usage_url: None,
             search_url: None,
+            headers: Default::default(),
+            key_header: None,
         };
         let tools = [crate::provider::ToolDef {
             name: "read",
