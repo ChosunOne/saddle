@@ -352,7 +352,7 @@ fn message_of(error: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{ProviderConfig, ToolResult};
+    use crate::provider::{Auth, ProviderConfig, ToolDef, ToolResult};
 
     struct Script(Vec<(&'static str, &'static str)>);
 
@@ -391,7 +391,7 @@ mod tests {
             search_url: None,
             headers: Default::default(),
             key_header: None,
-            auth: crate::provider::Auth::ApiKey,
+            auth: Auth::ApiKey,
             oauth: None,
         }
     }
@@ -440,7 +440,7 @@ mod tests {
         assert_eq!(sent[3]["output"], "the file");
         // No tools means no `tools` key, and a tool has its own shape here.
         assert!(sent_body.get("tools").is_none());
-        let tools = vec![crate::provider::ToolDef {
+        let tools = vec![ToolDef {
             name: "read",
             description: "reads",
             schema: json!({ "type": "object" }),

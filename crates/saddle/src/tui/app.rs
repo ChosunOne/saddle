@@ -16,10 +16,14 @@ use super::sessions::{PickOutcome, SessionPicker};
 use super::settings::{Change, SettingsDialog, SettingsOutcome};
 use crate::agent::call_detail;
 use crate::agent::{End, Resumed};
+use crate::compact::Event as CompactEvent;
 use crate::provider::ModelsError;
 use crate::provider::Usage;
 use crate::provider::{Item, Part};
 use crate::term::clean;
+use crate::tui::permissions::Outcome as PermissionOutcome;
+use crate::tui::themes::Outcome as ThemeOutcome;
+use crate::tui::tree::TreeOutcome;
 
 /// Sent by the agent thread.
 #[derive(Debug, Clone, PartialEq)]
@@ -645,14 +649,13 @@ impl App {
             || self.themes.is_some()
     }
 
-    fn compaction(&mut self, event: crate::compact::Event) {
-        use crate::compact::Event;
+    fn compaction(&mut self, event: CompactEvent) {
         let current = self
             .entries
             .iter()
             .rposition(|e| matches!(e, Entry::Compaction(v) if v.state == CompactState::Running));
         match event {
-            Event::Started {
+            CompactEvent::Started {
                 reason,
                 tokens,
                 window,
@@ -677,7 +680,7 @@ impl App {
                     self.busy = Some(Activity::Compacting);
                 }
             }
-            Event::Reasoning(s) => {
+            CompactEvent::Reasoning(s) => {
                 if let Some(i) = current
                     && let Entry::Compaction(v) = &mut self.entries[i]
                 {
@@ -685,7 +688,7 @@ impl App {
                     self.cache[i] = None;
                 }
             }
-            Event::Text(s) => {
+            CompactEvent::Text(s) => {
                 if let Some(i) = current
                     && let Entry::Compaction(v) = &mut self.entries[i]
                 {
@@ -693,7 +696,7 @@ impl App {
                     self.cache[i] = None;
                 }
             }
-            Event::Done {
+            CompactEvent::Done {
                 summarized,
                 kept,
                 before,
@@ -716,7 +719,7 @@ impl App {
                     self.busy = Some(Activity::Waiting);
                 }
             }
-            Event::Failed(why) => {
+            CompactEvent::Failed(why) => {
                 if let Some(i) = current
                     && let Entry::Compaction(v) = &mut self.entries[i]
                 {
@@ -1005,12 +1008,12 @@ impl App {
         }
         if let Some(tree) = &mut self.tree {
             return match tree.key(key) {
-                crate::tui::tree::TreeOutcome::Stay => None,
-                crate::tui::tree::TreeOutcome::Close => {
+                TreeOutcome::Stay => None,
+                TreeOutcome::Close => {
                     self.tree = None;
                     None
                 }
-                crate::tui::tree::TreeOutcome::Select { rewind_to, text } => {
+                TreeOutcome::Select { rewind_to, text } => {
                     self.tree = None;
                     // The prompt goes back into the editor, ready to be changed and sent again.
                     if let Some(text) = text {
@@ -1018,7 +1021,7 @@ impl App {
                     }
                     Some(Action::Rewind(rewind_to))
                 }
-                crate::tui::tree::TreeOutcome::Copy(text) => Some(Action::Copy(text, "the branch")),
+                TreeOutcome::Copy(text) => Some(Action::Copy(text, "the branch")),
             };
         }
         if let Some(picker) = &mut self.resume {
@@ -1199,15 +1202,14 @@ impl App {
     /// Moving the highlight previews, enter keeps and saves, escape puts back the theme that was in
     /// force — and the name in the status line goes back with it.
     pub fn themes_key(&mut self, key: KeyEvent) -> Option<Action> {
-        use crate::tui::themes::Outcome;
         let before = self.theme_before.clone();
         let outcome = self.themes.as_mut()?.key(key);
         match outcome {
-            Outcome::Stay => {
+            ThemeOutcome::Stay => {
                 self.preview_theme();
                 None
             }
-            Outcome::Cancel => {
+            ThemeOutcome::Cancel => {
                 // Both what is drawn and the name the status line shows come back from what the
                 // app had, not from what the list was told: a picker that opened on the wrong
                 // entry must not be able to make escape change the theme (D74).
@@ -1219,7 +1221,7 @@ impl App {
                 self.theme_before = None;
                 None
             }
-            Outcome::Choose(name) => {
+            ThemeOutcome::Choose(name) => {
                 self.preview_theme();
                 self.themes = None;
                 self.theme_before = None;
@@ -1231,15 +1233,14 @@ impl App {
     /// The permissions editor, while it is open: it takes every key, and a change it asks for is
     /// carried out by the controller (D45).
     pub fn permissions_key(&mut self, key: KeyEvent) -> Option<Action> {
-        use crate::tui::permissions::Outcome;
         let dialog = self.permissions.as_mut()?;
         match dialog.key(key) {
-            Outcome::Stay => None,
-            Outcome::Close => {
+            PermissionOutcome::Stay => None,
+            PermissionOutcome::Close => {
                 self.permissions = None;
                 None
             }
-            Outcome::Apply(change) => Some(Action::Grant(change)),
+            PermissionOutcome::Apply(change) => Some(Action::Grant(change)),
         }
     }
 
@@ -1925,6 +1926,8 @@ fn display(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{Api, ToolCall, ToolResult};
+    use crate::tui::login::{Choice, Login, Outcome as LoginOutcome};
 
     fn app() -> App {
         App::new(Header {
@@ -1958,7 +1961,7 @@ mod tests {
         // D86: a note goes into the transcript, and a dialog covers it, so the reason a click did
         // nothing was unreachable exactly when it was needed.
         let mut app = app();
-        let choice = crate::tui::login::Choice {
+        let choice = Choice {
             name: "openai-chatgpt".into(),
             detail: String::new(),
             status: "not signed in".into(),
@@ -1968,14 +1971,14 @@ mod tests {
             custom: false,
             oauth: true,
         };
-        let mut login = crate::tui::login::Login::new(
+        let mut login = Login::new(
             vec![choice],
             vec![],
             Some("openai-chatgpt"),
             true,
             "auth.json".into(),
         );
-        let Some(crate::tui::login::Outcome::SignIn(id, _)) = login.take_pending() else {
+        let Some(LoginOutcome::SignIn(id, _)) = login.take_pending() else {
             panic!("a sign-in to start");
         };
         login.device_code(id, Ok(("https://auth.test/device".into(), "AB12".into())));
@@ -2001,7 +2004,7 @@ mod tests {
         // can be selected, so it is put where the paste comes from. An answer for an attempt that is
         // no longer on screen is not copied: it belongs to a sign-in nobody is looking at.
         let mut app = app();
-        let choice = crate::tui::login::Choice {
+        let choice = Choice {
             name: "openai-chatgpt".into(),
             detail: String::new(),
             status: "not signed in".into(),
@@ -2011,14 +2014,14 @@ mod tests {
             custom: false,
             oauth: true,
         };
-        let mut login = crate::tui::login::Login::new(
+        let mut login = Login::new(
             vec![choice],
             vec![],
             Some("openai-chatgpt"),
             true,
             "auth.json".into(),
         );
-        let Some(crate::tui::login::Outcome::SignIn(id, _)) = login.take_pending() else {
+        let Some(LoginOutcome::SignIn(id, _)) = login.take_pending() else {
             panic!("a sign-in to start");
         };
         app.open_login(login);
@@ -2554,7 +2557,6 @@ mod tests {
 
     #[test]
     fn a_resumed_session_is_redrawn_from_its_items() {
-        use crate::provider::{Api, ToolCall, ToolResult};
         let items = vec![
             Item::User("fix it".into()),
             Item::Assistant(vec![

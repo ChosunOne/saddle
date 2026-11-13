@@ -17,10 +17,14 @@ pub use http::{ModelsError, fetch_usage, list_models, page_paths, quota_from_pag
 pub use oauth::Tokens;
 pub use reported::Reported;
 
+use crate::auth::AuthStore;
+
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -209,13 +213,11 @@ fn sniff(d: &[u8]) -> Option<(&'static str, u32, u32)> {
 
 /// Standard base64 with padding, which is what both APIs take.
 pub fn base64_encode(bytes: &[u8]) -> String {
-    use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// The bytes back, or `None` if the string is not base64.
 pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.decode(text).ok()
 }
 
@@ -913,8 +915,8 @@ pub struct SearchTarget {
 #[derive(Clone)]
 pub struct OAuthState {
     pub flow: oauth::Flow,
-    pub tokens: std::sync::Arc<std::sync::Mutex<Tokens>>,
-    pub store: std::path::PathBuf,
+    pub tokens: Arc<Mutex<Tokens>>,
+    pub store: PathBuf,
     pub provider: String,
 }
 
@@ -1039,14 +1041,14 @@ impl Provider {
     ///
     /// A provider built without this says so in `missing_key`, which is the honest answer: the
     /// tokens exist but this process was not told where to find them.
-    pub fn with_stored_oauth(mut self, store: &std::path::Path) -> Self {
+    pub fn with_stored_oauth(mut self, store: &Path) -> Self {
         let Some(flow) = self.config.oauth.clone() else {
             return self;
         };
         if self.config.auth != Auth::Oauth {
             return self;
         }
-        if let Ok(auth) = crate::auth::AuthStore::load(store)
+        if let Ok(auth) = AuthStore::load(store)
             && let Some(tokens) = auth.oauth(&self.name).cloned()
         {
             self.with_oauth(flow, tokens, store.to_path_buf());
@@ -1055,10 +1057,10 @@ impl Provider {
     }
 
     /// Attaches the OAuth tokens a login stored, so this provider can use and refresh them (D85).
-    pub fn with_oauth(&mut self, flow: oauth::Flow, tokens: Tokens, store: std::path::PathBuf) {
+    pub fn with_oauth(&mut self, flow: oauth::Flow, tokens: Tokens, store: PathBuf) {
         self.oauth = Some(OAuthState {
             flow,
-            tokens: std::sync::Arc::new(std::sync::Mutex::new(tokens)),
+            tokens: Arc::new(Mutex::new(tokens)),
             store,
             provider: self.name.clone(),
         });
@@ -1114,7 +1116,7 @@ impl Provider {
                 oauth.provider, oauth.provider
             )
         })?;
-        if let Ok(mut store) = crate::auth::AuthStore::load(&oauth.store) {
+        if let Ok(mut store) = AuthStore::load(&oauth.store) {
             store.set_oauth(&oauth.provider, fresh.clone());
             let _ = store.save(&oauth.store);
         }

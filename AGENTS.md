@@ -215,6 +215,13 @@ nearly every module header names the ones it implements, for example:
 
 ## Conventions the code follows
 
+- Imports go at the top of the file, and nothing is written inline. Writing `use std::fs;`
+  inside a function, or `crate::tui::login::Purpose::Model` in the middle of an expression, is what
+  this line forbids: the module gets one import block, and a name used below it is spelled plainly.
+  Where two modules bring in the same name, both are imported with an alias that says which is
+  which (`Row as PermissionRow`), rather than one of them being qualified where it is used. A test
+  module's imports belong at the top of that module. `#[cfg(test)]` on an import is how a
+  test-only name stays out of the binary.
 - Doc comments are lowercase sentences and explain intent, not mechanics. `//!` opens a module with
   its purpose and its decision numbers; `///` covers public items.
 - `anyhow` with `bail!`/`Context` in the `saddle` binary crate; typed `thiserror` errors in the

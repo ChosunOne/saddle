@@ -917,6 +917,8 @@ fn error_message(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::responses::CLIENT_VERSION;
+    use super::super::{Api, Auth, ProviderConfig};
     use super::*;
 
     #[test]
@@ -1231,8 +1233,8 @@ mod tests {
     fn the_listing_url_is_the_one_the_backend_serves() {
         // D85: the route is `/codex/models` and it *requires* the version, so both halves matter
         // and both were wrong at some point.
-        let mut config = super::super::ProviderConfig {
-            api: super::super::Api::OpenaiResponses,
+        let mut config = ProviderConfig {
+            api: Api::OpenaiResponses,
             base_url: "https://chatgpt.com/backend-api/codex".into(),
             model: "m".into(),
             api_key_env: None,
@@ -1244,14 +1246,14 @@ mod tests {
             search_url: None,
             headers: Default::default(),
             key_header: None,
-            auth: super::super::Auth::ApiKey,
+            auth: Auth::ApiKey,
             oauth: None,
         };
         assert_eq!(
             listing_url(&config),
             format!(
                 "https://chatgpt.com/backend-api/codex/models?client_version={}",
-                super::super::responses::CLIENT_VERSION
+                CLIENT_VERSION
             )
         );
         // The trailing slash a user's base URL may carry is not part of the route.
@@ -1262,7 +1264,7 @@ mod tests {
             listing_url(&config)
         );
         // A compatible server keeps its own, plain listing.
-        config.api = super::super::Api::Openai;
+        config.api = Api::Openai;
         assert_eq!(
             listing_url(&config),
             "https://chatgpt.com/backend-api/codex/models"
@@ -1296,28 +1298,20 @@ mod tests {
     fn an_empty_served_catalogue_names_the_client_version() {
         // The backend gates its list on `client_version` and answers an empty list, not an error, so
         // silence there has a cause and the message has to say which version was asked with (D85).
-        let ModelsError::Failed(why) =
-            served(Vec::new(), super::super::Api::OpenaiResponses).unwrap_err()
-        else {
+        let ModelsError::Failed(why) = served(Vec::new(), Api::OpenaiResponses).unwrap_err() else {
             panic!("an empty catalogue is a failure with a reason");
         };
-        assert!(
-            why.contains(super::super::responses::CLIENT_VERSION),
-            "{why}"
-        );
+        assert!(why.contains(CLIENT_VERSION), "{why}");
         assert!(why.contains("too old"), "{why}");
         // A server that simply has no models is not that case, and says nothing.
-        assert_eq!(
-            served(Vec::new(), super::super::Api::Openai).unwrap(),
-            vec![]
-        );
+        assert_eq!(served(Vec::new(), Api::Openai).unwrap(), vec![]);
     }
 
     #[test]
     fn the_reported_client_version_is_a_current_one() {
         // D85: the catalogue is gated on this, and an old value silently returns fewer models, so it
         // has to be a plain Codex CLI version and not something that predates the gate.
-        let v = super::super::responses::CLIENT_VERSION;
+        let v = CLIENT_VERSION;
         let parts: Vec<&str> = v.split('.').collect();
         assert_eq!(parts.len(), 3, "{v}");
         assert!(parts.iter().all(|p| p.parse::<u32>().is_ok()), "{v}");

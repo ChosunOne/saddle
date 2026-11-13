@@ -9,12 +9,15 @@
 //! metadata address are refused unless the grant named that address itself, and ureq is given the
 //! addresses that were checked rather than the name, so DNS rebinding cannot swap one underneath.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
 use anyhow::Result;
 use saddle_cap::Principal;
 use saddle_policy::Request;
 use serde_json::Value;
+
+#[cfg(test)]
+use serde_json::json;
 use ureq::http::Uri;
 use ureq::unversioned::resolver::{ArrayVec, DefaultResolver, ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
@@ -400,8 +403,7 @@ pub(crate) fn private(ip: IpAddr) -> Option<&'static str> {
 
 /// Checks where a name resolves before a request is built, so a refusal can say why (D28).
 fn resolve_public(host: &str, port: u16) -> Result<(), String> {
-    use std::net::ToSocketAddrs;
-    let addrs: Vec<std::net::SocketAddr> = (host, port)
+    let addrs: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("{host} did not resolve: {e}"))?
         .collect();
@@ -470,7 +472,6 @@ impl Resolver for Checked {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn a_url_becomes_the_parts_a_grant_matches() {
@@ -554,7 +555,7 @@ mod tests {
 
     #[test]
     fn headers_are_checked_and_a_value_is_carried_but_a_host_cannot_be() {
-        let parse = |v: serde_json::Value| headers_field(&v);
+        let parse = |v: Value| headers_field(&v);
         // A key goes in a header, and it is carried as written.
         let headers = parse(json!({"headers": {"authorization": "Bearer sk-1"}})).unwrap();
         assert_eq!(

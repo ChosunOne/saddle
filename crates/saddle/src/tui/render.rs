@@ -11,14 +11,23 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::app::{
     Activity, App, COPY_NOTE, Cached, CompactState, CompactionView, Entry, NoteKind, Placed, Seen,
 };
-use super::login::{Login, MODEL_ROWS, Stage, matching};
+use super::login::{Login, MODEL_ROWS, Purpose, Stage, matching};
 use super::permissions::{ADD_HELP, Kind, Permissions};
 use super::sessions::{ROWS as SESSION_ROWS, SessionPicker, age};
 use super::settings::{ROWS, SettingsDialog};
+use super::themes::{ROWS as THEME_ROWS, ThemePicker};
 use super::tree::{ROWS as TREE_ROWS, Tree};
-use crate::tui::status::StatusData;
+use crate::tui::image;
+#[cfg(test)]
+use crate::tui::plan_images;
+use crate::tui::status::{Field, StatusData};
 use crate::tui::syntax::{self, Language, State};
 use crate::tui::theme::Theme;
+
+#[cfg(test)]
+use super::app::Action;
+#[cfg(test)]
+use super::login::{Choice, Outcome};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Output lines a collapsed tool block shows.
@@ -809,17 +818,14 @@ fn entry_rows(entry: &Entry, view: View, theme: &Theme) -> Vec<Row> {
             // The picture is drawn over the rows after this one, so they are left empty for it. The
             // marker line stays, and is all a terminal without a graphics protocol shows (D59).
             let mut out: Vec<Row> = vec![Row::plain(vec![Span::styled(
-                crate::tui::image::fallback(&image.name, image.width, image.height),
+                image::fallback(&image.name, image.width, image.height),
                 dim(theme),
             )])];
             if view.images {
                 // The rows the picture will cover, from its own size scaled into the transcript
                 // width: kitty draws it at its pixel size when it fits, and scaled when it does
                 // not (D59).
-                let fit = crate::tui::image::fit(
-                    (image.width, image.height),
-                    (view.room.0, crate::tui::image::MAX_ROWS),
-                );
+                let fit = image::fit((image.width, image.height), (view.room.0, image::MAX_ROWS));
                 out.extend(std::iter::repeat_n(
                     Row::plain(Vec::new()),
                     fit.rows as usize,
@@ -1151,8 +1157,8 @@ fn transcript_with_images(
                 expand: app.expand_tools,
                 thinking: app.show_thinking,
                 spinner: app.spinner,
-                room: (width, crate::tui::image::MAX_ROWS),
-                images: app.protocol != crate::tui::image::Protocol::Text,
+                room: (width, image::MAX_ROWS),
+                images: app.protocol != image::Protocol::Text,
             };
             let rendered: Vec<Line<'static>> = match &app.entries[i] {
                 Entry::Tool {
@@ -1406,11 +1412,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     });
     // The workspace is drawn on the left unless the template already places it, so a user who
     // moves it into the line does not see it twice (D36).
-    if !app
-        .header
-        .status
-        .contains(crate::tui::status::Field::Workspace)
-    {
+    if !app.header.status.contains(Field::Workspace) {
         let room = (status_area.width as usize).saturating_sub(right.width() + 2);
         let left = keep_tail(&home_relative(&app.header.workspace), room);
         frame.render_widget(
@@ -1570,10 +1572,10 @@ fn login_title(login: &Login) -> String {
     }
     // The picker names the model in force, so the list is read against something (D88).
     match (login.purpose(), c.model.as_deref()) {
-        (crate::tui::login::Purpose::Model, Some(model)) if !model.is_empty() => {
+        (Purpose::Model, Some(model)) if !model.is_empty() => {
             format!(" Model for {} · {model} ", c.name)
         }
-        (crate::tui::login::Purpose::Model, _) => format!(" Model for {} ", c.name),
+        (Purpose::Model, _) => format!(" Model for {} ", c.name),
         _ => format!(" Log in to {} ", c.name),
     }
 }
@@ -1701,7 +1703,7 @@ fn draw_login(
             login_title(login)
         }
         Stage::Checking { .. } => {
-            let picker = login.purpose() == crate::tui::login::Purpose::Model;
+            let picker = login.purpose() == Purpose::Model;
             let spin = SPINNER[spinner % SPINNER.len()];
             lines.push(Line::from(vec![
                 Span::styled(format!("{spin} "), Style::new().fg(theme.warning)),
@@ -1833,7 +1835,7 @@ fn draw_login(
                 )));
             }
             lines.push(Line::default());
-            let esc = if login.purpose() == crate::tui::login::Purpose::Model {
+            let esc = if login.purpose() == Purpose::Model {
                 "esc close"
             } else {
                 "esc back"
@@ -2114,13 +2116,7 @@ fn draw_settings(
 }
 
 /// `/theme`: every theme by name, the highlight previewed on the whole screen (D74).
-fn draw_themes(
-    frame: &mut Frame<'_>,
-    picker: &crate::tui::themes::ThemePicker,
-    area: Rect,
-    theme: &Theme,
-) -> Seen {
-    use crate::tui::themes::ROWS as THEME_ROWS;
+fn draw_themes(frame: &mut Frame<'_>, picker: &ThemePicker, area: Rect, theme: &Theme) -> Seen {
     let width = area.width.saturating_sub(4).min(72);
     let inner = width.saturating_sub(2) as usize;
     let accent = Style::new().fg(theme.accent);
@@ -2412,11 +2408,8 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     // rows is: the marker scrolling off the top does not take the picture with it (D59).
     let room = area.width.saturating_sub(4).max(8);
     for (line, image, id) in at {
-        let box_ = crate::tui::image::fit(
-            (image.width, image.height),
-            (room, crate::tui::image::MAX_ROWS),
-        );
-        if crate::tui::image::band(line, box_.rows, top, height).is_none() {
+        let box_ = image::fit((image.width, image.height), (room, image::MAX_ROWS));
+        if image::band(line, box_.rows, top, height).is_none() {
             continue;
         }
         placed.push(Placed {
@@ -2471,13 +2464,21 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 mod tests {
     use super::*;
     use crate::agent::End;
+    use crate::provider::Image;
+    use crate::store::{Point, PointKind, Summary};
     use crate::tui::app::{AgentEvent, Header};
-    use crate::tui::theme::Theme;
+    use crate::tui::permissions::{Kind, Permissions, Row as PermissionRow};
+    use crate::tui::settings::Values;
+    use crate::tui::theme::{Theme, ThemeTables};
+    use crate::tui::tree::Tree;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
 
-    fn img(name: &str, w: u32, h: u32) -> crate::provider::Image {
-        crate::provider::Image {
+    fn img(name: &str, w: u32, h: u32) -> Image {
+        Image {
             media_type: "image/png".into(),
             data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==".into(),
             name: name.into(),
@@ -2490,7 +2491,7 @@ mod tests {
     fn two_attached_pictures_are_both_placed() {
         // Two images in one conversation is the ordinary case for "@a.png @b.png" (D59).
         let mut app = bare_app();
-        app.protocol = crate::tui::image::Protocol::Kitty;
+        app.protocol = image::Protocol::Kitty;
         app.entries.push(Entry::User("look at these".into()));
         app.cache.push(None);
         app.entries.push(Entry::Image(img("one.png", 64, 64)));
@@ -2508,13 +2509,7 @@ mod tests {
         assert_ne!(app.images[0].id, app.images[1].id, "with different ids");
         // And the drawing pass plans both, on their own rows.
         let area = ratatui::layout::Rect::new(0, 0, 80, 40);
-        let (_, draw, _) = crate::tui::plan_images(
-            crate::tui::image::Protocol::Kitty,
-            &app.drawn,
-            &app.images,
-            area,
-            0,
-        );
+        let (_, draw, _) = plan_images(image::Protocol::Kitty, &app.drawn, &app.images, area, 0);
         assert_eq!(draw.len(), 2, "{draw:?}");
         assert_ne!(draw[0].0, draw[1].0, "on different rows: {draw:?}");
     }
@@ -2525,7 +2520,7 @@ mod tests {
         // scrolling the marker off the top made the picture disappear although nearly all of it was
         // still on screen. The marker is a caption, not the picture (D59).
         let mut app = bare_app();
-        app.protocol = crate::tui::image::Protocol::Kitty;
+        app.protocol = image::Protocol::Kitty;
         app.entries.push(Entry::User("look at this".into()));
         app.cache.push(None);
         app.entries.push(Entry::Image(img("shot.png", 64, 64)));
@@ -2562,8 +2557,8 @@ mod tests {
         let placed = &app.images[0];
         assert_eq!(placed.line, marker);
         // And the drawing pass crops it to the rows that are on screen, at the top of the area.
-        let (_, draw, after) = crate::tui::plan_images(
-            crate::tui::image::Protocol::Kitty,
+        let (_, draw, after) = plan_images(
+            image::Protocol::Kitty,
             &app.drawn,
             &app.images,
             seen.area,
@@ -3047,7 +3042,7 @@ mod tests {
     fn a_catppuccin_flavour_paints_the_screen() {
         // The palette has to reach the renderer, not just build (D76): the frame in Mocha's mauve,
         // its own text colour, and syntax in its own colours.
-        let tables = crate::tui::theme::ThemeTables::new();
+        let tables = ThemeTables::new();
         let mut app = bare_app();
         app.theme = crate::tui::theme::build("catppuccin-mocha", &tables).unwrap();
         app.entries.push(Entry::User("hello".into()));
@@ -3081,7 +3076,7 @@ mod tests {
         // only in a log. The dialog is drawn with the code the host reported, and with the error
         // where the code was when the sign-in fails.
         let mut app = bare_app();
-        let choice = |name: &str, oauth: bool| crate::tui::login::Choice {
+        let choice = |name: &str, oauth: bool| Choice {
             name: name.into(),
             detail: String::new(),
             status: if oauth {
@@ -3095,14 +3090,14 @@ mod tests {
             custom: false,
             oauth,
         };
-        let mut login = crate::tui::login::Login::new(
+        let mut login = Login::new(
             vec![choice("openai", false), choice("openai-chatgpt", true)],
             vec![],
             Some("openai-chatgpt"),
             true,
             "~/.local/state/saddle/auth.json".into(),
         );
-        let Some(crate::tui::login::Outcome::SignIn(id, _)) = login.take_pending() else {
+        let Some(Outcome::SignIn(id, _)) = login.take_pending() else {
             panic!("a sign-in to start");
         };
         app.open_login(login);
@@ -3151,29 +3146,26 @@ mod tests {
 
     #[test]
     fn a_drag_inside_a_dialog_copies_the_dialog_text() {
-        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         // D87: a dialog owns the screen while it is open, so a drag there means its text. Without
         // this the text was drawn and unselectable, which is what the sign-in screen made obvious.
         let mut app = bare_app();
-        app.settings = Some(crate::tui::settings::SettingsDialog::new(
-            crate::tui::settings::Values {
-                provider: "synthetic".into(),
-                model: "hf:zai-org/GLM-5.3".into(),
-                effort: None,
-                max_tokens: None,
-                context_window: None,
-                window: 128_000,
-                status: String::new(),
-                max_steps: None,
-                auto_compact: true,
-                idle_compact: true,
-                background_compact: true,
-                show_reasoning: true,
-                expand_tools: false,
-                config_path: "~/.config/saddle/config.toml".into(),
-                policy_path: "~/.config/saddle/config.toml".into(),
-            },
-        ));
+        app.settings = Some(SettingsDialog::new(Values {
+            provider: "synthetic".into(),
+            model: "hf:zai-org/GLM-5.3".into(),
+            effort: None,
+            max_tokens: None,
+            context_window: None,
+            window: 128_000,
+            status: String::new(),
+            max_steps: None,
+            auto_compact: true,
+            idle_compact: true,
+            background_compact: true,
+            show_reasoning: true,
+            expand_tools: false,
+            config_path: "~/.config/saddle/config.toml".into(),
+            policy_path: "~/.config/saddle/config.toml".into(),
+        }));
         let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let seen = app.dialog_seen.clone().expect("the dialog's text was kept");
@@ -3208,7 +3200,7 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         });
-        let Some(crate::tui::app::Action::Copy(text, what)) = copied else {
+        let Some(Action::Copy(text, what)) = copied else {
             panic!("a drag in the dialog must copy, got {copied:?}");
         };
         assert_eq!(what, "the selection");
@@ -3226,7 +3218,6 @@ mod tests {
 
     #[test]
     fn a_drag_in_a_dialog_highlights_nothing_in_the_transcript() {
-        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         // The transcript is shaded before the dialogs are drawn, and a dialog's selection records
         // line numbers in the dialog's own frame. Shading the transcript with them painted a second
         // highlight near the top of the screen, over unrelated text (D87).
@@ -3239,25 +3230,23 @@ mod tests {
                 .push(Entry::User(format!("transcript line {i}")));
             app.cache.push(None);
         }
-        app.settings = Some(crate::tui::settings::SettingsDialog::new(
-            crate::tui::settings::Values {
-                provider: "synthetic".into(),
-                model: "m".into(),
-                effort: None,
-                max_tokens: None,
-                context_window: None,
-                window: 1,
-                status: String::new(),
-                max_steps: None,
-                auto_compact: true,
-                idle_compact: true,
-                background_compact: true,
-                show_reasoning: true,
-                expand_tools: false,
-                config_path: "c".into(),
-                policy_path: "c".into(),
-            },
-        ));
+        app.settings = Some(SettingsDialog::new(Values {
+            provider: "synthetic".into(),
+            model: "m".into(),
+            effort: None,
+            max_tokens: None,
+            context_window: None,
+            window: 1,
+            status: String::new(),
+            max_steps: None,
+            auto_compact: true,
+            idle_compact: true,
+            background_compact: true,
+            show_reasoning: true,
+            expand_tools: false,
+            config_path: "c".into(),
+            policy_path: "c".into(),
+        }));
         let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let seen = app.dialog_seen.clone().unwrap();
@@ -3281,7 +3270,7 @@ mod tests {
         let mut outside = 0;
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                let inside = seen.area.contains(ratatui::layout::Position::new(x, y));
+                let inside = seen.area.contains(Position::new(x, y));
                 if !inside && buf[(x, y)].bg == highlight {
                     outside += 1;
                 }
@@ -3298,29 +3287,26 @@ mod tests {
 
     #[test]
     fn a_drag_past_a_dialog_stops_at_its_edge_and_closing_drops_it() {
-        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let mut app = bare_app();
         app.entries.push(Entry::User("a transcript line".into()));
         app.cache.push(None);
-        app.settings = Some(crate::tui::settings::SettingsDialog::new(
-            crate::tui::settings::Values {
-                provider: "synthetic".into(),
-                model: "m".into(),
-                effort: None,
-                max_tokens: None,
-                context_window: None,
-                window: 1,
-                status: String::new(),
-                max_steps: None,
-                auto_compact: true,
-                idle_compact: true,
-                background_compact: true,
-                show_reasoning: true,
-                expand_tools: false,
-                config_path: "c".into(),
-                policy_path: "c".into(),
-            },
-        ));
+        app.settings = Some(SettingsDialog::new(Values {
+            provider: "synthetic".into(),
+            model: "m".into(),
+            effort: None,
+            max_tokens: None,
+            context_window: None,
+            window: 1,
+            status: String::new(),
+            max_steps: None,
+            auto_compact: true,
+            idle_compact: true,
+            background_compact: true,
+            show_reasoning: true,
+            expand_tools: false,
+            config_path: "c".into(),
+            policy_path: "c".into(),
+        }));
         let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let seen = app.dialog_seen.clone().unwrap();
@@ -3372,25 +3358,23 @@ mod tests {
             app.selection.is_some(),
             "the transcript is selectable again"
         );
-        app.settings = Some(crate::tui::settings::SettingsDialog::new(
-            crate::tui::settings::Values {
-                provider: "synthetic".into(),
-                model: "m".into(),
-                effort: None,
-                max_tokens: None,
-                context_window: None,
-                window: 1,
-                status: String::new(),
-                max_steps: None,
-                auto_compact: true,
-                idle_compact: true,
-                background_compact: true,
-                show_reasoning: true,
-                expand_tools: false,
-                config_path: "c".into(),
-                policy_path: "c".into(),
-            },
-        ));
+        app.settings = Some(SettingsDialog::new(Values {
+            provider: "synthetic".into(),
+            model: "m".into(),
+            effort: None,
+            max_tokens: None,
+            context_window: None,
+            window: 1,
+            status: String::new(),
+            max_steps: None,
+            auto_compact: true,
+            idle_compact: true,
+            background_compact: true,
+            show_reasoning: true,
+            expand_tools: false,
+            config_path: "c".into(),
+            policy_path: "c".into(),
+        }));
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         assert_eq!(app.selection, None, "the old selection did not survive");
     }
@@ -3400,7 +3384,7 @@ mod tests {
         // D88: the point of the picker is that the name does not have to be known, so the screen has
         // to show the served list, the filter being typed, and which model is current.
         let mut app = bare_app();
-        let mut choice = crate::tui::login::Choice {
+        let mut choice = Choice {
             name: "synthetic".into(),
             detail: String::new(),
             status: "logged in".into(),
@@ -3411,9 +3395,8 @@ mod tests {
             oauth: false,
         };
         choice.model = Some("gpt-5.6-sol".into());
-        let mut login =
-            crate::tui::login::Login::for_model(vec![choice], "synthetic", "auth.json".into());
-        let Some(crate::tui::login::Outcome::Check(id, _)) = login.take_pending() else {
+        let mut login = Login::for_model(vec![choice], "synthetic", "auth.json".into());
+        let Some(Outcome::Check(id, _)) = login.take_pending() else {
             panic!("a listing to ask for");
         };
         login.models(
@@ -3445,7 +3428,7 @@ mod tests {
         // nothing was chosen.
         assert_eq!(
             app.login.as_ref().unwrap().stage,
-            crate::tui::login::Stage::Models {
+            Stage::Models {
                 models: vec![
                     "gpt-5.6-luna".into(),
                     "gpt-5.6-sol".into(),
@@ -3458,10 +3441,7 @@ mod tests {
         );
         // Typing narrows what is drawn.
         for c in "terra".chars() {
-            app.key(ratatui::crossterm::event::KeyEvent::new(
-                ratatui::crossterm::event::KeyCode::Char(c),
-                ratatui::crossterm::event::KeyModifiers::NONE,
-            ));
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let text = screen(&terminal);
@@ -3479,7 +3459,7 @@ mod tests {
         // the address has to be a target. What is checked here is that the cells the click lands on
         // are the cells the address was drawn in.
         let mut app = bare_app();
-        let choice = crate::tui::login::Choice {
+        let choice = Choice {
             name: "openai-chatgpt".into(),
             detail: String::new(),
             status: "not signed in".into(),
@@ -3489,14 +3469,14 @@ mod tests {
             custom: false,
             oauth: true,
         };
-        let mut login = crate::tui::login::Login::new(
+        let mut login = Login::new(
             vec![choice],
             vec![],
             Some("openai-chatgpt"),
             true,
             "auth.json".into(),
         );
-        let Some(crate::tui::login::Outcome::SignIn(id, _)) = login.take_pending() else {
+        let Some(Outcome::SignIn(id, _)) = login.take_pending() else {
             panic!("a sign-in to start");
         };
         app.open_login(login);
@@ -3526,7 +3506,6 @@ mod tests {
         let start = at.x + at.width - 1;
         assert_eq!(screen[(start, at.y)].symbol(), "e", "and ends with it");
         // Clicking it asks to open that address; clicking the code does not.
-        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let click = |column, row| MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column,
@@ -3566,7 +3545,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         let copied = app.mouse(up(at.x + 4, at.y));
-        let Some(crate::tui::app::Action::Copy(text, _)) = copied else {
+        let Some(Action::Copy(text, _)) = copied else {
             panic!("a drag on the link must select it, got {copied:?}");
         };
         assert!(text.starts_with("http"), "{text}");
@@ -3577,10 +3556,9 @@ mod tests {
         // D74: the point of the picker is that you see the choice before making it, so the box has
         // to be drawn in the highlighted theme and say which one that is.
         let mut app = bare_app();
-        let tables: crate::tui::theme::ThemeTables =
-            toml::from_str("[mine]\nborder = \"#ff0000\"\n").unwrap();
+        let tables: ThemeTables = toml::from_str("[mine]\nborder = \"#ff0000\"\n").unwrap();
         let name = app.theme.name.clone();
-        app.open_themes(crate::tui::themes::ThemePicker::collect(&tables, &name));
+        app.open_themes(ThemePicker::collect(&tables, &name));
         let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let text = screen(&terminal);
@@ -3594,10 +3572,7 @@ mod tests {
 
         // Moving to the config theme draws the box with its border colour, which is the preview.
         while app.themes.as_ref().unwrap().current().name != "mine" {
-            app.key(ratatui::crossterm::event::KeyEvent::new(
-                ratatui::crossterm::event::KeyCode::Down,
-                ratatui::crossterm::event::KeyModifiers::NONE,
-            ));
+            app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         assert_eq!(
             app.theme.border,
@@ -3741,22 +3716,21 @@ mod tests {
 
     #[test]
     fn the_permissions_editor_lists_what_the_project_grants() {
-        use crate::tui::permissions::{Permissions, Row};
         let mut app = bare_app();
         app.permissions = Some(Permissions::new(
             vec![
-                Row {
+                PermissionRow {
                     rule: "agent.fs-read[0]".into(),
-                    kind: crate::tui::permissions::Kind::FsRead,
+                    kind: Kind::FsRead,
                     root: "workspace".into(),
                     exclude: ".env*".into(),
                     on: true,
                     editable: true,
                     locked: None,
                 },
-                Row {
+                PermissionRow {
                     rule: "agent.exec".into(),
-                    kind: crate::tui::permissions::Kind::Exec,
+                    kind: Kind::Exec,
                     root: String::new(),
                     exclude: String::new(),
                     on: true,
@@ -3830,12 +3804,11 @@ mod tests {
         // The shipped themes must be usable, not just parseable: a theme with a role left out would
         // be a colour nobody chose.
         for name in crate::tui::theme::builtin_names() {
-            let theme = crate::tui::theme::build(name, &crate::tui::theme::ThemeTables::new())
+            let theme = crate::tui::theme::build(name, &ThemeTables::new())
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(theme.name, name);
         }
-        let light =
-            crate::tui::theme::build("light", &crate::tui::theme::ThemeTables::new()).unwrap();
+        let light = crate::tui::theme::build("light", &ThemeTables::new()).unwrap();
         let default = Theme::default();
         assert_ne!(light.accent, default.accent, "light is a different theme");
         assert_ne!(
@@ -3866,8 +3839,6 @@ mod tests {
 
     #[test]
     fn the_tree_draws_every_message_with_here_marked_and_other_branches_dimmed() {
-        use crate::store::{Point, PointKind};
-        use crate::tui::tree::Tree;
         let point = |node, kind, preview: &str, here, active| Point {
             node,
             parent: None,
@@ -3903,8 +3874,6 @@ mod tests {
 
     #[test]
     fn settings_and_resume_dialogs_draw() {
-        use crate::store::Summary;
-        use crate::tui::settings::Values;
         let mut app = bare_app();
         app.settings = Some(SettingsDialog::new(Values {
             provider: "synthetic".into(),

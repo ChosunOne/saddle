@@ -583,6 +583,43 @@ impl Login {
         Some((check, draft))
     }
 
+    /// The same screen, opened without a listing, saying why it could not be asked (D88).
+    ///
+    /// A picker must always appear: the alternative is a note in the transcript, which a dialog
+    /// covers, so the command looks like it did nothing at all.
+    pub fn for_model_unavailable(provider: &str, why: String, auth_path: String) -> Self {
+        let mut login = Self::unavailable(provider, why, auth_path);
+        login.purpose = Purpose::Model;
+        login
+    }
+
+    fn unavailable(provider: &str, why: String, auth_path: String) -> Self {
+        let choice = Choice {
+            name: provider.to_owned(),
+            detail: String::new(),
+            status: String::new(),
+            needs_key: false,
+            has_key: false,
+            model: None,
+            custom: false,
+            oauth: false,
+        };
+        let mut login = Self::new(vec![choice], Vec::new(), None, false, auth_path);
+        login.note_listing_failed(why);
+        login
+    }
+
+    /// Say on the list that it could not be fetched, keeping the screen a picker (D88).
+    pub fn note_listing_failed(&mut self, why: String) {
+        self.stage = Stage::Models {
+            models: Vec::new(),
+            filter: String::new(),
+            selected: 0,
+            note: Some(why),
+        };
+        self.error = None;
+    }
+
     /// The host's answer to [`Outcome::Check`]. Answers to an abandoned check are ignored.
     pub fn models(&mut self, id: u64, result: Result<Vec<String>, ModelsError>) {
         if self.stage != (Stage::Checking { id }) {
@@ -607,13 +644,20 @@ impl Login {
                 };
             }
             Err(ModelsError::Rejected(why)) => {
+                let why = format!("the key was rejected: {why}");
+                // A picker has no key field to send anyone back to, so the reason goes on the list
+                // and a name can still be typed (D88).
+                if self.fields.is_empty() {
+                    self.note_listing_failed(format!("{why}; type a model name"));
+                    return;
+                }
                 self.stage = Stage::Fill;
                 self.at = self
                     .fields
                     .iter()
                     .position(|f| f.kind == FieldKind::Key)
                     .unwrap_or(0);
-                self.error = Some(format!("the key was rejected: {why}"));
+                self.error = Some(why);
             }
             Err(ModelsError::Failed(why)) => {
                 self.stage = Stage::Models {
@@ -882,6 +926,53 @@ mod tests {
         assert_eq!(req.provider, "openai");
         assert_eq!(req.model, "gpt-5.5");
         assert_eq!(req.key, None);
+    }
+
+    #[test]
+    fn a_rejected_listing_leaves_the_picker_a_picker() {
+        // D88: a rejected listing sent a picker into the field stage, which it has no fields for —
+        // an empty box with nothing to type in. The reason belongs on the list, where a name can
+        // still be typed instead.
+        let mut l = Login::for_model(choices(), "openai", "auth.json".into());
+        let Some(Outcome::Check(id, _)) = l.take_pending() else {
+            panic!("a listing to ask for");
+        };
+        l.models(id, Err(ModelsError::Rejected("401 nope".into())));
+        let Stage::Models { note, models, .. } = &l.stage else {
+            panic!("still a picker, got {:?}", l.stage);
+        };
+        assert!(models.is_empty());
+        let note = note.as_deref().unwrap_or_default();
+        assert!(note.contains("rejected"), "{note}");
+        assert!(note.contains("type a model name"), "{note}");
+        // And a name typed there still works, which is the way out.
+        type_text(&mut l, "a-typed-model");
+        let Outcome::Submit(req) = press(&mut l, KeyCode::Enter) else {
+            panic!("expected a submission");
+        };
+        assert_eq!(req.model, "a-typed-model");
+    }
+
+    #[test]
+    fn a_picker_that_could_not_ask_what_is_served_says_so_on_the_list() {
+        // D88: the command must always open something. A note in the transcript is invisible while
+        // a dialog is what the person is waiting for, which reads as the command doing nothing.
+        let mut l = Login::for_model_unavailable(
+            "openai",
+            "config.toml: expected an equals".into(),
+            "auth.json".into(),
+        );
+        assert_eq!(l.purpose(), Purpose::Model);
+        assert_eq!(l.choice().name, "openai");
+        let Stage::Models { note, .. } = &l.stage else {
+            panic!("a picker, got {:?}", l.stage);
+        };
+        assert!(
+            note.as_deref()
+                .unwrap_or_default()
+                .contains("expected an equals")
+        );
+        assert_eq!(l.take_pending(), None, "nothing to ask for");
     }
 
     #[test]

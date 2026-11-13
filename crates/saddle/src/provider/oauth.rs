@@ -18,6 +18,8 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -641,10 +643,10 @@ fn wait_for_callback(
     state: &str,
     ask: &mut dyn FnMut(&str) -> Result<String>,
 ) -> Result<Callback> {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = mpsc::channel();
     let state_owned = state.to_owned();
     let from_browser = tx.clone();
-    std::thread::Builder::new()
+    thread::Builder::new()
         .name("saddle-oauth".into())
         .spawn(move || {
             let _ = from_browser.send(accept_one(listener, &state_owned));
@@ -851,7 +853,9 @@ pub fn headers(tokens: &Tokens) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Api, Auth, Provider, Reported, endpoint};
     use super::*;
+    use crate::auth::AuthStore;
 
     fn flow() -> Settings {
         Flow {
@@ -1045,7 +1049,7 @@ mod tests {
         // belongs to the server's own fixed callback, not to the browser flow's loopback, and
         // sending the wrong one answers `token_exchange_user_error` after the person has already
         // approved the code — the last step, with nothing to retry.
-        let flow = super::super::endpoint("openai-chatgpt", &Default::default())
+        let flow = endpoint("openai-chatgpt", &Default::default())
             .unwrap()
             .oauth
             .unwrap();
@@ -1097,7 +1101,7 @@ mod tests {
         // refreshing a token that is still good.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
-        let mut cred = crate::auth::AuthStore::load(&path).unwrap();
+        let mut cred = AuthStore::load(&path).unwrap();
         cred.set_oauth(
             "openai-chatgpt",
             Tokens {
@@ -1110,17 +1114,12 @@ mod tests {
         );
         cred.save(&path).unwrap();
 
-        let config = super::super::endpoint("openai-chatgpt", &Default::default()).unwrap();
-        assert_eq!(config.auth, super::super::Auth::Oauth);
-        assert_eq!(config.api, super::super::Api::OpenaiResponses);
+        let config = endpoint("openai-chatgpt", &Default::default()).unwrap();
+        assert_eq!(config.auth, Auth::Oauth);
+        assert_eq!(config.api, Api::OpenaiResponses);
         assert_eq!(config.base_url, OPENAI_API_BASE);
         // The preset needs no key: a missing key is not a failure for an OAuth provider.
-        let mut p = super::super::Provider::new(
-            "openai-chatgpt",
-            config,
-            None,
-            &super::super::Reported::default(),
-        );
+        let mut p = Provider::new("openai-chatgpt", config, None, &Reported::default());
         assert!(p.missing_key().is_some(), "not attached yet");
         p = p.with_stored_oauth(&path);
         assert!(p.missing_key().is_none(), "the stored login was not found");
@@ -1150,13 +1149,8 @@ mod tests {
             "an expired token must not be sent"
         );
         // And with no store to write to, a refresh failure names the command that fixes it.
-        let config = super::super::endpoint("openai-chatgpt", &Default::default()).unwrap();
-        let mut p = super::super::Provider::new(
-            "openai-chatgpt",
-            config,
-            None,
-            &super::super::Reported::default(),
-        );
+        let config = endpoint("openai-chatgpt", &Default::default()).unwrap();
+        let mut p = Provider::new("openai-chatgpt", config, None, &Reported::default());
         p.with_oauth(
             Flow::default(),
             tokens,

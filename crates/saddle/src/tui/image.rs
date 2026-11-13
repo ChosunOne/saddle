@@ -10,6 +10,9 @@
 
 use std::fmt::Write as _;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+
 /// How a terminal can draw a picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
@@ -181,8 +184,7 @@ pub fn fit(pixels: (u32, u32), room: (u16, u16)) -> Fit {
 /// box**, which stretches it, and without them a 64×64 PNG is 64×64 pixels of screen. They are sent
 /// when it has to be scaled, and `y`/`h` name the band of the source that is on screen (D59).
 fn kitty(png: &[u8], pixels: (u32, u32), window: &Window, id: u32) -> String {
-    use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+    let b64 = STANDARD.encode(png);
     // Base64 is ASCII, so a 4096-byte split is always a character boundary.
     let chunks: Vec<&str> = b64
         .as_bytes()
@@ -234,8 +236,7 @@ fn source(pixels: (u32, u32), window: &Window) -> String {
 
 /// iTerm2's inline image: one OSC 1337, the size in cells, and the file inline.
 fn iterm2(png: &[u8], cols: u16, rows: u16) -> String {
-    use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+    let b64 = STANDARD.encode(png);
     format!(
         "\x1b]1337;File=inline=1;size={};width={cols};height={rows};preserveAspectRatio=1:{b64}\x07",
         png.len()

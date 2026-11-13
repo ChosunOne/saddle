@@ -9,8 +9,17 @@
 //! only by a key or a click in the sign-in dialog — so it grants the agent nothing, and the address
 //! it opens is one the person's own `config.toml` named, which the agent cannot write (D42).
 
+use std::env;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::thread;
+
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(test)]
+use std::time::Duration;
+#[cfg(test)]
+use std::{fs, sync::Mutex};
 
 use anyhow::{Result, bail};
 
@@ -66,7 +75,7 @@ pub fn is_link(url: &str) -> bool {
 /// "this terminal belongs to someone else's session" (D86).
 pub fn no_display(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
     let set = |name: &str| get(name).is_some_and(|v| !v.trim().is_empty());
-    match std::env::consts::OS {
+    match env::consts::OS {
         // A window server is the session, and the variables name it.
         "linux" | "freebsd" | "openbsd" | "netbsd" => {
             if set("DISPLAY") || set("WAYLAND_DISPLAY") {
@@ -91,12 +100,12 @@ pub fn open(url: &str, report: &Report) -> Result<String> {
     if !is_link(url) {
         bail!("not a web address: {url}");
     }
-    if let Some(why) = no_display(&|k| std::env::var(k).ok()) {
+    if let Some(why) = no_display(&|k| env::var(k).ok()) {
         bail!("{why}");
     }
-    let browser = std::env::var("BROWSER").ok();
+    let browser = env::var("BROWSER").ok();
     let mut tried = Vec::new();
-    for argv in openers(browser.as_deref(), std::env::consts::OS) {
+    for argv in openers(browser.as_deref(), env::consts::OS) {
         let mut command = command_for(&argv, url);
         let program = argv
             .first()
@@ -111,7 +120,7 @@ pub fn open(url: &str, report: &Report) -> Result<String> {
                 // non-zero is the only way to know the click did not work.
                 let seen = program.clone();
                 let report = report.clone();
-                std::thread::spawn(move || match child.wait_with_output() {
+                thread::spawn(move || match child.wait_with_output() {
                     Ok(out) if !out.status.success() => {
                         let why = String::from_utf8_lossy(&out.stderr);
                         let why = why.lines().next().unwrap_or("").trim().to_owned();
@@ -172,7 +181,7 @@ mod tests {
 
     /// `$BROWSER` is process-wide, and these tests run at once: whichever holds this is the only
     /// one that may set it.
-    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ENV: Mutex<()> = Mutex::new(());
 
     #[test]
     fn the_browser_is_the_persons_choice_first() {
@@ -217,23 +226,22 @@ mod tests {
         // The spawn itself, with a stub where the browser would be: this is the part a unit test of
         // the argv cannot show, and it is the part that could fail on a machine with no browser.
         let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("browser.sh");
         let out = dir.path().join("argv.txt");
-        std::fs::write(
+        fs::write(
             &script,
             format!("#!/bin/sh\necho \"$@\" > {}\n", out.display()),
         )
         .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         let mut cmd = command_for(
             &[script.to_string_lossy().into_owned(), "--new-window".into()],
             "https://auth.test/device?x=1",
         );
         let status = cmd.status().expect("the stub ran");
         assert!(status.success());
-        let seen = std::fs::read_to_string(&out).unwrap();
+        let seen = fs::read_to_string(&out).unwrap();
         assert_eq!(seen.trim(), "--new-window https://auth.test/device?x=1");
     }
 
@@ -242,41 +250,40 @@ mod tests {
         // The real `open`, with `$BROWSER` pointing at a stub: this is the only way to see the choice
         // of program and the spawn together. It is one process, so the variable is set here and
         // nowhere else in the suite.
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("browser.sh");
         let out = dir.path().join("argv.txt");
-        std::fs::write(
+        fs::write(
             &script,
             format!("#!/bin/sh\necho \"$@\" > {}\n", out.display()),
         )
         .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         // SAFETY: the tests that touch the environment hold `ENV`, and set only these two.
-        let was = std::env::var_os("DISPLAY");
+        let was = env::var_os("DISPLAY");
         unsafe {
-            std::env::set_var("BROWSER", script.to_string_lossy().into_owned());
+            env::set_var("BROWSER", script.to_string_lossy().into_owned());
             // A display is what makes opening a browser meaningful; this sandbox has none.
-            std::env::set_var("DISPLAY", ":0");
+            env::set_var("DISPLAY", ":0");
         }
         let quiet: Report = Arc::new(|_| {});
         let answered = open("https://auth.test/device", &quiet);
         unsafe {
-            std::env::remove_var("BROWSER");
+            env::remove_var("BROWSER");
             match was {
-                Some(v) => std::env::set_var("DISPLAY", v),
-                None => std::env::remove_var("DISPLAY"),
+                Some(v) => env::set_var("DISPLAY", v),
+                None => env::remove_var("DISPLAY"),
             }
         }
         assert_eq!(answered.unwrap(), script.to_string_lossy());
         // The browser is not waited for, so the file may be written just after `open` returns.
         let mut seen = String::new();
         for _ in 0..100 {
-            seen = std::fs::read_to_string(&out).unwrap_or_default();
+            seen = fs::read_to_string(&out).unwrap_or_default();
             if !seen.is_empty() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(seen.trim(), "https://auth.test/device");
     }
@@ -310,31 +317,29 @@ mod tests {
         // The silent case: `xdg-open` with no desktop handler behind it starts, exits 3 and says
         // nothing on the screen, so the click looked like it did nothing (D86).
         let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::Mutex;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("no-handler.sh");
-        std::fs::write(
+        fs::write(
             &script,
             "#!/bin/sh\necho 'no method available for opening' >&2\nexit 3\n",
         )
         .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         let said: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = said.clone();
         let report: Report = Arc::new(move |why: String| sink.lock().unwrap().push(why));
         // SAFETY: the tests that touch the environment hold `ENV`, and set only these two.
-        let was = std::env::var_os("DISPLAY");
+        let was = env::var_os("DISPLAY");
         unsafe {
-            std::env::set_var("BROWSER", script.to_string_lossy().into_owned());
-            std::env::set_var("DISPLAY", ":0");
+            env::set_var("BROWSER", script.to_string_lossy().into_owned());
+            env::set_var("DISPLAY", ":0");
         }
         let started = open("https://auth.test/device", &report);
         unsafe {
-            std::env::remove_var("BROWSER");
+            env::remove_var("BROWSER");
             match was {
-                Some(v) => std::env::set_var("DISPLAY", v),
-                None => std::env::remove_var("DISPLAY"),
+                Some(v) => env::set_var("DISPLAY", v),
+                None => env::remove_var("DISPLAY"),
             }
         }
         assert!(started.is_ok(), "the program did start");
@@ -345,7 +350,7 @@ mod tests {
             if !seen.is_empty() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(seen.len(), 1, "one note, not a stream: {seen:?}");
         assert!(seen[0].contains("no method available"), "{}", seen[0]);

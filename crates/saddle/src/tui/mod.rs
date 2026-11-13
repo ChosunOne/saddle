@@ -1106,16 +1106,28 @@ impl Controller {
             // No provider yet, so the question is really which one, and `/login` asks it.
             return self.open_login(app, None, false);
         }
-        let (choices, _) = self.login_choices()?;
-        if !choices.iter().any(|c| !c.custom && c.name == provider) {
-            bail!("{provider} is not a configured provider; /login to choose one");
-        }
         let auth_path = render::home_relative(&self.paths.auth_store());
-        let mut login = Login::for_model(choices, &provider, auth_path);
+        // Whatever goes wrong is said inside the picker, never as a note: a note is a transcript
+        // entry, a dialog covers the transcript, and the person read the silence as nothing having
+        // happened at all (D88).
+        let prepared = self.login_choices().and_then(|(choices, _)| {
+            if choices.iter().any(|c| !c.custom && c.name == provider) {
+                Ok(choices)
+            } else {
+                bail!("{provider} is not a configured provider; /login chooses one")
+            }
+        });
+        let mut login = match prepared {
+            Ok(choices) => Login::for_model(choices, &provider, auth_path),
+            Err(e) => Login::for_model_unavailable(&provider, format!("{e:#}"), auth_path),
+        };
         let pending = login.take_pending();
         app.open_login(login);
-        if let Some(login::Outcome::Check(id, draft)) = pending {
-            self.check_models(id, draft)?;
+        if let Some(login::Outcome::Check(id, draft)) = pending
+            && let Err(e) = self.check_models(id, draft)
+            && let Some(login) = &mut app.login
+        {
+            login.note_listing_failed(format!("{e:#}"));
         }
         Ok(())
     }
@@ -1980,7 +1992,10 @@ impl Drop for Screen {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
     use super::*;
+    use crate::auth::AuthStore;
 
     /// A controller over a throwaway config, so a slash command can be followed all the way to
     /// what it does (D74).
@@ -2114,10 +2129,7 @@ mod tests {
         assert!(why.contains("kimi"), "{why}");
         assert!(login.device.code.is_none(), "no code was issued");
         // Still on the sign-in screen, so a key press cannot index an empty field list.
-        app.key(ratatui::crossterm::event::KeyEvent::new(
-            ratatui::crossterm::event::KeyCode::Esc,
-            ratatui::crossterm::event::KeyModifiers::NONE,
-        ));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     }
 
     #[test]
@@ -2130,7 +2142,7 @@ mod tests {
             "provider = \"synthetic\"\n[providers.synthetic]\nmodel = \"hf:zai-org/GLM-5.3\"\n",
         );
         // A stored key, so choosing a model is the only thing that could fail.
-        let mut auth = crate::auth::AuthStore::load(&c.paths.auth_store()).unwrap();
+        let mut auth = AuthStore::load(&c.paths.auth_store()).unwrap();
         auth.set("synthetic", "sk-test".into());
         auth.save(&c.paths.auth_store()).unwrap();
         let mut app = an_app();
@@ -2155,14 +2167,8 @@ mod tests {
             .models(id, Ok(vec!["picked-a".into(), "picked-b".into()]));
         let action = {
             let login = app.login.as_mut().unwrap();
-            login.key(ratatui::crossterm::event::KeyEvent::new(
-                ratatui::crossterm::event::KeyCode::Down,
-                ratatui::crossterm::event::KeyModifiers::NONE,
-            ));
-            login.key(ratatui::crossterm::event::KeyEvent::new(
-                ratatui::crossterm::event::KeyCode::Enter,
-                ratatui::crossterm::event::KeyModifiers::NONE,
-            ))
+            login.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            login.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         };
         let login::Outcome::Submit(req) = action else {
             panic!("expected a submission, got {action:?}");
@@ -2174,6 +2180,70 @@ mod tests {
         assert_eq!(app.header.model, "picked-b");
         let written = std::fs::read_to_string(c.paths.user_config()).unwrap();
         assert!(written.contains("picked-b"), "{written}");
+    }
+
+    #[test]
+    fn typing_slash_model_and_pressing_enter_opens_the_picker() {
+        // The keyboard path, which is the only one that matters and the one I did not test: typing
+        // the command with the `/` menu open, then enter. Testing `Action::Model(None)` directly
+        // proved the dialog works and nothing about whether `/model` reaches it (D88).
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller(
+            dir.path(),
+            "provider = \"synthetic\"\n[providers.synthetic]\nmodel = \"hf:zai-org/GLM-5.3\"\n",
+        );
+        let mut auth = AuthStore::load(&c.paths.auth_store()).unwrap();
+        auth.set("synthetic", "sk-test".into());
+        auth.save(&c.paths.auth_store()).unwrap();
+        let mut app = an_app();
+        app.header.provider = "synthetic".into();
+        fn press(app: &mut App, code: KeyCode) -> Option<Action> {
+            app.key(KeyEvent::new(code, KeyModifiers::NONE))
+        }
+        for ch in "/model".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        // The menu is open over the command being typed, which is where enter used to go instead.
+        assert!(app.popup().is_some(), "the / menu is showing");
+        let action = press(&mut app, KeyCode::Enter);
+        assert_eq!(action, Some(Action::Model(None)), "enter runs /model");
+        assert_eq!(app.editor.text(), "", "and the editor is clear");
+        c.perform(&mut app, action.unwrap());
+        let login = app.login.as_ref().expect("the picker is open");
+        assert_eq!(login.purpose(), login::Purpose::Model);
+        assert_eq!(login.choice().name, "synthetic");
+    }
+
+    #[test]
+    fn slash_model_opens_a_picker_even_when_it_cannot_list_anything() {
+        // D88: whatever is wrong — an unreadable config, a provider not in the catalog — the command
+        // opens the picker and says why. Silence was the reported bug: a note behind a transcript
+        // that a dialog covers reads as nothing happening.
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller(dir.path(), "provider = \"synthetic\"\n");
+        // A config that cannot be parsed, so preparing the picker fails.
+        std::fs::write(c.paths.user_config(), "provider = ").unwrap();
+        let mut app = an_app();
+        app.header.provider = "synthetic".into();
+        let action = app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(action, None);
+        for ch in "/model".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let action = app
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("enter runs /model");
+        c.perform(&mut app, action);
+        let login = app.login.as_ref().expect("the picker opened anyway");
+        assert_eq!(login.purpose(), login::Purpose::Model);
+        let login::Stage::Models { note, .. } = &login.stage else {
+            panic!("a picker, got {:?}", login.stage);
+        };
+        let note = note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("config.toml") || note.contains("TOML") || note.contains("expected"),
+            "the reason is on the list, not in a note behind it: {note}"
+        );
     }
 
     #[test]

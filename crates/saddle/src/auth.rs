@@ -11,6 +11,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::provider::Tokens;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub struct Credential {
@@ -19,7 +21,7 @@ pub struct Credential {
     pub api_key: String,
     /// Tokens from an OAuth login, when the provider authenticates that way (D85).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oauth: Option<crate::provider::Tokens>,
+    pub oauth: Option<Tokens>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -45,7 +47,7 @@ impl AuthStore {
     }
 
     /// The last OAuth login for a provider (D85).
-    pub fn oauth(&self, provider: &str) -> Option<&crate::provider::Tokens> {
+    pub fn oauth(&self, provider: &str) -> Option<&Tokens> {
         self.providers.get(provider).and_then(|c| c.oauth.as_ref())
     }
 
@@ -60,7 +62,7 @@ impl AuthStore {
     }
 
     /// Replaces a provider's OAuth tokens, keeping any key it also has.
-    pub fn set_oauth(&mut self, provider: &str, tokens: crate::provider::Tokens) {
+    pub fn set_oauth(&mut self, provider: &str, tokens: Tokens) {
         let entry = self.providers.entry(provider.to_owned()).or_default();
         entry.oauth = Some(tokens);
     }
@@ -134,7 +136,7 @@ mod tests {
         let dir = tempdir();
         let path = dir.path().join("auth.json");
         let mut store = AuthStore::default();
-        let tokens = crate::provider::Tokens {
+        let tokens = Tokens {
             access: "at".into(),
             refresh: "rt".into(),
             expires_at: 123,
@@ -162,7 +164,6 @@ mod tests {
             "the oauth entry grew a key field: {text}"
         );
         // The file stays private.
-        use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "{mode:o}");
         // Logging out forgets it.

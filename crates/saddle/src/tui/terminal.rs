@@ -15,7 +15,10 @@
 //! itself. Asking from there turned raw mode off and left every keystroke echoed onto the screen
 //! and the interface deaf to all of them.
 
+use std::io::IsTerminal as _;
+use std::io::Read as _;
 use std::io::Write as _;
+use std::os::fd::AsRawFd as _;
 use std::time::{Duration, Instant};
 
 use ratatui::style::Color;
@@ -74,7 +77,6 @@ fn may_ask(stdin_is_tty: bool, stdout_is_tty: bool, raw_mode: bool) -> bool {
 }
 
 fn ask() -> Reported {
-    use std::io::IsTerminal as _;
     let raw_mode = ratatui::crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
     if !may_ask(
         std::io::stdin().is_terminal(),
@@ -137,7 +139,6 @@ pub fn query() -> Reported {
         if !poll(&stdin, deadline - now) {
             break;
         }
-        use std::io::Read as _;
         let mut byte = [0u8; 1];
         match stdin.read(&mut byte) {
             Ok(1) => {
@@ -156,7 +157,6 @@ pub fn query() -> Reported {
 
 /// Whether a byte is waiting within `limit`. `poll(2)` on stdin, so nothing is consumed by asking.
 fn poll(stdin: &std::io::Stdin, limit: Duration) -> bool {
-    use std::os::fd::AsRawFd as _;
     let mut fd = std::mem::MaybeUninit::<libc_pollfd>::zeroed();
     // SAFETY: `fd` is a plain struct of integers, and the descriptor is borrowed for the call.
     unsafe {

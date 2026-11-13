@@ -20,9 +20,11 @@ mod term;
 mod tools;
 mod tui;
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Write, stdin};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -1083,16 +1085,12 @@ fn login(provider_name: &str, paths: &paths::Paths) -> Result<ExitCode> {
                 format!("`{provider_name}` says it authenticates with OAuth but names no endpoints")
             })?;
             let mut tell = |line: &str| eprintln!("saddle: {line}");
-            let mut pause =
-                |seconds: u64| std::thread::sleep(std::time::Duration::from_secs(seconds));
+            let mut pause = |seconds: u64| thread::sleep(Duration::from_secs(seconds));
             let mut ask = |prompt: &str| -> Result<String> {
                 eprint!("saddle: {prompt}");
-                use std::io::Write;
                 let _ = std::io::stderr().flush();
                 let mut line = String::new();
-                std::io::stdin()
-                    .read_line(&mut line)
-                    .context("reading from stdin")?;
+                stdin().read_line(&mut line).context("reading from stdin")?;
                 Ok(line.trim().to_owned())
             };
             let tokens = provider::oauth::login(&flow, "saddle", &mut tell, &mut ask, &mut pause)?;
@@ -1109,7 +1107,7 @@ fn login(provider_name: &str, paths: &paths::Paths) -> Result<ExitCode> {
                 None => eprintln!("saddle: paste the API key for {provider_name}"),
             }
             let mut key = String::new();
-            std::io::stdin()
+            stdin()
                 .read_line(&mut key)
                 .context("reading the key from stdin")?;
             let key = key.trim().to_owned();
