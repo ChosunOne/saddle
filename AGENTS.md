@@ -72,43 +72,59 @@ everything else: `-E` filters by name, `--no-fail-fast` summaries, per-test time
 and isolation that makes a flaky test obvious.
 
 ```sh
-cargo build --offline
-cargo nextest run --offline                  # every suite, one process per test
-cargo nextest run --offline --bin saddle     # just the unit tests in the binary
-cargo nextest run --offline -p saddle-cap    # one crate
-cargo nextest run --offline -E 'test(/^tui::/)'   # by name, with nextest's filter expressions
+cargo build
+cargo nextest run                            # every suite, one process per test
+cargo nextest run --bin saddle               # just the unit tests in the binary
+cargo nextest run -p saddle-cap              # one crate
+cargo nextest run -E 'test(/^tui::/)'        # by name, with nextest's filter expressions
 cargo fmt --all --check                      # must stay clean; no rustfmt.toml, so defaults apply
-cargo clippy --offline --all-targets         # must stay clean
+cargo clippy --all-targets                   # must stay clean
 ```
 
-`nextest` is installed at `~/.cargo/bin/cargo-nextest` (0.9.146); `cargo nextest run --offline`
-needs no network. Three differences from `cargo test` are worth knowing:
+`nextest` is installed at `~/.cargo/bin/cargo-nextest` (0.9.146). Three differences from
+`cargo test` are worth knowing:
 
 - **Doctests are not run** — nextest runs test binaries, not rustdoc. Nothing here documents a
   runnable example (the fenced block in `config.rs` is a sample file, in a binary crate, which has
-  no doctests at all), so nothing is missed today; `cargo test --offline --doc` is what would run
-  one if it were written.
+  no doctests at all), so nothing is missed today; `cargo test --doc` is what would run one if it
+  were written.
 - **One test is one process**, so a test that relies on state another test set up will not see it,
   and `-j`/`--test-threads` is how many run at once rather than how many share a process. It is
   also why a test that leaks a global (an `std::env` variable, a signal handler) passes under
   `cargo test` and fails here.
 - **A failure stops the run** unless `--no-fail-fast` is given, so use
-  `cargo nextest run --offline --no-fail-fast` to see every failure in one pass.
+  `cargo nextest run --no-fail-fast` to see every failure in one pass.
 
 `crates/saddle/tests/agent.rs` still fails under a sandboxed agent that blocks `socket()`/`bind()` —
-that is the environment, not the code (`cargo nextest run --offline --no-fail-fast` and look at
-whether every failure is in `saddle::agent`). One binary at a time is `--lib` or `--test <name>`,
-as in `cargo nextest run --offline --test cli`; the binary's own unit tests are `--bin saddle`.
+that is the environment, not the code (`cargo nextest run --no-fail-fast` and look at whether every
+failure is in `saddle::agent`). One binary at a time is `--lib` or `--test <name>`, as in
+`cargo nextest run --test cli`; the binary's own unit tests are `--bin saddle`.
 
 There is no CI config in the tree, no `rust-toolchain` pin and no `rustfmt.toml`. Edition 2024,
 `rust-version = 1.88`. All dependencies are declared in the root `Cargo.toml` under
 `[workspace.dependencies]` and referenced per crate as `dep.workspace = true`; add new dependencies
 in the root, not in a crate manifest.
 
-Cargo may have no network access: pass `--offline` and do not add dependencies that are not already in
-`Cargo.lock`. A command does have a network of its own now (D79), so `cargo add` works through the
-proxy when the session's `net` grants allow the registry — which is how `syntect` arrived (D80). The
-registry is still the only place a crate comes from: nothing here is fetched by hand.
+Do not pass `--offline`. It is no longer needed: a command has a network of its own (D79) and reaches
+the crates.io registry through the proxy when the session's `net` grants allow it — which is how
+`syntect` arrived (D80). Checked, not assumed: a crate that was not in the cache was added, fetched,
+compiled and run without it, and `cargo update --dry-run` read the index.
+
+Dropping it does not make a build depend on the network. Cargo touches the index only when something
+is missing, so a build whose dependencies are all present needs no network at all — checked by
+building and running the suite with the proxy pointed at a dead port, which succeeded. `--offline`
+therefore buys nothing on the ordinary path, and it turns a genuine dependency problem into a
+confusing one: a `--offline` build fails with "no matching package" when the real answer was one
+download away.
+
+Keep it in your pocket for the case it is for: a session whose grants do not include the registry, or
+a machine with no network at all. There an ordinary build still works — nothing is fetched — but a
+dependency that is missing fails after about ten seconds of cargo retrying with a connection error,
+where `--offline` says `no matching package` at once. That is the only thing it improves. The registry
+is still the only place a crate comes from — nothing here is fetched by hand.
+
+An online build leaves `Cargo.lock` alone when the requirements are already satisfied; `cargo add` and
+`cargo update` write it, so check `jj diff --stat` after those, as for any scripted edit.
 
 ### Running the binary by hand
 
@@ -119,7 +135,7 @@ writable location:
 
 ```sh
 XDG_CONFIG_HOME=/tmp/saddle-try/config XDG_STATE_HOME=/tmp/saddle-try/state \
-  cargo run --offline -q --bin saddle -- check
+  cargo run -q --bin saddle -- check
 ```
 
 `--bin saddle` is required: the workspace has two binaries and no `default-run`. `saddle check` is the
