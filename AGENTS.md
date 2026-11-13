@@ -38,7 +38,7 @@ Inside `crates/saddle/src`:
 | `output` | line-mode output: a terminal, or one JSON object per line for a program (D52) |
 | `cache` | the cache-miss notice: one line to the user when a prompt is re-read at full price (D50) |
 | `reserved` | the D20 snapshot and restore of reserved paths around `exec` |
-| `provider/` | the neutral conversation form, the Anthropic, OpenAI-compatible and Responses renderers (every other server is a `[providers.<name>]` table naming which one it imitates, D84), the cache-affinity key, headers and lifetime, sent to OpenAI's own API and to a host a table forces (D100), OAuth login and token refresh (D85), the model list, the cached context windows and prices (D34, D36); reasoning is kept for every model and replayed in its original position (D95, D96) |
+| `provider/` | the neutral conversation form, the Anthropic, OpenAI-compatible and Responses renderers (every other server is a `[providers.<name>]` table naming which one it imitates, D84), the cache-affinity key, headers, lifetime and originator, sent to OpenAI's own API and to the subscription backend (D100), and the WebSocket that backend is spoken to over, with the delta a kept connection allows (D101), OAuth login and token refresh (D85), the model list, the cached context windows and prices (D34, D36); reasoning is kept for every model and replayed in its original position (D95, D96) |
 | `tui/` | the full-screen UI: app state, rendering (a prompt is markdown in the user's colour, D81; tables are fitted to the width, D83), editor, login (a key or an OAuth sign-in, D85; the searchable model picker `/model` opens, D88), selection (a drag copies the transcript's text or the open dialog's, D87), settings, session list, `permissions` (the grants editor, D45), `tree` (the message tree, D54), `image` (drawing a picture: kitty and iTerm2, D59), `status` (the `[ui] status` template, D36), `theme` (the colour roles, D71), `palette` (pi's role vocabulary, colour forms and the palette derived from the terminal, D72, D73), `terminal` (asking the terminal for its colours, D73), `syntax` (code blocks: syntect's grammars, nine roles, the theme's colours, D80) and `themes` (the `/theme` picker, D74), and `browser` (opening the link a sign-in shows, D86) |
 
 `crates/saddle/src/main.rs` dispatches subcommands (`run`, `check`, `tool`, `audit verify`)
@@ -170,8 +170,9 @@ XDG_CONFIG_HOME=/tmp/saddle-try/config XDG_STATE_HOME=/tmp/saddle-try/state \
 `--bin saddle` is required: the workspace has two binaries and no `default-run`. `saddle check` is the
 cheapest way to see the resolved roots, the grants in force for the working directory, the
 effective grants, whether that policy has been reviewed, whether `exec` is available on this kernel,
-what network a command will get (its own namespace, or none), and the context window and price in
-force for the configured model.
+what network a command will get (its own namespace, or none), the context window and price in force
+for the configured model, and what its prompt cache will be told — the key and session headers, the
+lifetime, the WebSocket and the originator, each of them conditional (D100, D101).
 
 To change what every workspace allows, edit `[agent]` in `config.toml`; to change one workspace, edit
 its file under `policies/` — what it sets replaces the base grant for that scope, narrower or wider,
@@ -279,7 +280,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D100 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D102 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

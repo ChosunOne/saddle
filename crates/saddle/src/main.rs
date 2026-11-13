@@ -974,6 +974,9 @@ fn check(dir: &std::path::Path, overrides: &config::Overrides) -> Result<ExitCod
                 // D36: what a reply costs, and where that came from, since nothing shows it until
                 // a session has spent something.
                 println!("price      {}", price_line(p.price()));
+                // D100, D101: every one of these is conditional and silent, so the review tool is
+                // where a person sees which of them this provider will actually be given.
+                println!("cache      {}", cache_line(&p));
                 if let Some(url) = &p.config.usage_url {
                     // D36: the same figures the status line shows, so a shape that does not parse
                     // can be seen without opening a session.
@@ -1004,6 +1007,27 @@ fn check(dir: &std::path::Path, overrides: &config::Overrides) -> Result<ExitCod
 }
 
 /// The price as `check` prints it: dollars per million, and nothing when nobody priced the model.
+/// What this provider will be told about caching, and how its requests travel (D100, D101).
+fn cache_line(p: &Provider) -> String {
+    let config = &p.config;
+    let responses = format!("{}/responses", config.base_url.trim_end_matches('/'));
+    let mut said = vec![if provider::routes_cache(config) {
+        "key and session headers".to_owned()
+    } else {
+        "nothing: this server is not OpenAI's".to_owned()
+    }];
+    if let Some(ttl) = provider::prompt_cache_retention(config) {
+        said.push(format!("{ttl} retention"));
+    }
+    if provider::websocket_url(config, &responses).is_some() {
+        said.push("websocket with deltas".to_owned());
+    }
+    if let Some(originator) = provider::codex_originator(config) {
+        said.push(format!("originator {originator}"));
+    }
+    said.join("; ")
+}
+
 fn price_line(price: Option<provider::Price>) -> String {
     let Some(price) = price else {
         return "not stated; set [providers.<name>.pricing] to show a cost".into();

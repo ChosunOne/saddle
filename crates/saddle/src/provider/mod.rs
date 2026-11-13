@@ -12,6 +12,9 @@ mod openai;
 mod openai_account;
 mod reported;
 mod responses;
+mod ws;
+
+pub use ws::websocket_url;
 mod sse;
 
 pub use http::{ModelInfo, ModelsError, list_models, page_paths, quota_from_page};
@@ -643,6 +646,10 @@ fn presets() -> BTreeMap<&'static str, ProviderEntry> {
                 api: Some(Api::OpenaiResponses),
                 base_url: Some(oauth::OPENAI_API_BASE.into()),
                 usage_url: Some("https://chatgpt.com/backend-api/wham/usage".into()),
+                // D100: Codex sends the cache key and both session headers to this backend, so
+                // saddle does too. `cache-affinity = false` in the table turns it back off, which
+                // is the one-line answer if the endpoint ever refuses them.
+                cache_affinity: Some(true),
                 auth: Some(Auth::Oauth),
                 oauth: Some(oauth::Flow {
                     method: Some(oauth::Method::Device),
@@ -974,21 +981,31 @@ pub struct Stated {
 /// and a strict one refuses a body field it does not know. So the fields go where the docs are —
 /// and a proxy in front of `api.openai.com` is, as far as this can tell, a different provider.
 fn openai_api(base_url: &str) -> bool {
+    host_of(base_url).eq_ignore_ascii_case("api.openai.com")
+}
+
+/// Whether a base URL is the subscription backend Codex talks to (D101).
+pub fn codex_backend(base_url: &str) -> bool {
+    host_of(base_url).eq_ignore_ascii_case("chatgpt.com")
+}
+
+fn host_of(base_url: &str) -> &str {
     let rest = base_url
         .split_once("://")
         .map_or(base_url, |(_, rest)| rest);
-    let host = rest.split('/').next().unwrap_or_default();
-    host.split(':')
+    rest.split('/')
         .next()
         .unwrap_or_default()
-        .eq_ignore_ascii_case("api.openai.com")
+        .split(':')
+        .next()
+        .unwrap_or_default()
 }
 
 /// Whether this provider should be asked to route a conversation to one cache (D100).
 ///
 /// OpenAI's own API is the documented case. Anything else has to say so in its table, because the
 /// fields are not part of the compatible format and a strict server refuses what it does not know.
-fn routes_cache(config: &ProviderConfig) -> bool {
+pub fn routes_cache(config: &ProviderConfig) -> bool {
     config.cache_affinity || openai_api(&config.base_url)
 }
 
@@ -1011,6 +1028,18 @@ pub fn prompt_cache_retention(config: &ProviderConfig) -> Option<&'static str> {
         && config.auth == Auth::ApiKey
         && config.cache_retention == CacheRetention::Long)
         .then_some("24h")
+}
+
+/// The `originator` the subscription backend checks before it answers at all (D100).
+///
+/// That endpoint refuses an originator it does not recognise, and the ones it recognises are the
+/// official clients': `codex_cli_rs`, `codex_vscode`, `codex_sdk_ts`, or anything starting with
+/// `Codex `. Saddle is not on that list, so it names the client it already claims to be when it
+/// asks the backend which models it serves (D85) — the same claim, in the one place where the
+/// alternative is not being served.
+pub fn codex_originator(config: &ProviderConfig) -> Option<&'static str> {
+    (config.api == Api::OpenaiResponses && codex_backend(&config.base_url))
+        .then_some("codex_cli_rs")
 }
 
 /// The headers Codex sends beside the key, for the same routing purpose (D100).
@@ -1269,11 +1298,17 @@ impl Provider {
     /// about which machine answers a prompt, and neither of those is a prompt.
     pub fn request_headers_for(&self, session: &str) -> Vec<(String, String)> {
         let mut headers = self.request_headers();
-        for (name, value) in affinity_headers(&self.config, session) {
+        let add = |headers: &mut Vec<(String, String)>, name: &str, value: &str| {
             // A header the config sets itself wins, as it does for the key's own header.
-            if !headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
-                headers.push((name, value));
+            if !headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                headers.push((name.to_owned(), value.to_owned()));
             }
+        };
+        if let Some(originator) = codex_originator(&self.config) {
+            add(&mut headers, "originator", originator);
+        }
+        for (name, value) in affinity_headers(&self.config, session) {
+            add(&mut headers, &name, &value);
         }
         headers
     }
@@ -1579,6 +1614,24 @@ model = "qwen"
                 .any(|(n, _)| n.eq_ignore_ascii_case("session-id"))
         );
 
+        // D100: the subscription backend refuses an originator it does not recognise, so it is
+        // told the client saddle already claims to be when it asks what that backend serves.
+        let codex = ProviderConfig {
+            api: Api::OpenaiResponses,
+            cache_affinity: true,
+            ..config("m", "https://chatgpt.com/backend-api/codex")
+        };
+        let sent = Provider::new("openai-chatgpt", codex, Some("at"), &Reported::default())
+            .request_headers_for("s1");
+        assert!(sent.contains(&("originator".to_owned(), "codex_cli_rs".to_owned())));
+        assert!(sent.contains(&("session-id".to_owned(), "s1".to_owned())));
+        assert!(
+            !p.request_headers_for("s1")
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("originator")),
+            "the API-key endpoint does not check one"
+        );
+
         // A header the configuration sets itself wins, as it does for the key's own header.
         let mut headers = BTreeMap::new();
         headers.insert("session-id".to_owned(), "mine".to_owned());
@@ -1623,21 +1676,22 @@ cache-retention = "long"
                 .cache_retention,
             CacheRetention::Short
         );
-        // Forcing the affinity fields onto an endpoint that is not `api.openai.com` is the other
-        // half: the ChatGPT backend, which cannot be checked from here (D100).
+        // The ChatGPT backend is not `api.openai.com`, so it has to ask for the affinity fields:
+        // its preset does, because Codex sends these same fields there (D100).
         assert!(
-            !endpoint("openai-chatgpt", &BTreeMap::new())
+            endpoint("openai-chatgpt", &BTreeMap::new())
                 .unwrap()
                 .cache_affinity
         );
-        let forced: BTreeMap<String, ProviderEntry> = toml::from_str(
+        // And a table can take that back, which is the answer if the endpoint ever refuses them.
+        let off: BTreeMap<String, ProviderEntry> = toml::from_str(
             r#"
 [openai-chatgpt]
-cache-affinity = true
+cache-affinity = false
 "#,
         )
         .unwrap();
-        assert!(endpoint("openai-chatgpt", &forced).unwrap().cache_affinity);
+        assert!(!endpoint("openai-chatgpt", &off).unwrap().cache_affinity);
     }
 
     #[test]

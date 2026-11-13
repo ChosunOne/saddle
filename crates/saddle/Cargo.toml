@@ -20,6 +20,7 @@ getrandom.workspace = true
 toml.workspace = true
 humantime.workspace = true
 ureq.workspace = true
+tungstenite.workspace = true
 ratatui.workspace = true
 pulldown-cmark.workspace = true
 unicode-width.workspace = true

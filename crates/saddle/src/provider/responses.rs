@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use super::{
     Api, Conversation, Item, Part, Provider, Reply, Sink, Stop, ToolCall, Usage, http,
-    prompt_cache_key, prompt_cache_retention,
+    prompt_cache_key, prompt_cache_retention, ws,
 };
 use super::{Cancelled, SUMMARY_INTRO, sse};
 
@@ -35,8 +35,31 @@ pub const CLIENT_VERSION: &str = "0.169.0";
 pub fn complete(p: &Provider, conv: &Conversation<'_>, sink: &mut dyn Sink) -> Result<Reply> {
     let url = format!("{}/responses", p.config.base_url.trim_end_matches('/'));
     let headers = p.request_headers_for(conv.session);
-    let events = http::stream(p, url, headers, &body(&p.config, conv))?;
-    read_stream(events, sink)
+    let body = body(&p.config, conv);
+    // D101: the subscription backend speaks WebSocket, and a kept connection is what makes sending
+    // only the newest items legal. Anything that goes wrong here falls back to the request that was
+    // already being made, so the fallback can only be as good as the old path, never worse.
+    let mut pending = None;
+    let streamed = match ws::websocket_url(&p.config, &url)
+        .filter(|_| !conv.session.is_empty())
+        .map(|ws_url| (ws_url, conv.session))
+    {
+        Some((ws_url, session)) => match ws::stream(session, &ws_url, &headers, &body) {
+            Ok((events, kept)) => {
+                pending = Some(kept);
+                events
+            }
+            Err(_) => http::stream(p, url.clone(), headers.clone(), &body)?,
+        },
+        None => http::stream(p, url.clone(), headers.clone(), &body)?,
+    };
+    let reply = read_stream(streamed, sink)?;
+    if let Some(pending) = pending {
+        // What the next request will send for this reply, not what the server called its output:
+        // the shapes differ, and the baseline has to match what saddle writes.
+        pending.finish(input(&[Item::Assistant(reply.parts.clone())]));
+    }
+    Ok(reply)
 }
 
 pub fn body(cfg: &super::ProviderConfig, conv: &Conversation<'_>) -> Value {

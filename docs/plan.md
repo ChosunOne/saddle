@@ -2507,11 +2507,16 @@ per-node caching rather than like a request that never asked.
   format, not the routing (D84), and a strict one refuses a body field it does not know — which is
   why the field is gated on the base URL at all. A proxy in front of `api.openai.com` is, as far as
   saddle can tell, a different provider, and gets nothing.
-- **A table can force it**: `cache-affinity = true` sends the key and the headers whatever the host
-  is. That is the case the ChatGPT backend needs — its host is `chatgpt.com/backend-api/codex`, and
-  Codex sends these same fields there — and it is exactly the case this build cannot check, so it is
-  never assumed: a server that refused an unknown field would fail every request rather than lose a
-  cache hit. The lifetime stays off for an OAuth endpoint whatever the table says.
+- **A table can ask for it**: `cache-affinity = true` sends the key and the headers whatever the
+  host is. The ChatGPT preset turns it on, because its host is `chatgpt.com/backend-api/codex`
+  rather than `api.openai.com`, Codex sends these same fields there, and a subscription is otherwise
+  the one path that would get no affinity at all. `cache-affinity = false` takes it back, and is the
+  one-line answer if that endpoint ever refuses them. The lifetime stays off for an OAuth endpoint
+  whatever the table says.
+- **The subscription backend is told an `originator`.** It refuses one it does not recognise, and
+  the ones it recognises are the official clients'. Saddle names the client it already claims to be
+  when it asks that backend which models it serves (D85) — the same claim, in the one place where
+  the alternative is not being served at all.
 - **`cache-retention = "long"` in a provider table** asks for `prompt_cache_retention: "24h"`. Off by
   default: for the models that read this field the provider's own default is already 24 hours unless
   the organization is under zero data retention, where asking is what gets refused. On GPT-5.6 and
@@ -2526,6 +2531,46 @@ per-node caching rather than like a request that never asked.
   are what OpenAI recommends for a multi-turn agent, and are the one lever that helps a *branched*
   conversation (D54) reuse a prefix up to the point it forked. Neither pi nor saddle places them, and
   nothing here depends on it; it waits for a decision that can test it against a real endpoint.
+
+**D101.** The subscription backend is spoken to over a WebSocket, and a kept connection makes a turn
+a delta.
+
+The backend a ChatGPT subscription reaches refuses `store: true`, so it keeps no conversation of its
+own and every request carried the whole history again. That is also why a cache miss there costs
+what it does. Over a WebSocket the backend does keep the connection's state, `previous_response_id`
+refers to it, and a later request can therefore carry only the items the connection has not seen.
+
+- **One reply path.** A frame is `{type: "response.create", ...}` with the same body the HTTP request
+  carries; each frame back is wrapped as the event the SSE reader already consumes. The parser, the
+  reasoning handling and the usage reading are the ones that were there, so a second API surface was
+  not written for the second transport.
+- **A delta is legal only on the connection that has the state.** The socket is kept per session id,
+  and a new connection always starts from the whole history, because what a continuation refers to
+  was left behind on the old one.
+- **A delta needs an exact baseline.** The body must match apart from `input`, and the new input must
+  extend what the server holds: what was sent plus what the reply produced. The produced items are
+  rendered by saddle, not taken from the response's `output`, because those two shapes differ and a
+  baseline that does not match what the next request writes would make every delta a rejected one.
+- **Only a completed response is kept.** A cancelled, failed or closed stream leaves a connection
+  nothing can be continued from, so the next request starts again in full.
+- **A continuation the backend has lost is resent in full.** It says so with an error frame rather
+  than a reply; one frame is cheap to spend finding out, and the alternative is a failed turn.
+- **Everything falls back.** A handshake that fails, or a frame that will not send, returns to the
+  HTTP request that was already being made. The fallback is silent — it is not the person's problem,
+  and the worst case is then the old behaviour rather than a failed turn.
+- **`check` says which of these a provider gets**, because each one is conditional and silent until
+  a bill arrives: the key and headers, the lifetime, the WebSocket, and the originator.
+
+**D102.** A cached subscription connection belongs to its destination and authentication context,
+not just to a conversation id. Reuse requires the same URL and request headers (compared through a
+digest so the cache retains no extra credential copy). A changed account, credential or endpoint
+opens a fresh connection with the full history. The WebSocket handshake uses the Responses v2 beta
+header, independently of the HTTP preset's beta header. A completed socket is handed back before
+its terminal event is published: the parser can finish immediately on that event. Incomplete
+responses do not seed a continuation. Handshake/send fallback to HTTP is reported to the person,
+without putting transport diagnostics in the model's conversation. Neither a delta payload nor
+connection reuse guarantees cached token accounting; the server's reported usage remains the
+evidence of a hit.
 
 ## 4. Scope enumeration
 

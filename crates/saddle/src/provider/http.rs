@@ -30,13 +30,19 @@ pub fn agent() -> ureq::Agent {
 }
 
 /// What the request thread sends back.
-enum Msg {
+pub(crate) enum Msg {
     Event(sse::Event),
     /// What the response's headers said about the allowance left (D36).
     Quota(Quota),
     Note(String),
     Failed(anyhow::Error),
     End,
+}
+
+/// A streamed reply fed by something other than HTTP, such as the WebSocket the subscription
+/// backend takes (D101). The consumer cannot tell the two apart.
+pub(crate) fn event_stream(rx: Receiver<Msg>, stop: Arc<AtomicBool>) -> EventStream {
+    EventStream { rx, stop }
 }
 
 /// A streamed reply read on its own thread. Waiting on it checks for a cancel every 50 ms, so a
