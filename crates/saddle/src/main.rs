@@ -103,6 +103,16 @@ enum Cmd {
         /// The tool input as JSON, e.g. '{"path": "src/main.rs"}'.
         input: String,
     },
+    /// Log in to a provider: an OAuth provider's browser code, or an API key typed in (D85).
+    Login {
+        /// The provider's name, as `saddle check` and `/login` list it.
+        provider: String,
+    },
+    /// Forget a provider's stored credential (D85).
+    Logout {
+        /// The provider's name.
+        provider: String,
+    },
     /// Session allowances: letting one session id use a workspace that holds credentials (D60).
     Session {
         #[command(subcommand)]
@@ -242,6 +252,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Some(Cmd::Tool { name, input }) => {
             tool(&cli.dir, &name, &input, &session, &paths, &overrides)
         }
+        Some(Cmd::Login { provider }) => login(&provider, &paths),
+        Some(Cmd::Logout { provider }) => logout(&provider, &paths),
         Some(Cmd::Session { cmd }) => session_cmd(cmd, &paths),
         Some(Cmd::Audit { .. }) => unreachable!("handled above"),
     }
@@ -298,7 +310,8 @@ fn run_agent(
                     provider::ask_endpoint(&config, key.as_deref(), &paths.reported_windows());
                     reported = provider::Reported::stored(&paths.reported_windows());
                 }
-                let p = Provider::new(&name, config, auth.key(&name), &reported);
+                let p = Provider::new(&name, config, auth.key(&name), &reported)
+                    .with_stored_oauth(&paths.auth_store());
                 match p.missing_key() {
                     Some(_) if interactive => (Some(p), tui::Start::LogIn(name)),
                     Some(why) => bail!("{why}"),
@@ -938,9 +951,14 @@ fn check(dir: &std::path::Path, overrides: &config::Overrides) -> Result<ExitCod
         Some(name) => match provider::resolve(name, &user.providers, None) {
             Ok(config) => {
                 let model = config.model.clone();
-                let p = Provider::new(name, config, auth.key(name), &reported);
+                let p = Provider::new(name, config, auth.key(name), &reported)
+                    .with_stored_oauth(&setup.paths.auth_store());
                 let key = match p.missing_key() {
+                    Some(_) if p.config.auth == provider::Auth::Oauth => {
+                        "not logged in; run `saddle login <provider>`"
+                    }
                     Some(_) => "no key yet; log in with /login in the TUI",
+                    None if p.config.auth == provider::Auth::Oauth => "OAuth token available",
                     None => "key available",
                 };
                 println!("provider   {name} · {model} · {key}");
@@ -1046,6 +1064,74 @@ fn usage_line(quota: &provider::Quota, spent: Option<f64>, now: std::time::Syste
     } else {
         parts.join(", ")
     }
+}
+
+/// Logs in to a provider: the device code for an OAuth provider, a typed key otherwise (D85).
+///
+/// This runs in the terminal rather than behind the TUI dialog on purpose: the flow needs a prompt
+/// the person answers while a poll runs, and the terminal is where a code is read and typed.
+fn login(provider_name: &str, paths: &paths::Paths) -> Result<ExitCode> {
+    let user = config::UserConfig::load(&paths.user_config())?;
+    let config = provider::endpoint(provider_name, &user.providers)?;
+    let store_path = paths.auth_store();
+    let mut store = auth::AuthStore::load(&store_path)?;
+    match config.auth {
+        provider::Auth::Oauth => {
+            let flow = config.oauth.clone().with_context(|| {
+                format!("`{provider_name}` says it authenticates with OAuth but names no endpoints")
+            })?;
+            let mut tell = |line: &str| eprintln!("saddle: {line}");
+            let mut pause =
+                |seconds: u64| std::thread::sleep(std::time::Duration::from_secs(seconds));
+            let mut ask = |prompt: &str| -> Result<String> {
+                eprint!("saddle: {prompt}");
+                use std::io::Write;
+                let _ = std::io::stderr().flush();
+                let mut line = String::new();
+                std::io::stdin()
+                    .read_line(&mut line)
+                    .context("reading from stdin")?;
+                Ok(line.trim().to_owned())
+            };
+            let tokens = provider::oauth::login(&flow, "saddle", &mut tell, &mut ask, &mut pause)?;
+            store.set_oauth(provider_name, tokens);
+            store.save(&store_path)?;
+            println!("{provider_name}: logged in (OAuth)");
+        }
+        provider::Auth::ApiKey => {
+            let var = config.api_key_env.as_deref();
+            match var {
+                Some(var) => {
+                    eprintln!("saddle: paste the API key for {provider_name} ({var}), or set {var}")
+                }
+                None => eprintln!("saddle: paste the API key for {provider_name}"),
+            }
+            let mut key = String::new();
+            std::io::stdin()
+                .read_line(&mut key)
+                .context("reading the key from stdin")?;
+            let key = key.trim().to_owned();
+            if key.is_empty() {
+                bail!("no key entered");
+            }
+            store.set(provider_name, key);
+            store.save(&store_path)?;
+            println!("{provider_name}: key saved");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Forgets a provider's stored credential.
+fn logout(provider_name: &str, paths: &paths::Paths) -> Result<ExitCode> {
+    let store_path = paths.auth_store();
+    let mut store = auth::AuthStore::load(&store_path)?;
+    if !store.remove(provider_name) {
+        bail!("{provider_name} has no stored credential");
+    }
+    store.save(&store_path)?;
+    println!("{provider_name}: logged out");
+    Ok(ExitCode::SUCCESS)
 }
 
 fn tool(

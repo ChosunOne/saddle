@@ -1975,6 +1975,50 @@ environment variable holding its key, and now the headers and the key's own head
   reference an environment variable for a second secret, and `api = "openai-responses"`, which
   belongs with the OAuth work because the one endpoint that requires it is the one OAuth reaches.
 
+**D85.** The built-in OpenAI provider authenticates with a key or with a ChatGPT login, and the
+login reaches a different endpoint through a different wire format.
+
+A ChatGPT subscription is not a setting on the API-key provider. Its token is spent at
+`https://chatgpt.com/backend-api/codex` on the **Responses API**, whose conversation is a list of
+typed items rather than role-tagged messages and whose stream is a sequence of named events rather
+than deltas on a choice. That is a second client (`provider/responses.rs`), not a flag.
+
+- **The login is the device code, and that was decided by which one could be verified.** The
+  `/oauth/authorize` browser redirect answers `invalid_authorize_request` to every request that is
+  not a real browser navigation — including the exact parameter set a first-party client sends —
+  while `POST /api/accounts/deviceauth/usercode` answers a real `user_code` and `device_auth_id` to
+  a plain POST. `saddle login openai-chatgpt` therefore prints a code to type at
+  `https://auth.openai.com/codex/device`, polls
+  `/api/accounts/deviceauth/token`, and exchanges the `authorization_code` and `code_verifier` it
+  gets back at `/oauth/token`. The browser redirect is implemented and unit-tested, but it is not
+  what the preset uses, because shipping an unverified path as the default is how a login breaks
+  for everyone at once.
+- **What the device flow cannot verify from here is the approval itself.** The probe reached a real
+  code; nothing but a person with a browser can approve it, so the exchange after approval is
+  written to the documented shape and unproven end to end.
+- **An OAuth provider has no key.** `auth = "oauth"` changes what `missing_key` means: the
+  credential is the stored access token, `available_key` returns nothing for it, and the token is
+  refreshed before a request — never mid-stream, where a 401 cannot be recovered from. The tokens
+  are shared behind one lock rather than copied, because a refresh rotates the refresh token and two
+  concurrent refreshes would retire the one the other just took (a background compaction is a second
+  `Provider`).
+- **`auth.json` grew an `oauth` object beside the key, and old files still load.** A credential is
+  either a key or tokens; neither shape writes the other's fields, so a file from before this change
+  is unchanged on disk and a key typed today does not grow an empty token object.
+- **The account is a claim in the token.** `chatgpt-account-id` comes from the access token's
+  `https://api.openai.com/auth` claim, not from the login, so it survives a refresh.
+- **Everything the login needs is a table**, like a provider: `[providers.<name>.oauth]` names the
+  URLs, client id, scopes and redirect. `openai-chatgpt` is a preset filling it in, and an empty
+  table is *incomplete* rather than silently OpenAI's — a provider that says `auth = "oauth"` and
+  nothing else must not log in to another service.
+- **`saddle login <provider>` and `saddle logout <provider>`** are the surface. The TUI's `/login`
+  still asks for a key: the device flow needs a prompt that is answered while a poll runs, and the
+  terminal is where a code is read and typed. Wiring it into the dialog is deferred rather than
+  pretended.
+- **Deferred:** the TUI login dialog running the device flow; an OAuth provider other than OpenAI in
+  the presets; refresh on a 401 (the token is refreshed before the request, and a refused one is
+  reported rather than retried); and the browser redirect for OpenAI, which needs a real navigation.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

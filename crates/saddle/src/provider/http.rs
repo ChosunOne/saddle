@@ -269,7 +269,8 @@ pub fn list_models(
         .into();
     let base = &config.base_url;
     let request = match config.api {
-        Api::Openai => {
+        // The Responses backend speaks the same bearer token and lists its models the same way.
+        Api::Openai | Api::OpenaiResponses => {
             let req = agent.get(format!("{base}/models"));
             match key {
                 Some(k) => req.header("authorization", format!("Bearer {k}")),
@@ -330,7 +331,9 @@ pub fn fetch_usage(
     let mut req = agent.get(url).header("accept", "application/json");
     if let Some(k) = key {
         req = match config.api {
-            Api::Openai => req.header("authorization", format!("Bearer {k}")),
+            Api::Openai | Api::OpenaiResponses => {
+                req.header("authorization", format!("Bearer {k}"))
+            }
             Api::Anthropic => req
                 .header("x-api-key", k)
                 .header("anthropic-version", super::anthropic::VERSION),

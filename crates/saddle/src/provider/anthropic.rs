@@ -26,7 +26,7 @@ fn official(cfg: &ProviderConfig) -> bool {
 pub fn complete(p: &Provider, conv: &Conversation<'_>, sink: &mut dyn Sink) -> Result<Reply> {
     let url = format!("{}/v1/messages", p.config.base_url);
     let mut headers = vec![("anthropic-version".to_owned(), VERSION.to_owned())];
-    headers.extend(super::request_headers(&p.config, p.key()));
+    headers.extend(p.request_headers());
     if official(&p.config) {
         headers.push(("anthropic-beta".to_owned(), FALLBACK_BETA.to_owned()));
     }
@@ -711,6 +711,8 @@ mod tests {
             search_url: None,
             headers: Default::default(),
             key_header: None,
+            auth: crate::provider::Auth::ApiKey,
+            oauth: None,
         };
         let tools = [crate::provider::ToolDef {
             name: "read",

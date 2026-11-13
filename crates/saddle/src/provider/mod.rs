@@ -7,11 +7,14 @@
 
 mod anthropic;
 mod http;
+pub(crate) mod oauth;
 mod openai;
 mod reported;
+mod responses;
 mod sse;
 
 pub use http::{ModelsError, fetch_usage, list_models, page_paths, quota_from_page};
+pub use oauth::Tokens;
 pub use reported::Reported;
 
 use std::collections::BTreeMap;
@@ -26,6 +29,10 @@ use serde_json::Value;
 pub enum Api {
     Anthropic,
     Openai,
+    /// OpenAI's Responses API: a different conversation shape and a different event stream, reached
+    /// with a ChatGPT subscription token (D85).
+    #[serde(rename = "openai-responses")]
+    OpenaiResponses,
 }
 
 /// A tool as the model sees it.
@@ -455,6 +462,22 @@ pub struct ProviderEntry {
     /// an `Authorization: Bearer` key is the norm; Azure wants `api-key` and no prefix, which is the
     /// case this exists for (D84).
     pub key_header: Option<String>,
+    /// How the provider authenticates (D85). An OAuth provider has no key: its access token comes
+    /// from the store `/login` writes, and is refreshed when it expires.
+    pub auth: Option<Auth>,
+    /// This provider's OAuth endpoints, from a preset or `[providers.<name>.oauth]` (D85).
+    pub oauth: Option<crate::provider::oauth::Flow>,
+}
+
+/// How a provider authenticates (D85).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Auth {
+    /// A key from the environment or from `/login`.
+    #[default]
+    ApiKey,
+    /// Tokens from an OAuth login, refreshed when they expire.
+    Oauth,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -476,6 +499,9 @@ pub struct ProviderConfig {
     pub headers: BTreeMap<String, String>,
     /// The header the key goes in, when it is not the default for this `api` (D84).
     pub key_header: Option<String>,
+    /// How the provider authenticates, and where, when it is OAuth (D85).
+    pub auth: Auth,
+    pub oauth: Option<crate::provider::oauth::Flow>,
 }
 
 /// Built-in providers.
@@ -507,6 +533,37 @@ fn presets() -> BTreeMap<&'static str, ProviderEntry> {
         (
             "openai",
             entry("https://api.openai.com/v1", "OPENAI_API_KEY"),
+        ),
+        (
+            // A ChatGPT subscription, which is a different endpoint and a different wire format
+            // from the API-key provider above, not a setting on it (D85).
+            "openai-chatgpt",
+            ProviderEntry {
+                api: Some(Api::OpenaiResponses),
+                base_url: Some(oauth::OPENAI_API_BASE.into()),
+                auth: Some(Auth::Oauth),
+                oauth: Some(oauth::Flow {
+                    method: Some(oauth::Method::Device),
+                    authorize_url: Some(oauth::OPENAI_AUTHORIZE_URL.into()),
+                    token_url: Some(oauth::OPENAI_TOKEN_URL.into()),
+                    client_id: Some(oauth::OPENAI_CLIENT_ID.into()),
+                    scopes: Some(oauth::OPENAI_SCOPES.into()),
+                    redirect_uri: Some(oauth::OPENAI_REDIRECT_URI.into()),
+                    redirect_port: Some(oauth::OPENAI_REDIRECT_PORT),
+                    device_code_url: Some(oauth::OPENAI_DEVICE_CODE_URL.into()),
+                    device_token_url: Some(oauth::OPENAI_DEVICE_TOKEN_URL.into()),
+                    verification_url: Some(oauth::OPENAI_VERIFICATION_URL.into()),
+                    ..oauth::Flow::default()
+                }),
+                // The subscription backend wants both, and states so in its own clients.
+                headers: [(
+                    "OpenAI-Beta".to_owned(),
+                    "responses=experimental".to_owned(),
+                )]
+                .into_iter()
+                .collect(),
+                ..ProviderEntry::default()
+            },
         ),
         (
             // The Anthropic base carries no `/v1`: its client appends `/v1/messages`, which keeps a
@@ -592,6 +649,13 @@ pub fn endpoint(name: &str, user: &BTreeMap<String, ProviderEntry>) -> Result<Pr
             .or_else(|| preset.map(|e| e.headers.clone()))
             .unwrap_or_default(),
         key_header: pick(|e| &e.key_header).filter(|h| !h.is_empty()),
+        auth: mine
+            .and_then(|e| e.auth)
+            .or_else(|| preset.and_then(|e| e.auth))
+            .unwrap_or_default(),
+        oauth: mine
+            .and_then(|e| e.oauth.clone())
+            .or_else(|| preset.and_then(|e| e.oauth.clone())),
     })
 }
 
@@ -646,6 +710,8 @@ pub fn catalog(user: &BTreeMap<String, ProviderEntry>) -> Vec<(String, ProviderE
                 m.headers.clone()
             },
             key_header: m.key_header.clone().or(base.key_header),
+            auth: m.auth.or(base.auth),
+            oauth: m.oauth.clone().or(base.oauth),
         }
     };
     let mut out: Vec<(String, ProviderEntry)> = presets
@@ -789,7 +855,7 @@ pub fn request_headers(config: &ProviderConfig, key: Option<&str>) -> Vec<(Strin
     let mut headers = Vec::new();
     let default = match config.api {
         Api::Anthropic => "x-api-key",
-        Api::Openai => "authorization",
+        Api::Openai | Api::OpenaiResponses => "authorization",
     };
     let name = config
         .key_header
@@ -814,6 +880,9 @@ pub fn request_headers(config: &ProviderConfig, key: Option<&str>) -> Vec<(Strin
 }
 
 pub fn available_key(config: &ProviderConfig, stored_key: Option<&str>) -> Option<String> {
+    if config.auth == Auth::Oauth {
+        return None;
+    }
     config
         .api_key_env
         .as_ref()
@@ -831,10 +900,25 @@ pub struct SearchTarget {
     pub key_env: Option<String>,
 }
 
+/// A provider's live OAuth state: where its endpoints are, its tokens, and where to write a
+/// refreshed one (D85).
+///
+/// The tokens are shared rather than copied, so a background compaction and the turn it belongs to
+/// see one token: a refresh rotates the refresh token, and two concurrent refreshes would leave one
+/// of them holding a token the server has already retired.
+#[derive(Clone)]
+pub struct OAuthState {
+    pub flow: oauth::Flow,
+    pub tokens: std::sync::Arc<std::sync::Mutex<Tokens>>,
+    pub store: std::path::PathBuf,
+    pub provider: String,
+}
+
 pub struct Provider {
     pub name: String,
     pub config: ProviderConfig,
     key: Option<String>,
+    oauth: Option<OAuthState>,
     agent: ureq::Agent,
     window: u64,
     source: WindowSource,
@@ -872,6 +956,7 @@ impl Provider {
             .price
             .or_else(|| reported.price(&config.base_url, &config.model));
         Self {
+            oauth: None,
             name: name.to_owned(),
             config,
             key,
@@ -893,6 +978,7 @@ impl Provider {
             name: self.name.clone(),
             config: self.config.clone(),
             key: self.key.clone(),
+            oauth: self.oauth.clone(),
             agent: http::agent(),
             window: self.window,
             source: self.source,
@@ -945,12 +1031,103 @@ impl Provider {
     }
 
     /// Why requests would fail for want of a key, if they would.
-    /// The key this provider sends, when it has one.
-    pub fn key(&self) -> Option<&str> {
-        self.key.as_deref()
+    /// Attaches whatever `/login` stored for this provider, when it authenticates with OAuth (D85).
+    ///
+    /// A provider built without this says so in `missing_key`, which is the honest answer: the
+    /// tokens exist but this process was not told where to find them.
+    pub fn with_stored_oauth(mut self, store: &std::path::Path) -> Self {
+        let Some(flow) = self.config.oauth.clone() else {
+            return self;
+        };
+        if self.config.auth != Auth::Oauth {
+            return self;
+        }
+        if let Ok(auth) = crate::auth::AuthStore::load(store)
+            && let Some(tokens) = auth.oauth(&self.name).cloned()
+        {
+            self.with_oauth(flow, tokens, store.to_path_buf());
+        }
+        self
+    }
+
+    /// Attaches the OAuth tokens a login stored, so this provider can use and refresh them (D85).
+    pub fn with_oauth(&mut self, flow: oauth::Flow, tokens: Tokens, store: std::path::PathBuf) {
+        self.oauth = Some(OAuthState {
+            flow,
+            tokens: std::sync::Arc::new(std::sync::Mutex::new(tokens)),
+            store,
+            provider: self.name.clone(),
+        });
+    }
+
+    /// The credential this request is sent with: the access token for an OAuth provider, else the
+    /// API key. A copy, because an OAuth token can be replaced by a refresh.
+    pub fn key(&self) -> Option<String> {
+        match &self.oauth {
+            Some(oauth) => oauth
+                .tokens
+                .lock()
+                .ok()
+                .map(|t| t.access.clone())
+                .filter(|a| !a.is_empty()),
+            None => self.key.clone(),
+        }
+    }
+
+    /// The headers this request carries: the credential where the provider wants it, the
+    /// provider's own, and the account an OAuth token belongs to (D84, D85).
+    pub fn request_headers(&self) -> Vec<(String, String)> {
+        let key = self.key();
+        let mut headers = request_headers(&self.config, key.as_deref());
+        if let Some(oauth) = &self.oauth
+            && let Ok(tokens) = oauth.tokens.lock()
+        {
+            headers.extend(oauth::headers(&tokens));
+        }
+        headers
+    }
+
+    /// Refreshes an expired OAuth token before a request, and remembers the new one (D85).
+    ///
+    /// A refresh is a request of its own, so it happens here rather than inside the stream: a 401
+    /// part-way through a reply is not recoverable, and a token that expires mid-turn would
+    /// otherwise fail the turn that was working.
+    pub fn refresh_tokens(&self) -> Result<()> {
+        let Some(oauth) = &self.oauth else {
+            return Ok(());
+        };
+        let settings = oauth.flow.settings()?;
+        let mut tokens = oauth
+            .tokens
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the OAuth token state was poisoned"))?;
+        if tokens.usable(120, oauth::now()) {
+            return Ok(());
+        }
+        let fresh = oauth::refresh(&settings, &tokens).with_context(|| {
+            format!(
+                "refreshing the {} login; run `saddle login {}` again",
+                oauth.provider, oauth.provider
+            )
+        })?;
+        if let Ok(mut store) = crate::auth::AuthStore::load(&oauth.store) {
+            store.set_oauth(&oauth.provider, fresh.clone());
+            let _ = store.save(&oauth.store);
+        }
+        *tokens = fresh;
+        Ok(())
     }
 
     pub fn missing_key(&self) -> Option<String> {
+        if self.config.auth == Auth::Oauth {
+            return match &self.oauth {
+                Some(_) => None,
+                None => Some(format!(
+                    "{} authenticates with OAuth: run `saddle login {}`",
+                    self.name, self.name
+                )),
+            };
+        }
         match (&self.key, &self.config.api_key_env) {
             (None, Some(var)) => Some(format!(
                 "no API key for {}: log in with /login in the TUI, or set {var}",
@@ -964,9 +1141,11 @@ impl Provider {
         if let Some(why) = self.missing_key() {
             bail!(why);
         }
+        self.refresh_tokens()?;
         match self.config.api {
             Api::Anthropic => anthropic::complete(self, conv, sink),
             Api::Openai => openai::complete(self, conv, sink),
+            Api::OpenaiResponses => responses::complete(self, conv, sink),
         }
     }
 }
@@ -1007,9 +1186,21 @@ model = "qwen"
         let e = resolve("nonesuch", &user, None).unwrap_err().to_string();
         assert!(e.contains("[providers.nonesuch]"), "{e}");
 
-        assert_eq!(builtin_names(), ["anthropic", "openai", "synthetic"]);
+        assert_eq!(
+            builtin_names(),
+            ["anthropic", "openai", "openai-chatgpt", "synthetic"]
+        );
         let names: Vec<String> = catalog(&user).into_iter().map(|(n, _)| n).collect();
-        assert_eq!(names, ["anthropic", "openai", "synthetic", "local"]);
+        assert_eq!(
+            names,
+            [
+                "anthropic",
+                "openai",
+                "openai-chatgpt",
+                "synthetic",
+                "local"
+            ]
+        );
         let secrets = secret_env_names(&user);
         assert_eq!(
             secrets,
@@ -1031,6 +1222,8 @@ model = "qwen"
             search_url: None,
             headers: BTreeMap::new(),
             key_header: None,
+            auth: Auth::ApiKey,
+            oauth: None,
         }
     }
 

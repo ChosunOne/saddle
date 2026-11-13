@@ -990,6 +990,8 @@ impl Controller {
                 search_url: None,
                 headers: Default::default(),
                 key_header: None,
+                auth: provider::Auth::ApiKey,
+                oauth: None,
             },
             None => {
                 let user = UserConfig::load(&self.paths.user_config())?;
@@ -1598,7 +1600,8 @@ impl Controller {
         let auth = AuthStore::load(&self.paths.auth_store())?;
         let reported = provider::Reported::stored(&self.paths.reported_windows());
         let config = provider::resolve(name, &user.providers, None)?;
-        Ok(Provider::new(name, config, auth.key(name), &reported))
+        Ok(Provider::new(name, config, auth.key(name), &reported)
+            .with_stored_oauth(&self.paths.auth_store()))
     }
 
     fn switch(&self, app: &mut App, provider: Provider) {

@@ -1751,6 +1751,8 @@ mod tests {
                 search_url: None,
                 headers: Default::default(),
                 key_header: None,
+                auth: crate::provider::Auth::ApiKey,
+                oauth: None,
             },
             Some("key"),
             &crate::provider::Reported::default(),

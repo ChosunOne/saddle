@@ -13,7 +13,7 @@ use super::{Cancelled, SUMMARY_INTRO, sse};
 
 pub fn complete(p: &Provider, conv: &Conversation<'_>, sink: &mut dyn Sink) -> Result<Reply> {
     let url = format!("{}/chat/completions", p.config.base_url);
-    let headers = super::request_headers(&p.config, p.key());
+    let headers = p.request_headers();
     let events = http::stream(p, url, headers, &body(&p.config, conv))?;
     read_stream(events, sink)
 }
