@@ -202,6 +202,11 @@ fn walk(
 /// The filter a walk applies: the agent's read grant on each path, without logging.
 fn policy_filter<'a>(session: &'a Session, root: &'a RootName) -> impl Fn(&str) -> bool + 'a {
     move |rel| {
+        // D66: a `[sandbox]` directory is not governed by a grant, so every entry beneath it is
+        // in reach for the tools its entry lists, and only those.
+        if session.is_tool_root(root) {
+            return true;
+        }
         let Ok(rel) = RelPath::new(rel) else {
             return false;
         };
@@ -215,7 +220,7 @@ fn policy_filter<'a>(session: &'a Session, root: &'a RootName) -> impl Fn(&str) 
 
 /// How a path is shown to the model: relative to the workspace when it is in it.
 fn shown(session: &Session, root: &RootName, rel: &str) -> String {
-    let base = session.roots().get(root).map(Path::to_path_buf);
+    let base = session.base_of(root);
     match base {
         Some(base) => {
             let abs = base.join(rel);
@@ -246,7 +251,7 @@ fn skipped_note(n: usize) -> String {
 
 pub fn ls(session: &mut Session, input: &Value) -> Result<ToolOutput> {
     let path = optional_str(input, "path").unwrap_or(".");
-    let loc = match gate(session, Scope::FsRead, path)? {
+    let loc = match gate(session, "ls", Scope::FsRead, path)? {
         Ok(loc) => loc,
         Err(out) => return Ok(out),
     };
@@ -334,7 +339,7 @@ pub fn find(session: &mut Session, input: &Value) -> Result<ToolOutput> {
         Err(e) => return Ok(ToolOutput::err(e)),
     };
     let path = optional_str(input, "path").unwrap_or(".");
-    let loc = match gate(session, Scope::FsRead, path)? {
+    let loc = match gate(session, "find", Scope::FsRead, path)? {
         Ok(loc) => loc,
         Err(out) => return Ok(out),
     };
@@ -407,7 +412,7 @@ pub fn grep(session: &mut Session, input: &Value) -> Result<ToolOutput> {
         Err(e) => return Ok(ToolOutput::err(e)),
     };
     let path = optional_str(input, "path").unwrap_or(".");
-    let loc = match gate(session, Scope::FsRead, path)? {
+    let loc = match gate(session, "grep", Scope::FsRead, path)? {
         Ok(loc) => loc,
         Err(out) => return Ok(out),
     };

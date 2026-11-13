@@ -203,7 +203,7 @@ fn join(lines: &[String]) -> String {
 
 /// Resolves and decides one path, the same way every other write does.
 fn gate_path(session: &mut Session, path: &str) -> Result<Result<Location, ToolOutput>> {
-    super::fs::gate(session, Scope::FsWrite, path)
+    super::fs::gate(session, "patch", Scope::FsWrite, path)
 }
 
 fn read_beneath(session: &Session, loc: &Location) -> Option<String> {

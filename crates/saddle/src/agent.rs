@@ -1179,6 +1179,18 @@ pub fn base_prompt(session: &Session, context: &[ContextFile]) -> String {
     for (name, path) in session.roots().iter() {
         let _ = writeln!(s, "  {:<10} {}", name.as_str(), path.display());
     }
+    // D66: outside every root, not part of the session, and decided by the config entry rather
+    // than by a grant.
+    if !session.setup.tool_paths.is_empty() {
+        s.push_str(
+            "\nAlso reachable by the tools named beside each, outside the workspace and not part of \
+             it. These are the user's own directories, listed in their config; no grant covers \
+             them and a workspace cannot add one:\n",
+        );
+        for path in &session.setup.tool_paths {
+            let _ = writeln!(s, "  {:<12} {}", path.tools.join(", "), path.written);
+        }
+    }
     s.push_str(&crate::skills::listing(&session.skills));
     if !context.is_empty() {
         s.push_str(

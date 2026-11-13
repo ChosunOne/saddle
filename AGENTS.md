@@ -143,7 +143,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D64 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D66 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
@@ -238,6 +238,13 @@ rather than loosening it.
   is never a `[roots]` entry: a root is nameable by any policy, so `fs-write = [{ root = "cargo" }]`
   in a workspace file could plant a program in `~/.cargo/bin`. `[sandbox] read`/`write` take paths
   for exactly that reason.
+- **A `[sandbox]` entry is a claim, not a pattern** (D66). It may be a bare path — a sandboxed
+  command's indirect reach, which is all any entry meant before — or a table that adds `tools`, the
+  file tools that may name that directory directly. Tool-visible directories are not roots and no
+  policy can name one; `check` lists them separately. An entry that names, contains or sits inside
+  the state or config directory is refused, and a misspelt tool name is an error because the file
+  tools run in saddle, with no kernel behind them. A named write still cannot reach a reserved path.
+  `saddle check` shows `tool paths`; `saddle tool read '{"path":"~/.agents/…"}'` is the by-hand test.
 - **`exec` is Linux-only**, needs landlock ABI 3 as a hard requirement, and has no network: seccomp
   blocks `socket()` for `AF_INET`/`AF_INET6`/`AF_UNIX`/`AF_NETLINK`/`AF_PACKET` and the io_uring
   entry points. Do not add hosts or paths to the sandbox allowlist to make a test pass. Network

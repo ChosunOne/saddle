@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use cap_std::fs::Dir;
 use saddle_cap::{Location, Principal, RelPath, Scope};
-use saddle_policy::Request;
+use saddle_policy::{Kind, Request};
 use serde_json::Value;
+
+use anyhow::Context as _;
 
 use super::{ToolOutput, num_field, str_field};
 use crate::session::Session;
@@ -156,7 +158,7 @@ fn page(text: &str, offset: Option<u64>, limit: Option<u64>) -> (String, Option<
 /// decided and logged, and symlinks are resolved beneath the root. Used by the read tool, by
 /// `@file` attachments and by project context files.
 pub fn read_text(session: &mut Session, path: &str) -> Result<Result<String, ToolOutput>> {
-    let loc = match gate(session, Scope::FsRead, path)? {
+    let loc = match gate(session, "read", Scope::FsRead, path)? {
         Ok(loc) => loc,
         Err(out) => return Ok(Err(out)),
     };
@@ -177,7 +179,7 @@ pub fn read_text(session: &mut Session, path: &str) -> Result<Result<String, Too
 /// The raw bytes of a file, through the same gate as [`read_text`]. Used for an attachment, which
 /// has to look at the bytes before deciding whether they are text or a picture (D58).
 pub fn read_bytes(session: &mut Session, path: &str) -> Result<Result<Vec<u8>, ToolOutput>> {
-    let loc = match gate(session, Scope::FsRead, path)? {
+    let loc = match gate(session, "read", Scope::FsRead, path)? {
         Ok(loc) => loc,
         Err(out) => return Ok(Err(out)),
     };
@@ -202,7 +204,7 @@ pub fn looks_like_image(bytes: &[u8]) -> bool {
 pub fn write(session: &mut Session, input: &Value) -> Result<ToolOutput> {
     let path = field!(input, "path");
     let content = field!(input, "content");
-    let loc = match gate(session, Scope::FsWrite, path)? {
+    let loc = match gate(session, "write", Scope::FsWrite, path)? {
         Ok(loc) => loc,
         Err(out) => return Ok(out),
     };
@@ -235,11 +237,11 @@ pub fn edit(session: &mut Session, input: &Value) -> Result<ToolOutput> {
     let path = field!(input, "path");
     let old = field!(input, "old");
     let new = field!(input, "new");
-    let loc = match gate(session, Scope::FsRead, path)? {
+    let loc = match gate(session, "edit", Scope::FsRead, path)? {
         Ok(loc) => loc,
         Err(out) => return Ok(out),
     };
-    if let Err(out) = gate(session, Scope::FsWrite, path)? {
+    if let Err(out) = gate(session, "edit", Scope::FsWrite, path)? {
         return Ok(out);
     }
     let text = match open_root(session, &loc).and_then(|d| d.read_to_string(loc.rel.to_path())) {
@@ -270,11 +272,12 @@ pub fn edit(session: &mut Session, input: &Value) -> Result<ToolOutput> {
 /// differs. Every decision is logged.
 pub(crate) fn gate(
     session: &mut Session,
+    tool: &str,
     scope: Scope,
     raw: &str,
 ) -> Result<Result<Location, ToolOutput>> {
     let who = Principal::Agent;
-    let loc = match session.locate(&who, scope, raw)? {
+    let loc = match session.locate(&who, tool, scope, raw)? {
         Ok(loc) => loc,
         Err(why) => return Ok(Err(ToolOutput::denied(&why))),
     };
@@ -282,6 +285,31 @@ pub(crate) fn gate(
         Ok(rel) => Location::new(loc.root.clone(), rel),
         Err(e) => return Ok(Err(ToolOutput::err(format!("{raw}: {e}")))),
     };
+    // D66: a `[sandbox]` directory is not covered by a grant, and `locate` has already checked
+    // the tool against the list the config names and recorded the decision. The reserved paths
+    // are still the host's (D23): a write there runs code as the user later, whatever granted it.
+    if session.is_tool_root(&loc.root) {
+        if scope == Scope::FsWrite {
+            for target in [&loc, &real] {
+                if session.engine.reserved().contains(target) {
+                    let why = format!("{raw} is reserved by the host and no grant can write it");
+                    session
+                        .audit
+                        .event(
+                            Kind::Decision,
+                            Some(&who),
+                            Some(scope),
+                            Some(false),
+                            serde_json::json!({ "path": raw }),
+                            &why,
+                        )
+                        .context("writing the audit log")?;
+                    return Ok(Err(ToolOutput::denied(&why)));
+                }
+            }
+        }
+        return Ok(Ok(loc));
+    }
     for target in [&loc, &real] {
         let req = match scope {
             Scope::FsRead => Request::FsRead { loc: target },
@@ -299,7 +327,7 @@ pub(crate) fn gate(
 }
 
 pub(crate) fn open_root(session: &Session, loc: &Location) -> io::Result<Dir> {
-    let path = session.roots().get(&loc.root).ok_or_else(|| {
+    let path = session.base_of(&loc.root).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, format!("no root `{}`", loc.root))
     })?;
     Dir::open_ambient_dir(path, cap_std::ambient_authority())

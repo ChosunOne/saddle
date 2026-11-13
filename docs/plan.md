@@ -1254,6 +1254,47 @@ use it.
 - **Not done, on purpose:** listing or serving a skill's bundled files from the `skill` tool, which
   would read inside the skill's directory without a grant (§8).
 
+**D66.** A `[sandbox]` entry may name the tools that reach it; a directory can be readable by the
+tools without being a root or part of the session.
+
+- **The gap.** Three sets existed: roots (the tools' namespace), `[sandbox]` (a child's reach), and
+  host-read content. A directory the user owns and wants the agent to read — `~/.agents`, a notes
+  directory — fell between them: readable by `bash` through the enumeration, refused by `read` as
+  outside every root. A root is the wrong answer, because a root is nameable by any workspace policy
+  (D62, D65). So the category is a *fourth* thing, and it is declared where a root cannot be: in
+  `[sandbox]`, which lives only in the user's `config.toml`.
+- **The shape.** An entry is a path, as before, or a table adding `tools`:
+  `{ path = "~/.agents", tools = ["read", "ls", "find", "grep"] }`. A bare path keeps its old
+  meaning exactly — indirect reach only — so nothing that exists today widens. The tools are named
+  individually rather than as a read/write level, because that is how the gate is asked: the tool
+  name is the thing to check. `write` and `edit` in the list allow writing there.
+- **No combination is validated.** Listing `edit` on a path only `read` reaches for a command is
+  allowed and simply fails at the tool or at the kernel; `bash` in the list is accepted even though
+  a command's reach comes from the entry itself, not from this list. Validating those pairs would
+  encode an opinion about how a person intends to use a directory.
+- **A tool name is validated, because there is no backstop behind it.** The file tools run in
+  saddle, not in the sandbox: landlock confines the `exec` child, so a host-side `write` has nothing
+  between it and the file but this list. A misspelt name would therefore read as a permission that
+  silently does nothing, so it is refused when the config loads.
+- **One entry, one claim, checked like a root.** An entry may not name, contain or sit inside the
+  state or config directory (D16). This was missing for `[sandbox]` generally — `read =
+  ["~/.config/saddle"]` handed a command the policy file — and it matters more now that an entry can
+  grant tool access. A default include rule over `~` prunes these instead, because a pattern is not
+  a claim.
+- **The reserved paths still hold** (D23). A named write bypasses the engine, so `gate` checks
+  `Reserved` itself: a hook or `.git/config` under a tool-visible directory is refused whatever the
+  entry lists, because it runs code as the user later.
+- **Not a root, and not nameable.** Found by path prefix like a root, but held apart from `Roots`,
+  so no policy can name one, `check` prints them under `tool paths` rather than `roots`, and the
+  prompt says they are outside the workspace and not part of it. Internally each gets a generated
+  name (`sandbox-1`) that skips any name a root uses, so a `Location` works unchanged and the name
+  never leaks: the audit records the absolute path.
+- **Decided without the engine.** A tool-visible directory is not covered by a grant, so there is no
+  rule to look up; the decision is the config entry, recorded as an ordinary `kind: decision` record
+  with the path, the outcome and an explanation naming the entry. The engine is unchanged, and no
+  grant can produce this outcome — which is what keeps it one config file rather than a second
+  authority a workspace could reach.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

@@ -731,6 +731,16 @@ fn check(dir: &std::path::Path, overrides: &config::Overrides) -> Result<ExitCod
     for line in &setup.merged {
         println!("  {line}");
     }
+    // D66: directories the file tools reach outside every root, and the tools on each. Not roots:
+    // no policy can name one, and they are not part of the session.
+    if !setup.tool_paths.is_empty() {
+        println!(
+            "tool paths  reachable by these tools, outside every root, not part of the session"
+        );
+        for path in &setup.tool_paths {
+            println!("  {:<28} {}", path.written, path.tools.join(", "));
+        }
+    }
     // A pattern is an input; this list is the authority a command actually runs under (D62).
     if !setup.extras.include.is_empty() {
         println!("exec reads");

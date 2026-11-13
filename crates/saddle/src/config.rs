@@ -143,9 +143,9 @@ pub struct CompactionConfig {
 #[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
     #[serde(default)]
-    pub read: Vec<String>,
+    pub read: Vec<SandboxEntry>,
     #[serde(default)]
-    pub write: Vec<String>,
+    pub write: Vec<SandboxEntry>,
     /// Directories worked out by walking a base and excluding what matches, so a command gets what
     /// it needs without saddle knowing about each tool (D62).
     #[serde(default)]
@@ -155,6 +155,50 @@ pub struct SandboxConfig {
     /// directory to exclude" means. Set false to have only the rules written here (D62).
     #[serde(default = "yes", rename = "include-defaults")]
     pub include_defaults: bool,
+}
+
+/// One `[sandbox]` entry: a directory a sandboxed command may reach (D62), and, if it names tools,
+/// a directory the file tools may reach too (D66).
+///
+/// A bare path is what every entry was before tool access existed: indirect reach only, through a
+/// command. A table adds `tools`, the list of file tools that may name the directory directly.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum SandboxEntry {
+    Path(String),
+    WithTools {
+        path: String,
+        /// Tool names, from `tools::NAMES`. Empty means indirect reach only, which is the default
+        /// for an entry that does not say otherwise (D66).
+        #[serde(default)]
+        tools: Vec<String>,
+    },
+}
+
+impl SandboxEntry {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Path(path) => path,
+            Self::WithTools { path, .. } => path,
+        }
+    }
+
+    /// The tools the file tools may use on this directory; empty for a bare path.
+    pub fn tools(&self) -> &[String] {
+        match self {
+            Self::Path(_) => &[],
+            Self::WithTools { tools, .. } => tools,
+        }
+    }
+}
+
+/// A directory the file tools may reach outside every root, with the tools allowed on it (D66).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPath {
+    pub dir: PathBuf,
+    /// As written in `config.toml`, for `check` and the prompt.
+    pub written: String,
+    pub tools: Vec<String>,
 }
 
 /// A policy document from an `[agent]` table: the `version` line the parser requires, and the
@@ -386,7 +430,11 @@ impl UserConfig {
     /// The extras every child gets: named roots, plus the directories the include rules work out
     /// (D62). Enumeration happens here because the protected directories are known here, and the
     /// result is a plain list of paths, so the lowering itself stays a mapping.
-    pub fn sandbox_extras(&self, roots: &Roots, protected: &[PathBuf]) -> Result<SandboxExtras> {
+    pub fn sandbox_extras(
+        &self,
+        roots: &Roots,
+        protected: &[PathBuf],
+    ) -> Result<(SandboxExtras, Vec<ToolPath>)> {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let expand = |path: &str| -> Result<PathBuf> {
             // `~` is home itself, and `~/x` is a path in it; anything else is taken as written.
@@ -406,26 +454,80 @@ impl UserConfig {
         // making one a root makes it nameable by every policy in the tree, and a workspace policy
         // could then grant `fs-write` on `~/.cargo` and plant a program in `~/.cargo/bin` that runs
         // outside the sandbox later (D62).
-        let names = |list: &[String]| -> Result<Vec<PathBuf>> {
-            list.iter()
-                .map(|n| match RootName::new(n) {
-                    Ok(name) if roots.contains(&name) => roots
-                        .get(&name)
-                        .map(Path::to_path_buf)
-                        .ok_or_else(|| anyhow::anyhow!("config.toml: unknown root `{name}`")),
-                    _ => {
-                        let path = expand(n)?;
-                        if !path.is_absolute() {
-                            bail!(
-                                "config.toml: [sandbox] entry `{n}` is neither a root nor an \
-                                 absolute path (use ~/... for a path in your home directory)"
-                            );
-                        }
-                        Ok(path)
+        let resolve = |n: &str| -> Result<PathBuf> {
+            match RootName::new(n) {
+                Ok(name) if roots.contains(&name) => roots
+                    .get(&name)
+                    .map(Path::to_path_buf)
+                    .ok_or_else(|| anyhow::anyhow!("config.toml: unknown root `{name}`")),
+                _ => {
+                    let path = expand(n)?;
+                    if !path.is_absolute() {
+                        bail!(
+                            "config.toml: [sandbox] entry `{n}` is neither a root nor an \
+                             absolute path (use ~/... for a path in your home directory)"
+                        );
                     }
+                    Ok(path)
+                }
+            }
+        };
+        // An entry may not name, contain, or sit inside the state or config directory: those hold
+        // the policy, the audit log and the stored keys, and D16 says no root contains them. A
+        // sandbox entry is the same claim by another route, and it used to be unchecked, so
+        // `read = ["~/.config/saddle"]` handed a command the policy file. A rule over `~` prunes
+        // these instead, because it is a pattern rather than a claim.
+        let check_protected = |path: &Path, written: &str| -> Result<()> {
+            for protected in protected {
+                if path.starts_with(protected) || protected.starts_with(path) {
+                    bail!(
+                        "config.toml: [sandbox] entry `{written}` names, contains or sits inside \
+                         {}, which holds the policy, the audit log and the stored keys; no \
+                         sandbox entry may reach it (D16). A default include rule over ~ leaves \
+                         it out on its own.",
+                        protected.display()
+                    );
+                }
+            }
+            Ok(())
+        };
+        let names = |list: &[SandboxEntry]| -> Result<Vec<PathBuf>> {
+            list.iter()
+                .map(|entry| {
+                    let path = resolve(entry.path())?;
+                    check_protected(&path, entry.path())?;
+                    Ok(path)
                 })
                 .collect()
         };
+        // Entries that name tools are also readable by the file tools (D66). An unknown name is an
+        // error rather than a silent no-op: the list is the authority for these directories, and
+        // there is no kernel check behind a host-side tool, so a typo would otherwise read as a
+        // permission that silently does nothing.
+        let mut tool_paths = Vec::new();
+        for entry in self.sandbox.read.iter().chain(self.sandbox.write.iter()) {
+            let tools = entry.tools();
+            if tools.is_empty() {
+                continue;
+            }
+            for tool in tools {
+                if !crate::tools::NAMES.contains(&tool.as_str()) {
+                    bail!(
+                        "config.toml: [sandbox] entry `{}` lists unknown tool `{tool}`; the \
+                         tools are {}",
+                        entry.path(),
+                        crate::tools::NAMES.join(", ")
+                    );
+                }
+            }
+            let dir = resolve(entry.path())?;
+            check_protected(&dir, entry.path())?;
+            tool_paths.push(ToolPath {
+                dir,
+                written: entry.path().to_owned(),
+                tools: tools.to_vec(),
+            });
+        }
         // The built-in rule first, so a machine with nothing configured still works (D62).
         let built_in = default_include();
         let rules: Vec<&IncludeConfig> = if self.sandbox.include_defaults {
@@ -483,11 +585,14 @@ impl UserConfig {
         }
         include.sort();
         include.dedup();
-        Ok(SandboxExtras {
-            read: names(&self.sandbox.read)?,
-            write: names(&self.sandbox.write)?,
-            include,
-        })
+        Ok((
+            SandboxExtras {
+                read: names(&self.sandbox.read)?,
+                write: names(&self.sandbox.write)?,
+                include,
+            },
+            tool_paths,
+        ))
     }
 }
 

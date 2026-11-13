@@ -1187,3 +1187,210 @@ fn a_sandbox_path_reaches_commands_and_not_the_file_tools() {
     );
     assert!(text.contains(&notes), "it is listed as exec reach: {text}");
 }
+
+/// Runs the binary with `HOME` pointed at a throwaway directory, so a `[sandbox]` entry can name
+/// something under it.
+fn saddle_in(env: &Env, home: &std::path::Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_saddle"))
+        .arg("-C")
+        .arg(env.ws.path())
+        .args(args)
+        .env("HOME", home)
+        .env("XDG_STATE_HOME", env.xdg.path().join("state"))
+        .env("XDG_CONFIG_HOME", env.xdg.path().join("config"))
+        .output()
+        .unwrap()
+}
+
+/// Writes `[sandbox] read` as the given TOML value, keeping the rest of the config.
+fn set_sandbox_read(env: &Env, value: toml::Value) {
+    let path = env.policy_path();
+    let mut doc: toml::Table = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .parse()
+        .unwrap();
+    let sandbox = doc
+        .entry("sandbox")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    sandbox.as_table_mut().unwrap().insert("read".into(), value);
+    std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+}
+
+#[test]
+fn a_sandbox_entry_naming_tools_lets_those_tools_reach_it() {
+    // D66: a directory outside the workspace, reachable by the tools named on its `[sandbox]`
+    // entry. It is not a root, so no policy can name it, and it is not part of the session.
+    let env = Env::new();
+    let home = tempfile::tempdir().unwrap();
+    let agents = home.path().join(".agents");
+    std::fs::create_dir_all(agents.join("skills/a")).unwrap();
+    std::fs::write(agents.join("skills/a/SKILL.md"), "---\nname: a\n---\nx\n").unwrap();
+    let notes = home.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("n.md"), "notes\n").unwrap();
+
+    let entry = |path: &str, tools: &[&str]| {
+        let mut table = toml::Table::new();
+        table.insert("path".into(), path.into());
+        table.insert(
+            "tools".into(),
+            toml::Value::Array(tools.iter().map(|t| toml::Value::from(*t)).collect()),
+        );
+        toml::Value::Table(table)
+    };
+    set_sandbox_read(
+        &env,
+        toml::Value::Array(vec!["~/notes".into(), entry("~/.agents", &["read", "ls"])]),
+    );
+
+    // A named tool reaches it.
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "read",
+            &format!(
+                r#"{{"path":"{}"}}"#,
+                agents.join("skills/a/SKILL.md").display()
+            ),
+        ],
+    );
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(text.contains("name: a"), "{text}");
+
+    // A tool the entry does not name is refused, and says which are allowed.
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "write",
+            &format!(
+                r#"{{"path":"{}","content":"x"}}"#,
+                agents.join("new.txt").display()
+            ),
+        ],
+    );
+    let text = stderr(&out);
+    assert!(
+        text.contains("not one of the tools config.toml allows"),
+        "{text}"
+    );
+    assert!(text.contains("read, ls"), "{text}");
+
+    // A bare path is indirect reach only: the entry above keeps ~/notes out of the tools' way.
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "read",
+            &format!(r#"{{"path":"{}"}}"#, notes.join("n.md").display()),
+        ],
+    );
+    assert!(
+        stderr(&out).contains("outside every root"),
+        "{}",
+        stderr(&out)
+    );
+
+    // `check` shows it under its own heading, never under roots.
+    let out = saddle_in(&env, home.path(), &["check"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let roots = text.split("grants").next().unwrap_or_default();
+    assert!(!roots.contains(".agents"), "not a root: {text}");
+    assert!(text.contains("tool paths"), "{text}");
+    assert!(text.contains("~/.agents"), "{text}");
+}
+
+#[test]
+fn a_sandbox_entry_naming_tools_can_write_but_never_a_reserved_path() {
+    // The tools run in saddle, so the list is what allows a write there; the skeleton is the
+    // kernel. D23 still holds, because a hook runs as the user later whatever granted the write.
+    let env = Env::new();
+    let home = tempfile::tempdir().unwrap();
+    let scratch = home.path().join("scratch");
+    std::fs::create_dir_all(scratch.join(".git/hooks")).unwrap();
+    let mut table = toml::Table::new();
+    table.insert("path".into(), "~/scratch".into());
+    table.insert(
+        "tools".into(),
+        toml::Value::Array(vec!["write".into(), "read".into()]),
+    );
+    set_sandbox_read(&env, toml::Value::Array(vec![toml::Value::Table(table)]));
+
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "write",
+            &format!(
+                r#"{{"path":"{}","content":"fine"}}"#,
+                scratch.join("ok.txt").display()
+            ),
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "write",
+            &format!(
+                r##"{{"path":"{}","content":"#!/bin/sh"}}"##,
+                scratch.join(".git/hooks/pre-commit").display()
+            ),
+        ],
+    );
+    assert!(
+        stderr(&out).contains("reserved by the host"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_sandbox_entry_may_not_reach_the_policy_or_the_audit_log() {
+    // D16: no sandbox entry may reach the state or config directory. It used to be unchecked, so
+    // `read = ["~/.config/saddle"]` handed a command the policy file.
+    let env = Env::new();
+    let config = env.policy_path();
+    let dir = config.parent().unwrap().to_path_buf();
+    set_sandbox_read(
+        &env,
+        toml::Value::Array(vec![toml::Value::from(dir.display().to_string())]),
+    );
+    let out = env.saddle(&["check"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    let text = stderr(&out);
+    assert!(text.contains("no sandbox entry may reach it"), "{text}");
+
+    // Naming something above it is refused too, since a rule covers everything beneath it.
+    let parent = dir.parent().unwrap().display().to_string();
+    set_sandbox_read(&env, toml::Value::Array(vec![toml::Value::from(parent)]));
+    let out = env.saddle(&["check"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+#[test]
+fn a_misspelt_tool_name_in_a_sandbox_entry_is_an_error() {
+    // The list is the authority for that directory, and there is no kernel check behind a
+    // host-side tool, so a typo must not read as a permission that silently does nothing.
+    let env = Env::new();
+    let mut table = toml::Table::new();
+    table.insert("path".into(), "/tmp".into());
+    table.insert("tools".into(), toml::Value::Array(vec!["raed".into()]));
+    set_sandbox_read(&env, toml::Value::Array(vec![toml::Value::Table(table)]));
+    let out = env.saddle(&["check"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("lists unknown tool `raed`"),
+        "{}",
+        stderr(&out)
+    );
+}

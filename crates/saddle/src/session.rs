@@ -78,6 +78,9 @@ pub struct Setup {
     pub notes: Vec<String>,
     /// This run's grant overrides, kept so a policy reload does not silently drop them (D63).
     pub overrides: crate::config::Overrides,
+    /// Directories the file tools may reach outside every root, and the tools allowed on each
+    /// (D66). From `[sandbox]` in the user's config only, so no workspace policy can add one.
+    pub tool_paths: Vec<crate::config::ToolPath>,
     /// Whether and how many skills to look for (D64), read with the rest of the config.
     pub skills: crate::config::SkillsConfig,
     /// The sensitive directories this workspace puts in reach, which is what the person is asked
@@ -106,7 +109,7 @@ impl Setup {
         let roots = Roots::resolve(entries, &paths.protected())?;
         // The include rules are enumerated here, where the protected directories are known, so
         // what a child may reach is a list rather than a pattern (D62).
-        let extras = user.sandbox_extras(&roots, &paths.protected())?;
+        let (extras, tool_paths) = user.sandbox_extras(&roots, &paths.protected())?;
 
         // One file holds everything (D63): `[agent]` is the base every workspace inherits, and
         // `[workspaces.<key>]` is this workspace's own grants, layered on top of it rather than
@@ -239,6 +242,7 @@ impl Setup {
             notes,
             exposed,
             overrides: overrides.clone(),
+            tool_paths,
             skills: skills_cfg,
         })
     }
@@ -274,6 +278,15 @@ impl Drop for PrivateTmp {
     }
 }
 
+/// A `[sandbox]` directory the file tools may reach, with an internal name so a `Location` works
+/// unchanged (D66). The name is never shown: `check`, the prompt and the audit use the real path.
+pub struct ToolRoot {
+    pub name: RootName,
+    pub dir: PathBuf,
+    pub tools: Vec<String>,
+    pub written: String,
+}
+
 pub struct Session {
     pub setup: Setup,
     pub engine: Engine,
@@ -286,6 +299,8 @@ pub struct Session {
     pub skills: Vec<crate::skills::Skill>,
     /// Notes for the person about a skill that was refused, shadowed or ignored.
     pub skill_notes: Vec<String>,
+    /// The `[sandbox]` directories the file tools may reach (D66).
+    pub tool_roots: Vec<ToolRoot>,
     _tmp: PrivateTmp,
 }
 
@@ -340,8 +355,35 @@ impl Session {
             host_env: std::env::vars().collect(),
             skills: Vec::new(),
             skill_notes: Vec::new(),
+            tool_roots: Vec::new(),
             _tmp: tmp,
         };
+        // An internal name per tool-visible directory, skipping any name a root already uses, so a
+        // `Location` addresses it without the name meaning anything to a policy (D66).
+        let mut used: Vec<RootName> = session.setup.roots.iter().map(|(n, _)| n.clone()).collect();
+        for path in session.setup.tool_paths.clone() {
+            let mut n = 1;
+            let name = loop {
+                let candidate = match RootName::new(&format!("sandbox-{n}")) {
+                    Ok(name) => name,
+                    Err(_) => break None,
+                };
+                if !used.contains(&candidate) {
+                    break Some(candidate);
+                }
+                n += 1;
+            };
+            let Some(name) = name else {
+                continue;
+            };
+            used.push(name.clone());
+            session.tool_roots.push(ToolRoot {
+                name,
+                dir: path.dir,
+                tools: path.tools,
+                written: path.written,
+            });
+        }
         // Discovered before the first request so the prompt can advertise them, and once only: a
         // skill is read at startup as an instruction file is, so a grants reload does not change
         // what the conversation was built from.
@@ -402,6 +444,7 @@ impl Session {
     pub fn locate(
         &mut self,
         who: &Principal,
+        tool: &str,
         scope: Scope,
         raw: &str,
     ) -> Result<Result<Location, String>> {
@@ -414,6 +457,50 @@ impl Session {
         if let Some(loc) = self.roots().locate(&abs) {
             return Ok(Ok(loc));
         }
+        // D66: a `[sandbox]` directory that names tools. No grant covers it, so the config entry is
+        // the authority; the tool name is what it lists, which is why the name is passed in.
+        if let Some(root) = self.tool_root_for(&abs) {
+            if root.tools.iter().any(|t| t == tool) {
+                let rel = match saddle_cap::RelPath::new(
+                    abs.strip_prefix(&root.dir).unwrap_or(Path::new("")),
+                ) {
+                    Ok(rel) => rel,
+                    Err(e) => return Ok(Err(format!("{raw}: {e}"))),
+                };
+                let loc = Location::new(root.name.clone(), rel);
+                let explanation = format!(
+                    "`{tool}` on {} is allowed by config.toml [sandbox]",
+                    root.written
+                );
+                self.audit
+                    .event(
+                        Kind::Decision,
+                        Some(who),
+                        Some(scope),
+                        Some(true),
+                        json!({ "path": abs.display().to_string() }),
+                        &explanation,
+                    )
+                    .context("writing the audit log")?;
+                return Ok(Ok(loc));
+            }
+            let explanation = format!(
+                "`{tool}` is not one of the tools config.toml allows on {} ({})",
+                root.written,
+                root.tools.join(", ")
+            );
+            self.audit
+                .event(
+                    Kind::Decision,
+                    Some(who),
+                    Some(scope),
+                    Some(false),
+                    json!({ "path": abs.display().to_string() }),
+                    &explanation,
+                )
+                .context("writing the audit log")?;
+            return Ok(Err(explanation));
+        }
         let explanation = format!("{raw} is outside every root");
         self.audit.event(
             Kind::Decision,
@@ -424,6 +511,31 @@ impl Session {
             &explanation,
         )?;
         Ok(Err(explanation))
+    }
+
+    /// The tool-visible directory containing `abs`, innermost first (D66).
+    fn tool_root_for(&self, abs: &Path) -> Option<&ToolRoot> {
+        let abs = saddle_cap::roots::normalize(abs);
+        self.tool_roots
+            .iter()
+            .filter(|r| abs.starts_with(&r.dir))
+            .max_by_key(|r| r.dir.components().count())
+    }
+
+    /// The directory a `Location`'s root stands for: a root, or a `[sandbox]` directory (D66).
+    pub fn base_of(&self, root: &RootName) -> Option<PathBuf> {
+        if let Some(path) = self.roots().get(root) {
+            return Some(path.to_path_buf());
+        }
+        self.tool_roots
+            .iter()
+            .find(|r| &r.name == root)
+            .map(|r| r.dir.clone())
+    }
+
+    /// Whether a location is a `[sandbox]` directory rather than a root, for the gate (D66).
+    pub fn is_tool_root(&self, root: &RootName) -> bool {
+        self.tool_roots.iter().any(|r| &r.name == root)
     }
 
     /// Closes the audit log. An allowance is *not* dropped here: it outlives the session so it can

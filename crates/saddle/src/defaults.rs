@@ -77,6 +77,17 @@ exec     = {{ why = "runs builds, tests and git" }}
 # widen read, ls or grep: it is one allow-list per child process, with no per-call decision. Make
 # only caches writable: a command that can write ~/.cargo/bin could plant a program you later run
 # outside the sandbox.
+#
+# An entry may also name the tools that may reach that directory directly, which is how a directory
+# outside the workspace -- your own skills, say -- becomes readable by read, ls and grep without
+# becoming a root and without any grant covering it:
+#
+#   read = ["~/notes", {{ path = "~/.agents", tools = ["read", "ls", "find", "grep"] }}]
+#
+# A bare path is indirect reach only, so "~/notes" above is still unreachable by the tools. The
+# tools are named individually: listing `write` or `edit` allows writing there, and that is enforced
+# by this list alone, because the tools run in saddle rather than in the sandbox. A typo in a name is
+# an error, not a silent no-op.
 [sandbox]
 write = [{write}]
 
@@ -169,6 +180,7 @@ fn create_new(path: &Path, text: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SandboxEntry;
     use crate::config::UserConfig;
     use saddle_cap::policy::Policy;
     use saddle_cap::{RootName, Roots};
@@ -188,7 +200,10 @@ mod tests {
         assert!(cfg.sandbox.read.is_empty());
         assert_eq!(
             cfg.sandbox.write,
-            ["~/.cargo/registry", "~/.cargo/git"],
+            [
+                SandboxEntry::Path("~/.cargo/registry".into()),
+                SandboxEntry::Path("~/.cargo/git".into())
+            ],
             "caches by path, not by name"
         );
         // The built-in rule rather than one written into the file (D62).
