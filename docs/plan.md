@@ -2602,6 +2602,16 @@ not cover `example.com`, and no suffix covers `*`. Exclusions from both grants a
 result is no wider than either. Nothing else crosses: a server holds no plain scope, no root of its
 own and no model budget, because it is a command rather than a plugin principal.
 
+**D106.** A command the host holds a conversation with needs its own stdin and stdout, so its spec
+travels on fd 3 rather than fd 0: `saddle_sandbox::spawn` mounts the spec socket there, puts the
+child in its own process group, and leaves both pipes to the caller. A helper started the old way
+has no fd 3 — Rust closes every descriptor it opens — so `run` is unchanged and the spec still
+arrives on stdin, after which the helper reopens stdin as `/dev/null`. The caller owns the pipes and
+therefore the relay: it must drain stderr, wait or kill the child, and service the proxy while it
+waits, which is why `spawn` does none of that itself. A fallback to reading the spec from stdin
+hangs rather than failing, so a host that speaks a protocol to a child needs its own handshake
+deadline.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

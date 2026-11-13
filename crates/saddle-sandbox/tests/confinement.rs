@@ -1,14 +1,14 @@
 //! Runs probes inside the real sandbox. The probe is this test binary itself, re-run with
 //! `PROBE` set, so the tests depend on nothing but the kernel.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use saddle_cap::sandbox::{SYSTEM_READ, SYSTEM_WRITE};
-use saddle_sandbox::{SandboxSpec, availability, run};
+use saddle_sandbox::{SandboxSpec, availability, run, spawn};
 
 const PROBE: &str = "SADDLE_SANDBOX_PROBE";
 const MARK: &str = "probe-result:";
@@ -21,6 +21,16 @@ fn probe() {
         return;
     };
     let (verb, arg) = action.split_once(':').unwrap_or((action.as_str(), ""));
+    // A command the host holds a conversation with answers every line it is given, which is what
+    // proves a spawned child kept its own stdin and stdout (D106).
+    if verb == "chat" {
+        let mut out = std::io::stdout();
+        for line in std::io::stdin().lines() {
+            writeln!(out, "{MARK}echo {}", line.unwrap()).unwrap();
+            out.flush().unwrap();
+        }
+        std::process::exit(0);
+    }
     let result: std::io::Result<String> = match verb {
         "read" => std::fs::read(arg).map(|b| format!("{} bytes", b.len())),
         "write" => std::fs::write(arg, b"x").map(|_| "written".into()),
@@ -114,6 +124,43 @@ impl Fixture {
             })
             .to_owned()
     }
+}
+
+#[test]
+fn a_spawned_command_keeps_its_own_stdin_and_stdout() {
+    // D106: the spec rides on fd 3 so fd 0 and fd 1 belong to the command, which is what lets
+    // saddle speak a protocol to it instead of only running it to completion.
+    if !sandbox_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let helper = Path::new(env!("CARGO_BIN_EXE_saddle-sandbox"));
+    let mut child = spawn(helper, &[], &fixture.spec("chat")).unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    for word in ["one", "two"] {
+        writeln!(stdin, "{word}").unwrap();
+        stdin.flush().unwrap();
+        // The test binary says a few lines of its own first, so the answer is the line carrying
+        // the marker rather than the next one.
+        let mut answer = None;
+        for line in lines.by_ref() {
+            if let Some((_, said)) = line.unwrap().split_once(MARK) {
+                answer = Some(said.to_owned());
+                break;
+            }
+        }
+        let Some(answer) = answer else {
+            let mut why = String::new();
+            std::io::Read::read_to_string(&mut stderr, &mut why).unwrap();
+            panic!("no answer to {word}: {why}");
+        };
+        assert_eq!(answer, format!("echo {word}"));
+    }
+    drop(stdin);
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{status:?}");
 }
 
 fn sandbox_available() -> bool {

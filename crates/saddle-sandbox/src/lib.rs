@@ -6,9 +6,10 @@
 //! landlock and seccomp, and execs the target, which inherits the confinement.
 
 use std::convert::Infallible;
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -122,13 +123,81 @@ pub fn helper_main() -> ! {
     std::process::exit(err.exit_code())
 }
 
+/// The descriptor a long-lived command's spec arrives on, so fd 0 stays the command's (D106).
+const SPEC_FD: i32 = 3;
+
 fn helper() -> Result<Infallible, SandboxError> {
-    let mut buf = String::new();
-    io::stdin().read_to_string(&mut buf)?;
-    let spec: SandboxSpec =
-        serde_json::from_str(&buf).map_err(|e| SandboxError::Spec(e.to_string()))?;
-    reopen_stdin_null()?;
+    let (spec, spec_was_on_stdin) = match spec_from_fd3() {
+        Some(bytes) => (parse_spec(bytes)?, false),
+        None => {
+            let mut buf = Vec::new();
+            io::stdin().read_to_end(&mut buf)?;
+            (parse_spec(buf)?, true)
+        }
+    };
+    // Only a run-to-completion command gives up its stdin: one the host speaks to needs it.
+    if spec_was_on_stdin {
+        reopen_stdin_null()?;
+    }
     enter(&spec)
+}
+
+fn parse_spec(bytes: Vec<u8>) -> Result<SandboxSpec, SandboxError> {
+    serde_json::from_slice(&bytes).map_err(|e| SandboxError::Spec(e.to_string()))
+}
+
+/// The spec on fd 3, when the host put one there (D106). A helper started by `run` has no fd 3:
+/// Rust closes every descriptor it opens, so the read fails and the spec comes from stdin.
+fn spec_from_fd3() -> Option<Vec<u8>> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: fd 3 is either the socket the host made or not open at all. The File is forgotten
+    // rather than dropped, so a closed descriptor is never closed a second time.
+    let mut file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(SPEC_FD) });
+    let mut buf = Vec::new();
+    match file.read_to_end(&mut buf) {
+        Ok(_) if !buf.is_empty() => Some(buf),
+        _ => None,
+    }
+}
+
+/// Host side: starts a long-lived sandboxed command whose stdin and stdout belong to the caller, so
+/// it can be spoken to (D106). The spec travels on fd 3 because fd 0 is the command's, and the
+/// child gets its own process group so the caller can end it and everything it started.
+///
+/// The caller owns the pipes: it must read stdout, drain stderr, and wait or kill the child. It
+/// also owns servicing the network relay while it waits, which is why this does not do it.
+pub fn spawn(helper: &Path, helper_args: &[&str], spec: &SandboxSpec) -> io::Result<Child> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+
+    let payload = serde_json::to_vec(spec).map_err(io::Error::other)?;
+    // A socket pair, so both ends are owned: the child's end becomes fd 3, and closing ours is
+    // what tells the helper the spec is complete.
+    let (mut ours, theirs) = UnixStream::pair()?;
+    let fd = theirs.as_raw_fd();
+    let mut command = Command::new(helper);
+    command
+        .args(helper_args)
+        .env_clear()
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: dup2 between fork and exec, on two descriptors that are valid in the child.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(fd, SPEC_FD) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn()?;
+    let _ = ours.write_all(&payload);
+    drop(ours);
+    drop(theirs);
+    Ok(child)
 }
 
 fn reopen_stdin_null() -> io::Result<()> {
