@@ -1,4 +1,7 @@
 //! A branch-only, read-only SQL surface; untrusted SQL never reaches the saved store (D92).
+//!
+//! Two views: the branch's messages, and one row per model request with what it used, what
+//! answered it and whether it read the provider's cache (D94).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -13,6 +16,7 @@ use serde_json::{Value, json};
 
 use super::{ToolOutput, str_field};
 use crate::session::Session;
+use crate::store::Snapshot;
 
 pub fn run(session: &mut Session, input: &Value) -> Result<ToolOutput> {
     let sql = match str_field(input, "sql") {
@@ -31,10 +35,10 @@ pub fn run(session: &mut Session, input: &Value) -> Result<ToolOutput> {
     if !decision.allow {
         return Ok(ToolOutput::denied(&decision.explanation));
     }
-    let Some(messages) = &session.query_snapshot else {
+    let Some(snapshot) = &session.query_snapshot else {
         return Ok(ToolOutput::err("no saved conversation is active"));
     };
-    Ok(match query(messages, sql) {
+    Ok(match query(snapshot, sql) {
         Ok(value) => ToolOutput::ok(value.to_string()),
         Err(error) => ToolOutput::err(format!("session query failed: {error}")),
     })
@@ -43,12 +47,14 @@ pub fn run(session: &mut Session, input: &Value) -> Result<ToolOutput> {
 fn authorize(ctx: AuthContext<'_>) -> Authorization {
     match ctx.action {
         AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
-        AuthAction::Read { table_name, .. }
-            if table_name == "messages"
-                || (table_name == "snapshot" && ctx.accessor == Some("messages")) =>
-        {
-            Authorization::Allow
-        }
+        AuthAction::Read { table_name, .. } => match (table_name, ctx.accessor) {
+            // The two views, and the backing table each of them reads (D92, D94).
+            ("messages" | "requests", _) => Authorization::Allow,
+            ("message_snapshot", Some("messages")) | ("request_snapshot", Some("requests")) => {
+                Authorization::Allow
+            }
+            _ => Authorization::Deny,
+        },
         AuthAction::Function {
             function_name:
                 "like" | "glob" | "lower" | "upper" | "length" | "substr" | "substring" | "instr"
@@ -60,20 +66,48 @@ fn authorize(ctx: AuthContext<'_>) -> Authorization {
     }
 }
 
-fn query(messages: &[(i64, String, String)], sql: &str) -> Result<Value> {
+fn query(snapshot: &Snapshot, sql: &str) -> Result<Value> {
     if sql.len() > 16 * 1024 {
         bail!("SQL exceeds 16 KiB");
     }
     let mut conn = Connection::open_in_memory()?;
     conn.execute_batch(
         "PRAGMA temp_store=MEMORY;
-        CREATE TABLE snapshot(ordinal INTEGER, id INTEGER, role TEXT, text TEXT);
-        CREATE VIEW messages AS SELECT ordinal, id, role, text FROM snapshot;",
+        CREATE TABLE message_snapshot(ordinal INTEGER, id INTEGER, role TEXT, text TEXT);
+        CREATE VIEW messages AS SELECT ordinal, id, role, text FROM message_snapshot;
+        CREATE TABLE request_snapshot(
+            ordinal INTEGER, node INTEGER, kind TEXT, provider TEXT, model TEXT,
+            input INTEGER, output INTEGER, cache_read INTEGER, cache_write INTEGER,
+            cached INTEGER, cost REAL, at TEXT, after INTEGER);
+        CREATE VIEW requests AS SELECT ordinal, node, kind, provider, model, input, output,
+            cache_read, cache_write, cached, cost, at, after FROM request_snapshot;",
     )?;
     {
-        let mut insert = conn.prepare("INSERT INTO snapshot VALUES (?1, ?2, ?3, ?4)")?;
-        for (ordinal, (id, role, text)) in messages.iter().enumerate() {
+        let mut insert = conn.prepare("INSERT INTO message_snapshot VALUES (?1, ?2, ?3, ?4)")?;
+        for (ordinal, (id, role, text)) in snapshot.messages.iter().enumerate() {
             insert.execute(params![(ordinal + 1) as i64, id, role, text])?;
+        }
+    }
+    {
+        let mut insert = conn.prepare("INSERT INTO request_snapshot VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)")?;
+        for (ordinal, row) in snapshot.requests.iter().enumerate() {
+            insert.execute(params![
+                (ordinal + 1) as i64,
+                row.node,
+                row.kind,
+                row.provider,
+                row.model,
+                row.usage.input as i64,
+                row.usage.output as i64,
+                row.usage.cache_read as i64,
+                row.usage.cache_write as i64,
+                // Whether the prompt was served from a provider cache at all. The counts stay the
+                // source of truth; this is the question a hit rate is about (D94).
+                i64::from(row.usage.cache_read > 0),
+                row.cost,
+                row.at,
+                row.after as i64,
+            ])?;
         }
     }
     conn.pragma_update(None, "query_only", true)?;
@@ -129,9 +163,33 @@ fn query(messages: &[(i64, String, String)], sql: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::Usage;
+    use crate::store::RequestRow;
 
-    fn messages() -> Vec<(i64, String, String)> {
-        vec![(7, "user".into(), "remember teal".into())]
+    fn messages() -> Snapshot {
+        Snapshot {
+            messages: vec![(7, "user".into(), "remember teal".into())],
+            requests: Vec::new(),
+        }
+    }
+
+    /// A request row, as the store would export it (D94).
+    fn request(provider: &str, model: &str, input: u64, cache_read: u64) -> RequestRow {
+        RequestRow {
+            node: 9,
+            kind: "reply".into(),
+            provider: provider.into(),
+            model: model.into(),
+            usage: Usage {
+                input,
+                output: 5,
+                cache_read,
+                cache_write: 0,
+            },
+            cost: 0.01,
+            at: "2026-01-01T00:00:00Z".into(),
+            after: 1,
+        }
     }
 
     #[test]
@@ -145,19 +203,66 @@ mod tests {
     }
 
     #[test]
+    fn reports_what_each_request_used_and_whether_it_read_the_cache() {
+        // D94: the store had the numbers and the tool could not see them, so "why does this
+        // provider's cache miss" was answerable only from the audit log. This is the query the
+        // view exists for.
+        let snapshot = Snapshot {
+            messages: messages().messages,
+            requests: vec![
+                request("synthetic", "glm", 1_000, 0),
+                request("synthetic", "glm", 1_000, 900),
+                request("openai", "gpt", 2_000, 0),
+            ],
+        };
+        let out = query(
+            &snapshot,
+            "SELECT provider, sum(cache_read), sum(cached), count(*) FROM requests
+             GROUP BY provider ORDER BY provider",
+        )
+        .unwrap();
+        assert_eq!(
+            out["rows"],
+            json!([["openai", 0, 0, 1], ["synthetic", 900, 1, 2]])
+        );
+        // One request, with the columns a person joins the messages on.
+        let out = query(
+            &snapshot,
+            "SELECT ordinal, kind, model, input, cache_read, cached, after FROM requests
+             WHERE cache_read > 0",
+        )
+        .unwrap();
+        assert_eq!(out["rows"], json!([[2, "reply", "glm", 1_000, 900, 1, 1]]));
+    }
+
+    #[test]
+    fn the_backing_tables_are_as_private_as_the_views() {
+        let snapshot = Snapshot {
+            messages: messages().messages,
+            requests: vec![request("openai", "gpt", 10, 0)],
+        };
+        for sql in [
+            "SELECT * FROM message_snapshot",
+            "SELECT * FROM request_snapshot",
+        ] {
+            assert!(query(&snapshot, sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
     fn cannot_write_attach_inspect_or_call_unapproved_functions() {
         for sql in [
             "DELETE FROM messages",
-            "UPDATE snapshot SET text='changed'",
+            "UPDATE message_snapshot SET text='changed'",
             "DROP VIEW messages",
             "ATTACH '/tmp/other.db' AS other",
             "PRAGMA database_list",
             "SELECT * FROM sqlite_schema",
-            "SELECT * FROM snapshot",
+            "SELECT * FROM message_snapshot",
             "SELECT * FROM pragma_database_list",
             "SELECT load_extension('anything')",
             "SELECT readfile('/etc/passwd')",
-            "SELECT 1); DELETE FROM snapshot; --",
+            "SELECT 1); DELETE FROM message_snapshot; --",
             "SELECT randomblob(1000000000)",
         ] {
             assert!(query(&messages(), sql).is_err(), "{sql}");
@@ -170,19 +275,25 @@ mod tests {
 
     #[test]
     fn bounds_rows_and_recursive_work() {
-        let rows = vec![(1, "user".into(), "hi".into()); 101];
-        let out = query(&rows, "SELECT * FROM messages").unwrap();
+        let snapshot = Snapshot {
+            messages: vec![(1, "user".into(), "hi".into()); 101],
+            requests: Vec::new(),
+        };
+        let out = query(&snapshot, "SELECT * FROM messages").unwrap();
         assert_eq!(out["rows"].as_array().unwrap().len(), 100);
         assert_eq!(out["truncated"], true);
-        assert!(query(&[], "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n) SELECT sum(x) FROM n").is_err());
+        assert!(query(&Snapshot::default(), "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n) SELECT sum(x) FROM n").is_err());
     }
 
     #[test]
     fn caps_serialized_bytes_and_rejects_oversized_sql() {
-        let rows = vec![(1, "user".into(), "\"".repeat(30_000))];
-        let out = query(&rows, "SELECT text FROM messages").unwrap();
+        let snapshot = Snapshot {
+            messages: vec![(1, "user".into(), "\"".repeat(30_000))],
+            requests: Vec::new(),
+        };
+        let out = query(&snapshot, "SELECT text FROM messages").unwrap();
         assert_eq!(out["truncated"], true);
         assert!(out.to_string().len() <= 50 * 1024);
-        assert!(query(&[], &" ".repeat(16 * 1024 + 1)).is_err());
+        assert!(query(&Snapshot::default(), &" ".repeat(16 * 1024 + 1)).is_err());
     }
 }

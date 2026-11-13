@@ -2282,8 +2282,9 @@ changed came back on a model it had never used.
   there still denies access, and `--revoke transcript-read` disables it for one run.
 - The host exports only the active conversation's branch, including original pre-compaction messages,
   into a fresh in-memory SQLite snapshot. SQL never runs on the saved database connection. Abandoned
-  branches, other conversations, state paths, usage records, native provider blocks and image bytes
-  are not exported. Tool-result diffs are omitted as they are elsewhere in model context.
+  branches, other conversations, state paths, native provider blocks and image bytes are not
+  exported; what each request on the branch used is, as a second view (D94). Tool-result diffs are
+  omitted as they are elsewhere in model context.
 - The sole public view is `messages(ordinal INTEGER, id INTEGER, role TEXT, text TEXT)`. Roles are
   `user`, `assistant`, `tool`, `summary`; ordinal is one-based branch order. Replies include text
   and serialized tool calls; tool results include call ids and content. A clone's copied history
@@ -2319,6 +2320,35 @@ changed came back on a model it had never used.
 - The existing off-thread usage lookup at startup and after turns serves both providers. API-key
   OpenAI keeps ordinary request/token rate-limit headers; they are not subscription allowances.
 
+**D94.** Every model request is recorded with what it used, which provider and model answered, and
+whether the prompt was served from that provider's cache.
+
+The store has kept a `usage` row per reply since D35, and `session_query` (D92) could see none of it:
+"why does this provider's cache miss" was answerable only from the audit log, which is outside the
+agent's reach by design and is not where a conversation's own numbers live.
+
+- **The row names what answered it.** `provider`, `model` and `kind` (`reply` or `summary`) are
+  recorded with the counts, because a conversation can switch models between turns (D91) and a cache
+  hit rate only means anything for the pair that answered. A compaction is a request the person paid
+  for (D78), so it is recorded the same way rather than left out — the request that filled a cache is
+  part of the story as much as the one that read it.
+- **`requests` is a second view** over the same in-memory snapshot (D92):
+  `requests(ordinal, node, kind, provider, model, input, output, cache_read, cache_write, cached,
+  cost, at, after)`. `cached` is 1 when `cache_read` is above zero: the counts stay the source of
+  truth and the flag answers the question a hit rate is asked. `after` is the ordinal of the last
+  message before the request, so a request joins to the prompt it answered — a large prompt with no
+  cached tokens is only diagnosable next to that prompt.
+- **`input` is the uncached part of the prompt**, which is what the OpenAI-compatible parser already
+  makes of `prompt_tokens` less `cached_tokens` so that it agrees with Anthropic's `input_tokens`.
+  A hit rate is therefore `sum(cache_read) / sum(input + cache_read + cache_write)`, the same
+  addition the context estimate uses (D33), and the two providers can be compared on one query.
+- **The gate is unchanged.** The same `transcript-read` grant, the same per-call audit record with
+  its SQL, the same authorizer: the backing tables are as private as the views, and SQL still never
+  reaches the saved database.
+- **A row written before this reads as `unknown`** for its kind and empty for its provider and model,
+  rather than being dropped or guessed at. What it cost is still true, and inventing a provider would
+  make a hit rate lie. Rows imported from the older JSON Lines files are the same case.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
@@ -2327,7 +2357,7 @@ changed came back on a model it had never used.
 | `fs-read` | reading files under granted roots | `saddle:host/fs-read` import | policy per call |
 | `fs-write` | writing files under granted roots | `saddle:host/fs-write` import | policy per call, reserved paths (D23) |
 | `net` | HTTP requests to granted hosts | `wasi:http/outgoing-handler` import, `fetch` and `websearch` tools, a command's proxy | host HTTP client, policy per request (D28, D39, D79, D82) |
-| `transcript-read` | reading session messages and observing them as they arrive | `saddle:host/transcript-read` import, `saddle:plugin/observer` export | policy per call |
+| `transcript-read` | reading session messages and their request usage, and observing them as they arrive | `saddle:host/transcript-read` import, `saddle:plugin/observer` export | policy per call |
 | `context-contribute` | adding notes and diagnostics to the context | `saddle:host/context-contribute` import | policy per call, slot schemas (D26) |
 | `tool` | registering tools the model can call | `saddle:plugin/tool` export | load-time check, catalogue rendering (D26) |
 | `veto` | denying a pending tool call | `saddle:plugin/veto` export | policy per call (D21) |

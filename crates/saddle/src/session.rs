@@ -12,6 +12,8 @@ use saddle_policy::{AuditLog, Decision, Engine, Kind, Request};
 use serde_json::json;
 
 use crate::config::UserConfig;
+use crate::paths::{Paths, find_workspace};
+use crate::store::Snapshot;
 
 /// The header a workspace's own grant file starts with. Empty of grants on purpose: its presence
 /// and an empty file mean the same thing, and an empty file is an invitation to write a key in it.
@@ -35,7 +37,6 @@ pub const WORKSPACE_POLICY_HEADER: &str = r#"# This workspace's own grants, laid
 # root contains, so nothing the agent runs can write it -- only you can. `saddle check` prints the
 # result, and --grant/--revoke change it for one run without touching this file.
 "#;
-use crate::paths::{Paths, find_workspace};
 
 /// What a workspace's own policy file starts as (D43): a comment saying what it is for, and nothing
 /// The roots a policy edit is validated against, without opening a session: the same set
@@ -326,8 +327,8 @@ pub struct Session {
     /// again. Held here rather than in the tool because a result's number only means the page the
     /// model was shown, and that is a property of the session (D82).
     pub last_search: Option<crate::tools::websearch::LastSearch>,
-    /// A host-built, branch-only snapshot, supplied by the agent for one query (D92).
-    pub query_snapshot: Option<Vec<(i64, String, String)>>,
+    /// A host-built, branch-only snapshot, supplied by the agent for one query (D92, D94).
+    pub query_snapshot: Option<Snapshot>,
     pub query_conversation: Option<String>,
     _tmp: PrivateTmp,
 }

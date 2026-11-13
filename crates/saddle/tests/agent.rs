@@ -415,6 +415,42 @@ fn tool_loop(api: Api) {
 }
 
 #[test]
+fn a_request_is_recorded_with_what_it_used_and_which_model_answered() {
+    // D94: the tool can see what each request cost and whether it hit the provider's cache, which
+    // is the question a poor hit rate is asked about. The mock states one request without a cached
+    // prompt and one with, so both columns are exercised.
+    let sql =
+        "SELECT kind, provider, model, input, cache_read, cached FROM requests ORDER BY ordinal";
+    let calls = [("q1", "session_query", json!({"sql": sql}))];
+    let (base, seen) = serve(vec![
+        sse_response(&openai_sse_usage("", &calls, 100, Some(40))),
+        sse_response(&openai_sse_usage("done", &[], 250, None)),
+    ]);
+    let env = Env::new(Api::Openai, &base);
+    env.write_override("[agent]\ntranscript-read = {}\n");
+    let out = env.saddle(&["run", "what did that cost"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let seen = seen.lock().unwrap();
+    let messages = seen[1].body["messages"].as_array().unwrap();
+    let result = messages
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("the query ran")["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let result: Value = serde_json::from_str(&result).unwrap();
+    // One row for the request that carried the call, which is the one that has happened so far.
+    // The provider states 100 prompt tokens of which 40 were cached, and the uncached 60 is what
+    // `input` holds, so a hit rate is read as cache_read over input + cache_read.
+    assert_eq!(
+        result["rows"],
+        json!([["reply", "mock", "mock-model", 60, 40, 1]]),
+        "{result}"
+    );
+}
+
+#[test]
 fn session_queries_are_scoped_read_only_and_audited() {
     let sql = "SELECT text FROM messages WHERE role='user'";
     let calls = [

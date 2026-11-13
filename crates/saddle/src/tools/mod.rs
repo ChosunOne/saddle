@@ -74,12 +74,21 @@ pub fn definitions() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "session_query",
-            description: "Read-only SQL over messages(ordinal INTEGER, id INTEGER, role TEXT, text TEXT) \
-                in the current conversation branch, including pre-compaction history. Roles: user, \
-                assistant, tool, summary. No other conversations, images, internal tables or files \
-                are accessible. Requires transcript-read. Results are capped at 100 rows and 50 KiB; \
-                use WHERE, ORDER BY ordinal and LIMIT/OFFSET to search and page. Example: \
-                SELECT ordinal, role, text FROM messages WHERE text LIKE '%decision%' LIMIT 10",
+            description: "Read-only SQL over two views of the current conversation branch, \
+                including pre-compaction history. \
+                messages(ordinal INTEGER, id INTEGER, role TEXT, text TEXT): role is user, \
+                assistant, tool or summary. \
+                requests(ordinal INTEGER, node INTEGER, kind TEXT, provider TEXT, model TEXT, \
+                input INTEGER, output INTEGER, cache_read INTEGER, cache_write INTEGER, \
+                cached INTEGER, cost REAL, at TEXT, after INTEGER): one row per model request, \
+                kind reply or summary, cached 1 when the prompt was served from the provider's \
+                cache, after the ordinal of the last message before it. \
+                No other conversations, images, internal tables or files are accessible. Requires \
+                transcript-read. Results are capped at 100 rows and 50 KiB; use WHERE, ORDER BY \
+                ordinal and LIMIT/OFFSET to search and page. Examples: \
+                SELECT ordinal, role, text FROM messages WHERE text LIKE '%decision%' LIMIT 10; \
+                SELECT provider, model, sum(cache_read), sum(input + cache_read) FROM requests \
+                GROUP BY provider, model",
             schema: json!({
                 "type": "object",
                 "properties": {"sql": {"type": "string", "description": "A read-only SQLite query"}},

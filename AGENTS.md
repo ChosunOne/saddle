@@ -27,14 +27,14 @@ Inside `crates/saddle/src`:
 | --- | --- |
 | `agent` | the model loop (no request limit unless one is set, D37; a turn stops on a repeated call and answer, D38), the system prompt (base plus grants, so a policy reload replaces only the grants, D47), tool dispatch, and compaction — synchronous at the hard threshold, started in the background at three quarters (D78), and run by the worker thread when the session is idle (D77) |
 | `session` | opening the workspace, resolving roots, the policy engine and audit log for a session |
-| `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch`, `tools/websearch`, `tools/session_query` | the eleven built-in tools (`fetch` is host-side network, D39; `patch` is D56; `websearch` asks the provider, or Exa, D82; `session_query` is branch-only read-only SQL, D92) |
+| `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch`, `tools/websearch`, `tools/session_query` | the eleven built-in tools (`fetch` is host-side network, D39; `patch` is D56; `websearch` asks the provider, or Exa, D82; `session_query` is branch-only read-only SQL over messages and request usage, D92, D94) |
 | `net` | the command network (D79): `hello` reads a hostname out of a TLS handshake, `head` out of a `CONNECT` line or a `Host` header, `proxy` decides and carries a connection, `bridge` joins the proxy's threads to the one engine and the one audit log |
 | `tools/diff` | line diffs of edited files, for the transcript only — the model never sees them |
 | `context` | instruction files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md` fallback), read through the policy |
 | `skills` | `SKILL.md` skills: discovery through the `read` gate, the prompt listing, `/skill:name` (D64, D67, D68, D69) |
 | `ignore` | ignore-file matching (`.gitignore`, `.ignore`, `.fdignore`), shared by `tools/search` and `skills` (D68) |
 | `compact` | replacing the older part of a long conversation with a model-written summary (D33), of a session left alone (D77) or written while the turn carries on (D78) |
-| `store` | the saved conversations: a SQLite tree of messages per workspace (D53), imported from the older JSON Lines files once |
+| `store` | the saved conversations: a SQLite tree of messages per workspace (D53), imported from the older JSON Lines files once, with one row per model request recording what it used and which model answered (D94) |
 | `output` | line-mode output: a terminal, or one JSON object per line for a program (D52) |
 | `cache` | the cache-miss notice: one line to the user when a prompt is re-read at full price (D50) |
 | `reserved` | the D20 snapshot and restore of reserved paths around `exec` |
@@ -70,10 +70,15 @@ remaining percentage and reset countdown (`5h`, `weekly`). `saddle check` includ
 timestamps. Usage GETs use refreshed OAuth and the same account headers as model requests.
 
 `session_query` requires `transcript-read = {}` in the agent grants. First-run defaults include it;
-existing explicit `[agent]` tables remain as written, and `--revoke transcript-read` disables it
-for one run. It queries only the active
-conversation branch, including pre-compaction messages, through the in-memory view
-`messages(ordinal, id, role, text)`. It never runs SQL on the saved database, grants filesystem
+existing explicit `[agent]` tables remain as written, and `--revoke transcript-read` disables it for
+one run. It queries only the active conversation branch, including pre-compaction messages, through
+two in-memory views:
+`messages(ordinal, id, role, text)`, and `requests(ordinal, node, kind, provider, model, input,
+output, cache_read, cache_write, cached, cost, at, after)` — one row per model request, `kind` being
+`reply` or `summary`, `cached` 1 when the prompt came from the provider's cache, and `after` the
+ordinal of the last message before it (D92, D94). That is what a poor cache hit rate is diagnosed
+with: `SELECT provider, model, sum(cache_read), sum(input + cache_read + cache_write) FROM requests
+GROUP BY provider, model` (D94). It never runs SQL on the saved database, grants filesystem
 access to state, or permits transcript mutation (D92). Results are capped at 100 rows and 50 KiB;
 SQL and execution are bounded too. A standalone `saddle tool session_query` has no active
 conversation and reports that rather than picking another session.
@@ -82,7 +87,7 @@ conversation and reports that rather than picking another session.
 
 Use **`cargo nextest`** to run tests, not `cargo test`: one process per test, run in parallel, so a
 test cannot see another one's state and a leak is caught here rather than in CI. On a suite this
-size the wall clock comes out about the same as `cargo test` — 457 of the binary's tests take ~2.1 s
+size the wall clock comes out about the same as `cargo test` — the binary's 470 tests take ~2.1 s
 either way, because a process per test costs what a thread saved — and the reason to use it is
 everything else: `-E` filters by name, `--no-fail-fast` summaries, per-test timeouts and retries,
 and isolation that makes a flaky test obvious.
@@ -269,7 +274,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D93 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D94 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

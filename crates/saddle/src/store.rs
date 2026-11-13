@@ -47,9 +47,83 @@ pub struct Model {
     pub model: String,
 }
 
+/// What one model request used and what answered it (D94).
+///
+/// A turn makes one request per reply and a compaction makes one of its own; both are paid for, so
+/// both are recorded. The provider and model go with each one because a conversation can switch
+/// between them (D91), and a cache hit rate only means anything for the pair that answered.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Request {
+    pub kind: RequestKind,
+    pub provider: String,
+    pub model: String,
+    pub usage: Usage,
+    pub cost: f64,
+}
+
+/// Which request a `usage` row is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestKind {
+    /// The reply to the conversation.
+    Reply,
+    /// A compaction's summary, which is a request the person paid for (D78).
+    Summary,
+}
+
+impl RequestKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            RequestKind::Reply => "reply",
+            RequestKind::Summary => "summary",
+        }
+    }
+}
+
+/// One recorded request, as `session_query` reads it (D94).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestRow {
+    pub node: i64,
+    pub kind: String,
+    pub provider: String,
+    pub model: String,
+    pub usage: Usage,
+    pub cost: f64,
+    /// When the row was written, to the second.
+    pub at: String,
+    /// The ordinal of the last message before this request, or 0 when it came first.
+    pub after: usize,
+}
+
+/// What one `session_query` may see: this branch's messages, and the requests that produced them
+/// (D92, D94).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Snapshot {
+    /// `(node, role, text)` per message on the branch, in order.
+    pub messages: Vec<(i64, String, String)>,
+    pub requests: Vec<RequestRow>,
+}
+
 /// The schema version this build writes. A database from a newer build is refused rather than
 /// guessed at, because a wrong guess here loses a conversation. Version 2 added `sessions.name`.
 const VERSION: u32 = 2;
+
+/// One `usage` row as the transcript tool reports it (D94).
+///
+/// A row written before the provider, model and kind were recorded still reads: what it cost is
+/// still true, and the parts it never had come back empty rather than being guessed at.
+fn request_row(node: &Node, after: usize) -> RequestRow {
+    let body: serde_json::Value = serde_json::from_str(&node.body).unwrap_or_default();
+    RequestRow {
+        node: node.id,
+        kind: body["kind"].as_str().unwrap_or("unknown").to_owned(),
+        provider: body["provider"].as_str().unwrap_or_default().to_owned(),
+        model: body["model"].as_str().unwrap_or_default().to_owned(),
+        usage: serde_json::from_value(body["usage"].clone()).unwrap_or_default(),
+        cost: body["cost"].as_f64().unwrap_or(0.0),
+        at: node.created.clone(),
+        after,
+    }
+}
 
 fn now() -> String {
     humantime::format_rfc3339_seconds(SystemTime::now()).to_string()
@@ -232,8 +306,15 @@ impl Store {
         }))
     }
 
-    pub fn usage(&self, session: &str, usage: &Usage, cost: f64) -> Result<()> {
-        let body = serde_json::json!({ "usage": usage, "cost": cost });
+    /// Records one model request: what it used, what it cost, and what answered it (D94).
+    pub fn request(&self, session: &str, request: &Request) -> Result<()> {
+        let body = serde_json::json!({
+            "kind": request.kind.as_str(),
+            "provider": request.provider,
+            "model": request.model,
+            "usage": request.usage,
+            "cost": request.cost,
+        });
         self.push(session, kind::USAGE, &body.to_string())?;
         Ok(())
     }
@@ -253,7 +334,7 @@ impl Store {
     /// One node as it was stored.
     fn node(&self, id: i64) -> Result<Node> {
         Ok(self.conn.query_row(
-            "SELECT id, parent, kind, body FROM nodes WHERE id = ?1",
+            "SELECT id, parent, kind, body, created FROM nodes WHERE id = ?1",
             params![id],
             |r| {
                 Ok(Node {
@@ -261,6 +342,7 @@ impl Store {
                     parent: r.get(1)?,
                     kind: r.get(2)?,
                     body: r.get(3)?,
+                    created: r.get(4)?,
                 })
             },
         )?)
@@ -284,9 +366,14 @@ impl Store {
         self.branch_to(self.leaf(session)?)
     }
 
-    /// Exports only the current branch's text, before compaction as well as after it (D92).
-    pub fn query_messages(&self, session: &str) -> Result<Vec<(i64, String, String)>> {
+    /// What `session_query` may see of one conversation: its branch's text, before compaction as
+    /// well as after it (D92), and what each request on that branch used (D94).
+    ///
+    /// One walk fills both, which is what lets a request name the message it answered: a request
+    /// that cost nothing for a 100k-token prompt is only diagnosable next to that prompt.
+    pub fn snapshot(&self, session: &str) -> Result<Snapshot> {
         let mut out = Vec::new();
+        let mut requests = Vec::new();
         for node in self.branch(session)? {
             if node.kind == kind::ITEM {
                 let item: Item = serde_json::from_str(&node.body)?;
@@ -324,9 +411,14 @@ impl Store {
                     "summary".into(),
                     body["summary"].as_str().unwrap_or_default().into(),
                 ));
+            } else if node.kind == kind::USAGE {
+                requests.push(request_row(&node, out.len()));
             }
         }
-        Ok(out)
+        Ok(Snapshot {
+            messages: out,
+            requests,
+        })
     }
 
     /// The current leaf, for a caller that needs to name a point in the tree (D54).
@@ -465,15 +557,16 @@ impl Store {
             )?;
         }
         let leaf = self.leaf(session)?;
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, parent, kind, body FROM nodes WHERE session = ?1 ORDER BY id")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, parent, kind, body, created FROM nodes WHERE session = ?1 ORDER BY id",
+        )?;
         let nodes = stmt.query_map(params![session], |r| {
             Ok(Node {
                 id: r.get(0)?,
                 parent: r.get(1)?,
                 kind: r.get(2)?,
                 body: r.get(3)?,
+                created: r.get(4)?,
             })
         })?;
         let mut out = Vec::new();
@@ -676,6 +769,7 @@ struct Node {
     parent: Option<i64>,
     kind: String,
     body: String,
+    created: String,
 }
 
 /// One message in the session, as the tree shows it.
@@ -946,15 +1040,20 @@ mod tests {
             ]),
         )
         .unwrap();
-        s.usage(
+        s.request(
             id,
-            &Usage {
-                input: 10,
-                output: 2,
-                cache_read: 300,
-                cache_write: 0,
+            &Request {
+                kind: RequestKind::Reply,
+                provider: "synthetic".into(),
+                model: "glm".into(),
+                usage: Usage {
+                    input: 10,
+                    output: 2,
+                    cache_read: 300,
+                    cache_write: 0,
+                },
+                cost: 0.25,
             },
-            0.25,
         )
         .unwrap();
     }
@@ -972,6 +1071,108 @@ mod tests {
         assert!(matches!(&loaded.items[2], Item::ToolResults(r) if r[0].is_error));
         assert_eq!(loaded.usage.cache_read, 300);
         assert!((loaded.cost - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_request_is_read_back_with_what_answered_it_and_which_message_it_followed() {
+        // D94: the numbers were kept per turn and thrown away from view, which is why a poor cache
+        // hit rate could not be diagnosed. A request now says what it used, which provider and
+        // model answered, and where in the conversation it landed.
+        let s = store();
+        let id = s.begin("synthetic", "glm").unwrap();
+        s.append(&id, &Item::User("first".into())).unwrap();
+        s.append(&id, &Item::Assistant(vec![Part::Text("hi".into())]))
+            .unwrap();
+        s.request(
+            &id,
+            &Request {
+                kind: RequestKind::Reply,
+                provider: "synthetic".into(),
+                model: "glm".into(),
+                usage: Usage {
+                    input: 1_000,
+                    output: 20,
+                    cache_read: 900,
+                    cache_write: 0,
+                },
+                cost: 0.02,
+            },
+        )
+        .unwrap();
+        s.append(&id, &Item::User("second".into())).unwrap();
+        s.request(
+            &id,
+            &Request {
+                kind: RequestKind::Summary,
+                provider: "openai".into(),
+                model: "gpt".into(),
+                usage: Usage {
+                    input: 200,
+                    output: 30,
+                    cache_read: 0,
+                    cache_write: 200,
+                },
+                cost: 0.01,
+            },
+        )
+        .unwrap();
+
+        let snapshot = s.snapshot(&id).unwrap();
+        let rows = &snapshot.requests;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].provider, "synthetic");
+        assert_eq!(rows[0].model, "glm");
+        assert_eq!(rows[0].kind, "reply");
+        assert_eq!(rows[0].usage.cache_read, 900);
+        assert!((rows[0].cost - 0.02).abs() < 1e-9);
+        // The second request follows the third message, and a compaction is recorded as one.
+        assert_eq!(rows[0].after, 2);
+        assert_eq!(rows[1].after, 3);
+        assert_eq!(rows[1].kind, "summary");
+        assert_eq!(rows[1].usage.cache_write, 200);
+        assert!(!rows[0].at.is_empty(), "a request is dated: {}", rows[0].at);
+    }
+
+    #[test]
+    fn a_request_recorded_before_the_model_was_kept_still_reads() {
+        // Rows written by an older build (and imported from the JSON Lines files) have only what
+        // they cost. They are reported as unknown rather than dropped or guessed at: the cost is
+        // still true, and inventing a provider would make a hit rate lie.
+        let s = store();
+        let id = s.begin("p", "m").unwrap();
+        s.append(&id, &Item::User("hello".into())).unwrap();
+        // Written as the older build wrote it: a usage row, with no provider, model or kind.
+        s.request(
+            &id,
+            &Request {
+                kind: RequestKind::Summary,
+                provider: "openai".into(),
+                model: "gpt".into(),
+                usage: Usage::default(),
+                cost: 0.0,
+            },
+        )
+        .unwrap();
+        let node = s.current(&id).unwrap().unwrap();
+        s.conn
+            .execute(
+                "UPDATE nodes SET body = ?2 WHERE id = ?1",
+                params![
+                    node,
+                    json!({"usage": {"input": 5, "output": 1, "cache_read": 0, "cache_write": 0},
+                           "cost": 0.5})
+                    .to_string()
+                ],
+            )
+            .unwrap();
+        let snapshot = s.snapshot(&id).unwrap();
+        assert_eq!(snapshot.requests.len(), 1);
+        let row = &snapshot.requests[0];
+        assert_eq!(row.kind, "unknown");
+        assert_eq!(row.provider, "");
+        assert_eq!(row.model, "");
+        assert_eq!(row.usage.input, 5);
+        assert!((row.cost - 0.5).abs() < 1e-9);
     }
 
     #[test]
@@ -1055,8 +1256,9 @@ mod tests {
         s.append(&other, &Item::User("other conversation".into()))
             .unwrap();
         let text: Vec<_> = s
-            .query_messages(&id)
+            .snapshot(&id)
             .unwrap()
+            .messages
             .into_iter()
             .map(|(_, _, text)| text)
             .collect();

@@ -16,7 +16,7 @@ use crate::provider::{
     ToolResult, Usage,
 };
 use crate::session::Session;
-use crate::store::{self, Store};
+use crate::store::{self, Request as StoreRequest, RequestKind, Store};
 use crate::tools::{self, ToolOutput};
 
 /// Tool output past this many bytes is cut before it enters the context.
@@ -643,7 +643,7 @@ impl Agent {
         // here any more, and pasting it over the conversation would lose whatever replaced it.
         if with_summary(&self.items, background.cut, &background.prefix, "").is_none() {
             // The request was made and paid for even though its answer is unusable (D78).
-            self.record_spend(&summary.usage, ui);
+            self.record_spend(&summary.usage, RequestKind::Summary, ui);
             self.log(
                 session,
                 json!({ "compaction": "BackgroundDiscarded", "usage": summary.usage }),
@@ -700,7 +700,7 @@ impl Agent {
             }),
             "conversation compacted",
         )?;
-        self.record_spend(&summary.usage, ui);
+        self.record_spend(&summary.usage, RequestKind::Summary, ui);
         let kept_len = new_items.len() - 1;
         // A background summary is silent while it is written, so the text arrives here (D78).
         if reason == Reason::Background {
@@ -724,18 +724,35 @@ impl Agent {
         Ok(())
     }
 
-    /// Records what a compaction request cost, whether or not its summary was used (D78).
+    /// Records one model request: what it cost, added to the session's total, and the row that
+    /// says which model answered and whether the prompt was served from its cache (D36, D94).
     ///
-    /// A discarded summary was still a request the user paid for, so the session's total has to
-    /// include it: a cost display that hides it is a cost display that lies.
-    fn record_spend(&mut self, usage: &Usage, ui: &mut dyn Ui) {
+    /// A discarded compaction summary is recorded too. It was still a request the user paid for, so
+    /// a total that hides it would be a total that lies (D78) — and for a cache hit rate, the
+    /// request that filled a cache is as much part of the story as the one that read it.
+    ///
+    /// Returns the cost, so the caller that tells the interface does not compute it a second time.
+    fn record_spend(&mut self, usage: &Usage, kind: RequestKind, ui: &mut dyn Ui) -> f64 {
         let cost = self.cost_of(usage);
         self.cost += cost;
+        let (provider, model) = self
+            .provider
+            .as_ref()
+            .map(|p| (p.name.clone(), p.config.model.clone()))
+            .unwrap_or_default();
+        let request = StoreRequest {
+            kind,
+            provider,
+            model,
+            usage: *usage,
+            cost,
+        };
         if let (Some(store), Some(id)) = (&self.store, &self.saved)
-            && let Err(e) = store.usage(id, usage, cost)
+            && let Err(e) = store.request(id, &request)
         {
             self.saving_failed(e, ui);
         }
+        cost
     }
 
     /// What a usage cost, from whatever price the config or the endpoint gave (D36).
@@ -1441,23 +1458,13 @@ impl Agent {
             u.cache_read += reply.usage.cache_read;
             u.cache_write += reply.usage.cache_write;
             // What this reply cost, from whatever price the config or the endpoint gave (D36).
-            let cost = self
-                .provider
-                .as_ref()
-                .and_then(Provider::price)
-                .map_or(0.0, |p| p.cost(&reply.usage));
-            self.cost += cost;
+            let cost = self.record_spend(&reply.usage, RequestKind::Reply, ui);
             ui.reply(&reply, cost);
             // A cache that has stopped being read costs several times what it should, and no
             // token count shows it. The user is told; the model is not (D50).
             let price = self.provider.as_ref().and_then(Provider::price);
             if let Some(note) = self.misses.reply(&reply.usage, price) {
                 ui.note(&note);
-            }
-            if let (Some(store), Some(id)) = (&self.store, &self.saved)
-                && let Err(e) = store.usage(id, &reply.usage, cost)
-            {
-                self.saving_failed(e, ui);
             }
 
             let calls: Vec<ToolCall> = reply.calls().cloned().collect();
@@ -1495,7 +1502,7 @@ impl Agent {
                         if call.name == "session_query" {
                             session.query_conversation = self.saved.clone();
                             session.query_snapshot = match (&self.store, &self.saved) {
-                                (Some(store), Some(id)) => Some(store.query_messages(id)?),
+                                (Some(store), Some(id)) => Some(store.snapshot(id)?),
                                 _ => None,
                             };
                         }
@@ -2273,15 +2280,20 @@ mod tests {
             .append(&id, &Item::Assistant(vec![Part::Text("two files".into())]))
             .unwrap();
         store
-            .usage(
+            .request(
                 &id,
-                &Usage {
-                    input: 1_200,
-                    output: 40,
-                    cache_read: 800,
-                    cache_write: 0,
+                &StoreRequest {
+                    kind: RequestKind::Reply,
+                    provider: "synthetic".into(),
+                    model: "glm".into(),
+                    usage: Usage {
+                        input: 1_200,
+                        output: 40,
+                        cache_read: 800,
+                        cache_write: 0,
+                    },
+                    cost: 0.0,
                 },
-                0.0,
             )
             .unwrap();
 
@@ -2302,6 +2314,40 @@ mod tests {
         // number rather than on zero (D35).
         assert!(saved.context > 0);
         assert_eq!(saved.context, agent.context_estimate());
+    }
+
+    #[test]
+    fn a_request_is_recorded_with_what_answered_it_and_whether_it_hit_the_cache() {
+        // D94: the row a cache hit rate is read from. Nothing here sends anything — the recording
+        // is the behaviour, and a real reply would add nothing but a socket.
+        let store = Store::in_memory("/ws").unwrap();
+        let id = store.begin("mock", "mock-model").unwrap();
+        store.append(&id, &Item::User("hello".into())).unwrap();
+        let mut agent = agent_with(store, &id);
+        agent.provider = Some(a_provider(1_000));
+        let mut ui = Recording::default();
+        agent.record_spend(
+            &Usage {
+                input: 1_000,
+                output: 40,
+                cache_read: 800,
+                cache_write: 0,
+            },
+            RequestKind::Reply,
+            &mut ui,
+        );
+        // A compaction is a request the person paid for too, and it says so.
+        agent.record_spend(&Usage::default(), RequestKind::Summary, &mut ui);
+
+        let snapshot = agent.store.as_ref().unwrap().snapshot(&id).unwrap();
+        let rows = &snapshot.requests;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].provider, "mock");
+        assert_eq!(rows[0].model, "mock-model");
+        assert_eq!(rows[0].kind, "reply");
+        assert_eq!(rows[0].usage.cache_read, 800);
+        assert_eq!(rows[0].after, 1, "after the prompt it answered");
+        assert_eq!(rows[1].kind, "summary");
     }
 
     #[test]
