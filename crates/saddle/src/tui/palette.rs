@@ -502,6 +502,23 @@ pub fn luminance((r, g, b): (f64, f64, f64)) -> f64 {
     0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
 }
 
+/// One colour moved `fraction` of the way to another (D76).
+///
+/// A palette defines surfaces as greys, not as tints, so a panel that has to say pass or fail has no
+/// colour of its own to use. Blending the flavour's own base towards its green or red keeps the hue
+/// of the theme instead of importing a background from nowhere — which is how the terminal ports of
+/// this palette do the same thing.
+pub fn blend(from: Color, to: Color, fraction: f64) -> Color {
+    let (Some(a), Some(b)) = (rgb(from), rgb(to)) else {
+        return from;
+    };
+    srgb((
+        lerp(a.0, b.0, fraction),
+        lerp(a.1, b.1, fraction),
+        lerp(a.2, b.2, fraction),
+    ))
+}
+
 /// The syntax colours, taken from a palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SyntaxColours {

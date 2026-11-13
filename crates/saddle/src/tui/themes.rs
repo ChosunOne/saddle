@@ -259,6 +259,28 @@ mod tests {
     }
 
     #[test]
+    fn the_catppuccin_flavours_are_offered_and_say_which_terminal_they_want() {
+        // A flavour is picked by looking at it, so it has to be in the list, and the note has to
+        // say which kind of terminal it belongs on — Latte on a dark terminal is unreadable (D76).
+        let p = ThemePicker::collect(&tables(""), "default");
+        for name in crate::tui::catppuccin::NAMES {
+            let entry = p
+                .entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} is not in the list"));
+            assert_eq!(entry.source, Source::Builtin);
+            let want = if name == "catppuccin-latte" {
+                "light"
+            } else {
+                "dark"
+            };
+            assert_eq!(entry.note(), want, "{name}");
+            assert!(entry.theme.is_ok(), "{name} does not build");
+        }
+    }
+
+    #[test]
     fn the_note_says_what_a_theme_looks_like() {
         let p = ThemePicker::collect(&tables(""), "default");
         let light = p.entries.iter().find(|e| e.name == "light").unwrap();

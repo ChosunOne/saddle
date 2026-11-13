@@ -2321,6 +2321,38 @@ mod tests {
     }
 
     #[test]
+    fn a_catppuccin_flavour_paints_the_screen() {
+        // The palette has to reach the renderer, not just build (D76): the frame in Mocha's mauve,
+        // its own text colour, and syntax in its own colours.
+        let tables = crate::tui::theme::ThemeTables::new();
+        let mut app = bare_app();
+        app.theme = crate::tui::theme::build("catppuccin-mocha", &tables).unwrap();
+        app.entries.push(Entry::User("hello".into()));
+        app.cache.push(None);
+        app.entries
+            .push(Entry::Assistant("```rust\nlet x = 1;\n```".into()));
+        app.cache.push(None);
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let seen: Vec<Color> = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].fg)
+            .collect();
+        let mauve = Color::Rgb(0xcb, 0xa6, 0xf7);
+        let keyword = Color::Rgb(0xcb, 0xa6, 0xf7);
+        let number = Color::Rgb(0xfa, 0xb3, 0x87);
+        assert!(seen.contains(&mauve), "the frame is Mocha's mauve");
+        assert!(seen.contains(&number), "the number is Mocha's peach");
+        assert!(seen.contains(&keyword), "the keyword is Mocha's mauve");
+        // And nothing from the old default palette's own syntax colours is left.
+        assert!(
+            !seen.contains(&Color::Rgb(165, 214, 255)),
+            "the previous palette's string colour is gone"
+        );
+    }
+
+    #[test]
     fn the_theme_list_is_drawn_with_the_theme_it_offers() {
         // D74: the point of the picker is that you see the choice before making it, so the box has
         // to be drawn in the highlighted theme and say which one that is.
@@ -2332,7 +2364,6 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let text = screen(&terminal);
-        println!("{text}");
         assert!(text.contains("Theme"), "{text}");
         for entry in ["default", "dark", "light", "mono", "system", "mine"] {
             assert!(text.contains(entry), "{entry} is not in the list:\n{text}");

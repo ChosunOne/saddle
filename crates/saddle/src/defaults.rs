@@ -119,14 +119,16 @@ write = [{write}]
 # .fetchmailrc .authinfo .bash_history .zsh_history .python_history .node_repl_history
 # .psql_history .mysql_history .mozilla .thunderbird .config/google-chrome .config/chromium
 
-# Colours. `theme` names one: built in are default, light and mono. Define your own under
+# Colours. `theme` names one: built in are default, dark, light, mono, system and the four
+# catppuccin flavours (catppuccin-latte, catppuccin-frappe, catppuccin-macchiato,
+# catppuccin-mocha; latte wants a light terminal, the other three a dark one). Define your own under
 # [themes.<name>], and it starts from the roles it does not list, so three lines restyle one thing:
 #
 #   [ui]
 #   theme = "mine"              # or "light/dark": light theme first, dark theme second
 #
 #   [themes.mine]
-#   extends = "default"         # or "light", "mono", or another theme here
+#   extends = "default"         # or "light", "mono", "catppuccin-mocha", or another theme here
 #   accent = "#ff00ff"
 #   muted = "240"
 #
@@ -142,11 +144,12 @@ write = [{write}]
 #   toolOutput toolErrorText compactDoneBg mdHeading mdLink mdLinkUrl mdCode mdCodeBlock
 #   mdCodeBlockBorder mdQuote mdQuoteBorder mdHr mdListBullet toolDiffAdded toolDiffRemoved
 #   toolDiffContext bashMode
-# A role pi has for something this interface does not draw (syntax highlighting, scrollbars, search
-# matches, per-level thinking borders, custom messages, HTML export) is refused with that reason
-# rather than silently ignored.
+# Every role pi defines is understood, and the syntax roles paint fenced code blocks. A role for
+# something this interface has no element for (HTML export, hook-injected messages) is carried and
+# draws nothing.
 #
-# /theme switches and saves; --use-theme changes it for one run; /reload re-reads this file.
+# /theme lists them all and previews each one; --use-theme changes it for one run; /reload re-reads
+# this file.
 # How the TUI starts. /settings changes these; ctrl+t and ctrl+o change them for one session.
 # [ui]
 # show-reasoning = true

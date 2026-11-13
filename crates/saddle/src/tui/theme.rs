@@ -1,10 +1,11 @@
 //! Colours (D71, D72). One place that says what each part of the screen is painted with, so a person
 //! can change it without patching the renderer, and so the renderer never names a colour directly.
 //!
-//! The role names are pi's, because a palette copied from a pi theme should be usable here; the roles
-//! pi has for things this harness does not draw — syntax highlighting, scrollbars, search matches,
-//! per-level thinking borders, custom messages, HTML export — are deliberately absent, since a role
-//! nothing paints with would be a setting that silently does nothing.
+//! The role names are pi's, and the palette carries pi's whole vocabulary, so a palette copied from a
+//! pi theme pastes in and is understood. Every role this interface has an element for is wired to it
+//! (D72); a role for something it does not draw — HTML export, hook-injected messages — is carried
+//! and paints nothing, which is the honest outcome for a table that is a palette rather than a
+//! checklist (D73).
 //!
 //! A theme is a table of roles. The built-in `default` is what this binary has always drawn, so a
 //! configuration that says nothing changes nothing; a `[themes.<name>]` table in `config.toml`
@@ -96,6 +97,10 @@ impl Default for Theme {
 /// `system` is not here: it is derived from what the terminal reports, at startup, by
 /// [`Palette::from_terminal`](crate::tui::palette::Palette::from_terminal).
 pub fn builtin_palette(name: &str) -> Option<Palette> {
+    // The four Catppuccin flavours, whose 26 colours each are the palette's own (D76).
+    if let Some(flavour) = super::catppuccin::flavour(name) {
+        return Some(flavour.palette());
+    }
     match name {
         "default" | "dark" => Some(Palette::default()),
         // For a light terminal: the ANSI defaults are chosen to read on white, and the block
@@ -193,7 +198,10 @@ pub fn builtin_palette(name: &str) -> Option<Palette> {
 
 /// Every built-in theme name, for a message that has to list them.
 pub fn builtin_names() -> Vec<&'static str> {
-    vec!["default", "dark", "light", "mono", "system"]
+    let mut names = vec!["default", "dark", "light", "mono"];
+    names.extend(super::catppuccin::NAMES);
+    names.push("system");
+    names
 }
 
 /// The themes a config defines, before the selected one is built.
@@ -285,6 +293,9 @@ fn resolve(
 
 /// The appearance a built-in name implies.
 fn appearance_of(name: &str) -> Appearance {
+    if let Some(flavour) = super::catppuccin::flavour(name) {
+        return flavour.appearance;
+    }
     match name {
         "light" => Appearance::Light,
         _ => Appearance::Dark,
@@ -700,10 +711,50 @@ mod tests {
     }
 
     #[test]
+    fn every_built_in_theme_builds_and_the_catppuccin_flavours_are_themselves() {
+        // A name in the list that does not build is a broken promise in the /theme picker (D76).
+        for name in builtin_names() {
+            let theme = build(name, &ThemeTables::new())
+                .unwrap_or_else(|e| panic!("{name} does not build: {e:#}"));
+            assert_eq!(theme.name, name);
+        }
+        // Each flavour is its own palette, and says which kind of terminal it is for.
+        let mocha = build("catppuccin-mocha", &ThemeTables::new()).unwrap();
+        assert_eq!(mocha.text, Color::Rgb(0xcd, 0xd6, 0xf4), "Mocha's own text");
+        assert_eq!(mocha.accent, Color::Rgb(0xcb, 0xa6, 0xf7), "Mocha's mauve");
+        assert_eq!(mocha.appearance, Appearance::Dark);
+        let latte = build("catppuccin-latte", &ThemeTables::new()).unwrap();
+        assert_eq!(latte.text, Color::Rgb(0x4c, 0x4f, 0x69), "Latte's own text");
+        assert_eq!(latte.appearance, Appearance::Light);
+        // Four flavours, four different themes: not the same palette under four names.
+        let accents: Vec<String> = crate::tui::catppuccin::NAMES
+            .iter()
+            .map(|n| format!("{:?}", build(n, &ThemeTables::new()).unwrap().accent))
+            .collect();
+        let distinct: std::collections::BTreeSet<&String> = accents.iter().collect();
+        assert_eq!(distinct.len(), 4, "{accents:?}");
+    }
+
+    #[test]
+    fn a_config_table_can_have_the_last_word_over_a_flavour() {
+        // A built-in is a starting point, not a locked door: `[themes.catppuccin-mocha]` overrides
+        // the roles it names and keeps the rest of the flavour (D72, D76).
+        let t = tables("[catppuccin-mocha]\naccent = \"#00ff00\"\n");
+        let theme = build("catppuccin-mocha", &t).unwrap();
+        assert_eq!(theme.accent, Color::Rgb(0, 255, 0), "the table wins");
+        assert_eq!(
+            theme.text,
+            Color::Rgb(0xcd, 0xd6, 0xf4),
+            "the flavour still shows"
+        );
+    }
+
+    #[test]
     fn an_unknown_theme_a_misspelt_role_and_an_unpainted_role_all_explain_themselves() {
         let err = build("nope", &ThemeTables::new()).unwrap_err().to_string();
         assert!(err.contains("no theme `nope`"), "{err}");
-        assert!(err.contains("default, dark, light, mono, system"), "{err}");
+        assert!(err.contains("mono, catppuccin-latte"), "{err}");
+        assert!(err.contains("catppuccin-mocha, system"), "{err}");
 
         let t = tables("[mine]\nacccent = \"cyan\"\n");
         let err = format!("{:#}", build("mine", &t).unwrap_err());

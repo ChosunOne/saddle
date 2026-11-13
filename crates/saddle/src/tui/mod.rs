@@ -3,6 +3,7 @@
 //! flag in [`crate::cancel`].
 
 mod app;
+pub mod catppuccin;
 mod editor;
 mod grant;
 pub mod image;

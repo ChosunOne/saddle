@@ -1621,6 +1621,48 @@ running interface is not safe, and shipping it was a mistake worth a decision.
   terminal, so the query is exercised by hand. What the tests pin down is the decision that keeps it
   out of the interface, and the parsing of the replies it would get.
 
+**D76.** Catppuccin is built in: four flavours, the palette's own colours, and one mapping.
+
+- **The colours are the published ones**, read from Catppuccin's own table rather than from memory:
+  26 per flavour, written as `#rrggbb` and parsed at compile time so the source can be compared with
+  the table line for line. A flavour is recognised by its hex values, so approximating one defeats
+  the point of shipping it.
+- **The names are prefixed**: `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`,
+  `catppuccin-mocha`. `mocha` alone would be ambiguous with any other theme that has one, and a name
+  in `config.toml` should say what it is.
+- **Latte wants a light terminal and the other three a dark one**, and no theme paints the terminal's
+  background — the terminal supplies it, as in pi. So Latte on a dark terminal is dark ink on a dark
+  background: the `/theme` picker says `light` beside it for exactly that reason (D74).
+- **A mark is the published colour; text is the published colour only where it can be read.** This is
+  the whole mapping, and the second half exists because of what Latte is: its accents are chosen as
+  fills for a light surface, and as glyphs on its own `base` most of them sit near 2.5:1 — green is
+  2.96:1, yellow 2.31:1, pink 2.34:1. Where an accent is used as text, it is moved towards the
+  flavour's own `text` by the least amount that clears D73's floor. On the three dark flavours every
+  accent already clears 4.5:1 by a wide margin, so nothing there is touched: the published colour is
+  what the terminal draws. Moving towards `text` rather than towards black is what keeps the result a
+  Catppuccin colour — it lands on the dark, desaturated version of the same hue, which is what a
+  light theme wants for that role anyway.
+- **Borders, bullets, rules, scrollbars and the reasoning levels keep the pastel.** Nothing reads them
+  as a glyph, so fidelity costs nothing there, and it is what makes the flavour recognisable.
+- **`mauve` is the identity colour** — accent, frame, headings, bullets, a tool's name — and the
+  three greys the interface uses are three steps of the palette's own ramp.
+- **A panel background is a colour Catppuccin has no name for.** On the dark flavours the surface
+  greys are the right answer and are used as the palette intends. On Latte they sit too close to its
+  own text ramp to carry text (`subtext1` on `surface1` is 3.44:1), so a panel there is a tint of
+  `base` instead, and a pass/fail panel is a tint of `base` towards `green` or `red` on every flavour
+  — 15% on a dark one and 12% on a light one, because the same tint takes more contrast away from
+  light-mode text. A search match is a solid accent with `base` written on it on a dark flavour, and
+  a pale tint with the flavour's ink on a light one: a mid-tone background reads on neither.
+- **The floors are measured, not asserted.** Each flavour is tested for 4.5:1 on the roles that are
+  read, 3:1 for secondary, 2:1 for the faintest, again on every panel background for the roles drawn
+  there, and for a panel being distinguishable from the base it sits on. The numbers that drove the
+  mapping are in this decision so the next person changing it knows what it was up against.
+- **The table is kept whole.** Six of the 26 colours are used by no role yet; they are still
+  recorded, because this is the palette and not a checklist, and a test reads all 26 — distinct
+  values, and a ramp that runs one way — so a hex copied twice is caught.
+- **A flavour is a starting point.** `[themes.catppuccin-mocha]` overrides the roles it names and
+  keeps the rest, like any other built-in (D72).
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

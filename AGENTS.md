@@ -107,8 +107,10 @@ one that was in force — and `/theme <name>` switches straight to one and saves
 `[themes.<name>]` tables of roles in `config.toml`, named as pi names them, and the renderer names no
 colour directly (D71, D72). A colour is an ANSI name, `#rgb`, `#rrggbb`, `oklch()`, `okhsl()`, a
 palette index, a `vars` entry, or `""` for the terminal default; `theme = "light/dark"` picks by
-the terminal's answer (or `COLORFGBG`), and `--use-theme` chooses for one run. A pi role for
-something this interface does not draw is refused with that reason. `theme = "system"` asks the
+the terminal's answer (or `COLORFGBG`), and `--use-theme` chooses for one run. Every role pi defines
+is understood; one for something this interface has no element for is carried and paints nothing. The
+four Catppuccin flavours are built in (D76): `catppuccin-latte` is for a light terminal and the other
+three for a dark one, and the picker says which. `theme = "system"` asks the
 terminal for its own colours at startup (OSC 10/11/4, 100 ms) and derives every role from them with a
 WCAG contrast floor, falling back to ANSI colours if it answers nothing (D73). The terminal is asked
 **once, before the screen is taken over** — never from inside the interface, where reading a reply
@@ -164,7 +166,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D75 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D76 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
