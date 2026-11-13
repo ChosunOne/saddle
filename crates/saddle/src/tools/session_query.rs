@@ -78,9 +78,11 @@ fn query(snapshot: &Snapshot, sql: &str) -> Result<Value> {
         CREATE TABLE request_snapshot(
             ordinal INTEGER, node INTEGER, kind TEXT, provider TEXT, model TEXT,
             input INTEGER, output INTEGER, cache_read INTEGER, cache_write INTEGER,
-            cached INTEGER, cost REAL, dropped INTEGER, at TEXT, after INTEGER);
+            cached INTEGER, cost REAL, dropped INTEGER, reasoning_tokens INTEGER,
+            at TEXT, after INTEGER);
         CREATE VIEW requests AS SELECT ordinal, node, kind, provider, model, input, output,
-            cache_read, cache_write, cached, cost, dropped AS reasoning_dropped, at, after
+            cache_read, cache_write, cached, cost, dropped AS reasoning_dropped,
+            reasoning_tokens, at, after
             FROM request_snapshot;
         CREATE TABLE reasoning_snapshot(ordinal INTEGER, node INTEGER, part INTEGER, text TEXT);
         CREATE VIEW reasoning AS SELECT ordinal, node, part, text FROM reasoning_snapshot;",
@@ -92,7 +94,7 @@ fn query(snapshot: &Snapshot, sql: &str) -> Result<Value> {
         }
     }
     {
-        let mut insert = conn.prepare("INSERT INTO request_snapshot VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)")?;
+        let mut insert = conn.prepare("INSERT INTO request_snapshot VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)")?;
         for (ordinal, row) in snapshot.requests.iter().enumerate() {
             insert.execute(params![
                 (ordinal + 1) as i64,
@@ -109,6 +111,7 @@ fn query(snapshot: &Snapshot, sql: &str) -> Result<Value> {
                 i64::from(row.usage.cache_read > 0),
                 row.cost,
                 row.dropped as i64,
+                row.reasoning_tokens as i64,
                 row.at,
                 row.after as i64,
             ])?;
@@ -204,6 +207,7 @@ mod tests {
             },
             cost: 0.01,
             dropped: 0,
+            reasoning_tokens: 0,
             at: "2026-01-01T00:00:00Z".into(),
             after: 1,
         }
@@ -273,6 +277,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["rows"], json!([[1, 0], [2, 2], [3, 0]]));
+    }
+
+    #[test]
+    fn a_request_says_how_much_of_its_output_was_thinking() {
+        // D99: the split, beside the output it is part of, so "what did we pay for that we never
+        // saw" is a sum rather than an estimate from character counts.
+        let mut thinking = request("openai", "gpt", 500, 400);
+        thinking.reasoning_tokens = 850;
+        let snapshot = Snapshot {
+            messages: messages().messages,
+            requests: vec![request("openai", "gpt", 500, 400), thinking],
+            reasoning: Vec::new(),
+        };
+        let out = query(
+            &snapshot,
+            "SELECT sum(output), sum(reasoning_tokens) FROM requests",
+        )
+        .unwrap();
+        assert_eq!(out["rows"], json!([[10, 850]]));
+        let out = query(
+            &snapshot,
+            "SELECT ordinal, output, reasoning_tokens FROM requests WHERE reasoning_tokens > 0",
+        )
+        .unwrap();
+        assert_eq!(out["rows"], json!([[2, 5, 850]]));
     }
 
     #[test]

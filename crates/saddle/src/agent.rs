@@ -643,7 +643,8 @@ impl Agent {
         // here any more, and pasting it over the conversation would lose whatever replaced it.
         if with_summary(&self.items, background.cut, &background.prefix, "").is_none() {
             // The request was made and paid for even though its answer is unusable (D78).
-            self.record_spend(&summary.usage, RequestKind::Summary, 0, ui);
+            // A compaction has no reply, so no split to record (D99).
+            self.record_spend(&summary.usage, RequestKind::Summary, 0, 0, ui);
             self.log(
                 session,
                 json!({ "compaction": "BackgroundDiscarded", "usage": summary.usage }),
@@ -700,7 +701,8 @@ impl Agent {
             }),
             "conversation compacted",
         )?;
-        self.record_spend(&summary.usage, RequestKind::Summary, 0, ui);
+        // A compaction has no reply, so no split to record (D99).
+        self.record_spend(&summary.usage, RequestKind::Summary, 0, 0, ui);
         let kept_len = new_items.len() - 1;
         // A background summary is silent while it is written, so the text arrives here (D78).
         if reason == Reason::Background {
@@ -740,6 +742,7 @@ impl Agent {
         usage: &Usage,
         kind: RequestKind,
         dropped: u64,
+        reasoning_tokens: u64,
         ui: &mut dyn Ui,
     ) -> f64 {
         let cost = self.cost_of(usage);
@@ -756,6 +759,7 @@ impl Agent {
             usage: *usage,
             cost,
             dropped,
+            reasoning_tokens,
         };
         if let (Some(store), Some(id)) = (&self.store, &self.saved)
             && let Err(e) = store.request(id, &request)
@@ -1472,6 +1476,7 @@ impl Agent {
                 &reply.usage,
                 RequestKind::Reply,
                 reply.dropped_reasoning,
+                reply.reasoning_tokens,
                 ui,
             );
             ui.reply(&reply, cost);
@@ -2309,6 +2314,7 @@ mod tests {
                     },
                     cost: 0.0,
                     dropped: 0,
+                    reasoning_tokens: 0,
                 },
             )
             .unwrap();
@@ -2351,10 +2357,11 @@ mod tests {
             },
             RequestKind::Reply,
             0,
+            300,
             &mut ui,
         );
         // A compaction is a request the person paid for too, and it says so.
-        agent.record_spend(&Usage::default(), RequestKind::Summary, 0, &mut ui);
+        agent.record_spend(&Usage::default(), RequestKind::Summary, 0, 0, &mut ui);
 
         let snapshot = agent.store.as_ref().unwrap().snapshot(&id).unwrap();
         let rows = &snapshot.requests;

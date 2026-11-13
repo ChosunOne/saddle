@@ -2455,6 +2455,40 @@ lossy summary of the reasoning behind it, which is exactly the part left unsearc
   snapshot (D92), the same authorizer, and a backing table as private as the other two: a query may
   read `reasoning` and not `reasoning_snapshot`.
 
+**D99.** The record holds how much of the output was thinking, and says what it still does not hold.
+
+`Usage` is four counts that add up to a bill: input, output, cache read, cache write. The APIs
+report more than that, and it divides into two kinds. One is a *partition* of a count already
+recorded — how much of `output` was reasoning — which answers, per request, a question the reasoning
+view can only answer when the reasoning is readable. The other is a field that changes what the
+price *is*. D97 started this by adding `cache_write` and `reasoning_dropped`; this finishes the
+first kind and writes down the second rather than reading it blindly.
+
+- **`requests` gains `reasoning_tokens`**, read from `completion_tokens_details.reasoning_tokens`
+  on chat completions and `output_tokens_details.reasoning_tokens` on Responses. Anthropic reports
+  no such split and records 0: its `output_tokens` already counts the thinking, with nothing saying
+  how much of it there was.
+- **It is not a field of `Usage`.** Those four add up; this one is part of `output`, so a fifth
+  field there would be summed twice by exactly the queries (`sum(input + output …)`) that exist to
+  total a bill. It goes on the request row beside `dropped`, which is the same kind of number.
+- **A row written before it reads as 0** (D94), and 0 means unknown rather than "the model did not
+  think" — the distinction the column exists to draw in the first place.
+- **What it buys** is the only evidence that survives a surface which hides its reasoning: a model
+  served over chat completions reports the split and no text at all, so `reasoning_tokens` against
+  `output` is where "it thought, we just cannot read it" becomes a number instead of an inference.
+  Where D98 does have the prose, the two are cross-checks on each other.
+- **What a parser still does not read, and why.** `total_tokens` is derivable. `audio_tokens`,
+  `accepted_prediction_tokens`/`rejected_prediction_tokens` and `server_tool_use.web_search_requests`
+  count features saddle never asks for. Two are left out because reading them without acting on
+  them would be a column that says a bill is different and nothing that says by how much:
+  **`service_tier`**, which both OpenAI surfaces and Anthropic report and which prices flex at about
+  half and priority above the standard rate, and **Anthropic's `cache_creation.ephemeral_5m`/
+  `ephemeral_1h` split**, where the one-hour write is billed at twice the input rate against 1.25×
+  for the five-minute one. Neither can differ today — saddle asks for no tier and sets no `ttl`, so
+  every request it makes is the default — and the price table is per model with no tier or TTL
+  dimension (D36). The first of them to be read has to come with the price dimension that reads it,
+  or the number is recorded and the bill stays wrong anyway.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

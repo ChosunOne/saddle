@@ -283,6 +283,9 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
         stop,
         // Anthropic reports no such thing; a thinking block it did not accept is an error instead.
         dropped_reasoning: 0,
+        // D99: and no split either — `output_tokens` already counts the thinking, with nothing
+        // saying how much of it there was.
+        reasoning_tokens: 0,
         stop_raw,
         model,
         usage,

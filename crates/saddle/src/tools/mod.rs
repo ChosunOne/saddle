@@ -80,11 +80,12 @@ pub fn definitions() -> Vec<ToolDef> {
                 assistant, tool or summary. \
                 requests(ordinal INTEGER, node INTEGER, kind TEXT, provider TEXT, model TEXT, \
                 input INTEGER, output INTEGER, cache_read INTEGER, cache_write INTEGER, \
-                cached INTEGER, cost REAL, reasoning_dropped INTEGER, at TEXT, after INTEGER): \
+                cached INTEGER, cost REAL, reasoning_dropped INTEGER, \
+                reasoning_tokens INTEGER, at TEXT, after INTEGER): \
                 one row per model request, kind reply or summary, cached 1 when the prompt was \
                 served from the provider's cache, reasoning_dropped the reasoning items the \
-                provider said it removed from the prompt, after the ordinal of the last message \
-                before it. \
+                provider said it removed from the prompt, reasoning_tokens how much of output was \
+                thinking, after the ordinal of the last message before it. \
                 reasoning(ordinal INTEGER, node INTEGER, part INTEGER, text TEXT): one row per \
                 reasoning block, ordinal the message it belongs to, part its position among that \
                 message's parts, text what it says when the block is prose at all (an encrypted \

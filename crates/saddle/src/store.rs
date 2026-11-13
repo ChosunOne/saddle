@@ -61,6 +61,9 @@ pub struct Request {
     pub cost: f64,
     /// Reasoning items the provider said it removed from what it was sent (D97).
     pub dropped: u64,
+    /// How many of the output tokens were spent thinking (D99), or 0 when the provider says
+    /// nothing about it or has no split to give.
+    pub reasoning_tokens: u64,
 }
 
 /// Which request a `usage` row is.
@@ -92,6 +95,8 @@ pub struct RequestRow {
     pub cost: f64,
     /// Reasoning items the provider said it removed from the prompt (D97).
     pub dropped: u64,
+    /// How many of the output tokens were spent thinking (D99).
+    pub reasoning_tokens: u64,
     /// When the row was written, to the second.
     pub at: String,
     /// The ordinal of the last message before this request, or 0 when it came first.
@@ -139,6 +144,9 @@ fn request_row(node: &Node, after: usize) -> RequestRow {
         usage: serde_json::from_value(body["usage"].clone()).unwrap_or_default(),
         cost: body["cost"].as_f64().unwrap_or(0.0),
         dropped: body["dropped"].as_u64().unwrap_or(0),
+        // A row written before this was recorded reads as 0: unknown is not a claim that the
+        // model did no thinking (D99).
+        reasoning_tokens: body["reasoning_tokens"].as_u64().unwrap_or(0),
         at: node.created.clone(),
         after,
     }
@@ -334,6 +342,7 @@ impl Store {
             "usage": request.usage,
             "cost": request.cost,
             "dropped": request.dropped,
+            "reasoning_tokens": request.reasoning_tokens,
         });
         self.push(session, kind::USAGE, &body.to_string())?;
         Ok(())
@@ -1092,6 +1101,7 @@ mod tests {
                 },
                 cost: 0.25,
                 dropped: 0,
+                reasoning_tokens: 0,
             },
         )
         .unwrap();
@@ -1158,6 +1168,7 @@ mod tests {
                 },
                 cost: 0.02,
                 dropped: 3,
+                reasoning_tokens: 0,
             },
         )
         .unwrap();
@@ -1176,6 +1187,7 @@ mod tests {
                 },
                 cost: 0.01,
                 dropped: 0,
+                reasoning_tokens: 0,
             },
         )
         .unwrap();
@@ -1216,6 +1228,7 @@ mod tests {
                 usage: Usage::default(),
                 cost: 0.0,
                 dropped: 0,
+                reasoning_tokens: 0,
             },
         )
         .unwrap();
@@ -1238,7 +1251,38 @@ mod tests {
         assert_eq!(row.provider, "");
         assert_eq!(row.model, "");
         assert_eq!(row.usage.input, 5);
+        assert_eq!(row.reasoning_tokens, 0);
         assert!((row.cost - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_request_keeps_the_split_of_output_that_was_thinking() {
+        // D99: the reply's own count, kept with the request it belongs to rather than inside
+        // `Usage`, whose fields add up to the bill — this one is part of `output`.
+        let s = store();
+        let id = s.begin("openai", "gpt").unwrap();
+        s.append(&id, &Item::User("hello".into())).unwrap();
+        s.request(
+            &id,
+            &Request {
+                kind: RequestKind::Reply,
+                provider: "openai".into(),
+                model: "gpt".into(),
+                usage: Usage {
+                    input: 10,
+                    output: 900,
+                    cache_read: 0,
+                    cache_write: 0,
+                },
+                cost: 0.1,
+                dropped: 0,
+                reasoning_tokens: 850,
+            },
+        )
+        .unwrap();
+        let snapshot = s.snapshot(&id).unwrap();
+        assert_eq!(snapshot.requests[0].reasoning_tokens, 850);
+        assert_eq!(snapshot.requests[0].usage.output, 900);
     }
 
     #[test]

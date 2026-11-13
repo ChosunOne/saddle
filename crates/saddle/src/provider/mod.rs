@@ -445,6 +445,14 @@ pub struct Reply {
     pub stop_raw: String,
     pub model: String,
     pub usage: Usage,
+    /// How many of the output tokens were spent thinking (D99).
+    ///
+    /// The API reports this as a number rather than as text saddle gets to keep, so it is the only
+    /// evidence that a model thought when the reasoning itself is hidden. It is a part of
+    /// `usage.output` and not an addition to it, which is why it lives here rather than becoming a
+    /// fifth field of `Usage`: the four in there add up to the bill, and this one would be counted
+    /// twice if it were one of them.
+    pub reasoning_tokens: u64,
     /// How many reasoning items the API said it removed from the input it was sent (D97).
     ///
     /// A server drops reasoning when the history before it changed, which is its own anti-distillation

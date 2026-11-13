@@ -187,6 +187,7 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
     // delta lands on the right one whichever the server sends.
     let mut by_item: BTreeMap<String, u64> = BTreeMap::new();
     let mut usage = Usage::default();
+    let mut reasoning_tokens = 0;
     let mut model = String::new();
     let mut status = String::new();
     let mut incomplete = String::new();
@@ -293,6 +294,10 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
                     .as_u64()
                     .unwrap_or(0);
                 usage.output = u["output_tokens"].as_u64().unwrap_or(usage.output);
+                // D99: the same split, under this API's name for it.
+                reasoning_tokens = u["output_tokens_details"]["reasoning_tokens"]
+                    .as_u64()
+                    .unwrap_or(0);
                 dropped_reasoning = dropped(&response["input_transformations"]);
                 finished = true;
             }
@@ -369,6 +374,7 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
         },
         model,
         usage,
+        reasoning_tokens,
         dropped_reasoning,
     })
 }
@@ -730,6 +736,19 @@ mod tests {
         assert_eq!(reply.usage.cache_read, 100);
         assert_eq!(reply.usage.cache_write, 800);
         assert_eq!(reply.dropped_reasoning, 1);
+    }
+
+    #[test]
+    fn the_part_of_the_output_that_was_thinking_is_read() {
+        // D99: the same split under this API's name for it.
+        let events = Script(vec![(
+            "response.completed",
+            r#"{"type":"response.completed","response":{"model":"m","status":"completed","usage":{"input_tokens":5,"output_tokens":900,"output_tokens_details":{"reasoning_tokens":850}}}}"#,
+        )]);
+        let mut sink = Silent;
+        let reply = read_stream(events, &mut sink).unwrap();
+        assert_eq!(reply.reasoning_tokens, 850);
+        assert_eq!(reply.usage.output, 900);
     }
 
     #[test]

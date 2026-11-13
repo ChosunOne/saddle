@@ -176,6 +176,7 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
     let mut calls: BTreeMap<u64, PendingCall> = BTreeMap::new();
     let mut finish = String::new();
     let mut usage = Usage::default();
+    let mut reasoning_tokens = 0;
     let mut model = String::new();
     let mut done = false;
 
@@ -216,6 +217,11 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
                 .as_u64()
                 .unwrap_or(0);
             usage.output = u["completion_tokens"].as_u64().unwrap_or(usage.output);
+            // D99: how much of that output was thinking. A count, not text: a server that hides
+            // its reasoning reports the split here and nothing else.
+            reasoning_tokens = u["completion_tokens_details"]["reasoning_tokens"]
+                .as_u64()
+                .unwrap_or(0);
         }
         let Some(choice) = chunk["choices"].get(0) else {
             continue;
@@ -297,6 +303,7 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
         stop_raw: finish,
         model,
         usage,
+        reasoning_tokens,
         dropped_reasoning: 0,
     })
 }
@@ -496,6 +503,27 @@ mod tests {
         assert_eq!(reply.usage.cache_read, 100);
         assert_eq!(reply.usage.cache_write, 800);
         assert_eq!(reply.usage.input, 900, "input stays the uncached part");
+    }
+
+    #[test]
+    fn the_part_of_the_output_that_was_thinking_is_read() {
+        // D99: a server that hides its reasoning reports only the split, so this number is the
+        // sole evidence that the model thought at all — and `output` alone cannot give it.
+        let stream = sse(&[
+            json!({"choices":[{"index":0,"delta":{"content":"x"}}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":900,
+                "completion_tokens_details":{"reasoning_tokens":850}}}),
+        ]);
+        let reply = read_stream(
+            sse::Reader::new(stream.as_bytes()),
+            &mut Collect(String::new()),
+        )
+        .unwrap();
+        assert_eq!(reply.reasoning_tokens, 850);
+        assert_eq!(
+            reply.usage.output, 900,
+            "the split is part of output, not instead of it"
+        );
     }
 
     #[test]

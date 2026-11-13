@@ -74,10 +74,11 @@ existing explicit `[agent]` tables remain as written, and `--revoke transcript-r
 one run. It queries only the active conversation branch, including pre-compaction messages, through
 three in-memory views:
 `messages(ordinal, id, role, text)`, `requests(ordinal, node, kind, provider, model, input,
-output, cache_read, cache_write, cached, cost, reasoning_dropped, at, after)` — one row per model
-request, `kind` being `reply` or `summary`, `cached` 1 when the prompt came from the provider's
-cache, `reasoning_dropped` the reasoning items the provider said it removed from the prompt (D97),
-and `after` the ordinal of the last message before it (D92, D94) — and `reasoning(ordinal, node,
+output, cache_read, cache_write, cached, cost, reasoning_dropped, reasoning_tokens, at, after)` —
+one row per model request, `kind` being `reply` or `summary`, `cached` 1 when the prompt came from
+the provider's cache, `reasoning_dropped` the reasoning items the provider said it removed from the
+prompt (D97), `reasoning_tokens` how much of `output` was thinking (D99), and `after` the ordinal
+of the last message before it (D92, D94) — and `reasoning(ordinal, node,
 part, text)`, one row per reasoning block, joined to `messages` on `ordinal` and in arrival order by
 `part` (D98). Only the prose is a row: an encrypted or redacted block is kept and replayed (D95) but
 has nothing a query could read. That is what a poor cache hit rate is diagnosed
@@ -278,7 +279,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D98 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D99 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
