@@ -1896,9 +1896,23 @@ answer "what is the current version of X".
   MCP is implemented and nothing is kept between calls, because the transport here is a single POST.
 - **Nothing is searched by default without a grant**, and a provider that serves no search falls
   through to Exa rather than failing: `search-url` absent means the fallback is the whole story.
+- **A result is read in two steps, and the second one costs nothing.** An excerpt answers most
+  questions, but a 400 KiB page cannot be shown for each of five results, so `{"result": n}` shows
+  result *n* of the search just made in full. The results are kept in the session, which is why the
+  number still means the page the model was shown: asking again could answer with different pages
+  under the same numbers, which is a silent substitution, not a read. Reading from what is held
+  makes no request, needs no grant beyond the search's own, and records nothing — no authority is
+  exercised, and the search that produced the data was already decided. A query given alongside
+  `result` that does not match the held search is searched, and the answer says which search it came
+  from. One consequence of the state being in memory: `saddle tool websearch '{"result": 2}'` in a
+  fresh process has nothing to expand and says so, so a by-hand read passes the query too.
+- **What "in full" means is bounded too.** An expansion carries at most the agent's own result limit
+  (100 KiB), so a page that fits is not cut twice on the way into the context, and one that does not
+  says how many bytes it has and where the page itself is — which is what `fetch` is for. An excerpt
+  says nothing about the rest; an expansion states when it stopped.
 - **Deferred:** Exa's `deep` search or research agent; a `[search]` section for a default result
-  count and a preferred backend; caching a query's results within a session; and reading a search
-  result's own page (that is `fetch`'s job).
+  count and a preferred backend; and keeping a search across processes, which would need an artifact
+  outside every root and buys nothing a second search does not.
 
 ## 4. Scope enumeration
 ## 4. Scope enumeration

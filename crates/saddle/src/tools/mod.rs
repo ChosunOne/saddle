@@ -7,7 +7,7 @@ pub(crate) mod fetch;
 pub mod fs;
 mod patch;
 pub mod search;
-mod websearch;
+pub(crate) mod websearch;
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -257,7 +257,10 @@ pub fn definitions() -> Vec<ToolDef> {
                           answer the query. Use it when the answer is not in the workspace and you \
                           do not already know the address; use `fetch` when you do. It needs a net \
                           grant for the search host, and it names the host it used in the result. \
-                          Returns a handful of results unless `num_results` says otherwise.",
+                          Five results come back unless `num_results` says otherwise, and each \
+                          passage is an excerpt: pass `result` with a result's number to read that \
+                          one in full, which reuses the search already made rather than asking \
+                          again.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -269,8 +272,14 @@ pub fn definitions() -> Vec<ToolDef> {
                         "type": "integer",
                         "description": "How many results to return; 5 by default, 100 at most",
                     },
+                    "result": {
+                        "type": "integer",
+                        "description": "The number of one result to read in full, as the \
+                                        previous search numbered it; omit `query` to use the \
+                                        search this session already made",
+                    },
                 },
-                "required": ["query"],
+                "required": [],
                 "additionalProperties": false,
             }),
         },

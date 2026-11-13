@@ -325,6 +325,10 @@ pub struct Session {
     /// Where the configured provider answers a web search, when it serves one (D82). Set again
     /// whenever the provider changes, so the tool follows the model.
     pub search: Option<crate::provider::SearchTarget>,
+    /// The results of the last search, so `{"result": n}` can show one in full without asking
+    /// again. Held here rather than in the tool because a result's number only means the page the
+    /// model was shown, and that is a property of the session (D82).
+    pub last_search: Option<crate::tools::websearch::LastSearch>,
     _tmp: PrivateTmp,
 }
 
@@ -384,6 +388,7 @@ impl Session {
             // The configured default provider, which is what `saddle tool` has. A run that resolved
             // a provider (`-p`, or one picked with /login) replaces this with that one's (D82).
             search,
+            last_search: None,
             _tmp: tmp,
         };
         // An internal name per tool-visible directory, skipping any name a root already uses, so a

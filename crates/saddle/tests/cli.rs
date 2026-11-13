@@ -606,6 +606,23 @@ fn websearch_is_a_tool_and_the_gate_decides_it() {
     assert!(text.contains("mcp.exa.ai"), "{text}");
     assert!(!text.contains("api.exa.ai"), "{text}");
 
+    // The second step of a search needs a search to expand (D82). No network is involved in the
+    // refusal, which is what makes it testable here.
+    let (ok, text) = env.tool("websearch", serde_json::json!({ "result": 1 }));
+    assert!(!ok, "{text}");
+    assert!(text.contains("no search to expand"), "{text}");
+    // Neither field is a refusal that says what to pass.
+    let (ok, text) = env.tool("websearch", serde_json::json!({}));
+    assert!(!ok, "{text}");
+    assert!(text.contains("`query` is empty"), "{text}");
+    // A result number is a number, and 1-based.
+    let (ok, text) = env.tool(
+        "websearch",
+        serde_json::json!({ "query": "x", "result": 0 }),
+    );
+    assert!(!ok, "{text}");
+    assert!(text.contains("positive whole number"), "{text}");
+
     // An unknown tool names the ones that exist, so the catalogue is readable from the binary.
     let refused = env.saddle(&["tool", "nonesuch", "{}"]);
     let listed = String::from_utf8_lossy(&refused.stderr);

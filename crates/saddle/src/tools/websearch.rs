@@ -26,6 +26,12 @@
 //! bounded excerpt of it, and the parser reads both spellings of the date so the fallback keeps its
 //! own.
 //!
+//! A search answers with excerpts, because five pages of up to 400 KiB cannot be shown at once. The
+//! full text of one result is one more call — `{"result": n}` — read out of the search this session
+//! already made rather than asked for again, so the number still means the page the model was shown,
+//! no request is made, and no grant beyond the search's own is needed. What is held lives in the
+//! session, so a fresh `saddle tool` process has nothing to expand and says so.
+//!
 //! Everything here goes through the engine before a request is made, so the `net` grant decides —
 //! `api.synthetic.new`, `api.exa.ai` and `mcp.exa.ai` are the hosts that have to be granted, and the
 //! same audit log records each one.
@@ -35,7 +41,7 @@ use saddle_cap::{Principal, Scope};
 use saddle_policy::{Kind, Request};
 use serde_json::{Value, json};
 
-use super::{ToolOutput, fetch, num_field, str_field};
+use super::{ToolOutput, fetch, num_field};
 use crate::session::Session;
 
 /// Results asked for when the model does not say.
@@ -44,6 +50,9 @@ const DEFAULT_RESULTS: u64 = 5;
 const MAX_RESULTS: u64 = 100;
 /// A reply larger than this is cut: it is the ceiling the agent puts on a tool result anyway.
 const MAX_BYTES: usize = 64 * 1024;
+/// What one expanded result may carry. This is the agent's own result limit, so a page that fits
+/// here is not cut a second time on the way into the context (D82).
+const MAX_FULL: usize = crate::agent::RESULT_LIMIT;
 /// How much of one quoted passage the model is shown. Exa's own highlights are short excerpts, but
 /// Synthetic's search returns whole page texts under that key, so without a ceiling one result fills
 /// the entire answer and the other four are lost.
@@ -80,17 +89,34 @@ pub struct Hit {
 }
 
 pub fn search(session: &mut Session, input: &Value) -> Result<ToolOutput> {
-    let query = match str_field(input, "query") {
-        Ok(q) => q.trim().to_owned(),
+    // `result` alone reads the full text of a result from the search this session already made, so
+    // inspecting one costs no second request and no second grant (D82).
+    let expand = match num_field(input, "result") {
+        Ok(n) => n,
         Err(out) => return Ok(out),
     };
+    let query = input
+        .get("query")
+        .and_then(Value::as_str)
+        .map(|q| q.trim().to_owned())
+        .unwrap_or_default();
+    if let Some(index) = expand {
+        return expand_result(session, &query, index);
+    }
     if query.is_empty() {
-        return Ok(ToolOutput::err("`query` is empty"));
+        return Ok(ToolOutput::err(
+            "`query` is empty; to read a result of the last search instead, pass `result`",
+        ));
     }
     let count = match num_field(input, "num_results") {
         Ok(n) => n.unwrap_or(DEFAULT_RESULTS).clamp(1, MAX_RESULTS),
         Err(out) => return Ok(out),
     };
+    run(session, &query, count)
+}
+
+/// Asks the chosen backend for a search, audits it, and remembers what came back.
+fn run(session: &mut Session, query: &str, count: u64) -> Result<ToolOutput> {
     let backend = match choose(session) {
         Ok(backend) => backend,
         Err(out) => return Ok(out),
@@ -106,10 +132,138 @@ pub fn search(session: &mut Session, input: &Value) -> Result<ToolOutput> {
         format!("searched the web for `{query}`"),
     )?;
     match backend {
-        Backend::Provider(target) => provider_search(session, &target, &query, count),
-        Backend::ExaRest => exa_rest(session, &query, count),
-        Backend::ExaMcp => exa_mcp(session, &query, count),
+        Backend::Provider(target) => provider_search(session, &target, query, count),
+        Backend::ExaRest => exa_rest(session, query, count),
+        Backend::ExaMcp => exa_mcp(session, query, count),
     }
+}
+
+/// One search, as the model saw it: the numbered results it was given, with their full text kept so
+/// the same number can be expanded to the whole page (D82).
+///
+/// The session holds this rather than the tool, because a number in a result is only meaningful
+/// against the search it came from: expanding by re-asking could show a different page under the
+/// same `2`, which is a silent substitution rather than a read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastSearch {
+    pub query: String,
+    /// Which backend answered, named as the audit names it.
+    pub via: &'static str,
+    pub hits: Vec<Hit>,
+}
+
+/// Keeps what the model was shown, so `{"result": n}` expands the page it actually saw.
+fn remember(session: &mut Session, query: &str, via: &'static str, hits: &[Hit]) {
+    session.last_search = Some(LastSearch {
+        query: query.to_owned(),
+        via,
+        hits: hits.to_vec(),
+    });
+}
+
+/// What an expansion has to work with before it can show a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Plan {
+    /// The session already holds the search that numbered this result: read from it.
+    FromCache,
+    /// A query was given that the session has not searched, so search it now.
+    Fresh,
+    /// Nothing to read and nothing to search: the call is incomplete.
+    Nothing,
+}
+
+/// Decides whether an expansion reads what was shown or has to search first.
+///
+/// A query that matches what was remembered is reused, because re-asking could answer with
+/// different pages under the same numbers — a silent substitution for the page the model was
+/// shown. A query that differs is searched, and the answer says which search it came from.
+fn plan(last: Option<&LastSearch>, query: &str) -> Plan {
+    match (last, query.is_empty()) {
+        (Some(_), true) => Plan::FromCache,
+        (Some(last), false) if last.query == query => Plan::FromCache,
+        (_, true) => Plan::Nothing,
+        (_, false) => Plan::Fresh,
+    }
+}
+
+/// The full text of one result: the second half of the two-step the tool describes (D82)./// The full text of one result: the second half of the two-step the tool describes (D82).
+///
+/// Nothing is fetched here when the session already holds the search, which is the common case — so
+/// reading a result needs no grant beyond the one the search itself needed. A query that does not
+/// match what was remembered is searched again, and says so, because that can return other pages.
+fn expand_result(session: &mut Session, query: &str, index: u64) -> Result<ToolOutput> {
+    match plan(session.last_search.as_ref(), query) {
+        Plan::FromCache => {}
+        Plan::Fresh => {
+            let out = run(session, query, DEFAULT_RESULTS)?;
+            if !out.ok {
+                return Ok(out);
+            }
+        }
+        Plan::Nothing => {
+            return Ok(ToolOutput::err(
+                "no search to expand in this session; call websearch with a `query` first, \
+                 or pass both `query` and `result` in one call",
+            ));
+        }
+    }
+    let Some(last) = session.last_search.as_ref() else {
+        return Ok(ToolOutput::err(
+            "no search to expand in this session; call websearch with a `query` first",
+        ));
+    };
+    let hits = &last.hits;
+    let Some(hit) = usize::try_from(index)
+        .ok()
+        .and_then(|i| i.checked_sub(1))
+        .and_then(|i| hits.get(i))
+    else {
+        return Ok(ToolOutput::err(format!(
+            "`result` is {index} and the search of `{}` returned {}; numbering starts at 1",
+            last.query,
+            hits.len()
+        )));
+    };
+    Ok(ToolOutput::ok(one_in_full(hit, index, hits.len(), last)))
+}
+
+/// One result written out in full: where it is, when it was published, and its text.
+fn one_in_full(hit: &Hit, index: u64, of: usize, last: &LastSearch) -> String {
+    let mut out = format!("{index}. {}\n   {}\n", title_of(hit), hit.url);
+    if let Some(when) = &hit.published {
+        out.push_str(&format!("   published {}\n", date_of(when)));
+    }
+    let body = hit.text.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    match body {
+        Some(text) => {
+            out.push('\n');
+            out.push_str(&whole_text(text, &hit.url));
+            out.push_str(&format!(
+                "\n\n(result {index} of {of}, in full, from the search of `{}` via {})",
+                last.query, last.via
+            ));
+        }
+        None => out.push_str(
+            "\n   (this result came without its text; the page itself is at the URL above, for \
+             `fetch`)",
+        ),
+    }
+    out
+}
+
+fn whole_text(text: &str, url: &str) -> String {
+    if text.len() <= MAX_FULL {
+        return text.to_owned();
+    }
+    let mut end = MAX_FULL;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n(showing the first {end} of {} bytes; the page itself is at {url})",
+        &text[..end],
+        text.len()
+    )
 }
 
 fn backend_name(backend: &Backend) -> &'static str {
@@ -181,6 +335,7 @@ fn provider_search(
     }
     let mut hits = parse_exa(&text)?;
     hits.truncate(usize::try_from(count).unwrap_or(hits.len()));
+    remember(session, query, "provider", &hits);
     let asked = if count > DEFAULT_RESULTS {
         format!(
             " ({count} asked, {} returned: the endpoint answers {})",
@@ -282,9 +437,11 @@ fn exa_rest(session: &mut Session, query: &str, count: u64) -> Result<ToolOutput
     if status != 200 {
         return Ok(ToolOutput::err(explain(status, &text)));
     }
+    let hits = parse_exa(&text)?;
+    remember(session, query, "exa", &hits);
     Ok(ToolOutput::ok(format!(
         "{}\n\n({count} asked of Exa, {})",
-        format_hits(&parse_exa(&text)?),
+        format_hits(&hits),
         describe(&text)
     )))
 }
@@ -461,6 +618,8 @@ pub fn format_hits(hits: &[Hit]) -> String {
             out.push_str(&format!("   > {}\n", passage_for_model(passage)));
         }
     }
+    // The second step, said where the model is looking rather than only in the tool's description.
+    out.push_str("\n(full text of one result: call websearch with {\"result\": N})");
     cut(out.trim_end())
 }
 
@@ -695,6 +854,108 @@ mod tests {
             ..Hit::default()
         };
         assert!(format_hits(&[empty]).contains("> real text"));
+    }
+
+    fn last_search(hits: Vec<Hit>) -> LastSearch {
+        LastSearch {
+            query: "rust atomics".to_owned(),
+            via: "provider",
+            hits,
+        }
+    }
+
+    #[test]
+    fn a_result_can_be_read_in_full_from_the_search_already_made() {
+        // D82: the excerpts are the first step; `{"result": n}` is the second, and it reads the page
+        // the model was already shown rather than asking for a search that could answer with
+        // different pages under the same numbers.
+        let hit = Hit {
+            title: "Atomics".into(),
+            url: "https://doc.rust-lang.org/nomicon/atomics.html".into(),
+            published: Some("2025-06-26T00:00:00.000Z".into()),
+            text: Some("the whole page, not an excerpt".into()),
+            ..Hit::default()
+        };
+        let held = last_search(vec![hit.clone(), hit]);
+        let text = one_in_full(&held.hits[0], 1, held.hits.len(), &held);
+        assert!(
+            text.starts_with("1. Atomics\n   https://doc.rust-lang.org"),
+            "{text}"
+        );
+        assert!(text.contains("published 2025-06-26"), "{text}");
+        // The whole body, untouched by the excerpt ceiling.
+        assert!(text.contains("the whole page, not an excerpt"), "{text}");
+        assert!(
+            text.contains(
+                "(result 1 of 2, in full, from the search of `rust atomics` via provider)"
+            ),
+            "{text}"
+        );
+        // A result that came without text points at the page rather than pretending it is empty.
+        let bare = Hit {
+            title: "t".into(),
+            url: "https://t/".into(),
+            ..Hit::default()
+        };
+        let held = last_search(vec![bare]);
+        let text = one_in_full(&held.hits[0], 1, 1, &held);
+        assert!(text.contains("came without its text"), "{text}");
+        assert!(text.contains("`fetch`"), "{text}");
+    }
+
+    #[test]
+    fn a_long_page_is_cut_at_what_a_tool_result_carries() {
+        // The ceiling is the agent's own result limit, so nothing is cut twice on the way in.
+        let page = "word ".repeat(60_000);
+        let text = whole_text(&page, "https://example.test/");
+        assert!(text.len() < page.len(), "not cut");
+        assert!(
+            text.contains(&format!("of {} bytes", page.len())),
+            "no total"
+        );
+        assert!(
+            text.contains("https://example.test/"),
+            "no address to fetch the rest"
+        );
+        assert!(text.len() <= MAX_FULL + 200, "{} bytes", text.len());
+        // Short text is passed through.
+        assert_eq!(whole_text("short", "https://x/"), "short");
+        // A cut never splits a character.
+        let multibyte = "é".repeat(MAX_FULL);
+        assert!(std::str::from_utf8(whole_text(&multibyte, "https://x/").as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn an_expansion_reads_the_search_it_names_or_searches_once_more() {
+        // D82: the numbers in a result belong to the search that produced them, so a matching query
+        // must read the held results rather than ask again — a second search could return
+        // different pages under the same numbers.
+        let held = last_search(vec![]);
+        assert_eq!(
+            plan(Some(&held), ""),
+            Plan::FromCache,
+            "no query, use the held"
+        );
+        assert_eq!(plan(Some(&held), "rust atomics"), Plan::FromCache);
+        assert_eq!(plan(Some(&held), "something else"), Plan::Fresh);
+        // Nothing held: a query makes the call work on its own, no query cannot.
+        assert_eq!(plan(None, "rust atomics"), Plan::Fresh);
+        assert_eq!(plan(None, ""), Plan::Nothing);
+    }
+
+    #[test]
+    fn the_results_say_how_to_read_one_in_full() {
+        // The affordance has to be visible in the answer, not only in the tool's description.
+        let hit = Hit {
+            title: "t".into(),
+            url: "https://t/".into(),
+            text: Some("x".into()),
+            ..Hit::default()
+        };
+        let text = format_hits(&[hit]);
+        assert!(text.contains("result\": N"), "{text}");
+        // No results, no hint: there is nothing to expand.
+        assert_eq!(format_hits(&[]), "no results");
     }
 
     #[test]
