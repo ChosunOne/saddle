@@ -421,7 +421,13 @@ fn run_agent(
     for note in &header.notes {
         out.info(note);
     }
-    let result = converse(&mut agent, &mut session, &mut out, prompt);
+    let result = converse(
+        &mut agent,
+        &mut session,
+        &mut out,
+        prompt,
+        header.theme.as_deref(),
+    );
     let closed = session.close();
     let code = result?;
     closed?;
@@ -434,9 +440,10 @@ fn converse(
     session: &mut Session,
     out: &mut output::Output,
     prompt: Option<String>,
+    theme: Option<&str>,
 ) -> Result<ExitCode> {
     if let Some(prompt) = prompt {
-        return Ok(match line_turn(agent, session, out, &prompt)? {
+        return Ok(match line_turn(agent, session, out, &prompt, theme)? {
             End::Answered => ExitCode::SUCCESS,
             _ => ExitCode::from(1),
         });
@@ -455,7 +462,7 @@ fn converse(
         if matches!(text, "/exit" | "/quit") {
             break;
         }
-        line_turn(agent, session, out, text)?;
+        line_turn(agent, session, out, text, theme)?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -467,6 +474,7 @@ fn line_turn(
     session: &mut Session,
     out: &mut output::Output,
     text: &str,
+    theme: Option<&str>,
 ) -> Result<End> {
     cancel::reset();
     let end = {
@@ -511,6 +519,17 @@ fn line_turn(
                 "a skill or instruction file already read into this conversation is unchanged",
             );
             End::Answered
+        } else if text == "/theme" || text.starts_with("/theme ") {
+            // A screen has the list to choose from (D74); a piped session has the names, and the
+            // same switch, so a command meant for the interface is not sent to the model as a
+            // prompt and charged for.
+            theme_command(
+                session,
+                out,
+                theme,
+                text.trim_start_matches("/theme").trim(),
+            )?;
+            End::Answered
         } else if let Some(rest) = text.strip_prefix("/skill:") {
             // The same expansion as the TUI's, from the skills the session discovered (D69). A
             // prompt written as a skill command works the same way in line mode, so a piped prompt
@@ -542,6 +561,52 @@ fn line_turn(
     };
     out.turn_end(&end);
     Ok(end)
+}
+
+/// `/theme` without a screen: report the names, or switch to one and save it, as the interface does
+/// (D71, D74).
+fn theme_command(
+    session: &Session,
+    out: &mut output::Output,
+    in_force: Option<&str>,
+    asked: &str,
+) -> Result<()> {
+    let config = session.setup.paths.user_config();
+    let user = UserConfig::load(&config)?;
+    if asked.is_empty() {
+        out.info(&format!(
+            "theme: {}",
+            in_force.unwrap_or_else(|| user.ui.theme.as_deref().unwrap_or("default"))
+        ));
+        out.info(&format!(
+            "built in: {}",
+            tui::theme::builtin_names().join(", ")
+        ));
+        if !user.themes.is_empty() {
+            let defined: Vec<&str> = user.themes.keys().map(String::as_str).collect();
+            out.info(&format!("defined in config.toml: {}", defined.join(", ")));
+        }
+        out.info(
+            "`/theme <name>` switches and saves it; in the full-screen interface /theme lists them",
+        );
+        return Ok(());
+    }
+    // Built before it is written, for the reason the interface gives: a name that does not build
+    // must not be saved, or the next session opens on an error whose cause is not on screen.
+    match tui::theme::build(asked, &user.themes) {
+        Ok(theme) => {
+            config::edit(&config, |doc| {
+                if doc.get("ui").is_none() {
+                    doc.insert("ui", toml_edit::Item::Table(toml_edit::Table::new()));
+                }
+                doc["ui"]["theme"] = toml_edit::value(asked);
+                Ok(())
+            })?;
+            out.info(&format!("theme: {}; saved in config.toml", theme.name));
+        }
+        Err(e) => out.info(&format!("{e:#}")),
+    }
+    Ok(())
 }
 
 /// Refuses to open a session in a workspace that puts credentials in reach, unless a person has

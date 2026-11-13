@@ -1190,6 +1190,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(dialog) = &app.permissions {
         draw_permissions(frame, dialog, area, &app.theme);
     }
+    if let Some(picker) = &app.themes {
+        // Drawn in the theme the highlight offers, which is the point of the preview (D74).
+        draw_themes(frame, picker, area, &app.theme);
+    }
     if let Some(login) = &app.login {
         draw_login(frame, login, area, app.spinner, &app.theme);
     }
@@ -1660,6 +1664,82 @@ fn draw_settings(frame: &mut Frame<'_>, dialog: &SettingsDialog, area: Rect, the
     };
     lines.push(Line::from(Span::styled(keys, dim(theme))));
     modal(frame, area, width, " Settings ", lines, cursor, theme);
+}
+
+/// `/theme`: every theme by name, the highlight previewed on the whole screen (D74).
+fn draw_themes(
+    frame: &mut Frame<'_>,
+    picker: &crate::tui::themes::ThemePicker,
+    area: Rect,
+    theme: &Theme,
+) {
+    use crate::tui::themes::ROWS as THEME_ROWS;
+    let width = area.width.saturating_sub(4).min(72);
+    let inner = width.saturating_sub(2) as usize;
+    let accent = Style::new().fg(theme.accent);
+    let name_width = picker
+        .entries
+        .iter()
+        .map(|e| e.name.width())
+        .max()
+        .unwrap_or(0)
+        .min(inner / 2);
+    let mut lines: Vec<Line> = Vec::new();
+    let top = picker.offset();
+    for (i, entry) in picker.entries.iter().enumerate().skip(top).take(THEME_ROWS) {
+        let chosen = i == picker.selected;
+        // The theme that was in force when the list opened, so escape has something to name.
+        let was = if entry.name == picker.original {
+            "*"
+        } else {
+            " "
+        };
+        let name = format!("{:<name_width$}", entry.name);
+        let note = keep_tail(&entry.note(), inner.saturating_sub(3 + name_width + 12));
+        let style = if entry.theme.is_ok() {
+            Style::new()
+        } else {
+            Style::new().fg(theme.error)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if chosen { "› " } else { "  " }, accent),
+            Span::styled(
+                format!("{was}{name}"),
+                if chosen {
+                    style.add_modifier(Modifier::BOLD)
+                } else {
+                    style
+                },
+            ),
+            Span::styled(
+                format!("  {:<12}", entry.source.label()),
+                if chosen { accent } else { dim(theme) },
+            ),
+            Span::styled(note, dim(theme)),
+        ]));
+    }
+    lines.push(Line::default());
+    // What the highlight does, in the theme it offers: the preview is the whole point.
+    let help = match &picker.current().theme {
+        Ok(_) => format!(
+            "{} · {} · enter uses it and saves it",
+            picker.current().name,
+            picker.current().note()
+        ),
+        Err(e) => format!("{} · {e}", picker.current().name),
+    };
+    lines.push(Line::from(Span::styled(
+        keep_tail(&help, inner),
+        match &picker.current().theme {
+            Ok(_) => dim(theme),
+            Err(_) => Style::new().fg(theme.error),
+        },
+    )));
+    lines.push(Line::from(Span::styled(
+        "* was in force · ↑↓ preview · enter choose · esc back",
+        dim(theme),
+    )));
+    modal(frame, area, width, " Theme ", lines, None, theme);
 }
 
 fn draw_permissions(frame: &mut Frame<'_>, dialog: &Permissions, area: Rect, theme: &Theme) {
@@ -2238,6 +2318,49 @@ mod tests {
                 .flat_map(|l| l.spans.iter())
                 .all(|s| s.style.bg == Some(Theme::default().tool_success_bg))
         );
+    }
+
+    #[test]
+    fn the_theme_list_is_drawn_with_the_theme_it_offers() {
+        // D74: the point of the picker is that you see the choice before making it, so the box has
+        // to be drawn in the highlighted theme and say which one that is.
+        let mut app = bare_app();
+        let tables: crate::tui::theme::ThemeTables =
+            toml::from_str("[mine]\nborder = \"#ff0000\"\n").unwrap();
+        let name = app.theme.name.clone();
+        app.open_themes(crate::tui::themes::ThemePicker::collect(&tables, &name));
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = screen(&terminal);
+        println!("{text}");
+        assert!(text.contains("Theme"), "{text}");
+        for entry in ["default", "dark", "light", "mono", "system", "mine"] {
+            assert!(text.contains(entry), "{entry} is not in the list:\n{text}");
+        }
+        assert!(text.contains("›"), "the highlight is marked:\n{text}");
+        assert!(text.contains("built in"), "the source is shown:\n{text}");
+        assert!(text.contains("config.toml"), "{text}");
+
+        // Moving to the config theme draws the box with its border colour, which is the preview.
+        while app.themes.as_ref().unwrap().current().name != "mine" {
+            app.key(ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Down,
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        assert_eq!(
+            app.theme.border,
+            Color::Rgb(0xff, 0x00, 0x00),
+            "the drawing is now `mine`"
+        );
+        // And the box itself carries that colour, so the list is read in what it offers.
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let reds = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].fg == Color::Rgb(0xff, 0x00, 0x00))
+            .count();
+        assert!(reds > 0, "the frame is drawn in the previewed theme");
     }
 
     fn screen(terminal: &Terminal<TestBackend>) -> String {

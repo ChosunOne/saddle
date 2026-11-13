@@ -389,7 +389,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/theme",
         args: "[name]",
-        about: "show the theme, or switch to another and save it (--use-theme for one run)",
+        about: "open the list of themes and preview them; a name switches straight to it",
     },
     SlashCommand {
         name: "/reload",
@@ -475,6 +475,11 @@ pub struct App {
     pub tree: Option<crate::tui::tree::Tree>,
     /// The permissions editor, drawn over everything else while open (D45).
     pub permissions: Option<crate::tui::permissions::Permissions>,
+    /// The theme list, drawn over everything else while open, and previewed as it moves (D74).
+    pub themes: Option<crate::tui::themes::ThemePicker>,
+    /// The theme in force when the list opened — its name and its colours — so escape puts back
+    /// exactly what was there (D74).
+    theme_before: Option<(String, crate::tui::theme::Theme)>,
     /// The agent's per-prompt limit, shown in /settings.
     /// Model requests per prompt, or `None` for no limit (D37).
     pub max_steps: Option<usize>,
@@ -570,6 +575,8 @@ impl App {
             settings: None,
             tree: None,
             permissions: None,
+            themes: None,
+            theme_before: None,
             history: Vec::new(),
             history_pos: None,
             draft: String::new(),
@@ -605,7 +612,10 @@ impl App {
 
     /// A dialog is open and takes the keys.
     pub fn dialog_open(&self) -> bool {
-        self.login.is_some() || self.resume.is_some() || self.settings.is_some()
+        self.login.is_some()
+            || self.resume.is_some()
+            || self.settings.is_some()
+            || self.themes.is_some()
     }
 
     fn compaction(&mut self, event: crate::compact::Event) {
@@ -929,6 +939,9 @@ impl App {
         if self.permissions.is_some() {
             return self.permissions_key(key);
         }
+        if self.themes.is_some() {
+            return self.themes_key(key);
+        }
         if let Some(settings) = &mut self.settings {
             return match settings.key(key) {
                 SettingsOutcome::Stay => None,
@@ -1103,7 +1116,7 @@ impl App {
             login.paste(text);
         } else if let Some(picker) = &mut self.resume {
             picker.paste(text);
-        } else if self.settings.is_none() {
+        } else if self.settings.is_none() && self.themes.is_none() {
             self.editor.insert_str(text);
         }
     }
@@ -1111,6 +1124,67 @@ impl App {
     /// The mouse: the wheel scrolls, and a drag across the transcript selects text (D35). Text is
     /// copied when the button comes up, so a drag that ends anywhere has already done what it
     /// looked like it would.
+    /// Opens the theme list on the theme in force, remembering what to put back (D74).
+    pub fn open_themes(&mut self, mut picker: crate::tui::themes::ThemePicker) {
+        let name = self
+            .header
+            .theme
+            .clone()
+            .unwrap_or_else(|| self.theme.name.clone());
+        // The app is the one that knows what is drawn, so the `*` the list marks says what was
+        // actually in force (D74).
+        picker.original = name.clone();
+        self.theme_before = Some((name, self.theme.clone()));
+        // Stored before the preview, which reads the picker: the other order draws the theme the
+        // list opened on only after the first keypress (D74).
+        self.themes = Some(picker);
+        self.preview_theme();
+    }
+
+    /// Draws with the highlighted theme, so the list is read in the theme it offers (D74).
+    fn preview_theme(&mut self) {
+        if let Some(theme) = self.themes.as_ref().and_then(|p| p.preview()).cloned() {
+            if let Some(picker) = &self.themes {
+                self.header.theme = Some(picker.current().name.clone());
+            }
+            self.theme = theme;
+        }
+    }
+
+    /// The theme list, while it is open: it takes every key (D74).
+    ///
+    /// Moving the highlight previews, enter keeps and saves, escape puts back the theme that was in
+    /// force — and the name in the status line goes back with it.
+    pub fn themes_key(&mut self, key: KeyEvent) -> Option<Action> {
+        use crate::tui::themes::Outcome;
+        let before = self.theme_before.clone();
+        let outcome = self.themes.as_mut()?.key(key);
+        match outcome {
+            Outcome::Stay => {
+                self.preview_theme();
+                None
+            }
+            Outcome::Cancel => {
+                // Both what is drawn and the name the status line shows come back from what the
+                // app had, not from what the list was told: a picker that opened on the wrong
+                // entry must not be able to make escape change the theme (D74).
+                if let Some((name, theme)) = before {
+                    self.theme = theme;
+                    self.header.theme = Some(name);
+                }
+                self.themes = None;
+                self.theme_before = None;
+                None
+            }
+            Outcome::Choose(name) => {
+                self.preview_theme();
+                self.themes = None;
+                self.theme_before = None;
+                Some(Action::Theme(Some(name)))
+            }
+        }
+    }
+
     /// The permissions editor, while it is open: it takes every key, and a change it asks for is
     /// carried out by the controller (D45).
     pub fn permissions_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -1131,7 +1205,8 @@ impl App {
         let overlay = self.login.is_some()
             || self.resume.is_some()
             || self.settings.is_some()
-            || self.permissions.is_some();
+            || self.permissions.is_some()
+            || self.themes.is_some();
         match ev.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_by(3);
@@ -2069,6 +2144,66 @@ mod tests {
             a.key(key(KeyCode::Enter)),
             Some(Action::Theme(Some("light".into())))
         );
+    }
+
+    #[test]
+    fn the_theme_list_previews_as_it_moves_and_escape_puts_the_old_theme_back() {
+        // D74: a theme is chosen by looking at it. Moving the highlight draws with the new one;
+        // escape restores both the drawing and the name in the status line; enter keeps it.
+        let mut a = app();
+        let tables: crate::tui::theme::ThemeTables =
+            toml::from_str("[mine]\ntext = \"#ffffff\"\naccent = \"#ff0000\"\n").unwrap();
+        let was = a.theme.name.clone();
+        // Opened on a theme that is not the app's, so "opens on the one in force" is a real claim,
+        // and not the last entry, so there is somewhere to move to.
+        let picker = crate::tui::themes::ThemePicker::collect(&tables, "dark");
+        a.open_themes(picker);
+        assert_eq!(
+            a.theme.name, "dark",
+            "the theme it opens on is the one drawn"
+        );
+        assert_eq!(a.header.theme.as_deref(), Some("dark"));
+        let start = "dark".to_owned();
+
+        // Down moves to the next entry and the screen is drawn in it.
+        assert_eq!(a.key(key(KeyCode::Down)), None);
+        let previewed = a.themes.as_ref().unwrap().current().name.clone();
+        assert_ne!(previewed, start);
+        assert_eq!(a.theme.name, previewed, "the preview is the drawing");
+        assert_eq!(a.header.theme.as_deref(), Some(previewed.as_str()));
+
+        // Escape: the theme that was in force comes back, by drawing and by name.
+        assert_eq!(a.key(key(KeyCode::Esc)), None);
+        assert!(a.themes.is_none(), "the list closed");
+        assert_eq!(a.theme.name, was, "the old theme is back");
+        assert_eq!(a.header.theme.as_deref(), Some(was.as_str()));
+
+        // Enter keeps the highlight: the action carries the name to save.
+        let picker = crate::tui::themes::ThemePicker::collect(&tables, &was);
+        a.open_themes(picker);
+        a.key(key(KeyCode::Down));
+        let chosen = a.themes.as_ref().unwrap().current().name.clone();
+        assert_eq!(
+            a.key(key(KeyCode::Enter)),
+            Some(Action::Theme(Some(chosen.clone())))
+        );
+        assert!(a.themes.is_none());
+        assert_eq!(a.theme.name, chosen, "kept after the list closes");
+    }
+
+    #[test]
+    fn the_theme_list_takes_every_key_while_it_is_open() {
+        // A picker that let a letter reach the editor would send a prompt instead of choosing.
+        let mut a = app();
+        let tables = crate::tui::theme::ThemeTables::new();
+        let name = a.theme.name.clone();
+        a.open_themes(crate::tui::themes::ThemePicker::collect(&tables, &name));
+        assert!(a.dialog_open());
+        assert!(a.menu().is_empty(), "no / menu over a dialog");
+        for c in ['x', '/', 'q'] {
+            assert_eq!(a.key(key(KeyCode::Char(c))), None);
+        }
+        assert!(a.editor.text().is_empty(), "nothing reached the editor");
     }
 
     #[test]

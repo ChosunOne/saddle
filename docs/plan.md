@@ -1560,6 +1560,35 @@ highlighter can be added offline and a code block is read, not compiled.
   language's keywords", not "what a grammar says this token is". A block with an unusual construct
   is highlighted plausibly and never wrongly breaks, which is the property a transcript needs.
 
+**D74.** A theme is chosen from a list, by looking at it.
+
+`/theme` with no argument used to print the theme's name and the names available, which meant knowing
+the name before you could choose it, and choosing blind. It now opens a picker.
+
+- **Every theme is in the list**: the built-ins and every `[themes.<name>]` table in `config.toml`,
+  each saying where it comes from, so a theme is edited by opening the file that holds it. A table
+  that shadows a built-in reports `config.toml`, since that is where it now lives.
+- **Moving the highlight previews the theme on the whole screen**, box and all. That is the point:
+  a palette is judged by looking at it, and no name in a list conveys a colour.
+- **Escape puts back the theme that was in force**, in the drawing and in the name the status line
+  shows. Both come from what the app had when the list opened, not from what the list was told it
+  had: a picker that opened on the wrong entry must not be able to make escape change the theme.
+  Enter is what makes the choice stick, by writing it to `config.toml` as `/theme <name>` always
+  has; the list is a way to reach that, not a second kind of choice.
+- **A theme that does not build stays in the list and cannot be chosen.** A broken palette is a
+  mistake to be shown, in the place it was made, rather than hidden until startup when the cause is
+  off screen. Its row carries the reason it failed.
+- **The list opens on the theme in force**, so the first thing read is where you are. A `light/dark`
+  pair (D72) has no row of its own: the half that applies is the entry to stand on.
+- **The list scrolls and does not wrap.** A key held down stops at the end rather than jumping back
+  to the top, which in a picker that previews would mean a flash of the wrong theme.
+- **`/theme <name>` still switches directly**, and `--use-theme` still chooses for one run without
+  writing anything: a name is a shortcut for a person who knows it, never the only way in.
+- **Line mode has no screen to list them on**, so `/theme` there reports the theme in force and the
+  names, and `/theme <name>` switches and saves as the interface does. That branch also stops
+  `/theme` being sent to the model as a prompt, which it was: a command meant for the interface must
+  never be billed as a question.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

@@ -16,6 +16,7 @@ pub mod status;
 pub mod syntax;
 pub mod terminal;
 pub mod theme;
+mod themes;
 mod tree;
 
 use std::fmt::Write as _;
@@ -1182,24 +1183,33 @@ impl Controller {
         Ok(())
     }
 
-    /// `/theme`: report the theme, or switch to one by name and write it to config.toml (D71).
+    /// `/theme`: open the list, or switch to the theme named and write it to config.toml (D71, D74).
     ///
     /// Writing the file is what `/model` does: a choice made once should not have to be made again.
     /// The switch is applied here as well, so it takes effect without a reload.
     fn theme(&self, app: &mut App, name: Option<String>) {
         let Some(name) = name else {
-            let mut said = format!("theme: {}", app.theme.name);
-            said.push_str(&format!(
-                "\nbuilt in: {}",
-                crate::tui::theme::builtin_names().join(", ")
-            ));
-            if let Ok(user) = UserConfig::load(&self.paths.user_config())
-                && !user.themes.is_empty()
-            {
-                let defined: Vec<&str> = user.themes.keys().map(String::as_str).collect();
-                said.push_str(&format!("\ndefined here: {}", defined.join(", ")));
+            // A theme is chosen by looking at it, so the list is a picker that previews rather than
+            // a printed set of names to choose from blind (D74).
+            let user = match UserConfig::load(&self.paths.user_config()) {
+                Ok(user) => user,
+                Err(e) => return app.note(NoteKind::Error, &format!("{e:#}")),
+            };
+            let current = app
+                .header
+                .theme
+                .clone()
+                .or(user.ui.theme.clone())
+                .unwrap_or_else(|| "default".to_owned());
+            // A theme derived from the terminal needs its answer before the preview is drawn (D73).
+            if crate::tui::theme::needs_terminal(&current, &user.themes) {
+                crate::tui::terminal::requery();
             }
-            return app.note(NoteKind::Info, &said);
+            app.open_themes(crate::tui::themes::ThemePicker::collect(
+                &user.themes,
+                &current,
+            ));
+            return;
         };
         let user = match UserConfig::load(&self.paths.user_config()) {
             Ok(user) => user,
@@ -1207,6 +1217,9 @@ impl Controller {
         };
         // Built before it is written: a name that does not build must not be saved, or the next
         // session would open on an error the person cannot see the cause of.
+        if crate::tui::theme::needs_terminal(&name, &user.themes) {
+            crate::tui::terminal::requery();
+        }
         let theme = match crate::tui::theme::build(&name, &user.themes) {
             Ok(theme) => theme,
             Err(e) => return app.note(NoteKind::Error, &format!("{e:#}")),
@@ -1762,6 +1775,80 @@ impl Drop for Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A controller over a throwaway config, so a slash command can be followed all the way to
+    /// what it does (D74).
+    fn controller(dir: &std::path::Path, config: &str) -> Controller {
+        let paths = Paths {
+            state: dir.join("state"),
+            config: dir.join("config"),
+        };
+        std::fs::create_dir_all(paths.user_config().parent().unwrap()).unwrap();
+        std::fs::write(paths.user_config(), config).unwrap();
+        let (commands, _) = std::sync::mpsc::channel();
+        let (events, _) = std::sync::mpsc::channel();
+        Controller {
+            commands,
+            events,
+            store: store::Store::open(&paths.sessions_index(), dir.to_path_buf()).unwrap(),
+            paths,
+        }
+    }
+
+    fn an_app() -> App {
+        App::new(crate::tui::Header {
+            provider: "mock".into(),
+            model: "mock-model".into(),
+            workspace: ".".into(),
+            audit: "a.jsonl".into(),
+            notes: Vec::new(),
+            show_reasoning: true,
+            expand_tools: false,
+            max_steps: None,
+            context_window: 128_000,
+            priced: false,
+            mouse: false,
+            status: crate::tui::status::Template::default(),
+            images: None,
+            theme: None,
+        })
+    }
+
+    #[test]
+    fn slash_theme_opens_the_list_on_the_theme_in_force() {
+        // `/theme` with no name is the list, not a printed set of names to choose from blind (D74).
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller(
+            dir.path(),
+            "provider = \"synthetic\"\n[ui]\ntheme = \"mono\"\n[themes.mine]\naccent = \"#ff0000\"\n",
+        );
+        let mut app = an_app();
+        c.perform(&mut app, Action::Theme(None));
+        let picker = app.themes.as_ref().expect("the list is open");
+        assert_eq!(
+            picker.current().name,
+            "mono",
+            "opened on the theme in force"
+        );
+        assert!(
+            picker.entries.iter().any(|e| e.name == "mine"),
+            "the theme defined in the config is offered"
+        );
+        assert_eq!(app.theme.name, "mono", "and it is what is being drawn");
+    }
+
+    #[test]
+    fn a_slash_theme_that_cannot_be_read_says_so_instead_of_opening_message() {
+        // The config is a person's file; a broken one is a note, not a crash and not a silent no-op.
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller(dir.path(), "this is not toml");
+        let mut app = an_app();
+        c.perform(&mut app, Action::Theme(None));
+        assert!(
+            app.themes.is_none(),
+            "no list from a config that did not parse"
+        );
+    }
 
     fn placed(line: usize, id: u32) -> Placed {
         Placed {
