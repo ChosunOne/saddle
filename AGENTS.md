@@ -26,7 +26,7 @@ Inside `crates/saddle/src`:
 | --- | --- |
 | `agent` | the model loop (no request limit unless one is set, D37; a turn stops on a repeated call and answer, D38), the system prompt (base plus grants, so a policy reload replaces only the grants, D47), tool dispatch, and compaction — synchronous at the hard threshold, started in the background at three quarters (D78), and run by the worker thread when the session is idle (D77) |
 | `session` | opening the workspace, resolving roots, the policy engine and audit log for a session |
-| `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch` | the nine built-in tools (`fetch` is host-side network, D39; `patch` is D56) |
+| `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch`, `tools/websearch` | the ten built-in tools (`fetch` is host-side network, D39; `patch` is D56; `websearch` asks Exa, D82) |
 | `net` | the command network (D79): `hello` reads a hostname out of a TLS handshake, `head` out of a `CONNECT` line or a `Host` header, `proxy` decides and carries a connection, `bridge` joins the proxy's threads to the one engine and the one audit log |
 | `tools/diff` | line diffs of edited files, for the transcript only — the model never sees them |
 | `context` | instruction files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md` fallback), read through the policy |
@@ -44,18 +44,19 @@ Inside `crates/saddle/src`:
 and intercepts `__sandbox` before clap parses anything — that is the helper process path, and it must
 stay first in `main`.
 
-Built-in tools are `read`, `write`, `edit`, `patch`, `ls`, `find`, `grep`, `bash`, `fetch`,
-(`tools::NAMES`). `patch` applies one apply-patch document across several files, deciding every path
-before writing any of them, and refuses the whole patch if one is denied (D56).
-`fetch` is the only one that reaches the network, and the **host** makes the request after the engine
-allows it (D39): `exec` children never have sockets, so `curl` in `bash` fails by design. It may send
-headers — a secret belongs there, never in a query string — and the audit log records the header
-names but never a value (D48). Adding
-network access means adding a `net` grant to the policy, never widening the sandbox allowlist. A
-grant is a hostname, a `*.suffix`, or `*` for any public host (D40); a wildcard still cannot reach
-loopback or private space, because that exemption needs a grant that names the address. `saddle tool
-<name> '<json>'` runs any one of them as the agent through the gate, which is the most direct way to
-check a policy change by hand.
+Built-in tools are `read`, `write`, `edit`, `patch`, `ls`, `find`, `grep`, `bash`, `fetch` and
+`websearch` (`tools::NAMES`). `patch` applies one apply-patch document across several files, deciding
+every path before writing any of them, and refuses the whole patch if one is denied (D56).
+`fetch` gets a URL that is already known and `websearch` finds one that is not: both are made by the
+**host** after the engine allows them (D39, D82), and both name their host in a `net` grant — `fetch`
+the URL's, `websearch` Exa's, which is `api.exa.ai` with a key and `mcp.exa.ai` without one (D82).
+`fetch` may send headers — a secret belongs there, never in a query string — and the audit log records
+the header names but never a value (D48). A command's own network is separate and reaches the proxy in
+this process (D79), so `curl` in `bash` works where the grants allow it. Adding network access means
+adding a `net` grant to the policy, never widening the sandbox allowlist. A grant is a hostname, a
+`*.suffix`, or `*` for any public host (D40); a wildcard still cannot reach loopback or private space,
+because that exemption needs a grant that names the address. `saddle tool <name> '<json>'` runs any one
+of them as the agent through the gate, which is the most direct way to check a policy change by hand.
 
 Planned but not yet present: `saddle-wit`, `saddle-loader`, `saddle-sdk` (v1, D15).
 
@@ -163,7 +164,7 @@ exists to prevent. Two concrete consequences worth restating, because they are t
   because a root is nameable by any workspace policy. Content the harness chooses — the global
   `AGENTS.md`, an attachment — is host-read with no root at all; a skill is not, since `read` loads
   it (D67).
-- Built-in tools are not privileged. None of the nine is a bypass: each passes through the same
+- Built-in tools are not privileged. None of the ten is a bypass: each passes through the same
   engine, the same audit log and the same sandbox as a plugin call (D17). `ls`, `find` and `grep`
   decide and log one read of the directory they start from, then filter everything beneath it through
   the same policy without a record per file, so an excluded file is skipped rather than shown
@@ -181,7 +182,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D81 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D82 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

@@ -7,6 +7,7 @@ pub(crate) mod fetch;
 pub mod fs;
 mod patch;
 pub mod search;
+mod websearch;
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -50,7 +51,16 @@ impl ToolOutput {
 }
 
 pub const NAMES: &[&str] = &[
-    "read", "write", "edit", "patch", "ls", "find", "grep", "bash", "fetch",
+    "read",
+    "write",
+    "edit",
+    "patch",
+    "ls",
+    "find",
+    "grep",
+    "bash",
+    "fetch",
+    "websearch",
 ];
 
 /// The tools as the model sees them. The descriptions say when to use each one.
@@ -241,6 +251,29 @@ pub fn definitions() -> Vec<ToolDef> {
                 "additionalProperties": false,
             }),
         },
+        ToolDef {
+            name: "websearch",
+            description: "Search the web and return the most relevant pages with the passages that \
+                          answer the query. Use it when the answer is not in the workspace and you \
+                          do not already know the address; use `fetch` when you do. It needs a net \
+                          grant for the search host, and it names the host it used in the result. \
+                          Returns a handful of results unless `num_results` says otherwise.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for, as a person would type it",
+                    },
+                    "num_results": {
+                        "type": "integer",
+                        "description": "How many results to return; 5 by default, 100 at most",
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": false,
+            }),
+        },
     ]
 }
 
@@ -257,6 +290,7 @@ pub fn call(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutp
         "bash" => bash::run(session, input),
         "fetch" => fetch::fetch(session, input),
         "patch" => patch::patch(session, input),
+        "websearch" => websearch::search(session, input),
         _ => bail!("unknown tool `{name}` (known: {})", NAMES.join(", ")),
     }
 }

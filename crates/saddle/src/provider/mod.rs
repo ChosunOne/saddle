@@ -426,6 +426,23 @@ impl std::error::Error for Cancelled {}
 
 /// One `[providers.<name>]` table in `config.toml`, or a built-in preset. Fields set in the
 /// config override the preset of the same name.
+/// Providers that answer a web search themselves, as `(provider, host)` (D82).
+///
+/// It is empty, and that is a finding rather than an omission: Synthetic serves chat completions
+/// only — `/v1/responses`, `/v1/search` and `/v1/web_search` all answer 404 on `api.synthetic.new`
+/// — so there is no server-side search to call. `openai` and `anthropic` are named by
+/// [`endpoint`] and neither is asked for one here.
+///
+/// The table is the seam the `websearch` tool reads first, so a provider that gains the capability
+/// is one line here and no new code path. The test below fails the day it is filled in, which
+/// makes that a deliberate change with a decision behind it rather than a silent switch.
+pub const SERVER_SIDE_SEARCH: &[(&str, &str)] = &[];
+
+/// The first provider in [`SERVER_SIDE_SEARCH`], when one exists.
+pub fn searching_provider() -> Option<(&'static str, &'static str)> {
+    SERVER_SIDE_SEARCH.first().copied()
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ProviderEntry {
@@ -864,6 +881,17 @@ impl Provider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_built_in_provider_searches_the_web_itself() {
+        // D82: Synthetic serves chat completions only, so `websearch` falls back to Exa. Filling
+        // this table in is a deliberate act, and the deny-list below is what makes it one.
+        assert!(
+            SERVER_SIDE_SEARCH.is_empty(),
+            "a provider now reports server-side search: wire it up and change D82"
+        );
+        assert_eq!(searching_provider(), None);
+    }
+
     use super::*;
     use crate::provider::http::ModelInfo;
 

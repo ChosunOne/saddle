@@ -577,6 +577,33 @@ fn a_wildcard_net_grant_allows_any_host_but_not_the_local_machine() {
 }
 
 #[test]
+fn websearch_is_a_tool_and_the_gate_decides_it() {
+    // D82: the search is asked of Exa, so it needs a net grant for the host it actually reached —
+    // which a session with no net grants must be refused, naming that host rather than a vendor.
+    let env = Env::new();
+    let (ok, text) = env.tool("websearch", serde_json::json!({ "query": "anything" }));
+    assert!(!ok, "{text}");
+    assert!(text.contains("no net grant covering"), "{text}");
+    // Without a key the search goes to Exa's MCP server, and that is the host the refusal names.
+    assert!(text.contains("mcp.exa.ai"), "{text}");
+
+    // A grant for a different Exa host is not a grant for this one.
+    env.write_policy(POLICY.replace(
+        "[agent]",
+        "[agent]\nnet = [{ host = \"api.exa.ai\", why = \"the keyed search\" }]",
+    ));
+    let (ok, text) = env.tool("websearch", serde_json::json!({ "query": "anything" }));
+    assert!(!ok, "{text}");
+    assert!(text.contains("mcp.exa.ai"), "{text}");
+    assert!(!text.contains("api.exa.ai"), "{text}");
+
+    // An unknown tool names the ones that exist, so the catalogue is readable from the binary.
+    let refused = env.saddle(&["tool", "nonesuch", "{}"]);
+    let listed = String::from_utf8_lossy(&refused.stderr);
+    assert!(listed.contains("websearch"), "{listed}");
+}
+
+#[test]
 fn check_says_what_network_a_command_will_get() {
     // D79: a command runs in its own namespace with one door to the proxy, or with no network at
     // all when a namespace cannot be made. Which one it will be is not something a person should

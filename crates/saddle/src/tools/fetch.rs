@@ -229,15 +229,17 @@ pub(crate) fn local(target: &Target) -> Option<String> {
     ))
 }
 
-fn get(target: &Target, named: bool, headers: &[(String, String)]) -> ToolOutput {
-    // `with_parts` is the only way to install a resolver, which is what pins the addresses that
-    // were checked. The connector is the default one, so TLS and pools are unchanged.
+/// The client every host-side request is made with: a resolver that pins the addresses that were
+/// checked, so a name cannot be swapped between the decision and the connection (D28).
+pub(crate) fn agent(named: bool) -> ureq::Agent {
+    // `with_parts` is the only way to install a resolver. The connector is the default one, so TLS
+    // and pools are unchanged.
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .user_agent(concat!("saddle/", env!("CARGO_PKG_VERSION")))
         .build();
-    let agent = ureq::Agent::with_parts(
+    ureq::Agent::with_parts(
         config,
         DefaultConnector::new(),
         Checked {
@@ -246,7 +248,44 @@ fn get(target: &Target, named: bool, headers: &[(String, String)]) -> ToolOutput
             // only.
             named,
         },
+    )
+}
+
+/// A request whose body is JSON, answered as text. The same rules as [`get`]: the addresses are
+/// pinned, and a status is a result rather than an error, so the caller can report what the server
+/// said.
+pub(crate) fn post(
+    target: &Target,
+    named: bool,
+    headers: &[(String, String)],
+    body: &str,
+) -> Result<(u16, String), String> {
+    if !named && let Err(why) = resolve_public(&target.host, target.port) {
+        return Err(why);
+    }
+    let url = format!(
+        "{}://{}{}",
+        target.scheme,
+        authority(&target.host, target.port, target.scheme == "https"),
+        target.path
     );
+    let mut request = agent(named).post(&url);
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let mut resp = request.send(body).map_err(|e| format!("{url}: {e}"))?;
+    let status = resp.status().as_u16();
+    let text = resp
+        .body_mut()
+        .with_config()
+        .limit(MAX_BYTES)
+        .read_to_string()
+        .map_err(|e| format!("{url} answered {status} but the body is not UTF-8 text: {e}"))?;
+    Ok((status, text))
+}
+
+fn get(target: &Target, named: bool, headers: &[(String, String)]) -> ToolOutput {
+    let agent = agent(named);
     // Resolved once here for the explanation, and again by the resolver that pins the addresses.
     // The second resolution is the one that matters: it is what ureq dials.
     if !named && let Err(why) = resolve_public(&target.host, target.port) {
