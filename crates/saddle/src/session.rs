@@ -361,6 +361,8 @@ pub struct Session {
     /// again. Held here rather than in the tool because a result's number only means the page the
     /// model was shown, and that is a property of the session (D82).
     pub last_search: Option<crate::tools::websearch::LastSearch>,
+    /// The MCP servers this policy grants, and the tools of theirs the model has declared (D108).
+    pub mcp: crate::mcp::registry::Registry,
     /// A host-built, branch-only snapshot, supplied by the agent for one query (D92, D94).
     pub query_snapshot: Option<Snapshot>,
     pub query_conversation: Option<String>,
@@ -411,12 +413,25 @@ impl Session {
         )?;
 
         let search = configured_search(&setup);
+        let host_env: Vec<(String, String)> = std::env::vars().collect();
+        // D108: the servers this policy grants, and the tables that declare how to start them. A
+        // granted server with no table is not an error here: `saddle check` says so, and the first
+        // search reports it once.
+        let mcp = {
+            let user = UserConfig::load(&setup.paths.user_config()).unwrap_or_default();
+            let grants = policy
+                .grants(&Principal::Agent)
+                .map(|g| g.mcp.clone())
+                .unwrap_or_default();
+            let tmp = setup.roots.get(&RootName::tmp()).map(Path::to_path_buf);
+            crate::mcp::registry::Registry::new(grants, user.mcp, host_env.clone(), tmp)
+        };
         let mut session = Self {
             setup,
             engine: Engine::new(policy),
             audit,
             sandbox,
-            host_env: std::env::vars().collect(),
+            host_env,
             skills: Vec::new(),
             skill_notes: Vec::new(),
             tool_roots: Vec::new(),
@@ -424,6 +439,7 @@ impl Session {
             // a provider (`-p`, or one picked with /login) replaces this with that one's (D82).
             search,
             last_search: None,
+            mcp,
             query_snapshot: None,
             query_conversation: None,
             _tmp: tmp,
@@ -698,7 +714,8 @@ impl Session {
 
     /// Closes the audit log. An allowance is *not* dropped here: it outlives the session so it can
     /// be picked again later, and is removed with `saddle session revoke` (D61).
-    pub fn close(self) -> Result<String> {
+    pub fn close(mut self) -> Result<String> {
+        self.mcp.close();
         Ok(self.audit.close(&self.setup.paths.sessions_index())?)
     }
 }

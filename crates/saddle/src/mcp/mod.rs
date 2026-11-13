@@ -3,6 +3,11 @@
 //! tools may be called; this module only reads what was declared and refuses a table that does not
 //! describe exactly one server.
 
+pub mod lower;
+pub mod protocol;
+pub mod registry;
+pub mod stdio;
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 

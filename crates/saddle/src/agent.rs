@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::cache;
 use crate::compact::{self, Reason};
 use crate::context::ContextFile;
+use crate::mcp;
 use crate::provider::{
     Cancelled, Conversation, Item, Part, Provider, Quota, Reply, Sink, Stop, ToolCall, ToolDef,
     ToolResult, Usage,
@@ -1536,6 +1537,12 @@ impl Agent {
                         let out = run_call(session, call, ui);
                         session.query_snapshot = None;
                         session.query_conversation = None;
+                        // A search may have declared a tool (D108). The list is rebuilt rather than
+                        // appended to, so a declaration that was refused for want of a grant never
+                        // reaches the prompt.
+                        let mut declared = tools::definitions();
+                        declared.extend(session.mcp.declared());
+                        self.tools = declared;
                         out?
                     }
                 };
@@ -1615,11 +1622,16 @@ fn run_call(session: &mut Session, call: &ToolCall, ui: &mut dyn Ui) -> Result<T
     ui.call(call);
     let out = match &call.input {
         Err(raw) => ToolOutput::err(json!({ "INVALID_JSON": raw }).to_string()),
-        Ok(_) if !tools::NAMES.contains(&call.name.as_str()) => ToolOutput::err(format!(
-            "unknown tool `{}`; the tools are {}",
-            call.name,
-            tools::NAMES.join(", ")
-        )),
+        Ok(_)
+            if !tools::NAMES.contains(&call.name.as_str())
+                && !call.name.starts_with(mcp::registry::PREFIX) =>
+        {
+            ToolOutput::err(format!(
+                "unknown tool `{}`; the tools are {}",
+                call.name,
+                tools::NAMES.join(", ")
+            ))
+        }
         Ok(input) => tools::call(session, &call.name, input)?,
     };
     ui.result(&out);

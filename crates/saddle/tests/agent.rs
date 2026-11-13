@@ -360,6 +360,7 @@ fn tool_loop(api: Api) {
         names,
         [
             "session_query",
+            "tool_search",
             "read",
             "write",
             "edit",

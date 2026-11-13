@@ -722,8 +722,8 @@ mod tests {
             oauth: None,
         };
         let tools = [crate::provider::ToolDef {
-            name: "read",
-            description: "d",
+            name: "read".into(),
+            description: "d".into(),
             schema: json!({"type":"object"}),
         }];
         let conv = Conversation {

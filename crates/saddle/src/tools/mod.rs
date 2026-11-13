@@ -8,7 +8,10 @@ pub mod fs;
 mod patch;
 pub mod search;
 pub(crate) mod session_query;
+mod tool_search;
 pub(crate) mod websearch;
+
+pub(crate) use bash::HELPER_ARG;
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -63,6 +66,7 @@ pub const NAMES: &[&str] = &[
     "fetch",
     "websearch",
     "session_query",
+    "tool_search",
 ];
 
 /// The tools as the model sees them. The descriptions say when to use each one.
@@ -73,7 +77,7 @@ pub fn definitions() -> Vec<ToolDef> {
     });
     vec![
         ToolDef {
-            name: "session_query",
+            name: "session_query".into(),
             description: "Read-only SQL over three views of the current conversation branch, \
                 including pre-compaction history. \
                 messages(ordinal INTEGER, id INTEGER, role TEXT, text TEXT): role is user, \
@@ -96,7 +100,8 @@ pub fn definitions() -> Vec<ToolDef> {
                 SELECT ordinal, role, text FROM messages WHERE text LIKE '%decision%' LIMIT 10; \
                 SELECT provider, model, sum(cache_read), sum(input + cache_read) FROM requests \
                 GROUP BY provider, model; SELECT m.ordinal, r.text FROM messages m \
-                JOIN reasoning r USING (ordinal) WHERE r.text LIKE '%cache%'",
+                JOIN reasoning r USING (ordinal) WHERE r.text LIKE '%cache%'"
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {"sql": {"type": "string", "description": "A read-only SQLite query"}},
@@ -105,11 +110,32 @@ pub fn definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "read",
+            name: "tool_search".into(),
+            description: "Find and declare a tool an MCP server offers. A server's tools are not \
+                          declared until this matches them, so use it before calling one: an \
+                          empty query declares everything the granted servers offer. A declared \
+                          tool is called by the name this returns, and stays declared for the \
+                          session."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Words to match against a tool's name and description; empty for all",
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "read".into(),
             description: "Read a UTF-8 text file, or a PNG, JPEG, GIF or WebP image. Text comes \
                           back at most 2000 lines and 50 KiB at a time, and says so when there is \
                           more, so a large file cannot fill the context; an image is handed over \
-                          as a picture for you to look at. Use this rather than `cat` in bash.",
+                          as a picture for you to look at. Use this rather than `cat` in bash."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -128,9 +154,10 @@ pub fn definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "write",
+            name: "write".into(),
             description: "Create a file, or replace a file's entire contents. Missing parent \
-                          directories are created. To change part of an existing file, use edit.",
+                          directories are created. To change part of an existing file, use edit."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -142,11 +169,12 @@ pub fn definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "edit",
+            name: "edit".into(),
             description: "Replace one occurrence of `old` with `new` in a file. `old` must match \
                           the file exactly, including whitespace and indentation, and must occur \
                           exactly once; include surrounding lines until it is unique. Read the \
-                          file before editing it.",
+                          file before editing it."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -159,7 +187,7 @@ pub fn definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "patch",
+            name: "patch".into(),
             description: "Change several files in one call, in the apply-patch format: \
                           `*** Begin Patch`, then `*** Add File: path`, `*** Update File: path` \
                           (with optional `*** Move to: path`), `*** Delete File: path`, then \
@@ -168,7 +196,8 @@ pub fn definitions() -> Vec<ToolDef> {
                           space is a context line kept on both sides. Use this for a rename or a \
                           change that touches several files; use edit for one change in one file. \
                           Every path is checked against the policy, and one denial refuses the \
-                          whole patch.",
+                          whole patch."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -182,9 +211,10 @@ pub fn definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "ls",
+            name: "ls".into(),
             description: "List a directory: one entry per line, directories ending in `/`. Use \
-                          this rather than `ls` in bash.",
+                          this rather than `ls` in bash."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -197,11 +227,12 @@ pub fn definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "find",
+            name: "find".into(),
             description: "Find files by name. A glob without a slash, such as `*.rs`, matches \
                           file names at any depth; one with a slash, such as `src/**/mod.rs`, \
                           matches paths from the search directory. Skips .git and files \
-                          .gitignore lists. Use this rather than `find` in bash.",
+                          .gitignore lists. Use this rather than `find` in bash."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -216,11 +247,12 @@ pub fn definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "grep",
+            name: "grep".into(),
             description: "Search file contents with a regular expression (Rust regex syntax). \
                           Returns `path:line: text` for each matching line, up to 200. Skips \
                           binary files, .git and files .gitignore lists. Use this rather than \
-                          grep or rg in bash.",
+                          grep or rg in bash."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -240,13 +272,14 @@ pub fn definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "bash",
+            name: "bash".into(),
             description: "Run a shell command with `sh -c` in the workspace root and return its \
                           exit code, stdout and stderr. Use it for builds, tests and git. The \
                           command runs in a sandbox: no network, \
                           files limited to the granted roots, a time limit, and background \
                           processes are killed when it exits. Output past 256 KiB per stream is \
-                          cut.",
+                          cut."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -261,13 +294,14 @@ pub fn definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "fetch",
+            name: "fetch".into(),
             description: "Fetch one http or https URL and return its status, content type and \
                           body as text. The host makes the request, so it needs a net grant for \
                           that host; `bash` never has network access, so use this rather than \
                           curl. Only GET, and the body is cut at 100 KiB. A key or other secret \
                           belongs in `headers`; it is never written to the audit log or shown \
-                          back to you.",
+                          back to you."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -286,15 +320,17 @@ pub fn definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "websearch",
-            description: "Search the web and return the most relevant pages with the passages that \
+            name: "websearch".into(),
+            description:
+                "Search the web and return the most relevant pages with the passages that \
                           answer the query. Use it when the answer is not in the workspace and you \
                           do not already know the address; use `fetch` when you do. It needs a net \
                           grant for the search host, and it names the host it used in the result. \
                           Five results come back unless `num_results` says otherwise, and each \
                           passage is an excerpt: pass `result` with a result's number to read that \
                           one in full, which reuses the search already made rather than asking \
-                          again.",
+                          again."
+                    .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -335,6 +371,14 @@ pub fn call(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutp
         "patch" => patch::patch(session, input),
         "websearch" => websearch::search(session, input),
         "session_query" => session_query::run(session, input),
+        "tool_search" => tool_search::search(session, input),
+        _ if name.starts_with(crate::mcp::registry::PREFIX) => {
+            // Same reason as `tool_search`: the registry is a field of the session it has to ask.
+            let mut registry = std::mem::take(&mut session.mcp);
+            let out = registry.call(name, input, session);
+            session.mcp = registry;
+            out
+        }
         _ => bail!("unknown tool `{name}` (known: {})", NAMES.join(", ")),
     }
 }

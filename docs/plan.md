@@ -2624,6 +2624,19 @@ else to live. `saddle mcp list` starts each declared and granted server and prin
 against what the grant allows, which is the by-hand check `saddle tool` plays for the built-ins
 (D17).
 
+**D108.** A server's tools are not declared to the model until it asks for them. `tool_search`
+matches a query against what the granted servers offer and declares the matches — as many as eight
+— and they stay declared for the session, so a session with ten configured servers costs ten lines
+in the prompt rather than ten schemas, and the tool list changes only when a declaration is made.
+The declared tool is named `mcp__<server>__<tool>`, which no built-in can collide with, and its
+description says which server it came from. A search can only ever declare what the grant names: a
+tool the server advertises and the grant does not is counted in the result and never declared, and
+calling one is a denial even if the model guesses the name. A granted tool that was never declared
+is a different thing — the model naming something it cannot see — so that is a protocol error
+rather than a denial. The registry lives on the session because starting a server needs the engine
+and the audit log, so it is taken out for the call and put back, which is the price of a tool call
+and a policy decision being the same object.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

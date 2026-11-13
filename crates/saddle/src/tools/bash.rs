@@ -17,7 +17,7 @@ use crate::reserved;
 use crate::session::Session;
 
 pub const OUTPUT_LIMIT: usize = 256 * 1024;
-const HELPER_ARG: &str = "__sandbox";
+pub(crate) const HELPER_ARG: &str = "__sandbox";
 
 pub fn run(session: &mut Session, input: &Value) -> Result<ToolOutput> {
     let command = match str_field(input, "command") {

@@ -1,6 +1,7 @@
 //! End to end through the binary: the policy in force, decisions, reserved paths, the exec sandbox,
 //! network grants and the audit log, in a throwaway workspace with its own XDG directories.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -763,6 +764,102 @@ mcp     = [{ server = "scout", tools = ["search"] }, { server = "ghost", tools =
     );
     assert!(
         text.contains("ghost · granted, but no [mcp.ghost] table"),
+        "{text}"
+    );
+}
+
+#[test]
+fn mcp_list_starts_a_server_and_says_what_the_grant_allows() {
+    // D107: proven from outside, through the real binary. A declared server is started under the
+    // sandbox, spoken to over its own stdin and stdout, and its tools compared with the grant.
+    let env = Env::new();
+    let script = env.ws.path().join("fake-mcp.sh");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}\n' ;;
+    *'"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search","description":"finds things","inputSchema":{}},{"name":"rm_rf","description":"deletes everything","inputSchema":{}}]}}\n' ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    env.write_config(&format!(
+        "\n[mcp.fake]\ncommand = {:?}\n",
+        script.display().to_string()
+    ));
+    env.write_policy(
+        r#"
+version = 1
+
+[agent]
+fs-read = [{ root = "workspace" }]
+exec    = { timeout-secs = 20 }
+mcp     = [{ server = "fake", tools = ["search"] }]
+"#,
+    );
+    let out = env.saddle(&["mcp", "list"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("fake  2 tool(s)"),
+        "the server was not spoken to: {text}"
+    );
+    assert!(
+        text.contains("search") && text.contains("granted      finds things"),
+        "{text}"
+    );
+    assert!(
+        text.contains("rm_rf") && text.contains("not granted  deletes everything"),
+        "{text}"
+    );
+}
+
+#[test]
+fn tool_search_declares_what_the_grant_allows_and_nothing_else() {
+    // D108: a server's tools are not in the prompt until the model searches for them, and a search
+    // can only ever declare what the grant names.
+    let env = Env::new();
+    let script = env.ws.path().join("fake-mcp.sh");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}\n' ;;
+    *'"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search","description":"finds things","inputSchema":{}},{"name":"rm_rf","description":"deletes everything","inputSchema":{}}]}}\n' ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    env.write_config(&format!(
+        "\n[mcp.fake]\ncommand = {:?}\n",
+        script.display().to_string()
+    ));
+    env.write_policy(
+        r#"
+version = 1
+
+[agent]
+fs-read = [{ root = "workspace" }]
+exec    = { timeout-secs = 20 }
+mcp     = [{ server = "fake", tools = ["search"] }]
+"#,
+    );
+    let (ok, text) = env.tool("tool_search", serde_json::json!({ "query": "" }));
+    assert!(ok, "{text}");
+    assert!(text.contains("mcp__fake__search: finds things"), "{text}");
+    assert!(!text.contains("mcp__fake__rm_rf"), "{text}");
+    assert!(
+        text.contains("1 further tool(s) of these servers are not granted"),
         "{text}"
     );
 }

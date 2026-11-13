@@ -23,6 +23,7 @@ pub use reported::Reported;
 
 use crate::auth::AuthStore;
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -46,8 +47,10 @@ pub enum Api {
 /// A tool as the model sees it.
 #[derive(Debug, Clone)]
 pub struct ToolDef {
-    pub name: &'static str,
-    pub description: &'static str,
+    /// A `Cow`, because a built-in's name is a literal and an MCP tool's is built when the model
+    /// declares it (D108).
+    pub name: Cow<'static, str>,
+    pub description: Cow<'static, str>,
     pub schema: Value,
 }
 

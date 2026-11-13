@@ -569,8 +569,8 @@ mod tests {
         // No tools means no `tools` key, and a tool has its own shape here.
         assert!(sent_body.get("tools").is_none());
         let tools = vec![ToolDef {
-            name: "read",
-            description: "reads",
+            name: "read".into(),
+            description: "reads".into(),
             schema: json!({ "type": "object" }),
         }];
         let body = body(

@@ -29,9 +29,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use saddle_cap::policy::McpGrant;
+use saddle_cap::{Principal, RootName};
 
 use crate::agent::{Agent, End};
 use crate::config::UserConfig;
+use crate::mcp::stdio::Client;
+use crate::mcp::{McpEntry, Transport};
+use crate::net::bridge::Bridge;
 use crate::provider::Provider;
 use crate::session::{PrivateTmp, Session, Setup, session_id};
 use crate::term::Terminal;
@@ -106,6 +111,11 @@ enum Cmd {
         /// The tool input as JSON, e.g. '{"path": "src/main.rs"}'.
         input: String,
     },
+    /// MCP servers: what each declared and granted one actually offers (D107).
+    Mcp {
+        #[command(subcommand)]
+        cmd: McpCmd,
+    },
     /// Log in to a provider: an OAuth provider's browser code, or an API key typed in (D85).
     Login {
         /// The provider's name, as `saddle check` and `/login` list it.
@@ -126,6 +136,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AuditCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum McpCmd {
+    /// Start each declared and granted server, and say what it offers against what is granted.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -255,6 +271,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Some(Cmd::Tool { name, input }) => {
             tool(&cli.dir, &name, &input, &session, &paths, &overrides)
         }
+        Some(Cmd::Mcp { cmd }) => mcp_cmd(cmd, &cli.dir, &session, &paths, &overrides),
         Some(Cmd::Login { provider }) => login(&provider, &paths),
         Some(Cmd::Logout { provider }) => logout(&provider, &paths),
         Some(Cmd::Session { cmd }) => session_cmd(cmd, &paths),
@@ -410,7 +427,11 @@ fn run_agent(
         provider,
         system,
         base,
-        tools::definitions(),
+        {
+            let mut declared = tools::definitions();
+            declared.extend(session.mcp.declared());
+            declared
+        },
         max_steps,
         Some(store),
         compact::Settings::from_config(&user.compaction),
@@ -1173,6 +1194,168 @@ fn logout(provider_name: &str, paths: &paths::Paths) -> Result<ExitCode> {
     store.save(&store_path)?;
     println!("{provider_name}: logged out");
     Ok(ExitCode::SUCCESS)
+}
+
+/// `saddle mcp list`: starts each server the policy grants and prints what it offers against what
+/// the grant allows (D107). This is the by-hand check `saddle tool` plays for the built-ins: a
+/// server that is declared, granted and broken says so here rather than at the first tool call.
+fn mcp_cmd(
+    cmd: McpCmd,
+    dir: &Path,
+    session: &str,
+    paths: &paths::Paths,
+    overrides: &config::Overrides,
+) -> Result<ExitCode> {
+    match cmd {
+        McpCmd::List => mcp_list(dir, session, paths, overrides),
+    }
+}
+
+fn mcp_list(
+    dir: &Path,
+    session: &str,
+    paths: &paths::Paths,
+    overrides: &config::Overrides,
+) -> Result<ExitCode> {
+    let workspace = dir
+        .canonicalize()
+        .map(|abs| paths::find_workspace(&abs))
+        .unwrap_or_else(|_| dir.to_path_buf());
+    let picked = gate_workspace(paths, &workspace, session)?;
+    let id = picked.as_deref().unwrap_or(session);
+    let mut session = Session::open_with(dir, Some(id), overrides)?;
+    let user = UserConfig::load(&session.setup.paths.user_config())?;
+    let Some(agent) = session.engine.policy().grants(&Principal::Agent).cloned() else {
+        session.close()?;
+        bail!("the policy gives the agent no grants");
+    };
+    if agent.mcp.is_empty() {
+        println!("no mcp server is granted: add `mcp = [...]` to the agent's grants");
+        session.close()?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let helper = std::env::current_exe().context("locating the saddle binary")?;
+    let tmp = session.roots().get(&RootName::tmp()).map(Path::to_path_buf);
+    let host_env = session.host_env.clone();
+    let mut failed = false;
+    for grant in &agent.mcp {
+        let Some(entry) = user.mcp.get(&grant.server) else {
+            println!(
+                "{}  granted, but no [mcp.{}] table in config.toml",
+                grant.server, grant.server
+            );
+            failed = true;
+            continue;
+        };
+        let stdio = match entry.transport() {
+            Ok(Transport::Stdio { command, args }) => (command.to_owned(), args.to_vec()),
+            Ok(Transport::Http { url }) => {
+                println!(
+                    "{}  {url}: the streamable-HTTP transport is not built yet",
+                    grant.server
+                );
+                failed = true;
+                continue;
+            }
+            Err(e) => {
+                println!("{}  {e:#}", grant.server);
+                failed = true;
+                continue;
+            }
+        };
+        let one = OneServer {
+            helper: &helper,
+            tmp: tmp.as_deref(),
+            host_env: &host_env,
+        };
+        match one.list(&mut session, grant, entry, &stdio) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
+            }
+            Err(e) => {
+                println!("{}  failed: {e:#}", grant.server);
+                failed = true;
+            }
+        }
+    }
+    session.close()?;
+    Ok(if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// What one listing needs that outlives the loop: where the sandbox helper is, and the little the
+/// spec needs that does not come from the grant.
+struct OneServer<'a> {
+    helper: &'a Path,
+    tmp: Option<&'a Path>,
+    host_env: &'a [(String, String)],
+}
+
+impl OneServer<'_> {
+    fn list(
+        &self,
+        session: &mut Session,
+        grant: &McpGrant,
+        entry: &McpEntry,
+        stdio: &(String, Vec<String>),
+    ) -> Result<Vec<String>> {
+        let (command, args) = stdio;
+        // One lowering, shared with the session's registry (D105, D107).
+        let mut spec =
+            crate::mcp::lower::spec(session, grant, entry, command, args, self.host_env)?;
+        // A server gets the same network a command gets (D79): the relay here, one door out.
+        let mut bridge = self.tmp.and_then(|dir| Bridge::start(dir).ok());
+        if let Some(bridge) = &bridge {
+            spec.net = Some(bridge.spec());
+        }
+        let mut client = Client::start(&grant.server, self.helper, &spec)?;
+        let mut denials: Vec<String> = Vec::new();
+        let tools = {
+            let mut service = || {
+                if let Some(bridge) = bridge.as_mut() {
+                    denials.extend(bridge.service(session));
+                }
+            };
+            client.initialize(&mut service)?;
+            client.tools(&mut service)?
+        };
+        let mut out = vec![format!("{}  {} tool(s)", grant.server, tools.len())];
+        for tool in tools {
+            let access = if grant.allows(&tool.name) {
+                "granted"
+            } else {
+                "not granted"
+            };
+            out.push(format!(
+                "  {:<28} {access:<12} {}",
+                tool.name,
+                first_line(&tool.description)
+            ));
+        }
+        for denial in denials {
+            out.push(format!("  denied  {denial}"));
+        }
+        // Dropped here, which kills the process group: a listing has no reason to leave a server
+        // running once it has answered.
+        drop(client);
+        Ok(out)
+    }
+}
+
+/// A description as one line of at most 100 characters, since a server may write a paragraph.
+fn first_line(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    if line.chars().count() > 100 {
+        let cut: String = line.chars().take(99).collect();
+        format!("{cut}…")
+    } else {
+        line.to_owned()
+    }
 }
 
 fn tool(
