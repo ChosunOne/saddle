@@ -2612,6 +2612,18 @@ waits, which is why `spawn` does none of that itself. A fallback to reading the 
 hangs rather than failing, so a host that speaks a protocol to a child needs its own handshake
 deadline.
 
+**D107.** A stdio server is started under the spec its grant was narrowed to (D105, D106) and
+spoken to in JSON-RPC 2.0, one object per line, over its own stdin and stdout. Its stderr is
+drained into a bounded tail on its own thread and quoted only when something failed, because
+"exited with status 1" without the reason costs an hour. The pipes are read on a thread so the
+caller can service the relay while it waits, and every reply has a deadline: the failure mode of
+this plumbing is a stall rather than an error (D106). A server gets the network a command gets —
+the relay in its namespace, one door out (D79) — and the `env` table of its declaration is added
+after the allowlist, because it is the server's own configuration and a token for it has nowhere
+else to live. `saddle mcp list` starts each declared and granted server and prints what it offers
+against what the grant allows, which is the by-hand check `saddle tool` plays for the built-ins
+(D17).
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
