@@ -2199,6 +2199,30 @@ different models under different names, and the identifier alone is not enough t
 - **`/login` still lists one provider** — the one just logged into — because that credential was
   just entered for it. The union is for switching, not for setting up.
 
+**D90.** `/new` starts a new session in the workspace this one is open on, and `/clear` is the same
+action under the name it had before.
+
+The command was missing rather than the machinery: `/clear` already dropped the transcript, and the
+next prompt already opened a new saved conversation with the last one left in the store — which is
+what pi's `/new` does, and the name a person coming from pi reaches for. One action, two names, and
+the menu lists both so neither is a command that has to be remembered.
+
+- **A new session has spent nothing and carries nothing.** The estimate of what the next request
+  would carry (`context_tokens`, `measured`), the dollars the status line shows for the
+  conversation, and the totals `/session` reports all described the history that has just been
+  dropped, so they start again with the next one. Left standing, the estimate claimed a context that
+  no longer existed, and the next turn would have been compacted for text that was no longer there.
+- **A compaction running in the background of the old conversation is dropped**, not awaited and not
+  applied: it was written from a prefix that is gone, and the check that discards a summary whose
+  conversation changed would only be relied on to catch it later (D78).
+- **The session id and the audit log carry on.** They belong to the *run*, not to the conversation:
+  the workspace, the policy and the roots were decided when the process opened, and a command typed
+  at the prompt cannot decide them again. What `/new` resets is the conversation — the thing
+  `/resume` lists and the audit log records as a turn's subject.
+- **The note names the workspace**, because that is the question a person is asking when they type
+  it: which directory this fresh session is in, and that the last one is still there to resume.
+
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

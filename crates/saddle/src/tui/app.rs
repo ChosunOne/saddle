@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::editor::Editor;
 use super::login::{Draft, Listed, Login, LoginRequest, Outcome};
+use super::render::home_relative;
 use super::sessions::{PickOutcome, SessionPicker};
 use super::settings::{Change, SettingsDialog, SettingsOutcome};
 use crate::agent::call_detail;
@@ -374,6 +375,11 @@ pub const COMMANDS: &[SlashCommand] = &[
         about: "the grants this project has: exclusions, and which scopes are on",
     },
     SlashCommand {
+        name: "/new",
+        args: "",
+        about: "start a new session in this workspace; the last one stays saved",
+    },
+    SlashCommand {
         name: "/resume",
         args: "",
         about: "continue a saved session from this workspace",
@@ -426,7 +432,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/clear",
         args: "",
-        about: "start a new session; the current one stays saved",
+        about: "the same as /new: a new session, with the last one saved",
     },
     SlashCommand {
         name: "/help",
@@ -1593,16 +1599,26 @@ impl App {
             "/permissions" => Some(Action::OpenPermissions),
             "/logout" => Some(Action::Logout(arg)),
             "/model" => Some(Action::Model(arg)),
-            "/clear" if self.busy.is_some() => {
-                self.info("/clear waits for the turn to end; esc cancels it");
+            "/new" | "/clear" if self.busy.is_some() => {
+                self.info(&format!(
+                    "{command} waits for the turn to end; esc cancels it"
+                ));
                 None
             }
-            "/clear" => {
+            "/new" | "/clear" => {
+                // the transcript, what it has spent and how large it had grown all belong to the
+                // conversation being left, so each starts again with the next one; what it did is
+                // still in the store and under this run's audit log (D90).
                 self.entries.clear();
                 self.cache.clear();
                 self.selection = None;
+                self.usage = Usage::default();
+                self.cost = 0.0;
                 self.context = 0;
-                self.info("new conversation; the session and its audit log continue");
+                self.info(&format!(
+                    "new session in {}; the last one stays saved",
+                    home_relative(&self.header.workspace)
+                ));
                 Some(Action::Clear)
             }
             other => {
@@ -2195,6 +2211,46 @@ mod tests {
         );
         type_text(&mut a, "/exit");
         assert_eq!(a.key(key(KeyCode::Enter)), Some(Action::Quit));
+    }
+
+    #[test]
+    fn a_new_session_starts_the_transcript_and_the_figures_again() {
+        // D90: `/new` is pi's name for what `/clear` did, and a session that has just started has
+        // spent nothing and carries nothing, whatever the one before it did.
+        let mut a = app();
+        a.push(Entry::User("earlier".into()));
+        a.cost = 1.50;
+        a.usage.input = 900;
+        a.context = 12_000;
+        type_text(&mut a, "/new");
+        assert_eq!(a.key(key(KeyCode::Enter)), Some(Action::Clear));
+        assert_eq!(a.entries.len(), 1, "{:?}", a.entries);
+        assert_eq!(a.cost, 0.0);
+        assert_eq!(a.usage, Usage::default());
+        assert_eq!(a.context, 0);
+        assert!(
+            matches!(&a.entries[0], Entry::Note(NoteKind::Info, t)
+                if t.starts_with("new session in ")
+                    && t.ends_with("; the last one stays saved")),
+            "{:?}",
+            a.entries[0]
+        );
+
+        // `/clear` is the same action under the other name, and says so in the menu.
+        a.cost = 2.0;
+        type_text(&mut a, "/clear");
+        assert_eq!(a.key(key(KeyCode::Enter)), Some(Action::Clear));
+        assert_eq!(a.cost, 0.0);
+        assert!(
+            COMMANDS
+                .iter()
+                .any(|c| c.name == "/new" && c.about.starts_with("start a new session"))
+        );
+        assert!(
+            COMMANDS
+                .iter()
+                .any(|c| c.name == "/clear" && c.about.starts_with("the same as /new"))
+        );
     }
 
     #[test]

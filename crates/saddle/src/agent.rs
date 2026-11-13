@@ -1028,11 +1028,22 @@ impl Agent {
         self.log(session, json!({ "model": model }), "provider changed")
     }
 
-    /// Starts a new conversation. The audit log carries on; the next prompt opens a new
-    /// saved session.
+    /// Starts a new conversation: what the last one spent and how large it had grown are not
+    /// carried into it, and a summary being written of it has nowhere to land (D90). The audit log
+    /// carries on — it belongs to the run, not to the conversation — and the next prompt opens a
+    /// new saved session.
     pub fn clear(&mut self) {
         self.items.clear();
         self.saved = None;
+        // The estimate describes the history that has just been dropped. Left alone it would make
+        // the next turn look closer to the window than it is, and compact history that no longer
+        // exists.
+        self.context_tokens = 0;
+        self.measured = 0;
+        // A background summary of the conversation being left would be pasted over a conversation
+        // it never saw; dropping the receiver tells that thread to stop.
+        self.background = None;
+        self.cost = 0.0;
     }
 
     /// Continues a conversation at the point a fork was taken, with the same store: what is
@@ -1730,6 +1741,43 @@ mod tests {
                 if t.contains("crates/AGENTS.md") && t.contains("be terse") && t.contains("<instructions reloaded>")),
             "{:?}",
             agent.items[0]
+        );
+    }
+
+    #[test]
+    fn a_new_session_forgets_the_spend_and_the_size_of_the_last_one() {
+        // D90: the estimate and the bill describe the conversation that was just dropped. Left
+        // standing they would claim a context that no longer exists — and a background summary of
+        // that text would land on a conversation it never saw.
+        let mut agent = Agent::new(
+            None,
+            String::new(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            crate::compact::Settings::default(),
+        );
+        agent.items.push(Item::User("earlier".into()));
+        agent.cost = 1.25;
+        agent.context_tokens = 40_000;
+        agent.measured = 1;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        agent.background = Some(Background {
+            done: rx,
+            prefix: vec![Item::User("earlier".into())],
+            before: 40_000,
+            cut: 1,
+        });
+        agent.clear();
+        assert!(agent.items.is_empty());
+        assert_eq!(agent.saved, None);
+        assert_eq!(agent.cost, 0.0, "the new conversation has spent nothing");
+        assert_eq!(agent.context_tokens, 0);
+        assert_eq!(agent.measured, 0);
+        assert!(
+            agent.background.is_none(),
+            "there is nothing left for that summary to describe"
         );
     }
 

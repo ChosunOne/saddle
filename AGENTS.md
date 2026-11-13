@@ -146,7 +146,10 @@ it lands, and is discarded if the conversation changed while it was written. Nei
 pi or opencode, so there is no reference behaviour — `docs/plan.md` is the specification.
 `/thinking` (or shift+tab) changes the reasoning effort for the session (D57), `/name` and
 `/session` name and describe it (D55), and escape twice on an empty prompt opens the message tree (D54), where a prompt can be sent again to
-make another branch; `/clone` copies the branch into a separate session instead. There is no
+make another branch; `/clone` copies the branch into a separate session instead. `/new` (or `/clear`,
+the same action under its old name) starts a fresh conversation in this workspace: the transcript, the
+spend the status line shows and the context estimate all begin again, the last conversation stays in
+`/resume`, and the session id and audit log carry on because they belong to the run (D90). There is no
 trust step (D44): nothing the agent runs can write a policy file, so `saddle check` is the whole
 review.
 
@@ -195,7 +198,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D89 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D90 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
