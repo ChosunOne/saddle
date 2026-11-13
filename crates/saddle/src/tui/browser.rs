@@ -10,8 +10,12 @@
 //! it opens is one the person's own `config.toml` named, which the agent cannot write (D42).
 
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
+
+/// Where a failure to open a link is reported, from this thread or the one watching the child.
+pub type Report = Arc<dyn Fn(String) + Send + Sync>;
 
 /// The programs that open a URL, in the order they are tried, given the environment and the OS.
 ///
@@ -55,7 +59,11 @@ pub fn is_link(url: &str) -> bool {
 }
 
 /// Opens `url` in the default browser, answering with the program that took it.
-pub fn open(url: &str) -> Result<String> {
+///
+/// A program that starts and then fails (no desktop handler, no display, a `$BROWSER` that is not a
+/// browser) is only visible in its exit status, so that is watched for a moment on a thread and
+/// `report`ed: a click that does nothing is the one outcome a person cannot diagnose.
+pub fn open(url: &str, report: &Report) -> Result<String> {
     if !is_link(url) {
         bail!("not a web address: {url}");
     }
@@ -68,13 +76,28 @@ pub fn open(url: &str) -> Result<String> {
             .map(String::as_str)
             .unwrap_or_default()
             .to_owned();
-        let spawned = command.spawn();
-        match spawned {
-            Ok(mut child) => {
-                // Reaped on a thread: the browser is not saddle's to wait for, but a child left
-                // unreaped is a zombie for as long as the session lasts.
-                std::thread::spawn(move || {
-                    let _ = child.wait();
+        command.stderr(Stdio::piped()).stdout(Stdio::null());
+        match command.spawn() {
+            Ok(child) => {
+                // Watched on a thread: the browser is not saddle's to wait for, but a child left
+                // unreaped is a zombie for as long as the session lasts, and a wrapper that exits
+                // non-zero is the only way to know the click did not work.
+                let seen = program.clone();
+                let report = report.clone();
+                std::thread::spawn(move || match child.wait_with_output() {
+                    Ok(out) if !out.status.success() => {
+                        let why = String::from_utf8_lossy(&out.stderr);
+                        let why = why.lines().next().unwrap_or("").trim().to_owned();
+                        report(format!(
+                            "{seen} could not open the link{}; press c to copy it, or set $BROWSER",
+                            if why.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" ({why})")
+                            }
+                        ));
+                    }
+                    _ => {}
                 });
                 return Ok(program);
             }
@@ -107,9 +130,9 @@ pub fn command_for(argv: &[String], url: &str) -> Command {
 }
 
 /// The same, with a failure answered by a note that says what to do instead.
-pub fn open_or_say(url: &str, note: &mut dyn FnMut(&str)) {
-    if let Err(e) = open(url) {
-        note(&format!(
+pub fn open_or_say(url: &str, note: &Report) {
+    if let Err(e) = open(url, note) {
+        note(format!(
             "could not open a browser: {}; press c to copy the link",
             e.to_string().split('\n').next().unwrap_or("")
         ));
@@ -119,6 +142,10 @@ pub fn open_or_say(url: &str, note: &mut dyn FnMut(&str)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `$BROWSER` is process-wide, and these tests run at once: whichever holds this is the only
+    /// one that may set it.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn the_browser_is_the_persons_choice_first() {
@@ -162,6 +189,7 @@ mod tests {
     fn a_browser_is_started_with_the_address_and_not_waited_for() {
         // The spawn itself, with a stub where the browser would be: this is the part a unit test of
         // the argv cannot show, and it is the part that could fail on a machine with no browser.
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("browser.sh");
@@ -199,7 +227,8 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         // SAFETY: the only test in this file that touches the environment, and it sets one variable.
         unsafe { std::env::set_var("BROWSER", script.to_string_lossy().into_owned()) };
-        let answered = open("https://auth.test/device");
+        let quiet: Report = Arc::new(|_| {});
+        let answered = open("https://auth.test/device", &quiet);
         unsafe { std::env::remove_var("BROWSER") };
         assert_eq!(answered.unwrap(), script.to_string_lossy());
         // The browser is not waited for, so the file may be written just after `open` returns.
@@ -212,6 +241,43 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(seen.trim(), "https://auth.test/device");
+    }
+
+    #[test]
+    fn a_program_that_starts_and_then_fails_is_reported() {
+        // The silent case: `xdg-open` with no desktop handler behind it starts, exits 3 and says
+        // nothing on the screen, so the click looked like it did nothing (D86).
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Mutex;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("no-handler.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'no method available for opening' >&2\nexit 3\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let said: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = said.clone();
+        let report: Report = Arc::new(move |why: String| sink.lock().unwrap().push(why));
+        // SAFETY: this test sets the one variable, and removes it again before returning.
+        unsafe { std::env::set_var("BROWSER", script.to_string_lossy().into_owned()) };
+        let started = open("https://auth.test/device", &report);
+        unsafe { std::env::remove_var("BROWSER") };
+        assert!(started.is_ok(), "the program did start");
+        // The report comes from the watching thread, so it is waited for.
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            seen = said.lock().unwrap().clone();
+            if !seen.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(seen.len(), 1, "one note, not a stream: {seen:?}");
+        assert!(seen[0].contains("no method available"), "{}", seen[0]);
+        assert!(seen[0].contains("press c to copy it"), "{}", seen[0]);
     }
 
     #[test]
@@ -232,7 +298,8 @@ mod tests {
         ] {
             assert!(!is_link(bad), "{bad} must not be opened");
         }
-        let e = open("file:///etc/passwd").unwrap_err().to_string();
+        let quiet: Report = Arc::new(|_| {});
+        let e = open("file:///etc/passwd", &quiet).unwrap_err().to_string();
         assert!(e.contains("not a web address"), "{e}");
     }
 }

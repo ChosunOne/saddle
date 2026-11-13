@@ -39,6 +39,11 @@ pub const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const OPENAI_SCOPES: &str = "openid profile email offline_access";
 pub const OPENAI_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+/// What a device-login code was issued for, which is not the browser flow's loopback address.
+///
+/// The token endpoint checks this against the code, so sending the loopback one answers
+/// `token_exchange_user_error` even though the code is valid.
+pub const OPENAI_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 pub const OPENAI_REDIRECT_PORT: u16 = 1455;
 pub const OPENAI_REDIRECT_PATH: &str = "/auth/callback";
 pub const OPENAI_DEVICE_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
@@ -65,6 +70,9 @@ pub struct Flow {
     pub redirect_path: Option<String>,
     /// The redirect as the server registered it, which is what the token exchange must repeat.
     pub redirect_uri: Option<String>,
+    /// Where a device-login code comes back to. A device flow has no redirect of its own, so the
+    /// server issued the code for a fixed address and the exchange must name the same one (D85).
+    pub device_redirect_uri: Option<String>,
     /// `device` for a login that shows a code to type in a browser, `browser` for a loopback
     /// redirect. The OpenAI preset uses `device` (D85).
     pub method: Option<Method>,
@@ -93,6 +101,11 @@ impl Flow {
         if self.client_id.is_none() {
             want.push("client-id");
         }
+        // A device flow cannot be exchanged without the address its code was issued for, and
+        // guessing one would fail at the last step with a message that does not say why (D85).
+        if self.method == Some(Method::Device) && self.device_redirect_uri.is_none() {
+            want.push("device-redirect-uri");
+        }
         (!want.is_empty()).then(|| {
             format!(
                 "this provider's oauth table needs {} — add it under [providers.<name>.oauth] in \
@@ -119,6 +132,7 @@ impl Flow {
                 .clone()
                 .unwrap_or_else(|| OPENAI_REDIRECT_PATH.to_owned()),
             redirect_uri: self.redirect_uri.clone().unwrap_or_default(),
+            device_redirect_uri: self.device_redirect_uri.clone(),
             method: self.method.unwrap_or_default(),
             device_code_url: self.device_code_url.clone(),
             device_token_url: self.device_token_url.clone(),
@@ -150,6 +164,7 @@ pub struct Settings {
     pub port: u16,
     pub path: String,
     pub redirect_uri: String,
+    pub device_redirect_uri: Option<String>,
     pub method: Method,
     pub device_code_url: Option<String>,
     pub device_token_url: Option<String>,
@@ -431,6 +446,46 @@ pub fn device_login(
     device_login_step(&settings, &mut show, pause, &AtomicBool::new(false))
 }
 
+impl Settings {
+    /// The address the code being exchanged was issued for: a device login's fixed one, or the
+    /// browser flow's loopback (D85).
+    pub fn callback_for_exchange(&self) -> String {
+        match self.method {
+            Method::Device => self
+                .device_redirect_uri
+                .clone()
+                .unwrap_or_else(|| self.redirect_uri.clone()),
+            Method::Browser => self.redirect_uri(),
+        }
+    }
+}
+
+/// What an OAuth error body says, as a sentence.
+///
+/// The shapes in use are `{"error": "invalid_grant", "error_description": "…"}` (OAuth's own),
+/// `{"error": {"message": "…", "code": "token_exchange_user_error"}}` (OpenAI's) and a bare string.
+/// Reading all three is what keeps a failure from being a pasted JSON fragment, which is what it was
+/// before: the nested form matched nothing and fell through to the raw body (D85).
+pub fn describe(text: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return text.chars().take(300).collect::<String>();
+    };
+    let message = value["error"]["message"]
+        .as_str()
+        .or(value["error_description"].as_str())
+        .or(value["error"].as_str())
+        .or(value["message"].as_str());
+    let code = value["error"]["code"]
+        .as_str()
+        .filter(|c| message != Some(*c));
+    match (message, code) {
+        (Some(m), Some(c)) => format!("{m} ({c})"),
+        (Some(m), None) => m.to_owned(),
+        (None, Some(c)) => c.to_owned(),
+        (None, None) => text.chars().take(300).collect(),
+    }
+}
+
 /// The token exchange, taking the verifier the device flow supplied rather than one of our own.
 fn exchange_with(flow: &Settings, code: &str, verifier: &str) -> Result<Tokens> {
     exchange(flow, code, verifier, None)
@@ -647,7 +702,7 @@ pub fn exchange(
         ("client_id".to_owned(), client.to_owned()),
         ("code".to_owned(), code.to_owned()),
         ("code_verifier".to_owned(), verifier.to_owned()),
-        ("redirect_uri".to_owned(), flow.redirect_uri()),
+        ("redirect_uri".to_owned(), flow.callback_for_exchange()),
     ];
     if let Some(resource) = &flow.resource {
         form.push(("resource".to_owned(), resource.clone()));
@@ -750,17 +805,7 @@ fn post_form(url: &str, form: &[(String, String)]) -> Result<Tokens> {
         .read_to_string()
         .unwrap_or_default();
     if status != 200 {
-        let detail = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v["error_description"]
-                    .as_str()
-                    .or(v["error"].as_str())
-                    .or(v["message"].as_str())
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| text.chars().take(200).collect());
-        bail!("the token endpoint refused ({status}): {detail}");
+        bail!("the token endpoint refused ({status}): {}", describe(&text));
     }
     let value: serde_json::Value =
         serde_json::from_str(&text).context("the token endpoint's answer is not JSON")?;
@@ -944,6 +989,7 @@ mod tests {
             redirect_port: Some(7777),
             redirect_path: Some("/cb".into()),
             redirect_uri: None,
+            device_redirect_uri: None,
             method: None,
             device_code_url: None,
             device_token_url: None,
@@ -969,6 +1015,80 @@ mod tests {
             "{url}"
         );
         assert!(url.contains("scope=openid"), "{url}");
+    }
+
+    #[test]
+    fn an_oauth_error_reads_as_a_sentence() {
+        // D85: the failure the person saw was a fragment of JSON, because the nested shape matched
+        // nothing and fell through to the raw body.
+        assert_eq!(
+            describe(
+                r#"{"error": {"message": "Could not validate your token.", "code": "token_exchange_user_error"}}"#
+            ),
+            "Could not validate your token. (token_exchange_user_error)"
+        );
+        // OAuth's own shape.
+        assert_eq!(
+            describe(r#"{"error": "invalid_grant", "error_description": "code expired"}"#),
+            "code expired"
+        );
+        // A bare code, with no message beside it.
+        assert_eq!(describe(r#"{"error": "invalid_client"}"#), "invalid_client");
+        // Something that is not JSON is passed through, cut so it cannot fill the screen.
+        assert_eq!(describe("upstream is down"), "upstream is down");
+        assert!(describe(&"x".repeat(5000)).chars().count() <= 300);
+    }
+
+    #[test]
+    fn a_device_code_is_exchanged_for_the_address_it_was_issued_for() {
+        // D85: the token endpoint checks the redirect against the code's. A device login's code
+        // belongs to the server's own fixed callback, not to the browser flow's loopback, and
+        // sending the wrong one answers `token_exchange_user_error` after the person has already
+        // approved the code — the last step, with nothing to retry.
+        let flow = super::super::endpoint("openai-chatgpt", &Default::default())
+            .unwrap()
+            .oauth
+            .unwrap();
+        let settings = flow.settings().expect("the preset is complete");
+        assert_eq!(settings.method, Method::Device);
+        assert_eq!(
+            settings.callback_for_exchange(),
+            OPENAI_DEVICE_REDIRECT_URI,
+            "the device flow exchanges against its own callback"
+        );
+        assert_ne!(
+            settings.callback_for_exchange(),
+            OPENAI_REDIRECT_URI,
+            "and never the browser flow's"
+        );
+        // The browser flow keeps its loopback address.
+        let browser = Settings {
+            method: Method::Browser,
+            redirect_uri: OPENAI_REDIRECT_URI.into(),
+            ..settings
+        };
+        assert_eq!(browser.callback_for_exchange(), OPENAI_REDIRECT_URI);
+    }
+
+    #[test]
+    fn a_device_table_without_its_callback_is_incomplete() {
+        // Saying `device` and naming no callback would fail at the exchange, after the person had
+        // typed the code, so the table is refused up front instead.
+        let flow = Flow {
+            method: Some(Method::Device),
+            authorize_url: Some("https://a.test/authorize".into()),
+            token_url: Some("https://a.test/token".into()),
+            client_id: Some("cid".into()),
+            ..Flow::default()
+        };
+        let why = flow.settings().unwrap_err().to_string();
+        assert!(why.contains("device-redirect-uri"), "{why}");
+        // A browser flow needs none: its redirect is the loopback it listens on.
+        let browser = Flow {
+            method: Some(Method::Browser),
+            ..flow
+        };
+        assert!(browser.settings().is_ok());
     }
 
     #[test]

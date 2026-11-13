@@ -549,6 +549,9 @@ fn presets() -> BTreeMap<&'static str, ProviderEntry> {
                     client_id: Some(oauth::OPENAI_CLIENT_ID.into()),
                     scopes: Some(oauth::OPENAI_SCOPES.into()),
                     redirect_uri: Some(oauth::OPENAI_REDIRECT_URI.into()),
+                    // The code a device login issues belongs to a fixed address of the server's,
+                    // not to the loopback one the browser flow uses (D85).
+                    device_redirect_uri: Some(oauth::OPENAI_DEVICE_REDIRECT_URI.into()),
                     redirect_port: Some(oauth::OPENAI_REDIRECT_PORT),
                     device_code_url: Some(oauth::OPENAI_DEVICE_CODE_URL.into()),
                     device_token_url: Some(oauth::OPENAI_DEVICE_TOKEN_URL.into()),

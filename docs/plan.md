@@ -2011,6 +2011,19 @@ than deltas on a choice. That is a second client (`provider/responses.rs`), not 
   URLs, client id, scopes and redirect. `openai-chatgpt` is a preset filling it in, and an empty
   table is *incomplete* rather than silently OpenAI's — a provider that says `auth = "oauth"` and
   nothing else must not log in to another service.
+- **There are two redirect addresses, and a device flow must exchange with its own.**
+  `redirect-uri` is where a browser flow's code comes back (`http://localhost:1455/auth/callback`);
+  `device-redirect-uri` is the address the server issued a device code for
+  (`https://auth.openai.com/deviceauth/callback`). The token endpoint checks the code against the
+  address it was issued for, so sending the loopback one after a device approval answers
+  `token_exchange_user_error` — on the last step, after the person has typed the code, with nothing
+  left to retry. A table that says `method = "device"` and names no device redirect is therefore
+  *incomplete*, which is refused before the code is requested rather than after it is approved.
+- **An error body is read for what it says.** OAuth's own shape is
+  `{"error": "invalid_grant", "error_description": "…"}`; OpenAI's is
+  `{"error": {"message": "…", "code": "token_exchange_user_error"}}`. Reading only the flat one
+  turned a refusal into a pasted JSON fragment, so all three shapes are read and a code is shown
+  beside the message.
 - **`/login` is the flow, in the dialog, and `saddle login <provider>` is the same flow in a
   terminal.** A provider chosen in `/login` that authenticates with OAuth has no key field: picking
   it shows the address and the code, and the poll runs on its own thread while the screen stays
@@ -2056,9 +2069,14 @@ unusable, which is what "I can't click the link and I can't select it" was.
 - **`o` opens the link and `c` copies it**, so the same two things work without a mouse, over ssh,
   and where the terminal does not report clicks at all.
 - **Opening it launches the person's own browser**: `$BROWSER` (with its flags) if set, else
-  `xdg-open`, `open`, or the Windows handler. The address is one argument and there is no shell, so
-  nothing in a URL is read as syntax; only `http`/`https` is opened, because anything else is not
-  an address a sign-in put there. If no program takes it, the note says so and points at `c`.
+  `xdg-open`, `gio open`, `sensible-browser`, `open`, or the Windows handler. The address is one
+  argument and there is no shell, so nothing in a URL is read as syntax; only `http`/`https` is
+  opened, because anything else is not an address a sign-in put there.
+- **A program that starts and then fails is reported, not swallowed.** `xdg-open` with no desktop
+  handler behind it starts, exits 3 and draws nothing, so a click looked like it did nothing at all.
+  The child's exit status and its first line of stderr are watched on a thread — not waited for, a
+  browser is not saddle's to outlive — and a non-zero exit becomes a note that names the program and
+  points at `c`. If no program can even be started, the note says that instead.
 - **This is a person's action and grants the agent nothing.** No tool produces `OpenUrl`; only a
   key or a click in that dialog does, and the address is one the person's own `config.toml` named,
   which no tool can write (D42). It is the same distinction `/permissions` rests on (D45, D46): a

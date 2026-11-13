@@ -922,7 +922,14 @@ impl Controller {
             }
             // The event loop handles it, since it needs the terminal.
             Action::OpenUrl(url) => {
-                browser::open_or_say(&url, &mut |why| app.note(NoteKind::Warn, why));
+                // The opener answers twice: at once if nothing could be started, and from a thread
+                // if the program it started then failed, which is the silent case a person cannot
+                // see (D86).
+                let events = self.events.clone();
+                let say: browser::Report = std::sync::Arc::new(move |why: String| {
+                    let _ = events.send(AgentEvent::Note(why));
+                });
+                browser::open_or_say(&url, &say);
                 Ok(())
             }
             Action::EditPrompt | Action::Copy(..) => Ok(()),
@@ -2010,6 +2017,7 @@ mod tests {
              [providers.mine.oauth]\nmethod = \"device\"\nclient-id = \"cid\"\n\
              authorize-url = \"http://127.0.0.1:9/authorize\"\n\
              token-url = \"http://127.0.0.1:9/token\"\n\
+             device-redirect-uri = \"http://127.0.0.1:9/callback\"\n\
              device-code-url = \"http://127.0.0.1:9/usercode\"\n\
              device-token-url = \"http://127.0.0.1:9/device-token\"\n",
         )

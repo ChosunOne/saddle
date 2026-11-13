@@ -2333,8 +2333,20 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     // The text of each line as drawn: a click maps to a character through it, and a copy takes
     // exactly what the screen showed (D35).
     let text: Vec<String> = lines.iter().map(plain).collect();
+    // Only when the transcript owns the selection: a drag inside an open dialog records line
+    // numbers in the dialog's own frame, and shading these lines with them painted a second
+    // highlight near the top of the screen (D87).
+    // A dialog is a surface of its own: a drag inside it records line numbers in its own frame, and
+    // shading these lines with them painted a second highlight near the top of the screen (D87).
+    let dialog_open = app.resume.is_some()
+        || app.tree.is_some()
+        || app.settings.is_some()
+        || app.permissions.is_some()
+        || app.themes.is_some()
+        || app.login.is_some();
     if let Some(sel) = app.selection
         && !sel.is_empty()
+        && !dialog_open
     {
         let (first, last) = sel.ends();
         for (i, line) in lines.iter_mut().enumerate().skip(top).take(height) {
@@ -3160,6 +3172,78 @@ mod tests {
             buf[at].bg, app.theme.selected_bg,
             "the first cell of the row is highlighted"
         );
+    }
+
+    #[test]
+    fn a_drag_in_a_dialog_highlights_nothing_in_the_transcript() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        // The transcript is shaded before the dialogs are drawn, and a dialog's selection records
+        // line numbers in the dialog's own frame. Shading the transcript with them painted a second
+        // highlight near the top of the screen, over unrelated text (D87).
+        let mut app = bare_app();
+        // A short transcript, so the lines the dialog's indices name are on screen: with a long one
+        // they are scrolled away and the bug would not show, which is why it surfaced on a fresh
+        // session (D87).
+        for i in 0..3 {
+            app.entries
+                .push(Entry::User(format!("transcript line {i}")));
+            app.cache.push(None);
+        }
+        app.settings = Some(crate::tui::settings::SettingsDialog::new(
+            crate::tui::settings::Values {
+                provider: "synthetic".into(),
+                model: "m".into(),
+                effort: None,
+                max_tokens: None,
+                context_window: None,
+                window: 1,
+                status: String::new(),
+                max_steps: None,
+                auto_compact: true,
+                idle_compact: true,
+                background_compact: true,
+                show_reasoning: true,
+                expand_tools: false,
+                config_path: "c".into(),
+                policy_path: "c".into(),
+            },
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let seen = app.dialog_seen.clone().unwrap();
+        // Select the dialog's first two rows.
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: seen.area.x,
+            row: seen.area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: seen.area.x + 6,
+            row: seen.area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let highlight = app.theme.selected_bg;
+        // Everything outside the dialog's box is unhighlighted: the transcript saw none of it.
+        let mut outside = 0;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let inside = seen.area.contains(ratatui::layout::Position::new(x, y));
+                if !inside && buf[(x, y)].bg == highlight {
+                    outside += 1;
+                }
+            }
+        }
+        assert_eq!(
+            outside, 0,
+            "the highlight must not appear outside the dialog"
+        );
+        // And inside it, the two rows are.
+        assert_eq!(buf[(seen.area.x, seen.area.y)].bg, highlight);
+        assert_eq!(buf[(seen.area.x, seen.area.y + 1)].bg, highlight);
     }
 
     #[test]
