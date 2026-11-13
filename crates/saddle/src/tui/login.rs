@@ -117,6 +117,10 @@ pub enum Outcome {
     SignIn(u64, String),
     /// That sign-in was abandoned, so the host should stop polling for it (D85).
     CancelSignIn(u64),
+    /// Open this link in the person's browser (D86).
+    OpenLink(String),
+    /// Put this link on the clipboard (D86).
+    CopyLink(String),
 }
 
 pub struct Login {
@@ -255,6 +259,17 @@ impl Login {
         self.error = None;
     }
 
+    /// The address to type the code at, once the server has named one.
+    pub fn link(&self) -> Option<String> {
+        let url = self.device.url.trim();
+        (!url.is_empty()).then(|| url.to_owned())
+    }
+
+    /// Whether this attempt is the one on screen, so a stale answer is not acted on (D85).
+    pub fn is_signing_in(&self, id: u64) -> bool {
+        self.stage == (Stage::SigningIn { id })
+    }
+
     /// Moves to the sign-in stage and answers with what the host must start (D85).
     ///
     /// Marking it asked is what keeps a second call from polling a second time: the host asks once
@@ -354,6 +369,22 @@ impl Login {
                 }
             }
             Stage::SigningIn { id } => {
+                // The two things a person needs from this screen: the link opened, and the link
+                // copied. The code is already on the clipboard by now (D86).
+                // Read from `device` rather than through `link()`, because `stage` is borrowed
+                // mutably by the match this arm is in.
+                let url = self.device.url.trim().to_owned();
+                if !url.is_empty() {
+                    match key.code {
+                        KeyCode::Char('o') | KeyCode::Char('O') => {
+                            return Outcome::OpenLink(url);
+                        }
+                        KeyCode::Char('c') | KeyCode::Char('C') => {
+                            return Outcome::CopyLink(url);
+                        }
+                        _ => {}
+                    }
+                }
                 // Back to the list, which is where a failed or abandoned sign-in is retried from.
                 if key.code == KeyCode::Esc {
                     let id = *id;
@@ -792,6 +823,37 @@ mod tests {
             panic!("expected a second sign-in");
         };
         assert_ne!(again, id, "an abandoned attempt's id must not be reused");
+    }
+
+    #[test]
+    fn o_opens_the_link_and_c_copies_it() {
+        // D86: the address is what the person needs, and a dialog's text is not selectable, so both
+        // ways of getting it out are keys rather than a mouse drag.
+        let mut l = with_sign_in();
+        press(&mut l, KeyCode::Down);
+        let Outcome::SignIn(id, _) = press(&mut l, KeyCode::Enter) else {
+            panic!("expected a sign-in");
+        };
+        // Before there is an address there is nothing to open or copy, and esc still cancels.
+        assert_eq!(press(&mut l, KeyCode::Char('o')), Outcome::Stay);
+        assert_eq!(press(&mut l, KeyCode::Char('c')), Outcome::Stay);
+        l.device_code(id, Ok(("https://auth.test/device".into(), "AB12".into())));
+        assert_eq!(
+            press(&mut l, KeyCode::Char('o')),
+            Outcome::OpenLink("https://auth.test/device".into())
+        );
+        assert_eq!(
+            press(&mut l, KeyCode::Char('c')),
+            Outcome::CopyLink("https://auth.test/device".into())
+        );
+        // The address pasted in with a trailing space is still the address.
+        l.device_code(id, Ok((" https://auth.test/device ".into(), "AB12".into())));
+        assert_eq!(
+            l.link().as_deref(),
+            Some("https://auth.test/device"),
+            "whitespace is not part of a link"
+        );
+        assert_eq!(press(&mut l, KeyCode::Esc), Outcome::CancelSignIn(id));
     }
 
     #[test]

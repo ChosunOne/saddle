@@ -3,6 +3,7 @@
 //! flag in [`crate::cancel`].
 
 mod app;
+mod browser;
 pub mod catppuccin;
 mod editor;
 mod grant;
@@ -742,8 +743,11 @@ fn event_loop(
                     _ => None,
                 };
                 match action {
-                    Some(Action::Copy(text)) => match copy_to_clipboard(&text) {
-                        Ok(()) => app.copied = Some(Instant::now()),
+                    Some(Action::Copy(text, what)) => match copy_to_clipboard(&text) {
+                        Ok(()) => {
+                            app.copied = Some(Instant::now());
+                            app.copied_what = what;
+                        }
                         Err(e) => app.note(NoteKind::Error, &format!("could not copy: {e}")),
                     },
                     Some(Action::EditPrompt) => edit_prompt(terminal, app, &control.paths)?,
@@ -917,7 +921,11 @@ impl Controller {
                 Ok(())
             }
             // The event loop handles it, since it needs the terminal.
-            Action::EditPrompt | Action::Copy(_) => Ok(()),
+            Action::OpenUrl(url) => {
+                browser::open_or_say(&url, &mut |why| app.note(NoteKind::Warn, why));
+                Ok(())
+            }
+            Action::EditPrompt | Action::Copy(..) => Ok(()),
         };
         if let Err(e) = result {
             app.note(NoteKind::Error, &format!("{e:#}"));

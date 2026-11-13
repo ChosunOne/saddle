@@ -2036,6 +2036,38 @@ than deltas on a choice. That is a second client (`provider/responses.rs`), not 
   redirect for OpenAI, which needs a real navigation; and a logout inside the dialog (`/logout`
   already forgets a provider).
 
+**D86.** The sign-in link can be opened and copied from inside the dialog, because in a terminal
+neither comes for free.
+
+A dialog in this UI draws text into cells. Nothing it draws is selectable: the mouse is captured so
+drags reach saddle, and saddle's selection covers the transcript, not an overlay. So the two things
+a device sign-in needs — an address to visit and a code to paste there — were on the screen and
+unusable, which is what "I can't click the link and I can't select it" was.
+
+- **The code goes on the clipboard the moment it arrives.** It is short, it is meaningless outside
+  this flow, and it exists to be pasted, so copying it is what the person would do next. It is
+  OSC 52, the same write the transcript's own copy uses (D35), so a terminal that refuses it leaves
+  the code on screen and `c` as the fallback. The confirmation names what was copied —
+  `copied the sign-in code` — rather than the selection's wording.
+- **The link is underlined and is a click target.** The renderer records the cells the address was
+  drawn in and the click is hit-tested against them, the way the jump badge already is (D35): what
+  is clickable is what looks clickable, and a click anywhere else still does nothing. Only the part
+  that fits is a target, since the rest was never drawn.
+- **`o` opens the link and `c` copies it**, so the same two things work without a mouse, over ssh,
+  and where the terminal does not report clicks at all.
+- **Opening it launches the person's own browser**: `$BROWSER` (with its flags) if set, else
+  `xdg-open`, `open`, or the Windows handler. The address is one argument and there is no shell, so
+  nothing in a URL is read as syntax; only `http`/`https` is opened, because anything else is not
+  an address a sign-in put there. If no program takes it, the note says so and points at `c`.
+- **This is a person's action and grants the agent nothing.** No tool produces `OpenUrl`; only a
+  key or a click in that dialog does, and the address is one the person's own `config.toml` named,
+  which no tool can write (D42). It is the same distinction `/permissions` rests on (D45, D46): a
+  person acting on their own interface is not a capability, and nothing the model says can reach
+  it.
+- **Deferred:** making a dialog's text selectable at all (which needs a selection model for
+  overlays, and the keys above cover what it was wanted for); opening the link from `saddle login`
+  in a terminal, where ordinary terminal selection already works.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

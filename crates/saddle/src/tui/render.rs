@@ -1339,13 +1339,21 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             Style::new().fg(app.theme.error),
         )),
         (None, None) => match app.copied.filter(|at| at.elapsed() < COPY_NOTE) {
-            Some(_) => Line::from(vec![
-                Span::styled("copied the selection", Style::new().fg(app.theme.success)),
-                Span::styled(
-                    "  (shift+drag still selects in the terminal)",
-                    dim(&app.theme),
-                ),
-            ]),
+            Some(_) => {
+                let mut spans = vec![Span::styled(
+                    format!("copied {}", app.copied_what),
+                    Style::new().fg(app.theme.success),
+                )];
+                // Only the transcript's own selection needs the hint; a dialog's text was never
+                // the terminal's to select (D86).
+                if app.copied_what == "the selection" {
+                    spans.push(Span::styled(
+                        "  (shift+drag still selects in the terminal)",
+                        dim(&app.theme),
+                    ));
+                }
+                Line::from(spans)
+            }
             None => Line::from(Span::styled(
                 "enter send · shift+enter newline · /help",
                 dim(&app.theme),
@@ -1435,8 +1443,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         // Drawn in the theme the highlight offers, which is the point of the preview (D74).
         draw_themes(frame, picker, area, &app.theme);
     }
-    if let Some(login) = &app.login {
-        draw_login(frame, login, area, app.spinner, &app.theme);
+    if app.login.is_some() {
+        let at = app
+            .login
+            .as_ref()
+            .and_then(|login| draw_login(frame, login, area, app.spinner, &app.theme));
+        // Kept for the click: a link drawn on the screen is not the terminal's to click (D86).
+        app.open_url_at = at;
     }
 }
 
@@ -1511,7 +1524,16 @@ fn login_title(login: &Login) -> String {
 }
 
 /// The /login dialog, centred over the screen. Keys are shown as dots.
-fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize, theme: &Theme) {
+/// Draws the login dialog, and answers with where the link was drawn, so a click on it can open it
+/// rather than doing nothing (D86).
+fn draw_login(
+    frame: &mut Frame<'_>,
+    login: &Login,
+    area: Rect,
+    spinner: usize,
+    theme: &Theme,
+) -> Option<Rect> {
+    let mut link_at = None;
     let width = area.width.saturating_sub(4).min(76);
     let inner = width.saturating_sub(2) as usize;
     let accent = Style::new().fg(theme.accent);
@@ -1643,10 +1665,24 @@ fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize, 
             } else if let Some(code) = &d.code {
                 lines.push(Line::from("A browser on any device signs this in".bold()));
                 lines.push(Line::default());
+                // The link is underlined so it reads as one, and its cells are recorded: a click
+                // here opens the browser, because drawn text is not the terminal's to click (D86).
                 lines.push(Line::from(vec![
                     Span::styled("  1. open  ", dim(theme)),
-                    Span::styled(d.url.clone(), Style::new().fg(theme.accent)),
+                    Span::styled(
+                        d.url.clone(),
+                        Style::new()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ),
                 ]));
+                // The column the address begins at, inside the box: the label it follows.
+                let start = "  1. open  ".width();
+                let room = inner.saturating_sub(start);
+                // Only the part of the address that fits is on screen, so only that is clickable:
+                // the box is drawn from the left and the rest never appears.
+                let shown = d.url.width().min(room);
+                link_at = Some((lines.len() - 1, start, shown));
                 lines.push(Line::from(vec![
                     Span::styled("  2. enter ", dim(theme)),
                     Span::styled(
@@ -1660,6 +1696,10 @@ fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize, 
                     Span::styled(format!("{spin} "), Style::new().fg(theme.warning)),
                     Span::raw("waiting for the sign-in…"),
                 ]));
+                lines.push(Line::from(Span::styled(
+                    "the code is on your clipboard, ready to paste",
+                    dim(theme),
+                )));
             } else {
                 let spin = SPINNER[spinner % SPINNER.len()];
                 lines.push(Line::from(vec![
@@ -1668,7 +1708,12 @@ fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize, 
                 ]));
             }
             lines.push(Line::default());
-            lines.push(Line::from(Span::styled("esc cancel", dim(theme))));
+            let hint = if d.url.is_empty() {
+                "esc cancel".to_owned()
+            } else {
+                "o open · c copy link · esc cancel".to_owned()
+            };
+            lines.push(Line::from(Span::styled(hint, dim(theme))));
             login_title(login)
         }
         Stage::Models {
@@ -1727,7 +1772,18 @@ fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize, 
             login_title(login)
         }
     };
-    modal(frame, area, width, &title, lines, cursor, theme);
+    let at = modal(frame, area, width, &title, lines, cursor, theme);
+    // A row inside the box, and a column inside the address that was drawn there.
+    link_at.map(|(row, col, len)| {
+        let x = at.x.saturating_add(1).saturating_add(col as u16);
+        let room = at.right().saturating_sub(1).saturating_sub(x);
+        Rect::new(
+            x,
+            at.y.saturating_add(1).saturating_add(row as u16),
+            (len as u16).min(room),
+            1,
+        )
+    })
 }
 
 /// A bordered box centred over `area`, with an optional cursor at (row, column) inside it.
@@ -1739,7 +1795,7 @@ fn modal(
     lines: Vec<Line<'_>>,
     cursor: Option<(usize, usize)>,
     theme: &Theme,
-) {
+) -> Rect {
     let height = (lines.len() as u16 + 2).min(area.height);
     let rect = Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
@@ -1763,6 +1819,7 @@ fn modal(
             rect.y + 1 + row as u16,
         ));
     }
+    rect
 }
 
 /// `/tree`: every message on the branch, the one the conversation is at, and where another branch
@@ -2922,7 +2979,11 @@ mod tests {
             "the code is on screen:\n{text}"
         );
         assert!(text.contains("waiting for the sign-in"), "{text}");
-        assert!(text.contains("esc cancel"), "{text}");
+        assert!(text.contains("o open · c copy link · esc cancel"), "{text}");
+        assert!(
+            text.contains("ready to paste"),
+            "the clipboard line must fit the box rather than be cut:\n{text}"
+        );
 
         app.login
             .as_mut()
@@ -2935,6 +2996,76 @@ mod tests {
             !text.contains("FPAT-OKEE6"),
             "the old code is gone:\n{text}"
         );
+    }
+
+    #[test]
+    fn the_sign_in_link_is_a_thing_a_click_can_open() {
+        // D86: a drawn link is the terminal's to ignore, and a dialog's text is not selectable, so
+        // the address has to be a target. What is checked here is that the cells the click lands on
+        // are the cells the address was drawn in.
+        let mut app = bare_app();
+        let choice = crate::tui::login::Choice {
+            name: "openai-chatgpt".into(),
+            detail: String::new(),
+            status: "not signed in".into(),
+            needs_key: false,
+            has_key: false,
+            model: None,
+            custom: false,
+            oauth: true,
+        };
+        let mut login = crate::tui::login::Login::new(
+            vec![choice],
+            vec![],
+            Some("openai-chatgpt"),
+            true,
+            "auth.json".into(),
+        );
+        let Some(crate::tui::login::Outcome::SignIn(id, _)) = login.take_pending() else {
+            panic!("a sign-in to start");
+        };
+        app.open_login(login);
+        // Nothing to click until the server names an address.
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.open_url_at, None);
+
+        app.login.as_mut().unwrap().device_code(
+            id,
+            Ok((
+                "https://auth.openai.com/codex/device".into(),
+                "FPAT-OKEE6".into(),
+            )),
+        );
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let at = app
+            .open_url_at
+            .expect("the link was drawn, so it has cells");
+        let screen = terminal.backend().buffer();
+        // The first cell of the target is the first character of the address.
+        assert_eq!(
+            screen[(at.x, at.y)].symbol(),
+            "h",
+            "the target starts at the link"
+        );
+        let start = at.x + at.width - 1;
+        assert_eq!(screen[(start, at.y)].symbol(), "e", "and ends with it");
+        // Clicking it asks to open that address; clicking the code does not.
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let click = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            app.mouse(click(at.x + 3, at.y)),
+            Some(crate::tui::app::Action::OpenUrl(
+                "https://auth.openai.com/codex/device".into()
+            ))
+        );
+        assert_eq!(app.mouse(click(at.x, at.y + 1)), None, "that is the code");
+        assert_eq!(app.mouse(click(0, 0)), None);
     }
 
     #[test]

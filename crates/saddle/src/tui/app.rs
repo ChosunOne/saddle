@@ -129,7 +129,10 @@ pub enum Action {
     /// Set the reasoning effort, or cycle to the next level (D57).
     Effort(Effort),
     /// Put the selected text on the terminal's clipboard; the event loop owns the terminal.
-    Copy(String),
+    /// Put this text on the clipboard, and say what it was (D86).
+    Copy(String, &'static str),
+    /// Open this link in the person's own browser (D86).
+    OpenUrl(String),
     OpenResume,
     /// Continue a saved conversation, by its id in the session store (D53).
     Resume(String),
@@ -457,6 +460,10 @@ pub struct App {
     pub seen: Option<Seen>,
     /// When the last copy happened, for the note in the activity line.
     pub copied: Option<std::time::Instant>,
+    /// What was copied, for the confirmation (D86).
+    pub copied_what: &'static str,
+    /// Where the sign-in link was drawn, so a click on it opens the browser (D86).
+    pub open_url_at: Option<ratatui::layout::Rect>,
     /// When escape was last pressed on an empty editor, so two of them open the tree (D54).
     last_escape: Option<std::time::Instant>,
     pub total_lines: usize,
@@ -568,6 +575,8 @@ impl App {
             selection: None,
             seen: None,
             copied: None,
+            copied_what: "the selection",
+            open_url_at: None,
             last_escape: None,
             total_lines: 0,
             images: Vec::new(),
@@ -947,6 +956,8 @@ impl App {
                 }
                 Outcome::Check(id, draft) => Some(Action::CheckModels(id, draft)),
                 Outcome::SignIn(id, provider) => Some(Action::SignIn(id, provider)),
+                Outcome::OpenLink(url) => Some(Action::OpenUrl(url)),
+                Outcome::CopyLink(url) => Some(Action::Copy(url, "the sign-in link")),
                 // Cancelling is the dialog saying stop asking; the answer is only ever for it, so
                 // there is nothing for the interface to do with it.
                 Outcome::CancelSignIn(_) => None,
@@ -999,7 +1010,7 @@ impl App {
                     }
                     Some(Action::Rewind(rewind_to))
                 }
-                crate::tui::tree::TreeOutcome::Copy(text) => Some(Action::Copy(text)),
+                crate::tui::tree::TreeOutcome::Copy(text) => Some(Action::Copy(text, "the branch")),
             };
         }
         if let Some(picker) = &mut self.resume {
@@ -1228,6 +1239,18 @@ impl App {
             || self.permissions.is_some()
             || self.themes.is_some();
         match ev.kind {
+            // A click on the sign-in link is the one thing a dialog offers the mouse: it is drawn
+            // underlined to invite it, and a terminal gives no other way to follow it (D86).
+            MouseEventKind::Down(MouseButton::Left)
+                if self
+                    .open_url_at
+                    .is_some_and(|r| r.contains(Position::new(ev.column, ev.row))) =>
+            {
+                self.login
+                    .as_ref()
+                    .and_then(|login| login.link())
+                    .map(Action::OpenUrl)
+            }
             MouseEventKind::ScrollUp => {
                 self.scroll_by(3);
                 None
@@ -1267,7 +1290,8 @@ impl App {
                     self.selection = None;
                     return None;
                 }
-                self.selected_text().map(Action::Copy)
+                self.selected_text()
+                    .map(|text| Action::Copy(text, "the selection"))
             }
             _ => None,
         }
@@ -1679,8 +1703,21 @@ impl App {
                 }
             }
             AgentEvent::DeviceCode(id, result) => {
+                let code = match &result {
+                    Ok((_, code)) => Some(code.clone()),
+                    Err(_) => None,
+                };
+                let mine = self
+                    .login
+                    .as_mut()
+                    .is_some_and(|login| login.is_signing_in(id));
                 if let Some(login) = &mut self.login {
                     login.device_code(id, result);
+                }
+                // The code has to be typed into a page in another window, and nothing in a dialog
+                // can be selected, so it goes where the paste will come from (D86).
+                if mine {
+                    return code.map(|code| Action::Copy(code, "the sign-in code"));
                 }
             }
             AgentEvent::SignedIn(id, result) => {
@@ -1871,6 +1908,55 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn the_sign_in_code_goes_to_the_clipboard_when_it_arrives() {
+        // D86: the code has to be typed into a page in another window, and nothing drawn in a dialog
+        // can be selected, so it is put where the paste comes from. An answer for an attempt that is
+        // no longer on screen is not copied: it belongs to a sign-in nobody is looking at.
+        let mut app = app();
+        let choice = crate::tui::login::Choice {
+            name: "openai-chatgpt".into(),
+            detail: String::new(),
+            status: "not signed in".into(),
+            needs_key: false,
+            has_key: false,
+            model: None,
+            custom: false,
+            oauth: true,
+        };
+        let mut login = crate::tui::login::Login::new(
+            vec![choice],
+            vec![],
+            Some("openai-chatgpt"),
+            true,
+            "auth.json".into(),
+        );
+        let Some(crate::tui::login::Outcome::SignIn(id, _)) = login.take_pending() else {
+            panic!("a sign-in to start");
+        };
+        app.open_login(login);
+        assert_eq!(
+            app.agent(AgentEvent::DeviceCode(
+                id,
+                Ok(("https://auth.test/device".into(), "AB12-CD34".into()))
+            )),
+            Some(Action::Copy("AB12-CD34".into(), "the sign-in code"))
+        );
+        // The address is on screen, so a click can open it.
+        assert_eq!(
+            app.login.as_ref().unwrap().link().as_deref(),
+            Some("https://auth.test/device")
+        );
+        // A stale attempt's code is dropped rather than copied over the current one.
+        assert_eq!(
+            app.agent(AgentEvent::DeviceCode(
+                id + 99,
+                Ok(("https://auth.test/other".into(), "ZZ99".into()))
+            )),
+            None
+        );
     }
 
     #[test]
@@ -2478,7 +2564,10 @@ mod tests {
         // The button coming up is what copies, and the highlight stays to show what was taken.
         assert_eq!(
             a.mouse(ev(MouseEventKind::Up(MouseButton::Left), 8, 1)),
-            Some(Action::Copy("hello world\n  second".into()))
+            Some(Action::Copy(
+                "hello world\n  second".into(),
+                "the selection"
+            ))
         );
         assert!(a.selection.is_some_and(|s| !s.dragging));
     }
