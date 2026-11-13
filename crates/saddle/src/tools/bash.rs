@@ -12,6 +12,7 @@ use saddle_policy::{Kind, Request};
 use serde_json::{Value, json};
 
 use super::{ToolOutput, str_field};
+use crate::net::bridge::Bridge;
 use crate::reserved;
 use crate::session::Session;
 
@@ -55,7 +56,7 @@ pub fn run(session: &mut Session, input: &Value) -> Result<ToolOutput> {
         .policy()
         .grants(&who)
         .context("agent has no grants")?;
-    let lowered = lower_exec(
+    let mut lowered = lower_exec(
         grants,
         session.roots(),
         &session.setup.extras,
@@ -70,6 +71,21 @@ pub fn run(session: &mut Session, input: &Value) -> Result<ToolOutput> {
         None => lowered.timeout,
     };
 
+    // The command's network: a socket here, a relay in its namespace, and this process deciding
+    // every connection the relay carries back (D79).
+    let tmp = session
+        .roots()
+        .get(&RootName::tmp())
+        .context("no temporary root")?
+        .to_path_buf();
+    // A bridge that cannot be made is not a reason to refuse the command: it runs with no network
+    // at all, which is what every command had before D79 and is strictly narrower (D79).
+    let mut bridge = Bridge::start(&tmp).ok();
+    if let Some(bridge) = &bridge {
+        lowered.spec.net = Some(bridge.spec());
+    }
+    let mut denials: Vec<String> = Vec::new();
+
     let ws = Dir::open_ambient_dir(&session.setup.workspace, cap_std::ambient_authority())?;
     let before = reserved::take(&ws).context("snapshotting reserved paths")?;
     let helper = std::env::current_exe().context("locating the saddle binary")?;
@@ -80,7 +96,15 @@ pub fn run(session: &mut Session, input: &Value) -> Result<ToolOutput> {
         timeout,
         OUTPUT_LIMIT,
         &crate::cancel::FLAG,
+        &mut || {
+            if let Some(bridge) = bridge.as_mut() {
+                denials.extend(bridge.service(session));
+            }
+        },
     );
+    if let Some(bridge) = bridge {
+        bridge.finish();
+    }
     let changes = reserved::restore(&ws, &before).context("restoring reserved paths")?;
     for (path, change) in &changes {
         session.audit.event(
@@ -119,6 +143,11 @@ pub fn run(session: &mut Session, input: &Value) -> Result<ToolOutput> {
     }
     for (path, _) in &changes {
         writeln!(text, "restored reserved path {}", path.display())?;
+    }
+    // What the command's network was refused, which the command itself cannot explain: it sees a
+    // connection that failed, not the rule that refused it.
+    for why in &denials {
+        writeln!(text, "--- net ---\n{why}")?;
     }
     let ok = out.code == Some(0) && !out.timed_out;
     Ok(ToolOutput {

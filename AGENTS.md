@@ -17,7 +17,7 @@ because it is followed.
 | --- | --- |
 | `crates/saddle-cap` | scopes, roots, grants, policy and manifest parsing, the component import check, the exec lowering. No wasmtime dependency. |
 | `crates/saddle-policy` | per-call decisions (`engine`) and the hash-chained audit log (`audit`) |
-| `crates/saddle-sandbox` | applies a sandbox spec to the current process and execs the target; also builds the `saddle-sandbox` helper binary used by its own tests |
+| `crates/saddle-sandbox` | applies a sandbox spec to the current process and execs the target, including the command's own network namespace and the relay in it (D79); also builds the `saddle-sandbox` helper binary used by its own tests |
 | `crates/saddle` | the binary: built-in tools, model providers, the model loop, the TUI |
 
 Inside `crates/saddle/src`:
@@ -27,6 +27,7 @@ Inside `crates/saddle/src`:
 | `agent` | the model loop (no request limit unless one is set, D37; a turn stops on a repeated call and answer, D38), the system prompt (base plus grants, so a policy reload replaces only the grants, D47), tool dispatch, and compaction — synchronous at the hard threshold, started in the background at three quarters (D78), and run by the worker thread when the session is idle (D77) |
 | `session` | opening the workspace, resolving roots, the policy engine and audit log for a session |
 | `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch` | the nine built-in tools (`fetch` is host-side network, D39; `patch` is D56) |
+| `net` | the command network (D79): `hello` reads a hostname out of a TLS handshake, `head` out of a `CONNECT` line or a `Host` header, `proxy` decides and carries a connection, `bridge` joins the proxy's threads to the one engine and the one audit log |
 | `tools/diff` | line diffs of edited files, for the transcript only — the model never sees them |
 | `context` | instruction files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md` fallback), read through the policy |
 | `skills` | `SKILL.md` skills: discovery through the `read` gate, the prompt listing, `/skill:name` (D64, D67, D68, D69) |
@@ -90,7 +91,8 @@ XDG_CONFIG_HOME=/tmp/saddle-try/config XDG_STATE_HOME=/tmp/saddle-try/state \
 `--bin saddle` is required: the workspace has two binaries and no `default-run`. `saddle check` is the
 cheapest way to see the resolved roots, the grants in force for the working directory, the
 effective grants, whether that policy has been reviewed, whether `exec` is available on this kernel,
-and the context window and price in force for the configured model.
+what network a command will get (its own namespace, or none), and the context window and price in
+force for the configured model.
 
 To change what every workspace allows, edit `[agent]` in `config.toml`; to change one workspace, edit
 its file under `policies/` — what it sets replaces the base grant for that scope, narrower or wider,
@@ -143,7 +145,10 @@ Anything that gives one of the three its authority from a second source is the f
 exists to prevent. Two concrete consequences worth restating, because they are the easy mistakes:
 
 - The exec sandbox spec is *derived* from the same grants as the policy decisions. A principal without
-  `net` must not reach the network through `curl` in a child process.
+  `net` must not reach the network through `curl` in a child process: the child's namespace has no route
+  out, and the one door it has leads to the host proxy, which decides every connection against the same
+  grants (D79). The ring is load-bearing — a child that could open a socket outside that namespace would
+  reach the internet with no decision at all.
 - **A tool's path is a location under a root; a sandbox list is not a grant** (D65). The file tools
   decide over `roots` (the workspace, `tmp`, `[roots]`): a path is mapped to the root containing it
   and the grant on that root decides, so a path outside every root is refused as unaddressable.
@@ -173,7 +178,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D78 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D79 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
@@ -279,10 +284,16 @@ rather than loosening it.
   directories is followed, which no root allows, but only to another declared entry: otherwise a
   link would reach the policy (D16).
   `saddle check` shows `tool paths`; `saddle tool read '{"path":"~/.agents/…"}'` is the by-hand test.
-- **`exec` is Linux-only**, needs landlock ABI 3 as a hard requirement, and has no network: seccomp
-  blocks `socket()` for `AF_INET`/`AF_INET6`/`AF_UNIX`/`AF_NETLINK`/`AF_PACKET` and the io_uring
-  entry points. Do not add hosts or paths to the sandbox allowlist to make a test pass. Network
-  access for the agent is the `fetch` tool and a `net` grant (D39), never a socket in a child.
+- **`exec` is Linux-only** and needs landlock ABI 3 as a hard requirement. A command now has a network
+  of its own (D79): a user and network namespace with no route out, a relay on its loopback, and a proxy
+  in this process that decides every connection with the same engine, audit log and `net` grants as
+  `fetch`. The name is read from the bytes a client sends (server name extension, `Host` header,
+  `CONNECT` line) and a connection that names no host is refused, because a grant names a host and an
+  address is not a name. `AF_UNIX`, `AF_PACKET`, io_uring and `setns` stay refused for the command —
+  a network namespace does not confine `docker.sock`. If the namespace cannot be made the command gets
+  no network at all, which is the pre-D79 behaviour and is strictly narrower. Do not add hosts or paths
+  to the sandbox allowlist to make a test pass, and do not let the relay learn a protocol: it copies
+  bytes so that a new protocol needs no new code there.
 - **Every allow and every deny is audited** (D10) with the resolved arguments: a path as
   `root:relpath`, a command as `argv` plus `cwd`, a request as method and a URL whose query values
   are replaced with `key=…`. D24 also lists byte count and content hash for a write, so check both

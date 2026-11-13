@@ -188,7 +188,7 @@ fn headers_field(input: &Value) -> Result<Vec<(String, String)>, ToolOutput> {
 /// The answer names the address rather than the name that resolved to it, because that is what the
 /// grant has to say: `{ host = "127.0.0.1", port = 8080 }`. A wildcard cannot stand in, since it
 /// covers only public space.
-fn local(target: &Target) -> Option<String> {
+pub(crate) fn local(target: &Target) -> Option<String> {
     // `localhost` is loopback by definition (RFC 6761), so it is recognised without a lookup.
     // Anything else is decided after the address is resolved, and only once the policy has allowed
     // the request, so a denied host is never looked up.
@@ -315,7 +315,7 @@ fn authority(host: &str, port: u16, https: bool) -> String {
 /// when a grant spells that address out (`session.net_names_host`), so `http://127.0.0.1:8080/`
 /// works when someone wrote that address down, and a wildcard grant still does not open loopback
 /// (D40). Deciding it from the shape of the URL instead would make `*` mean the local machine.
-fn private(ip: IpAddr) -> Option<&'static str> {
+pub(crate) fn private(ip: IpAddr) -> Option<&'static str> {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();

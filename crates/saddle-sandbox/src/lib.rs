@@ -16,8 +16,13 @@ use std::time::{Duration, Instant};
 
 pub use saddle_cap::sandbox::SandboxSpec;
 
+mod dns;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod namespaces;
+#[cfg(target_os = "linux")]
+mod relay;
 
 /// Landlock ABI below which exec is unavailable: ABI 3 adds control over `truncate(2)`.
 pub const REQUIRED_LANDLOCK_ABI: i32 = 3;
@@ -78,6 +83,32 @@ pub fn availability() -> Result<i32, String> {
         )),
         None => Err("landlock is not enabled in this kernel".into()),
     }
+}
+
+/// What a command's network will be, for `check` to print. A user namespace cannot be created in
+/// this process to find out, so this reports what the kernel's own switches say (D79).
+pub fn network_availability() -> Result<String, String> {
+    if !cfg!(target_os = "linux") {
+        return Err("a command's network is Linux-only in v1".into());
+    }
+    if let Ok(value) = std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
+        && value.trim() == "0"
+    {
+        return Err("unprivileged user namespaces are disabled".into());
+    }
+    let resolvers = std::fs::read_to_string("/etc/resolv.conf")
+        .map(|text| crate::namespaces::resolvers(&text))
+        .unwrap_or_default();
+    if resolvers.is_empty() {
+        // The proxy still works, because it is reached by an address rather than a name.
+        return Ok(
+            "its own namespace; no resolver on loopback, so only the proxy variables work".into(),
+        );
+    }
+    Ok(format!(
+        "its own namespace, and DNS answered for {} resolver(s) on loopback",
+        resolvers.len()
+    ))
 }
 
 /// Entry point for the helper process. Never returns: it execs the target or exits with 125
@@ -170,6 +201,8 @@ pub struct Output {
 /// feeds it `spec`, and waits at most `timeout`, or until `cancel` is set. Afterwards the whole
 /// group is killed, so background processes the command started do not outlive it (unless they
 /// called `setsid`).
+/// `service` is called while the command runs, once per poll, so the caller can answer the
+/// questions the command's network asks without blocking the wait for it (D79).
 pub fn run(
     helper: &Path,
     helper_args: &[&str],
@@ -177,6 +210,7 @@ pub fn run(
     timeout: Duration,
     output_limit: usize,
     cancel: &AtomicBool,
+    service: &mut dyn FnMut(),
 ) -> io::Result<Output> {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
 
@@ -238,6 +272,7 @@ pub fn run(
             kill_group(pgid);
             break child.wait()?;
         }
+        service();
         thread::sleep(Duration::from_millis(10));
     };
     kill_group(pgid);

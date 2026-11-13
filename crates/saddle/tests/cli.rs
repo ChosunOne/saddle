@@ -573,6 +573,17 @@ fn a_wildcard_net_grant_allows_any_host_but_not_the_local_machine() {
 }
 
 #[test]
+fn check_says_what_network_a_command_will_get() {
+    // D79: a command runs in its own namespace with one door to the proxy, or with no network at
+    // all when a namespace cannot be made. Which one it will be is not something a person should
+    // have to run a command to find out.
+    let env = Env::new();
+    let out = env.saddle(&["check"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("net        a command gets "), "{text}");
+}
+
+#[test]
 fn fetch_refuses_a_url_it_should_not_follow() {
     let env = Env::new();
     assert!(env.saddle(&["check"]).status.success());

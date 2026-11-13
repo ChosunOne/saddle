@@ -31,10 +31,13 @@ pub(crate) fn landlock_abi() -> Option<i32> {
 }
 
 pub(crate) fn enter(spec: &SandboxSpec) -> Result<Infallible, SandboxError> {
+    // The network comes first: it needs `/proc/self/uid_map` and the loopback interface, and
+    // landlock refuses both once it is applied (D79).
+    let networked = start_network(spec);
     std::env::set_current_dir(&spec.cwd)?;
     let program = resolve_program(&spec.argv[0], &spec.env)?;
     apply_landlock(spec)?;
-    apply_seccomp()?;
+    apply_seccomp(networked)?;
     let source = Command::new(&program)
         .arg0(&spec.argv[0])
         .args(&spec.argv[1..])
@@ -42,6 +45,28 @@ pub(crate) fn enter(spec: &SandboxSpec) -> Result<Infallible, SandboxError> {
         .envs(spec.env.iter().map(|(k, v)| (k, v)))
         .exec();
     Err(SandboxError::Exec { program, source })
+}
+
+/// Gives the command its own network, or leaves it with none. True means sockets may be allowed
+/// because everything they can reach is the command's own loopback (D79).
+///
+/// Every step can fail, and every failure means the answer is "no network": an environment without
+/// user namespaces runs the command exactly as it ran before D79, with `socket(2)` refused. That is
+/// why the answer is a `bool` rather than a result — the caller must not be able to treat a failure
+/// as permission.
+fn start_network(spec: &SandboxSpec) -> bool {
+    let Some(net) = &spec.net else {
+        return false;
+    };
+    // Read before landlock restricts /etc to reading, and before the command exists, so the
+    // resolver list cannot be influenced by anything the command does.
+    let resolvers = std::fs::read_to_string("/etc/resolv.conf")
+        .map(|text| crate::namespaces::resolvers(&text))
+        .unwrap_or_default();
+    if crate::namespaces::enter(&resolvers).is_err() {
+        return false;
+    }
+    crate::relay::spawn(net, &resolvers).is_ok()
 }
 
 fn existing(paths: &[PathBuf]) -> impl Iterator<Item = &PathBuf> {
@@ -84,18 +109,29 @@ fn apply_landlock(spec: &SandboxSpec) -> Result<(), SandboxError> {
     Ok(())
 }
 
-fn apply_seccomp() -> Result<(), SandboxError> {
+fn apply_seccomp(networked: bool) -> Result<(), SandboxError> {
     let sc = |e: seccompiler::BackendError| SandboxError::Seccomp(e.to_string());
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
     // socket(domain, ...) for any domain that reaches outside the sandbox. socketpair stays open.
-    let domains = [
-        libc::AF_INET,
-        libc::AF_INET6,
-        libc::AF_UNIX,
-        libc::AF_NETLINK,
-        libc::AF_PACKET,
-    ];
+    //
+    // With a network namespace of its own (D79) the internet domains are no longer a way out —
+    // there is nothing on the other side of them but the command's own loopback — so they are
+    // allowed. Unix sockets stay refused: they are the way to `docker.sock`, `gpg-agent` and every
+    // other local daemon, which a network namespace does not confine. Netlink stays allowed too,
+    // because glibc uses it to ask about interfaces, and inside this namespace there is nothing to
+    // learn but the loopback that was just raised.
+    let domains: &[libc::c_int] = if networked {
+        &[libc::AF_UNIX, libc::AF_PACKET]
+    } else {
+        &[
+            libc::AF_INET,
+            libc::AF_INET6,
+            libc::AF_UNIX,
+            libc::AF_NETLINK,
+            libc::AF_PACKET,
+        ]
+    };
     let socket_rules = domains
         .iter()
         .map(|&domain| {
@@ -111,10 +147,12 @@ fn apply_seccomp() -> Result<(), SandboxError> {
     rules.insert(libc::SYS_socket, socket_rules);
 
     // io_uring can open sockets without calling socket(2). An empty rule list matches always.
+    // So can setns(2), which would let a command walk back out into another namespace.
     for nr in [
         libc::SYS_io_uring_setup,
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
+        libc::SYS_setns,
     ] {
         rules.insert(nr, Vec::new());
     }

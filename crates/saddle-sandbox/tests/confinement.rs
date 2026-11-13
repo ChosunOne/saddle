@@ -86,6 +86,7 @@ impl Fixture {
             ],
             read,
             write,
+            net: None,
         }
     }
 
@@ -98,6 +99,7 @@ impl Fixture {
             Duration::from_secs(30),
             1 << 20,
             &NEVER,
+            &mut || {},
         )
         .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -220,7 +222,16 @@ fn timeout_kills_the_command() {
     spec.argv = vec!["sh".into(), "-c".into(), "sleep 30".into()];
     let helper = Path::new(env!("CARGO_BIN_EXE_saddle-sandbox"));
     let start = std::time::Instant::now();
-    let out = run(helper, &[], &spec, Duration::from_millis(300), 1024, &NEVER).unwrap();
+    let out = run(
+        helper,
+        &[],
+        &spec,
+        Duration::from_millis(300),
+        1024,
+        &NEVER,
+        &mut || {},
+    )
+    .unwrap();
     assert!(out.timed_out);
     assert_eq!(out.signal, Some(libc::SIGKILL));
     assert!(start.elapsed() < Duration::from_secs(5));
@@ -235,7 +246,16 @@ fn missing_program_exits_127() {
     let mut spec = f.spec("unused");
     spec.argv = vec!["definitely-not-a-program".into()];
     let helper = Path::new(env!("CARGO_BIN_EXE_saddle-sandbox"));
-    let out = run(helper, &[], &spec, Duration::from_secs(5), 1024, &NEVER).unwrap();
+    let out = run(
+        helper,
+        &[],
+        &spec,
+        Duration::from_secs(5),
+        1024,
+        &NEVER,
+        &mut || {},
+    )
+    .unwrap();
     assert_eq!(
         out.code,
         Some(127),
@@ -259,7 +279,16 @@ fn cancel_kills_the_command_and_its_children() {
         CANCEL.store(true, Ordering::SeqCst);
     });
     let start = std::time::Instant::now();
-    let out = run(helper, &[], &spec, Duration::from_secs(30), 1024, &CANCEL).unwrap();
+    let out = run(
+        helper,
+        &[],
+        &spec,
+        Duration::from_secs(30),
+        1024,
+        &CANCEL,
+        &mut || {},
+    )
+    .unwrap();
     setter.join().unwrap();
     assert!(out.cancelled && !out.timed_out);
     assert_eq!(out.signal, Some(libc::SIGKILL));

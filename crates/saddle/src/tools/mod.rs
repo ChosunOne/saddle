@@ -3,7 +3,7 @@
 
 mod bash;
 mod diff;
-mod fetch;
+pub(crate) mod fetch;
 pub mod fs;
 mod patch;
 pub mod search;

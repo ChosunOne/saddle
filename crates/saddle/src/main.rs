@@ -8,6 +8,7 @@ mod config;
 mod context;
 mod defaults;
 mod ignore;
+mod net;
 mod output;
 mod paths;
 mod provider;
@@ -906,6 +907,11 @@ fn check(dir: &std::path::Path, overrides: &config::Overrides) -> Result<ExitCod
     match saddle_sandbox::availability() {
         Ok(abi) => println!("exec       available (landlock ABI {abi})"),
         Err(reason) => println!("exec       unavailable: {reason}"),
+    }
+    // A command used to have no network at all; now it has its own, with one door (D79).
+    match saddle_sandbox::network_availability() {
+        Ok(what) => println!("net        a command gets {what}"),
+        Err(reason) => println!("net        a command has no network: {reason}"),
     }
     // What an attached picture will do, and what decided it, since a terminal that draws nothing
     // looks the same as one that was never asked (D59).

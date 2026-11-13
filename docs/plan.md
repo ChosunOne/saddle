@@ -1729,14 +1729,69 @@ summary on another thread and keeps generating.
   bookkeeping against an injected job, and the type-level proof that a provider can cross threads.
   The end-to-end path is exercised by hand.
 
+**D79.** A command gets its own network, with one door back to this process.
+
+Before this, `exec` had no network at all (D19), which is why a build could not fetch a dependency
+and why a test that starts a server and connects to it could not run. This supersedes the last
+sentence of D28 and D19's no-network rule; both remain as the fallback described at the end.
+
+- **Its own namespace, and no route out.** The helper enters a user namespace (unprivileged, so no
+  privilege is needed) and then a network namespace, and raises `lo`. A socket in that namespace can
+  reach `127.0.0.1` and nothing else, because there is nothing else to route to. That is what makes
+  it safe to stop refusing `socket(2)` for `AF_INET` and `AF_INET6`.
+- **One door.** A relay on the namespace's loopback carries each accepted connection to this process
+  over a unix socket, saying one line first — `tls`, `http` or `proxy`, the dialect its port implies
+  — and then copies bytes. It decides nothing and parses nothing, so a new protocol needs no new code
+  there. The relay is forked before the seccomp filter applies, because `AF_UNIX` stays refused for
+  the command itself: a network namespace does not confine `docker.sock`, `gpg-agent` or any other
+  local daemon.
+- **The decision stays here.** The proxy runs in threads but the engine and the audit log do not
+  travel with it: a thread asks over a channel and the session thread answers while it waits for the
+  command. One engine, one audit log, one policy — the property the third lowering exists to protect.
+- **The name comes from the bytes, not from an address.** A TLS connection is decided on its server
+  name extension, a plaintext one on its `Host` header or absolute URL, and a `CONNECT` on its own
+  line. A connection that names no host is refused: a grant names a host, and an address is not a
+  name (D28, D40). Encrypted Client Hello is refused too, because the outer name is a cover and
+  matching it would prove nothing. A `CONNECT` tunnel is decided once and carried unchanged, since
+  the handshake inside it can only reach the host that was allowed.
+- **DNS is a redirect, not an authority.** Every name is answered with `127.0.0.1` and a zero TTL, so
+  a client that ignores the proxy variables still lands on the relay and is decided there. The
+  resolver addresses `resolv.conf` names are assigned to the namespace's own loopback, so the query
+  arrives here and no file in the guest is rewritten — an unprivileged user may not bind-mount over
+  `/etc/resolv.conf`, and rewriting a file the guest can read would put name resolution in a second
+  place.
+- **No new vocabulary.** The bridge is plumbing and carries no authority: `net` grants are the only
+  authority, checked per request, exactly as `fetch` checks them (D39). There is no `exec`-level
+  switch, so no policy can grant a network that bypasses the grants.
+- **The command's own loopback is free.** It is its own, it cannot leave, and no grant is asked for.
+  The *host's* loopback and the network behind it are unchanged: reachable only by a grant that names
+  that address, so `*` still does not open them (D40).
+- **The proxy variables are set where the spec is built**, so they cannot disagree with the port the
+  relay listens on, and `no_proxy` names loopback so a guest reaches its own servers directly.
+- **Failure is a fallback, never a widening.** If the namespace or the relay cannot start, the
+  command runs exactly as it did before this decision: no network, `socket(2)` refused. `saddle`
+  check` reports which of the two a command will get, and a resolver that cannot be answered is
+  reported rather than silently dropped.
+- **Still refused for the command:** `AF_UNIX`, `AF_PACKET`, the io_uring entry points, and `setns`,
+  so a command cannot walk back into a namespace it was not given. `AF_NETLINK` is allowed only
+  because glibc uses it to ask about interfaces, and inside this namespace there is nothing to learn
+  but the loopback that was just raised.
+- **Deferred:** a protocol whose first bytes carry no name (SSH, `git://`), which needs a pre-checked
+  address or a shim; IPv6 resolver addresses; landlock's own TCP port rule (ABI 4+) as a second lock;
+  and an opt-out for a workspace that wants a command with no network at all.
+- **What is not verified here**: every kernel step above. The sandbox this is developed in has no
+  sockets and no user namespaces of its own, so the tests cover the decisions, the parsers, the
+  message a namespace is given, and the environment a command inherits; the rest is exercised by
+  hand in a real session.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
 | --- | --- | --- | --- |
-| `exec` | running commands | `saddle:host/exec` import | sandbox helper (D18, D19) |
+| `exec` | running commands | `saddle:host/exec` import | sandbox helper (D18, D19); the network it reaches is `net` (D79) |
 | `fs-read` | reading files under granted roots | `saddle:host/fs-read` import | policy per call |
 | `fs-write` | writing files under granted roots | `saddle:host/fs-write` import | policy per call, reserved paths (D23) |
-| `net` | HTTP requests to granted hosts | `wasi:http/outgoing-handler` import, `fetch` tool | host HTTP client, policy per request (D28, D39) |
+| `net` | HTTP requests to granted hosts | `wasi:http/outgoing-handler` import, `fetch` tool, a command's proxy | host HTTP client, policy per request (D28, D39, D79) |
 | `transcript-read` | reading session messages and observing them as they arrive | `saddle:host/transcript-read` import, `saddle:plugin/observer` export | policy per call |
 | `context-contribute` | adding notes and diagnostics to the context | `saddle:host/context-contribute` import | policy per call, slot schemas (D26) |
 | `tool` | registering tools the model can call | `saddle:plugin/tool` export | load-time check, catalogue rendering (D26) |

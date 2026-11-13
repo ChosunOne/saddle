@@ -28,6 +28,21 @@ pub const BASE_ENV: &[&str] = &[
     "PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "TERM", "TZ",
 ];
 
+/// The port the guest's loopback listens on for the proxy protocol, and the port the proxy
+/// variables point at. One number, so the relay and the environment cannot disagree (D79).
+pub const PROXY_PORT: u16 = 3128;
+
+/// How a command reaches the network: its own namespace, and this one door back to the proxy
+/// (D79). `None` means the command gets no network at all, which is what every command had before
+/// D79 and what it falls back to when a namespace cannot be made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetBridge {
+    /// The unix socket the relay in the namespace connects back to, in this process.
+    pub socket: PathBuf,
+    /// Where the guest's loopback accepts the proxy protocol.
+    pub proxy_port: u16,
+}
+
 /// Everything the helper needs to confine itself and exec the target. Serialised to the helper's
 /// stdin (D18).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +55,9 @@ pub struct SandboxSpec {
     pub read: Vec<PathBuf>,
     /// Paths the child may read, write, create and delete beneath.
     pub write: Vec<PathBuf>,
+    /// The network the child reaches, if any (D79).
+    #[serde(default)]
+    pub net: Option<NetBridge>,
 }
 
 /// User-level additions from `config.toml` (`[sandbox] read = [...]`, `write = [...]`), for
@@ -273,6 +291,22 @@ pub fn lower_exec(
         })
         .cloned()
         .collect();
+    // Programs disagree about the case of the proxy variables, so both are set. The guest's own
+    // loopback is reached directly: it is the guest's, and it cannot leave (D79).
+    let proxy = format!("http://127.0.0.1:{PROXY_PORT}");
+    for name in [
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ] {
+        env.push((name.into(), proxy.clone()));
+    }
+    for name in ["no_proxy", "NO_PROXY"] {
+        env.push((name.into(), "localhost,127.0.0.1,::1".into()));
+    }
     env.retain(|(k, _)| k != "TMPDIR");
     env.push(("TMPDIR".into(), tmp.to_string_lossy().into_owned()));
     env.sort();
@@ -287,6 +321,9 @@ pub fn lower_exec(
             env,
             read,
             write,
+            // The caller fills this in once it has a socket to offer: the bridge is plumbing, not
+            // a grant, and the authority it reaches is decided per request (D79).
+            net: None,
         },
         timeout: exec.timeout,
     })
@@ -482,7 +519,37 @@ exec = { why = "x", env = ["CARGO_TERM_COLOR"] }
         .unwrap();
         let spec = lowered.spec;
         let names: Vec<&str> = spec.env.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(names, ["CARGO_TERM_COLOR", "LC_ALL", "PATH", "TMPDIR"]);
+        // The proxy variables are set here rather than by the caller, so they cannot disagree with
+        // the port the relay listens on (D79). Both cases, because programs disagree about it.
+        assert_eq!(
+            names,
+            [
+                "ALL_PROXY",
+                "CARGO_TERM_COLOR",
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
+                "LC_ALL",
+                "NO_PROXY",
+                "PATH",
+                "TMPDIR",
+                "all_proxy",
+                "http_proxy",
+                "https_proxy",
+                "no_proxy",
+            ]
+        );
+        let proxy = format!("http://127.0.0.1:{PROXY_PORT}");
+        for name in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
+            assert!(
+                spec.env.contains(&(name.to_owned(), proxy.clone())),
+                "{name} does not reach the proxy"
+            );
+        }
+        // The command's own loopback is reached directly: it is its own, and cannot leave.
+        assert!(
+            spec.env
+                .contains(&("no_proxy".to_owned(), "localhost,127.0.0.1,::1".to_owned()))
+        );
         let tmp_canon = tmp.path().canonicalize().unwrap();
         assert!(
             spec.env
