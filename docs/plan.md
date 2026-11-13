@@ -1216,6 +1216,13 @@ use it.
   `SKILL.md` is the host's and decides nothing, as the existence checks for instruction files do;
   what the policy decides is reading the file. More specific wins, as with instruction
   files: a project skill replaces a user one of the same name and the note says which it replaced.
+- **A skill installed by linking it in is a skill.** The walk follows symlinks, unlike the file
+  tools' walk: `~/.agents/skills/x -> ~/somewhere/x` is the usual way to share one, and discovery is
+  a host read of the user's own directory rather than a path the model chose. Skipping links (as the
+  first version did, by testing `file_type().is_dir()`, which does not follow) dropped a linked
+  skill with no note at all — a silent absence, which is the worst shape for a bug. A visited
+  directory is remembered through `canonicalize`, so a link that loops terminates, and the reported
+  directory is the link's target so a skill's own references resolve.
 - **Discovery happens once, at open**, like the instruction files: the conversation was built from
   what was there when it started. Both what was advertised and each body loaded are audit records
   (`kind: skill`, with byte count and hash), so a person can see what entered the context and when

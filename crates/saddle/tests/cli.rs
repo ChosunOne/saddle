@@ -1029,7 +1029,19 @@ fn a_skill_is_advertised_by_name_and_loaded_on_demand() {
     )
     .unwrap();
 
-    let (ok, text) = env.tool("skill", serde_json::json!({}));
+    // A throwaway HOME throughout: the user tier would otherwise be the developer's own skills.
+    let home = tempfile::tempdir().unwrap();
+    let skill = |input: &str| {
+        let out = saddle_in(&env, home.path(), &["tool", "skill", input]);
+        let text = if out.status.success() {
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        } else {
+            stderr(&out)
+        };
+        (out.status.success(), text)
+    };
+
+    let (ok, text) = skill("{}");
     assert!(ok, "{text}");
     assert!(text.contains("house"), "advertised, not loaded: {text}");
     assert!(text.contains("House style."), "{text}");
@@ -1038,15 +1050,12 @@ fn a_skill_is_advertised_by_name_and_loaded_on_demand() {
         "the body is not the list"
     );
 
-    let (ok, text) = env.tool("skill", serde_json::json!({ "name": "house" }));
+    let (ok, text) = skill(r#"{"name":"house"}"#);
     assert!(ok, "{text}");
     assert!(text.contains("lowercase doc comments"), "{text}");
 
     // A name is an identifier, so there is no path to traverse.
-    let (ok, text) = env.tool(
-        "skill",
-        serde_json::json!({ "name": "../../../etc/passwd" }),
-    );
+    let (ok, text) = skill(r#"{"name":"../../../etc/passwd"}"#);
     assert!(!ok, "{text}");
     assert!(text.contains("no skill `../../../etc/passwd`"), "{text}");
 }
@@ -1073,8 +1082,11 @@ fn a_skill_the_policy_refuses_is_not_advertised() {
             )]),
         );
     });
-    let (ok, text) = env.tool("skill", serde_json::json!({}));
-    assert!(ok, "{text}");
+    // A throwaway HOME, so the developer's own ~/.agents/skills cannot leak into the assertion.
+    let home = tempfile::tempdir().unwrap();
+    let out = saddle_in(&env, home.path(), &["tool", "skill", "{}"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{text}");
     assert!(text.contains("there are no skills"), "{text}");
 }
 

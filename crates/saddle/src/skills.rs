@@ -123,25 +123,35 @@ fn user_roots(session: &Session) -> Vec<PathBuf> {
     dirs
 }
 
-/// Every `SKILL.md` below `base`, depth-capped, never following a symlink.
+/// Every `SKILL.md` below `base`, depth-capped.
+///
+/// Symlinks are followed, unlike the file tools' walk: a skill installed by linking it into
+/// `~/.agents/skills` is the usual way to share one, and discovery is a host read of the user's own
+/// directory rather than a path the model chose. The price is a cycle, so a directory already
+/// visited is skipped; the depth cap bounds the rest. A project skill is still read through the
+/// policy afterwards, so a link leading out of the workspace is refused there rather than here.
 fn walk(base: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
         std::collections::VecDeque::from([(base.to_path_buf(), 0)]);
     while let Some((dir, depth)) = queue.pop_front() {
+        // The resolved directory is what a cycle repeats, so that is what is remembered.
+        let real = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if !seen.insert(real) {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        let mut children: Vec<PathBuf> = entries
-            .flatten()
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .map(|e| e.path())
-            .collect();
+        let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
         children.sort();
         for child in children {
+            // `is_file` follows a link, so a linked skill is found even though the entry itself is
+            // not a directory.
             if child.join(FILE).is_file() {
                 found.push(child.join(FILE));
-            } else if depth < MAX_DEPTH {
+            } else if depth < MAX_DEPTH && std::fs::metadata(&child).is_ok_and(|m| m.is_dir()) {
                 queue.push_back((child, depth + 1));
             }
         }
@@ -158,7 +168,12 @@ fn add(
     text: String,
     max: usize,
 ) {
-    let dir = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+    // The resolved directory, so the model can find the bundled files the skill mentions even when
+    // the skill was installed by linking it in.
+    let dir = file
+        .parent()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
     let fields = match frontmatter(&text) {
         Some(fields) => fields,
         None => {
@@ -507,6 +522,56 @@ mod tests {
             "the body is loaded, not advertised"
         );
         assert_eq!(listing(&[]), "");
+    }
+
+    #[test]
+    fn a_skill_installed_by_linking_it_in_is_found() {
+        // A skill shared by symlinking it into the skills directory is the usual arrangement, and
+        // this walk used to skip it: the entry is not a directory, so the filter dropped it before
+        // the SKILL.md check and the skill vanished with no note at all.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("elsewhere/prose-lint");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(
+            real.join(FILE),
+            "---\nname: prose-lint\ndescription: d\n---\nbody\n",
+        )
+        .unwrap();
+        let skills_dir = dir.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::os::unix::fs::symlink(&real, skills_dir.join("prose-lint")).unwrap();
+
+        let found = walk(&skills_dir);
+        assert_eq!(found, [skills_dir.join("prose-lint").join(FILE)]);
+
+        // A link that loops must not walk for ever.
+        std::os::unix::fs::symlink(&skills_dir, skills_dir.join("loop")).unwrap();
+        assert_eq!(walk(&skills_dir).len(), 1, "the cycle is visited once");
+    }
+
+    #[test]
+    fn a_linked_skill_reports_its_real_directory() {
+        // The directory is what the model resolves a skill's own references against, so it is the
+        // target of the link rather than the link.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("elsewhere/x");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join(FILE), "---\nname: x\ndescription: d\n---\nbody\n").unwrap();
+        let mut skills = Vec::new();
+        let mut notes = Vec::new();
+        let link = dir.path().join("skills/x");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        add(
+            &mut skills,
+            &mut notes,
+            &link.join(FILE),
+            "~/skills/x/SKILL.md".into(),
+            std::fs::read_to_string(link.join(FILE)).unwrap(),
+            32,
+        );
+        assert_eq!(skills.len(), 1, "{notes:?}");
+        assert_eq!(skills[0].dir, real.canonicalize().unwrap());
     }
 
     #[test]
