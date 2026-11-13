@@ -1862,16 +1862,21 @@ answer "what is the current version of X".
   both at once. The URL is a provider setting — `search-url`, in `[providers.<name>]` or the preset —
   rather than a constant, so a compatible server that serves one is configured and not patched.
 - **The request is the query and nothing else.** `POST {"query": "..."}` answers
-  `{"results": [{url, title, text, highlights}]}` — Exa's own shape, since this endpoint returns
-  theirs. Extra fields are ignored rather than refused (`numResults` changes nothing: five results
-  come back whatever is asked), so the tool sends the one field it knows and applies `num_results`
-  to what arrived, saying so when the count asked for is larger than the count served. A body
-  missing `query` is refused as `400 Invalid POST body: .query is missing`, and an empty query is a
-  `500`.
-- **`highlights` is not an excerpt here.** It carries the whole page. Exa's highlights are passages,
-  Synthetic's are the document, so showing them raw spends the entire answer on one result: the
-  model gets at most [`MAX_QUOTE`] characters of each, at most three passages per result, one line
-  each, with an ellipsis where it was cut. The 64 KiB ceiling stays as a backstop.
+  `{"results": [{url, title, text, published}]}`. Extra request fields are ignored rather than
+  refused (`numResults` changes nothing: five results come back whatever is asked), so the tool
+  sends the one field it knows and applies `num_results` to what arrived, saying so when the count
+  asked for is larger than the count served. A body missing `query` is refused as
+  `400 Invalid POST body: .query is missing`, and an empty query is a `500`.
+- **The documented fields are read, and the undocumented ones are not load-bearing.** `text` is the
+  result's own text and can be 400 KiB; `published` is a timestamp, present on some results and
+  absent on others; there is no `author`. The endpoint also returns `highlights` — Exa's field,
+  undocumented here — which is a prefix of the page rather than a passage chosen from it, so a
+  parser that read only that would show titles with no content the day it went away. The excerpt is
+  therefore the highlights when a backend sends non-empty ones, else `text`, and either way the
+  model gets at most 1000 characters per passage, three passages per result, one line each, cut with
+  an ellipsis. A date is shown as its date (`2025-11-05`) rather than as a timestamp. One parser
+  reads both backends — `published` or Exa's `publishedDate`, `highlights` or `text` — so neither
+  loses its dates. The 64 KiB ceiling stays as a backstop.
 - **A large success is still a success.** The reply for five results is about 220 KiB, so a search
   that reused `fetch`'s 100 KiB limit would report a refusal for a working request. The POST path
   takes its own ceiling for this reason.

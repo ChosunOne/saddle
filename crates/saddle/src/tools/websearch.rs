@@ -20,6 +20,12 @@
 //! which is a payment challenge rather than a rate limit. That is why the anonymous path is MCP and
 //! not REST.
 //!
+//! The provider answers `{"results": [{url, title, text, published}]}`. `text` is the whole page and
+//! `published` is on some results only; the endpoint also returns Exa's `highlights`, which is a
+//! prefix of that page rather than a passage chosen from it. Whichever arrives, the model is shown a
+//! bounded excerpt of it, and the parser reads both spellings of the date so the fallback keeps its
+//! own.
+//!
 //! Everything here goes through the engine before a request is made, so the `net` grant decides —
 //! `api.synthetic.new`, `api.exa.ai` and `mcp.exa.ai` are the hosts that have to be granted, and the
 //! same audit log records each one.
@@ -66,8 +72,11 @@ pub struct Hit {
     pub url: String,
     pub published: Option<String>,
     pub author: Option<String>,
-    /// The passages Exa thought were the answer, in its order.
+    /// The passages the backend chose, in its order: Exa's `highlights`, which are excerpts.
     pub highlights: Vec<String>,
+    /// The result's own text — `/v2/search` documents this field and it is often the whole page,
+    /// so it is the fallback excerpt when a backend sends no highlights (D82).
+    pub text: Option<String>,
 }
 
 pub fn search(session: &mut Session, input: &Value) -> Result<ToolOutput> {
@@ -411,7 +420,9 @@ fn hit(result: &Value) -> Hit {
     Hit {
         title: text("title").unwrap_or_default(),
         url: text("url").unwrap_or_default(),
-        published: text("publishedDate"),
+        // `/v2/search` documents `published`; Exa's REST search calls the same thing
+        // `publishedDate`, so one parser reads both rather than one backend losing its dates.
+        published: text("published").or_else(|| text("publishedDate")),
         author: text("author"),
         highlights: result
             .get("highlights")
@@ -424,6 +435,7 @@ fn hit(result: &Value) -> Hit {
                     .collect()
             })
             .unwrap_or_default(),
+        text: text("text"),
     }
 }
 
@@ -437,7 +449,7 @@ pub fn format_hits(hits: &[Hit]) -> String {
         out.push_str(&format!("{}. {}\n   {}\n", i + 1, title_of(h), h.url));
         let mut line: Vec<String> = Vec::new();
         if let Some(when) = &h.published {
-            line.push(format!("published {when}"));
+            line.push(format!("published {}", date_of(when)));
         }
         if let Some(who) = &h.author {
             line.push(format!("by {who}"));
@@ -445,7 +457,7 @@ pub fn format_hits(hits: &[Hit]) -> String {
         if !line.is_empty() {
             out.push_str(&format!("   {}\n", line.join(", ")));
         }
-        for passage in h.highlights.iter().take(MAX_QUOTES) {
+        for passage in h.excerpts().iter().take(MAX_QUOTES) {
             out.push_str(&format!("   > {}\n", passage_for_model(passage)));
         }
     }
@@ -463,6 +475,40 @@ fn passage_for_model(text: &str) -> String {
     }
     let kept: String = one_line.chars().take(MAX_QUOTE).collect();
     format!("{kept}…")
+}
+
+impl Hit {
+    /// What to quote from this result: the passages the backend chose, or the result's own text.
+    ///
+    /// Empty strings are dropped rather than quoted, so a result with `"highlights": [""]` still
+    /// shows its text instead of a blank line.
+    fn excerpts(&self) -> Vec<&str> {
+        let chosen: Vec<&str> = self
+            .highlights
+            .iter()
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        if !chosen.is_empty() {
+            return chosen;
+        }
+        self.text
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|t| vec![t])
+            .unwrap_or_default()
+    }
+}
+
+/// An ISO timestamp as the date it states, since that is the part a reader can use.
+fn date_of(stamp: &str) -> &str {
+    let bytes = stamp.as_bytes();
+    let iso = bytes.len() >= 10
+        && bytes[..10].iter().enumerate().all(|(i, b)| match i {
+            4 | 7 => *b == b'-',
+            _ => b.is_ascii_digit(),
+        });
+    if iso { &stamp[..10] } else { stamp }
 }
 
 fn title_of(hit: &Hit) -> &str {
@@ -600,6 +646,55 @@ mod tests {
         // A result with no title is named by its address, so it is still distinguishable.
         assert!(text.contains("2. https://docs.rs/syntect"), "{text}");
         assert!(describe(body).contains("request abc") && describe(body).contains("$0.0050"));
+    }
+
+    #[test]
+    fn the_documented_search_shape_is_read() {
+        // D82: `POST /v2/search` documents `url`, `title`, `text` and `published` — no highlights,
+        // no author. A parser that only read Exa's `highlights` would show titles with no content,
+        // so this is the shape that matters most and the one the fallback must not depend on.
+        let body = r#"{
+            "results": [{
+                "url": "https://curl.se/docs/projdocs.html",
+                "title": "curl — Project Documentation",
+                "text": "Project Documentation. The curl project is ...",
+                "published": "2025-11-05T00:00:00.000Z"
+            }]
+        }"#;
+        let hits = parse_exa(body).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].published.as_deref(),
+            Some("2025-11-05T00:00:00.000Z")
+        );
+        assert!(hits[0].highlights.is_empty());
+        let text = format_hits(&hits);
+        assert!(text.contains("1. curl — Project Documentation"), "{text}");
+        assert!(
+            text.contains("> Project Documentation. The curl project is ..."),
+            "the text is the excerpt: {text}"
+        );
+        // A timestamp is shown as its date, and anything that is not one is shown as it came.
+        assert!(text.contains("published 2025-11-05\n"), "{text}");
+        assert!(!text.contains("2025-11-05T00:00"), "{text}");
+        assert_eq!(date_of("not a date"), "not a date");
+        assert_eq!(date_of("2025-11-05"), "2025-11-05");
+        // A result with neither highlights nor text is a link rather than a blank quote.
+        let bare = Hit {
+            title: "t".into(),
+            url: "https://t/".into(),
+            ..Hit::default()
+        };
+        assert!(!format_hits(&[bare]).contains("> "), "quoted nothing");
+        // An empty highlight falls back to the text rather than quoting a blank line.
+        let empty = Hit {
+            title: "t".into(),
+            url: "https://t/".into(),
+            highlights: vec![String::new(), "  ".into()],
+            text: Some("real text".into()),
+            ..Hit::default()
+        };
+        assert!(format_hits(&[empty]).contains("> real text"));
     }
 
     #[test]
