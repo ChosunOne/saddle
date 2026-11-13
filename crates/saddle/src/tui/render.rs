@@ -1,6 +1,6 @@
 //! Drawing: the transcript, the queue, the activity line, the editor and the status line.
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -17,6 +17,7 @@ use super::sessions::{ROWS as SESSION_ROWS, SessionPicker, age};
 use super::settings::{ROWS, SettingsDialog};
 use super::tree::{ROWS as TREE_ROWS, Tree};
 use crate::tui::status::StatusData;
+use crate::tui::syntax::{self, Language, State};
 use crate::tui::theme::Theme;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -186,6 +187,9 @@ struct Markdown {
     bullet: Option<String>,
     quote: usize,
     code: bool,
+    /// The language the open fence names, and the highlighter's carry-over state (D73).
+    lang: Language,
+    code_state: State,
     blank_before_next_block: bool,
     link: Option<String>,
     table: Option<Table>,
@@ -281,8 +285,14 @@ impl Markdown {
                     if l.is_empty() && lines.peek().is_none() {
                         break;
                     }
+                    // The block's own colour is the base; each run paints over it with its role
+                    // wherever the language is known (D73).
                     self.line
-                        .push(Span::styled(format!("  {l}"), self.block_style()));
+                        .push(Span::styled("  ".to_owned(), self.block_style()));
+                    for (kind, text) in syntax::highlight(self.lang, l, &mut self.code_state) {
+                        let style = self.block_style().patch(kind.style(&self.theme.syntax));
+                        self.line.push(Span::styled(text.to_owned(), style));
+                    }
                     self.flush();
                 }
             }
@@ -338,9 +348,14 @@ impl Markdown {
                 };
                 self.styles.push(style);
             }
-            Tag::CodeBlock(_) => {
+            Tag::CodeBlock(kind) => {
                 self.start_block();
                 self.code = true;
+                self.lang = match kind {
+                    CodeBlockKind::Fenced(tag) => Language::parse(&tag),
+                    CodeBlockKind::Indented => Language::Unknown,
+                };
+                self.code_state = State::default();
             }
             Tag::BlockQuote(_) => {
                 self.start_block();
@@ -412,6 +427,8 @@ impl Markdown {
             }
             TagEnd::CodeBlock => {
                 self.code = false;
+                self.lang = Language::Unknown;
+                self.code_state = State::default();
                 self.flush();
                 self.blank_before_next_block = true;
             }
@@ -1991,6 +2008,80 @@ mod tests {
             after.shown[0].2, 1,
             "one row of the picture is above the fold: {:?}",
             after.shown
+        );
+    }
+
+    /// The runs of a row as (text, foreground colour), wrapped wide so nothing splits.
+    fn block_runs(row: &Row) -> Vec<(String, Option<Color>)> {
+        wrap(row, 200)
+            .iter()
+            .flat_map(|l| {
+                l.spans
+                    .iter()
+                    // The row's own prefix runs are empty; the block's runs are the content.
+                    .filter(|s| !s.content.is_empty())
+                    .map(|s| (s.content.to_string(), s.style.fg))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// How many distinct foreground colours a row is drawn in.
+    fn distinct(runs: &[(String, Option<Color>)]) -> usize {
+        let mut seen: Vec<Option<Color>> = runs.iter().map(|(_, c)| *c).collect();
+        seen.sort_by_key(|c| format!("{c:?}"));
+        seen.dedup();
+        seen.len()
+    }
+
+    #[test]
+    fn the_fence_tag_reaches_the_highlighter() {
+        assert_eq!(Language::parse("rust"), Language::Rust);
+        let rows = markdown("```rust\nlet x = 1;\n```", &Theme::default());
+        let runs = block_runs(&rows[0]);
+        assert!(
+            runs.iter()
+                .any(|(t, c)| t == "let" && *c == Some(Theme::default().syntax.keyword)),
+            "{runs:?}"
+        );
+    }
+
+    #[test]
+    fn a_fenced_block_with_a_language_is_highlighted_and_one_without_is_not() {
+        // A highlighted line shows more than one colour, and the text is unchanged: highlighting
+        // paints, it does not edit (D73).
+        let theme = Theme::default();
+        let rows = markdown("```rust\nlet x: u32 = foo(1);\n```", &theme);
+        let runs = block_runs(&rows[0]);
+        let colours = distinct(&runs);
+        assert!(colours > 2, "not highlighted: {runs:?}");
+        let joined: String = runs.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(joined, "  let x: u32 = foo(1);");
+
+        // A fence that names no language gets one colour, as it did before highlighting existed.
+        let rows = markdown("```\nlet x = 1;\n```", &theme);
+        let runs = block_runs(&rows[0]);
+        assert_eq!(distinct(&runs), 1, "{runs:?}");
+    }
+
+    #[test]
+    fn a_multiline_block_comment_stays_a_comment_on_every_line() {
+        // The highlighter carries state across lines, so a block's rows are walked in order (D73).
+        let theme = Theme::default();
+        let rows = markdown("```rust\n/* one\ntwo */ let x = 1;\n```", &theme);
+        // The first run of each row is the indent, in the block's own colour; the next is the
+        // comment, in the comment role, on both lines.
+        for row in rows.iter().take(2) {
+            let runs = block_runs(row);
+            assert_eq!(runs[0].0, "  ", "{runs:?}");
+            assert_eq!(runs[1].1, Some(theme.syntax.comment), "{runs:?}");
+        }
+        // After `*/` the same line is code again.
+        let runs = block_runs(&rows[1]);
+        assert!(
+            runs.iter()
+                .any(|(t, c)| t == "let" && *c == Some(theme.syntax.keyword)),
+            "{runs:?}"
         );
     }
 

@@ -1496,11 +1496,69 @@ one place at its root.
   and `toolOutput` its body; `thinkingText` is a reasoning block; `userMessageText` the prompt;
   `mdHeading`/`mdListBullet`/`mdHr`/`mdQuoteBorder` the markdown pieces; `toolDiffContext` a diff's
   gutter; `borderAccent`, `borderMuted` and `bashMode` the three states of the editor's frame.
-- **Not taken: pi's `system` theme**, which queries the terminal's own palette and derives every
-  role from it with a WCAG contrast floor, rebuilding when the terminal's appearance changes. That
-  needs the query (OSC 11/4 with a timeout, on a terminal this harness does not currently question)
-  and the contrast solver; it is a separate piece of work, and it cannot be verified in a sandbox
-  with no terminal to answer.
+- **Not taken here: pi's `system` theme.** It queries the terminal's own palette and derives every
+  role from it; that is D73.
+
+**D73.** Two more of pi's: the `system` theme, derived from the terminal, and syntax highlighting.
+
+`theme = "system"` is a reserved name and not a palette. It asks the terminal what its colours are
+and derives every role from the answer.
+
+- **The query is OSC 10 for the foreground, OSC 11 for the background and OSC 4 for each of the
+  sixteen ANSI colours**, written in one burst, then stdin read until the replies stop or 100 ms
+  pass — pi's timeout. Only for a theme that needs it, only once, and only when stdin is a terminal:
+  a pipe has nobody to answer. The reply is read in raw mode and raw mode is put back immediately,
+  because the full-screen interface is about to take the terminal over; the answer is kept, so a
+  theme rebuilt mid-session does not ask again.
+- **The parsing is separated from the asking.** `terminal::parse` takes the bytes and is tested
+  against the replies a terminal sends — `rgb:rrrr/gggg/bbbb`, `#rrggbb`, one-digit fields scaled not
+  truncated, ANSI colours by index — and against a key press and a partial sequence in the middle of
+  them. That seam is the whole reason this is testable here: a sandbox has no terminal to answer, so
+  the query itself is only ever exercised by hand.
+- **The background decides the appearance, and the appearance is then a fact about the terminal, not
+  a guess.** Relative luminance above 0.35 is light. `COLORFGBG` is consulted only when the terminal
+  was asked nothing, since it is a variable a terminal may not set at all. A `light/dark` pair (D72)
+  therefore picks its half from the same answer.
+- **Each role takes its hue from a matching ANSI colour** — errors from red, success from green,
+  warnings from yellow, links from blue, code from magenta, accent from cyan — and falls back to the
+  built-in palette's hue for a colour the terminal did not report. Lightness is then placed, not
+  taken: `place` bisects towards white on a dark background or black on a light one until the
+  contrast clears the floor. **4.5:1 for anything read as text**, 3:1 for `muted`, 2:1 for `dim`,
+  which are faint on purpose and would be useless at 4.5. The search asks for 1.02× the floor so
+  rounding to the eight bits a terminal draws cannot land a shade under it.
+- **A derived role is an explicit RGB colour wherever one can be worked out.** A named ANSI colour is
+  replaced by the value it stands for, so the palette does not depend on the terminal's own palette a
+  second time — which is what makes the ratio it promises a fact rather than an intention.
+- **Block backgrounds are mixed from the reported background** (a little lighter on dark, a little
+  darker on light), so a panel is visible on a terminal nobody has seen before.
+- **A terminal that answers nothing gets pi's fallback**: ANSI indices, the terminal's default
+  colours, faint secondary text, and no panel backgrounds at all, because a background nobody
+  reported cannot be contrasted against.
+- **A light/dark switch is noticed when the theme is rebuilt** — `/theme`, or `/reload`, which asks
+  again before building. pi additionally listens for xterm's mode 2031, which reports a switch as it
+  happens; that needs a claim on stdin that crossterm holds, so this waits for the rebuild rather
+  than pretending to watch.
+
+**Syntax highlighting** is a lexical highlighter, not a parser (`tui/syntax.rs`), because no
+highlighter can be added offline and a code block is read, not compiled.
+
+- **The fence's tag chooses the language**, by the spellings that appear in practice (`rs`, `ts`,
+  `console`, `rust,ignore`). Rust, Python, JavaScript/TypeScript, shell, JSON, TOML, YAML, C and Go
+  have their own keywords and comment markers.
+- **An untagged fence is not highlighted**: one run in the block's own colour, which is what pi draws.
+  A fence naming a language that is not known still gets the parts that read the same in any
+  language — strings, numbers, comments — rather than nothing.
+- **The highlighter carries two pieces of state between lines**: a block comment and a multi-line
+  string can open on one line and close on another, so the rows of a block are walked in order and a
+  block's state is reset when it ends.
+- **It returns runs, in order, covering the whole line**, and each run patches the block's base
+  colour rather than replacing it — so a role that is the terminal default still draws, and wrapping
+  splits between runs instead of at the line.
+- **Every colour is a `syntax*` role** from the palette, so a pi theme, a `config.toml` palette and
+  the derived `system` palette all paint code the same way.
+- **The parser that is not there is a decision, not a shortcut**: `syntaxKeyword` means "the
+  language's keywords", not "what a grammar says this token is". A block with an unusual construct
+  is highlighted plausibly and never wrongly breaks, which is the property a transcript needs.
 
 ## 4. Scope enumeration
 

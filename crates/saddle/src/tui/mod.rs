@@ -7,11 +7,14 @@ mod editor;
 mod grant;
 pub mod image;
 mod login;
+pub mod palette;
 mod permissions;
 mod render;
 mod sessions;
 mod settings;
 pub mod status;
+pub mod syntax;
+pub mod terminal;
 pub mod theme;
 mod tree;
 
@@ -218,7 +221,30 @@ pub fn theme_selected(user: &UserConfig) -> Result<crate::tui::theme::Theme> {
         .theme
         .clone()
         .unwrap_or_else(|| "default".to_owned());
+    // `system` is derived from the terminal's own colours, so ask it once, here, before the screen
+    // is taken over: the reply arrives on stdin and must not land in the middle of a drawn frame
+    // (D73).
+    if crate::tui::theme::needs_terminal(&name, &user.themes) {
+        crate::tui::terminal::prime();
+    }
     crate::tui::theme::build(&name, &user.themes)
+}
+
+impl Controller {
+    /// Whether the selected theme is derived from the terminal, so a rebuild should ask it again
+    /// (D73).
+    fn theme_needs_terminal(&self, app: &App) -> bool {
+        let Ok(user) = UserConfig::load(&self.paths.user_config()) else {
+            return false;
+        };
+        let name = app
+            .header
+            .theme
+            .clone()
+            .or(user.ui.theme.clone())
+            .unwrap_or_else(|| "default".to_owned());
+        crate::tui::theme::needs_terminal(&name, &user.themes)
+    }
 }
 
 fn theme_from_config(paths: &Paths, selected: &Option<String>) -> Result<crate::tui::theme::Theme> {
@@ -1203,7 +1229,14 @@ impl Controller {
     }
 
     /// The theme named by the config, or the default (D71).
+    ///
+    /// The terminal is asked again first, so a session started in the dark and carried into the
+    /// light gets the colours that match (D73): the answer costs one round trip, and asking is the
+    /// only way to know.
     pub fn reload_theme(&self, app: &mut App) {
+        if self.theme_needs_terminal(app) {
+            crate::tui::terminal::requery();
+        }
         let selected = app.header.theme.clone();
         match theme_from_config(&self.paths, &selected) {
             Ok(theme) => {
@@ -1234,6 +1267,11 @@ impl Controller {
             None => app.header.status = Template::default(),
             Some(Ok(template)) => app.header.status = template,
             Some(Err(e)) => app.note(NoteKind::Error, &format!("[ui] status: {e}")),
+        }
+        // A `/reload` after the terminal switched from light to dark is the moment to notice.
+        if self.theme_needs_terminal(app) {
+            crate::tui::terminal::requery();
+            self.reload_theme(app);
         }
         app.max_steps = user.max_steps.filter(|n| *n > 0);
         self.send(app, Command::SetMaxSteps(app.max_steps));

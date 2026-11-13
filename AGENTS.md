@@ -37,7 +37,7 @@ Inside `crates/saddle/src`:
 | `cache` | the cache-miss notice: one line to the user when a prompt is re-read at full price (D50) |
 | `reserved` | the D20 snapshot and restore of reserved paths around `exec` |
 | `provider/` | the neutral conversation form, the Anthropic and OpenAI-compatible renderers, the model list, the cached context windows and prices (D34, D36) |
-| `tui/` | the full-screen UI: app state, rendering, editor, login, settings, session list, `permissions` (the grants editor, D45), `tree` (the message tree, D54), `image` (drawing a picture: kitty and iTerm2, D59), and `status` (the `[ui] status` template, D36) and `theme` (the colour roles, D71) |
+| `tui/` | the full-screen UI: app state, rendering, editor, login, settings, session list, `permissions` (the grants editor, D45), `tree` (the message tree, D54), `image` (drawing a picture: kitty and iTerm2, D59), `status` (the `[ui] status` template, D36), `theme` (the colour roles, D71), `palette` (pi's role vocabulary, colour forms and the palette derived from the terminal, D72, D73), `terminal` (asking the terminal for its colours, D73) and `syntax` (the code-block highlighter, D73) |
 
 `crates/saddle/src/main.rs` dispatches subcommands (`run`, `check`, `tool`, `audit verify`)
 and intercepts `__sandbox` before clap parses anything — that is the helper process path, and it must
@@ -106,8 +106,13 @@ restarting (D70). `/theme [name]` shows the theme or switches to one and saves i
 `[themes.<name>]` tables of roles in `config.toml`, named as pi names them, and the renderer names no
 colour directly (D71, D72). A colour is an ANSI name, `#rgb`, `#rrggbb`, `oklch()`, `okhsl()`, a
 palette index, a `vars` entry, or `""` for the terminal default; `theme = "light/dark"` picks by
-`COLORFGBG`, and `--use-theme` chooses for one run. A pi role for something this interface does not
-draw is refused with that reason. `/thinking` (or shift+tab) changes the reasoning effort for the session (D57), `/name` and
+the terminal's answer (or `COLORFGBG`), and `--use-theme` chooses for one run. A pi role for
+something this interface does not draw is refused with that reason. `theme = "system"` asks the
+terminal for its own colours at startup (OSC 10/11/4, 100 ms) and derives every role from them with a
+WCAG contrast floor, falling back to ANSI colours if it answers nothing (D73). Code blocks are
+highlighted by a hand-written lexical highlighter whose colours are `syntax*` roles, so a theme paints
+code too (D73).
+`/thinking` (or shift+tab) changes the reasoning effort for the session (D57), `/name` and
 `/session` name and describe it (D55), and escape twice on an empty prompt opens the message tree (D54), where a prompt can be sent again to
 make another branch; `/clone` copies the branch into a separate session instead. There is no
 trust step (D44): nothing the agent runs can write a policy file, so `saddle check` is the whole
@@ -155,7 +160,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D72 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D73 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
