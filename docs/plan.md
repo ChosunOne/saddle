@@ -2591,6 +2591,17 @@ and the grant (D103) still decides whether it runs: `saddle check` prints the ta
 grants, naming both a server that is declared and not granted and one that is granted and not
 declared.
 
+**D105.** An MCP server is a delegate of the agent, so what it reaches is the intersection of what
+its grant asks for with what the agent holds: `mcp = [{ server = "x", tools = ["t"], net = [{ host
+= "api.example.com" }] }]`. A grant that asks for nothing inherits the agent's own reach; one that
+asks for more — a root the agent lacks, a host no agent `net` grant covers, a scheme or port the
+agent does not hold — is a load error naming the rule (`agent.mcp[0].fs-read[0]`), never a silent
+trim, because a server quietly weaker than written is a worse thing to debug than a policy that
+will not load. A suffix covers strict subdomains only, as `matches` does, so `*.example.com` does
+not cover `example.com`, and no suffix covers `*`. Exclusions from both grants apply, so the
+result is no wider than either. Nothing else crosses: a server holds no plain scope, no root of its
+own and no model budget, because it is a command rather than a plugin principal.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

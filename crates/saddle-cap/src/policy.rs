@@ -76,6 +76,14 @@ impl RuleId {
     }
 }
 
+/// A rule inside another, such as `agent.mcp[0].fs-read[1]`: an audit record names the exact line
+/// a person wrote, not just the grant it sits in.
+impl RuleId {
+    fn under(&self, part: &str, index: usize) -> Self {
+        Self(format!("{}.{part}[{index}]", self.0))
+    }
+}
+
 impl fmt::Display for RuleId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -230,6 +238,18 @@ pub struct McpGrant {
     /// Every tool named, never a pattern: a server that grows a tool overnight does not grow it
     /// into the callable set.
     pub tools: Vec<String>,
+    /// What the server asks to reach. Empty means it inherits the agent's own reach; anything
+    /// here must be inside it, or the policy does not load (D105).
+    pub reach: McpReach,
+}
+
+/// The files and hosts one MCP server asks for, before it is narrowed to what the agent holds
+/// (D105).
+#[derive(Debug, Clone, Default)]
+pub struct McpReach {
+    pub fs_read: Vec<FsGrant>,
+    pub fs_write: Vec<FsGrant>,
+    pub net: Vec<NetGrant>,
 }
 
 impl McpGrant {
@@ -419,12 +439,19 @@ struct RawNet {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 struct RawMcp {
     server: String,
     #[serde(default)]
     tools: Vec<String>,
     #[serde(default)]
     why: Option<String>,
+    #[serde(default)]
+    fs_read: Vec<RawFs>,
+    #[serde(default)]
+    fs_write: Vec<RawFs>,
+    #[serde(default)]
+    net: Vec<RawNet>,
 }
 
 #[derive(Deserialize)]
@@ -515,15 +542,28 @@ impl Policy {
                 ));
             }
             for m in &g.mcp {
-                lines.push(with_why(
-                    format!(
-                        "{} = server {} tools [{}]",
-                        m.rule,
-                        m.server,
-                        m.tools.join(", ")
-                    ),
-                    &m.why,
-                ));
+                let mut line = format!(
+                    "{} = server {} tools [{}]",
+                    m.rule,
+                    m.server,
+                    m.tools.join(", ")
+                );
+                if !m.reach.fs_read.is_empty() || !m.reach.fs_write.is_empty() {
+                    let roots: Vec<&str> = m
+                        .reach
+                        .fs_read
+                        .iter()
+                        .chain(&m.reach.fs_write)
+                        .map(|f| f.root.as_str())
+                        .collect();
+                    line.push_str(&format!(" fs [{}]", roots.join(", ")));
+                }
+                if !m.reach.net.is_empty() {
+                    let hosts: Vec<String> =
+                        m.reach.net.iter().map(|n| n.host.to_string()).collect();
+                    line.push_str(&format!(" net [{}]", hosts.join(", ")));
+                }
+                lines.push(with_why(line, &m.why));
             }
             if let Some(b) = &g.model_invoke {
                 lines.push(with_why(
@@ -554,6 +594,26 @@ fn with_why(line: String, why: &str) -> String {
     } else {
         format!("{line}  # {why}")
     }
+}
+
+/// One filesystem entry of an MCP grant, checked against the roots exactly as an agent's is.
+fn lower_fs(rule: RuleId, f: RawFs, roots: &Roots) -> Result<FsGrant, PolicyError> {
+    let root = RootName::new(&f.root).map_err(|e| invalid(&rule, e.to_string()))?;
+    if !roots.contains(&root) {
+        let known: Vec<_> = roots.iter().map(|(n, _)| n.as_str()).collect();
+        return Err(invalid(
+            &rule,
+            format!("unknown root `{root}` (known: {})", known.join(", ")),
+        ));
+    }
+    let exclude_set = exclude_set(&f.exclude).map_err(|e| invalid(&rule, e))?;
+    Ok(FsGrant {
+        why: why(f.why),
+        rule,
+        root,
+        exclude: f.exclude,
+        exclude_set,
+    })
 }
 
 fn lower(who: &Principal, raw: RawGrants, roots: &Roots) -> Result<Grants, PolicyError> {
@@ -657,11 +717,34 @@ fn lower(who: &Principal, raw: RawGrants, roots: &Roots) -> Result<Grants, Polic
                 tools.push(tool.to_owned());
             }
         }
+        let mut reach = McpReach::default();
+        for (j, f) in m.fs_read.into_iter().enumerate() {
+            reach
+                .fs_read
+                .push(lower_fs(rule.under("fs-read", j), f, roots)?);
+        }
+        for (j, f) in m.fs_write.into_iter().enumerate() {
+            reach
+                .fs_write
+                .push(lower_fs(rule.under("fs-write", j), f, roots)?);
+        }
+        for (j, n) in m.net.into_iter().enumerate() {
+            let rule = rule.under("net", j);
+            let host = HostPattern::parse(&n.host).map_err(|e| invalid(&rule, e))?;
+            reach.net.push(NetGrant {
+                why: why(n.why),
+                rule,
+                host,
+                scheme: n.scheme.unwrap_or(UrlScheme::Https),
+                port: n.port,
+            });
+        }
         grants.mcp.push(McpGrant {
             why: why(m.why),
             rule,
             server: server.to_owned(),
             tools,
+            reach,
         });
     }
 

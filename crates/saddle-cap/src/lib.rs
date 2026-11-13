@@ -3,11 +3,12 @@
 
 pub mod component;
 pub mod manifest;
+pub mod narrow;
 pub mod policy;
 pub mod roots;
 pub mod sandbox;
 pub mod scope;
 
-pub use policy::{Grants, PluginId, Policy, PolicyError, Principal, RuleId};
+pub use policy::{Grants, McpReach, PluginId, Policy, PolicyError, Principal, RuleId};
 pub use roots::{Location, RelPath, RootName, Roots};
 pub use scope::Scope;
