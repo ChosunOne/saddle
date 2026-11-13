@@ -1358,33 +1358,37 @@ tools without being a root or part of the session.
   said so, the project tier being read through the policy, more specific winning over less, and the
   audit records. What goes is the tool and the host-read tier that justified it.
 
-**D68.** Skill discovery follows pi's rules for a skills directory, and a project skill is found
-anywhere in the workspace.
+**D68.** Skill discovery follows pi's rules for a skills directory, and a project's skills are in
+one place at its root.
 
-- **The two halves need each other.** A skill scoped to `crates/saddle` has to be discoverable from
-  the workspace root, which means walking the tree rather than the ancestors of the start directory
-  (what D64 did). Walking a whole tree is only affordable if there is a pruning rule, and there
-  already was one waiting: the project's own ignore files. So the scan honours them, and the cost of
-  the wider search is paid by the metadata the project already maintains.
-- **One ignore matcher, two callers.** `src/ignore.rs` holds the parser and the matcher; the search
-  tools and skill discovery both use it, because "what is ignored" has to mean one thing — a file
-  `grep` skips and discovery walks is a disagreement nobody can see. Which files are read is the
-  caller's choice: both read `.gitignore`, `.ignore` and `.fdignore`. The syntax is the part of
-  `.gitignore` that matters: `#` comments, `!` negation, a trailing `/` for directories, a pattern
-  with a slash anchored to its file's directory and one without matching at any depth, the last
-  match winning.
+- **One directory, not a tree scan.** A project's skills are `.agents/skills` at the workspace root
+  — the shape pi has with `.pi/skills`. An earlier version walked the whole workspace looking for
+  `.agents/skills` anywhere: no boundary, work proportional to directories that have nothing to do
+  with skills, and a scan of the tree on every session open. A skill scoped to one crate is a
+  directory in this one skills directory whose text says which crate it is for.
 - **A skills directory is read the way pi reads one.** A directory holding `SKILL.md` is a skill and
-  is **not** descended into, which is what stops a skill's own `references/` becoming more skills.
-  Otherwise its subdirectories are searched, dot entries and `node_modules` are skipped, and at the
-  top level only a bare `.md` file is a skill too. `MAX_DEPTH` bounds a tree of directories with no
-  skill in it, and the project scan remembers resolved directories so a symlink loop terminates.
-- **The project tier is every `.agents/skills` in the workspace, shallowest first.** A deeper skill
-  replaces a shallower one of the same name, which keeps D64's rule that the more specific file wins,
-  and the note names both. Dot directories are skipped, which is also what stops the scan entering
-  `.agents` itself.
-- **A refusal is said out loud.** `saddle tool` now prints discovery's notes to stderr. Until it did,
-  a skill refused by the policy or skipped by a rule vanished with no output at all, which is the
-  worst shape a bug takes: the same silence as "there are none".
+  is **not** descended into, so a skill's own `references/` never becomes more skills. Otherwise its
+  subdirectories are searched, dot entries and `node_modules` are skipped, and at the top level a
+  bare `.md` file is a skill too. `MAX_DEPTH` bounds a tree of directories with no skill in it.
+- **It honours the project's ignore files.** `.gitignore`, `.ignore` and `.fdignore`, through the
+  matcher in `src/ignore.rs` that `tools/search` also uses: "what is ignored" has to mean one thing,
+  or a file `grep` skips and discovery walks is a disagreement nobody can see.
+- **Four conventions taken from pi, because being different has no upside here.** A name the
+  specification rejects is a **warning and the skill still loads**, named as written — dropping a
+  skill that can be read is the worse failure, and other implementations are stricter than this one.
+  A declared name that differs from its directory is noted, since portable skills match. A name
+  **collision keeps the first** discovered and reports both, so which body a name resolves to does
+  not depend on how deep a directory sits. `disable-model-invocation: true` keeps a skill out of the
+  prompt.
+- **Metadata is escaped.** A description is written by whoever wrote the skill, and a project skill
+  by whoever wrote the repository. Interpolated raw into the listing, a description containing
+  `</skills>` ends the block and forges a `<skill>` entry — prompt injection into the system prompt,
+  where the injected text outranks what surrounds it. Every interpolated field is escaped.
+- **A refusal is said out loud.** `saddle tool` prints discovery's notes to stderr. Until it did, a
+  skill refused by the policy or skipped by a rule vanished with no output at all, the same silence
+  as "there are none".
+- **What this does not have yet**: `/skill:name`, so a hidden skill cannot be invoked at all — the
+  flag is honoured in the prompt today and reachable only by asking for the file by path (§8).
 
 ## 4. Scope enumeration
 

@@ -1749,39 +1749,32 @@ fn a_tool_path_may_follow_a_link_to_another_declared_path() {
 }
 
 #[test]
-fn a_project_skill_is_found_in_a_subdirectory_of_the_workspace() {
-    // D68: the project tier was the ancestors of the start directory, so a skill scoped to
-    // `crates/sub` was invisible from the root. The scan looks at the whole tree instead.
+fn the_projects_skills_are_in_one_directory_at_the_root() {
+    // D68: one place, as pi has one. A skills directory in a subdirectory is not the project's, and
+    // the scan does not go looking for it.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
-    let nested = env.path("crates/sub/.agents/skills/nested");
-    std::fs::create_dir_all(&nested).unwrap();
-    std::fs::write(
-        nested.join("SKILL.md"),
-        "---\nname: nested\ndescription: Only for the nested crate.\n---\nbody\n",
-    )
-    .unwrap();
-    assert_eq!(env.advertised(home.path()), ["nested"]);
-    let out = saddle_in(
-        &env,
-        home.path(),
-        &[
-            "tool",
-            "read",
-            &format!(r#"{{"path":"{}"}}"#, nested.join("SKILL.md").display()),
-        ],
-    );
-    assert!(out.status.success(), "{}", stderr(&out));
+    for rel in [".agents/skills/at-root", "crates/sub/.agents/skills/nested"] {
+        let dir = env.path(rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = rel.rsplit('/').next().unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: d\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+    assert_eq!(env.advertised(home.path()), ["at-root"]);
 }
 
 #[test]
 fn skill_discovery_honours_ignore_files_and_skips_node_modules() {
-    // The ignore files are what make a whole-tree scan affordable, and a dependency's skills are
-    // not the project's.
+    // The rules apply inside the one skills directory: a dependency's skills are not the project's,
+    // and a project that ignores a path in its skills directory means it.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
-    for dir in ["build", "vendor", "node_modules/pkg", ".hidden", "keep"] {
-        let skills = env.path(&format!("{dir}/.agents/skills/s-{dir}"));
+    for dir in ["keep", "ignored", "node_modules/pkg", ".hidden"] {
+        let skills = env.path(&format!(".agents/skills/{dir}/s"));
         std::fs::create_dir_all(&skills).unwrap();
         std::fs::write(
             skills.join("SKILL.md"),
@@ -1789,9 +1782,7 @@ fn skill_discovery_honours_ignore_files_and_skips_node_modules() {
         )
         .unwrap();
     }
-    std::fs::write(env.path(".gitignore"), "build/\n").unwrap();
-    std::fs::write(env.path(".ignore"), "vendor\n").unwrap();
-    // Only the directory nothing excludes is advertised.
+    std::fs::write(env.path(".agents/skills/.ignore"), "ignored\n").unwrap();
     assert_eq!(env.advertised(home.path()), ["s-keep"]);
 }
 
@@ -1831,26 +1822,21 @@ fn a_directory_holding_a_skill_yields_one_skill_and_a_bare_markdown_file_is_one(
 }
 
 #[test]
-fn a_deeper_skill_of_the_same_name_wins_and_a_refusal_is_said_out_loud() {
-    // Shallowest first, so the deeper one replaces it; the note reaches stderr, which is where a
-    // silent skip used to be invisible.
+fn a_refusal_is_said_out_loud_and_the_first_skill_of_a_name_wins() {
+    // pi's rule: the first discovered keeps the name and the collision is reported. The note reaches
+    // stderr, which is where a silent skip used to be invisible.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
-    for (base, name, body) in [
-        ("", "same", "root-body"),
-        ("sub", "same", "deeper-body"),
-        ("", "refused", "nope"),
+    for (dir, declared) in [
+        ("same", "same"),
+        ("aa-same", "same"),
+        ("refused", "refused"),
     ] {
-        let rel = if base.is_empty() {
-            format!(".agents/skills/{name}")
-        } else {
-            format!("{base}/.agents/skills/{name}")
-        };
-        let dir = env.path(&rel);
-        std::fs::create_dir_all(&dir).unwrap();
+        let path = env.path(&format!(".agents/skills/{dir}"));
+        std::fs::create_dir_all(&path).unwrap();
         std::fs::write(
-            dir.join("SKILL.md"),
-            format!("---\nname: {name}\ndescription: d\n---\n{body}\n"),
+            path.join("SKILL.md"),
+            format!("---\nname: {declared}\ndescription: d\n---\nbody of {dir}\n"),
         )
         .unwrap();
     }
@@ -1871,30 +1857,13 @@ fn a_deeper_skill_of_the_same_name_wins_and_a_refusal_is_said_out_loud() {
         text.contains("refused/SKILL.md was not advertised: denied:"),
         "the refusal must be visible: {text}"
     );
-    let mut found = env.advertised(home.path());
-    found.sort();
-    assert_eq!(found, ["same"], "the refused one is not offered");
-
-    // The deeper `same` is the one advertised.
-    let log = env.audit_logs().last().cloned().unwrap();
-    let files: Vec<String> = std::fs::read_to_string(log)
-        .unwrap()
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|r| r["kind"] == "skill")
-        .flat_map(|r| {
-            r["args"]["discovered"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|s| s["file"].as_str().map(str::to_owned))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        })
-        .collect();
     assert!(
-        files.iter().all(|f| f.contains("sub/.agents")),
-        "the deeper one wins: {files:?}"
+        text.contains("already has that name") && text.contains("aa-same/SKILL.md"),
+        "the collision must be visible: {text}"
+    );
+    assert_eq!(
+        env.advertised(home.path()),
+        ["same"],
+        "the first keeps the name"
     );
 }
