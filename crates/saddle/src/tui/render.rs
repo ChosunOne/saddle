@@ -2696,6 +2696,8 @@ mod tests {
             status: crate::tui::status::DEFAULT_STATUS.into(),
             max_steps: None,
             auto_compact: true,
+            idle_compact: true,
+            background_compact: true,
             show_reasoning: true,
             expand_tools: false,
             config_path: "~/.config/saddle/config.toml".into(),

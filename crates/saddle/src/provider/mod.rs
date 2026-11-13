@@ -778,6 +778,24 @@ impl Provider {
         }
     }
 
+    /// A second client with the same settings, for a request that runs while the first is busy
+    /// (D78).
+    ///
+    /// A compaction in the background must not share the client the turn is using: `complete` takes
+    /// `&self` and would be fine, but the point is to have an independent request in flight, and a
+    /// clone of the settings is what makes that true without either one borrowing the other.
+    pub fn twin(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            config: self.config.clone(),
+            key: self.key.clone(),
+            agent: http::agent(),
+            window: self.window,
+            source: self.source,
+            price: self.price,
+        }
+    }
+
     /// Tokens the model takes, as far as the config, the provider and the table can say.
     pub fn window(&self) -> u64 {
         self.window

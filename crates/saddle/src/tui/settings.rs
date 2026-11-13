@@ -16,6 +16,8 @@ pub enum Setting {
     StatusLine,
     MaxSteps,
     AutoCompact,
+    IdleCompact,
+    BackgroundCompact,
     ShowReasoning,
     ExpandTools,
     EditConfig,
@@ -40,6 +42,8 @@ pub struct Values {
     /// `None` is no limit (D37).
     pub max_steps: Option<usize>,
     pub auto_compact: bool,
+    pub idle_compact: bool,
+    pub background_compact: bool,
     pub show_reasoning: bool,
     pub expand_tools: bool,
     pub config_path: String,
@@ -58,6 +62,8 @@ pub enum Change {
     /// `None` returns to the default.
     MaxSteps(Option<usize>),
     AutoCompact(bool),
+    IdleCompact(bool),
+    BackgroundCompact(bool),
     ShowReasoning(bool),
     ExpandTools(bool),
     EditConfig,
@@ -81,7 +87,7 @@ pub struct SettingsDialog {
     pub error: Option<String>,
 }
 
-pub const ROWS: [Setting; 13] = [
+pub const ROWS: [Setting; 15] = [
     Setting::Provider,
     Setting::Model,
     Setting::Effort,
@@ -90,6 +96,8 @@ pub const ROWS: [Setting; 13] = [
     Setting::StatusLine,
     Setting::MaxSteps,
     Setting::AutoCompact,
+    Setting::IdleCompact,
+    Setting::BackgroundCompact,
     Setting::ShowReasoning,
     Setting::ExpandTools,
     Setting::Permissions,
@@ -107,6 +115,8 @@ impl Setting {
             Setting::ContextWindow => "Context window",
             Setting::StatusLine => "Status line",
             Setting::AutoCompact => "Compact automatically",
+            Setting::IdleCompact => "Compact while idle",
+            Setting::BackgroundCompact => "Compact in the background",
             Setting::MaxSteps => "Model requests per prompt",
             Setting::ShowReasoning => "Show reasoning",
             Setting::ExpandTools => "Show full tool output",
@@ -130,6 +140,12 @@ impl Setting {
                 "placeholders such as {cost}, {quota}, {cachehit}; empty uses the default"
             }
             Setting::AutoCompact => "summarize older messages when the context is nearly full",
+            Setting::IdleCompact => {
+                "past half full and left alone for two minutes, so coming back is not a full window"
+            }
+            Setting::BackgroundCompact => {
+                "past three quarters, summarize while the turn carries on instead of stopping it"
+            }
             Setting::MaxSteps => "model requests one prompt may take; leave it empty for no limit",
             Setting::ShowReasoning => "the start-up default; ctrl+t changes it for this session",
             Setting::ExpandTools => "the start-up default; ctrl+o changes it for this session",
@@ -188,6 +204,8 @@ impl SettingsDialog {
                 .max_steps
                 .map_or_else(|| "unlimited".into(), |n| n.to_string()),
             Setting::AutoCompact => on_off(v.auto_compact),
+            Setting::IdleCompact => on_off(v.idle_compact),
+            Setting::BackgroundCompact => on_off(v.background_compact),
             Setting::ShowReasoning => on_off(v.show_reasoning),
             Setting::ExpandTools => on_off(v.expand_tools),
             // The value column says what the row does, since the grants themselves are a screen
@@ -271,6 +289,8 @@ impl SettingsDialog {
                 return SettingsOutcome::Stay;
             }
             Setting::AutoCompact => Change::AutoCompact(!v.auto_compact),
+            Setting::IdleCompact => Change::IdleCompact(!v.idle_compact),
+            Setting::BackgroundCompact => Change::BackgroundCompact(!v.background_compact),
             Setting::ShowReasoning => Change::ShowReasoning(!v.show_reasoning),
             Setting::ExpandTools => Change::ExpandTools(!v.expand_tools),
             Setting::Permissions => Change::OpenPermissions,
@@ -322,6 +342,8 @@ mod tests {
             status: crate::tui::status::DEFAULT_STATUS.into(),
             max_steps: None,
             auto_compact: true,
+            idle_compact: true,
+            background_compact: true,
             show_reasoning: true,
             expand_tools: false,
             config_path: "~/.config/saddle/config.toml".into(),
@@ -432,6 +454,24 @@ mod tests {
             SettingsOutcome::Apply(Change::ShowReasoning(false))
         );
         assert_eq!(press(&mut d, KeyCode::Esc), SettingsOutcome::Close);
+    }
+
+    #[test]
+    fn the_compaction_toggles_are_reachable_from_the_dialog() {
+        // D77 and D78 are config keys a person should not have to know about to find.
+        for (setting, want) in [
+            (Setting::AutoCompact, Change::AutoCompact(false)),
+            (Setting::IdleCompact, Change::IdleCompact(false)),
+            (Setting::BackgroundCompact, Change::BackgroundCompact(false)),
+        ] {
+            let mut d = SettingsDialog::new(values());
+            go_to(&mut d, setting);
+            assert_eq!(d.value(setting), "on", "on by default");
+            assert_eq!(press(&mut d, KeyCode::Enter), SettingsOutcome::Apply(want));
+        }
+        // And each says what it does, rather than only its name.
+        assert!(Setting::IdleCompact.help().contains("half full"));
+        assert!(Setting::BackgroundCompact.help().contains("three quarters"));
     }
 
     #[test]

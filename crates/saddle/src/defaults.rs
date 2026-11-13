@@ -150,6 +150,25 @@ write = [{write}]
 #
 # /theme lists them all and previews each one; --use-theme changes it for one run; /reload re-reads
 # this file.
+#
+# Compaction (D33, D77, D78). When the conversation nears the window the older part is replaced by a
+# summary; these decide when, and whether that happens while you wait.
+#
+# [compaction]
+# auto = true                 # compact at all, including once after a "context too long" error
+# reserve-tokens = 16384      # room kept free below the window
+# keep-recent-tokens = 20000  # recent conversation kept word for word beside the summary
+# idle = true                 # summarize a session you left alone, so coming back to it does not
+#                             # spend the whole window on a prompt typed before a break
+# idle-fraction = 0.5         # ... once it is this share of the window full
+# idle-seconds = 120          # ... and you have been away this long
+# background = true            # start the summary at three quarters and keep generating, rather
+#                             # than stopping the turn to summarize
+# background-fraction = 0.75  # ... at this share of the window
+#
+# A summary costs one request. Idle compaction spends it while you are away; background compaction
+# spends it beside the turn. Both are visible in the transcript when they happen.
+#
 # How the TUI starts. /settings changes these; ctrl+t and ctrl+o change them for one session.
 # [ui]
 # show-reasoning = true

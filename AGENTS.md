@@ -24,14 +24,14 @@ Inside `crates/saddle/src`:
 
 | module | owns |
 | --- | --- |
-| `agent` | the model loop (no request limit unless one is set, D37; a turn stops on a repeated call and answer, D38), the system prompt (base plus grants, so a policy reload replaces only the grants, D47), tool dispatch |
+| `agent` | the model loop (no request limit unless one is set, D37; a turn stops on a repeated call and answer, D38), the system prompt (base plus grants, so a policy reload replaces only the grants, D47), tool dispatch, and compaction — synchronous at the hard threshold, started in the background at three quarters (D78), and run by the worker thread when the session is idle (D77) |
 | `session` | opening the workspace, resolving roots, the policy engine and audit log for a session |
 | `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch` | the nine built-in tools (`fetch` is host-side network, D39; `patch` is D56) |
 | `tools/diff` | line diffs of edited files, for the transcript only — the model never sees them |
 | `context` | instruction files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md` fallback), read through the policy |
 | `skills` | `SKILL.md` skills: discovery through the `read` gate, the prompt listing, `/skill:name` (D64, D67, D68, D69) |
 | `ignore` | ignore-file matching (`.gitignore`, `.ignore`, `.fdignore`), shared by `tools/search` and `skills` (D68) |
-| `compact` | replacing the older part of a long conversation with a model-written summary (D33) |
+| `compact` | replacing the older part of a long conversation with a model-written summary (D33), of a session left alone (D77) or written while the turn carries on (D78) |
 | `store` | the saved conversations: a SQLite tree of messages per workspace (D53), imported from the older JSON Lines files once |
 | `output` | line-mode output: a terminal, or one JSON object per line for a program (D52) |
 | `cache` | the cache-miss notice: one line to the user when a prompt is re-read at full price (D50) |
@@ -118,6 +118,13 @@ means owning stdin and raw mode, and turning raw mode off leaves every keystroke
 interface deaf to all of them (D75). Code blocks are
 highlighted by a hand-written lexical highlighter whose colours are `syntax*` roles, so a theme paints
 code too (D73).
+The context is compacted three ways (D33): synchronously when it would overflow (`[compaction]
+auto`, `reserve-tokens`, `keep-recent-tokens`), **in the background** at `background-fraction`
+(three quarters by default) while the turn keeps generating (D78), and **when the session has been
+left alone** at `idle-fraction` (half) for `idle-seconds` (D77). Both of the last two are `/settings`
+rows and a `[compaction]` switch, because each spends a request. A background summary is silent until
+it lands, and is discarded if the conversation changed while it was written. Neither feature exists in
+pi or opencode, so there is no reference behaviour — `docs/plan.md` is the specification.
 `/thinking` (or shift+tab) changes the reasoning effort for the session (D57), `/name` and
 `/session` name and describe it (D55), and escape twice on an empty prompt opens the message tree (D54), where a prompt can be sent again to
 make another branch; `/clone` copies the branch into a separate session instead. There is no
@@ -166,7 +173,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D76 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D78 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

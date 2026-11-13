@@ -103,6 +103,9 @@ enum Command {
 
 /// How long to wait for the agent thread to close the session after the UI exits.
 const SHUTDOWN: Duration = Duration::from_secs(3);
+/// How often the agent thread wakes with nothing to do, to notice that the session has gone idle
+/// (D77). Short enough that a two-minute idle threshold is honoured within a second of it.
+const IDLE_TICK: Duration = Duration::from_millis(500);
 /// Redraw interval for the spinner while the agent works.
 const TICK: Duration = Duration::from_millis(80);
 
@@ -247,7 +250,43 @@ fn work(
 ) -> Result<()> {
     let mut ui = ChannelUi(events.clone());
     let mut fatal = None;
-    for command in commands {
+    // How long the agent waits for a command before it looks at the clock itself. A session that
+    // stays open is idle most of the time, and idle is when a compaction is cheapest (D77).
+    let tick = IDLE_TICK;
+    let mut last_activity = Instant::now();
+    loop {
+        let command = match commands.recv_timeout(tick) {
+            Ok(command) => command,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // A background summary that finished while nobody was looking lands here, within a
+                // tick of finishing (D78).
+                if let Err(e) = agent.poll_background(&mut session, &mut ui) {
+                    let msg = format!("{e:#}");
+                    let _ = events.send(AgentEvent::Fatal(msg.clone()));
+                    fatal = Some(msg);
+                    break;
+                }
+                // Nothing has happened for a while. Compacting here costs a request the user did
+                // not ask for, so it only happens when the conversation is half full and the
+                // session has been left alone (D77).
+                if agent.idle_compaction_due(last_activity.elapsed()) {
+                    match agent.compact(&mut session, crate::compact::Reason::Idle, None, &mut ui) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            let msg = format!("{e:#}");
+                            let _ = events.send(AgentEvent::Fatal(msg.clone()));
+                            fatal = Some(msg);
+                            break;
+                        }
+                    }
+                    // One attempt per idle stretch: the countdown starts again, so a session that
+                    // stays half full does not ask the model the same question every tick.
+                    last_activity = Instant::now();
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match command {
             Command::Prompt { text, skill } => match skill
                 .map(|name| session.record_skill_load(&name))
@@ -261,6 +300,14 @@ fn work(
                 }
                 Ok(_) => match agent.turn(&mut session, &text, &mut ui) {
                     Ok(end) => {
+                        // A background compaction started during the turn may have finished after
+                        // the last safe point; collect it before the turn is called done (D78).
+                        if let Err(e) = agent.poll_background(&mut session, &mut ui) {
+                            let msg = format!("{e:#}");
+                            let _ = events.send(AgentEvent::Fatal(msg.clone()));
+                            fatal = Some(msg);
+                            break;
+                        }
                         let _ = events.send(AgentEvent::TurnEnd(end));
                     }
                     Err(e) => {
@@ -473,6 +520,10 @@ fn work(
             }
             Command::Quit => break,
         }
+        // Idle is measured from when the work finished, not from when it was asked for: a turn
+        // that took ten minutes has been busy for ten minutes, and the session is not "left alone"
+        // the instant it ends (D77).
+        last_activity = Instant::now();
     }
     let closed = session.close();
     let _ = events.send(AgentEvent::Closed);
@@ -999,6 +1050,8 @@ impl Controller {
             status: app.header.status.to_string(),
             max_steps: app.max_steps,
             auto_compact: user.compaction.auto.unwrap_or(true),
+            idle_compact: user.compaction.idle.unwrap_or(true),
+            background_compact: user.compaction.background.unwrap_or(true),
             show_reasoning: app.show_thinking,
             expand_tools: app.expand_tools,
             config_path: render::home_relative(&self.paths.user_config()),
@@ -1139,15 +1192,9 @@ impl Controller {
                 })?;
                 app.header.status = parsed;
             }
-            Change::AutoCompact(on) => {
-                config::edit(&path, |doc| {
-                    config::table(doc, "compaction")?["auto"] = toml_edit::value(on);
-                    Ok(())
-                })?;
-                let user = UserConfig::load(&path)?;
-                let settings = crate::compact::Settings::from_config(&user.compaction);
-                self.send(app, Command::SetCompaction(settings));
-            }
+            Change::AutoCompact(on) => self.set_compaction(app, "auto", on)?,
+            Change::IdleCompact(on) => self.set_compaction(app, "idle", on)?,
+            Change::BackgroundCompact(on) => self.set_compaction(app, "background", on)?,
             Change::MaxSteps(n) => {
                 config::edit(&path, |doc| {
                     set_or_remove(
@@ -1237,6 +1284,19 @@ impl Controller {
             NoteKind::Info,
             &format!("theme: {name}; saved in config.toml"),
         );
+    }
+
+    /// Writes one `[compaction]` switch and applies the result to the running session (D77, D78).
+    fn set_compaction(&self, app: &mut App, key: &str, on: bool) -> Result<()> {
+        let path = self.paths.user_config();
+        config::edit(&path, |doc| {
+            config::table(doc, "compaction")?[key] = toml_edit::value(on);
+            Ok(())
+        })?;
+        let user = UserConfig::load(&path)?;
+        let settings = crate::compact::Settings::from_config(&user.compaction);
+        self.send(app, Command::SetCompaction(settings));
+        Ok(())
     }
 
     /// The theme named by the config, or the default (D71).

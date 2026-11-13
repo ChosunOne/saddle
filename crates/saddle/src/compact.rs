@@ -11,16 +11,40 @@ pub use crate::provider::DEFAULT_CONTEXT_WINDOW;
 
 pub const DEFAULT_RESERVE: u64 = 16_384;
 pub const DEFAULT_KEEP_RECENT: u64 = 20_000;
+/// Half the window: the point where a session left alone is worth summarizing (D77).
+pub const DEFAULT_IDLE_FRACTION: f64 = 0.5;
+/// Two minutes: long enough not to be a pause between typing, short enough to have happened before
+/// a person comes back to the terminal.
+pub const DEFAULT_IDLE_SECONDS: u64 = 120;
+/// Three quarters: near enough to the hard threshold to be worth summarizing, far enough that there
+/// is room to finish the summary while the turn uses what is left (D78).
+pub const DEFAULT_BACKGROUND_FRACTION: f64 = 0.75;
 /// Tool output is cut to this many characters in the text the summary is written from.
 const TOOL_RESULT_CHARS: usize = 2000;
 /// Tool input is cut to this many characters there too.
 const TOOL_INPUT_CHARS: usize = 500;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
     pub auto: bool,
     pub reserve: u64,
     pub keep_recent: u64,
+    pub idle: bool,
+    pub idle_fraction: f64,
+    pub idle_after: std::time::Duration,
+    pub background: bool,
+    pub background_fraction: f64,
+}
+
+/// A share of the window, clamped to something a person meant.
+///
+/// `0` would compact a session the moment it had one message and `1` would never fire before the
+/// hard threshold, so both are read as unset rather than obeyed.
+fn fraction(value: Option<f64>, default: f64) -> f64 {
+    match value {
+        Some(f) if f > 0.0 && f < 1.0 => f,
+        _ => default,
+    }
 }
 
 impl Settings {
@@ -29,6 +53,13 @@ impl Settings {
             auto: c.auto.unwrap_or(true),
             reserve: c.reserve_tokens.unwrap_or(DEFAULT_RESERVE),
             keep_recent: c.keep_recent_tokens.unwrap_or(DEFAULT_KEEP_RECENT),
+            idle: c.idle.unwrap_or(true),
+            idle_fraction: fraction(c.idle_fraction, DEFAULT_IDLE_FRACTION),
+            idle_after: std::time::Duration::from_secs(
+                c.idle_seconds.unwrap_or(DEFAULT_IDLE_SECONDS),
+            ),
+            background: c.background.unwrap_or(true),
+            background_fraction: fraction(c.background_fraction, DEFAULT_BACKGROUND_FRACTION),
         }
     }
 }
@@ -46,6 +77,10 @@ pub enum Reason {
     Threshold,
     /// The provider refused a request as too long.
     Overflow,
+    /// The session was left alone and the context was half full (D77).
+    Idle,
+    /// The context reached the background threshold and the turn carried on (D78).
+    Background,
 }
 
 impl Reason {
@@ -54,7 +89,17 @@ impl Reason {
             Reason::Manual => "asked for",
             Reason::Threshold => "the context is nearly full",
             Reason::Overflow => "the provider said the context is too long",
+            Reason::Idle => "the session was idle",
+            Reason::Background => "the context passed three quarters while the turn went on",
         }
+    }
+
+    /// Whether this compaction stops the turn, which is what the interface shows as an activity.
+    ///
+    /// A background one does not: the turn is still answering, and saying "compacting" while it
+    /// writes would be a lie about what the terminal is waiting for (D78).
+    pub fn blocks(self) -> bool {
+        !matches!(self, Reason::Background)
     }
 }
 
@@ -298,6 +343,35 @@ pub fn is_overflow(message: &str) -> bool {
     ]
     .iter()
     .any(|p| m.contains(p))
+}
+
+/// Builds a conversation of about `tokens` tokens, for the tests that need a full window (D77).
+///
+/// Not compiled into the binary: it exists so a test can say "a session at 60% of a 100k window"
+/// without writing out a transcript.
+#[cfg(test)]
+pub mod tests_support {
+    use super::{Item, Part};
+
+    /// Items of a thousand tokens each, alternating a prompt and a reply, so a cut point has
+    /// boundaries to fall on and the kept part can fit under `keep_recent`.
+    pub fn conversation(tokens: usize) -> Vec<Item> {
+        let mut items = Vec::new();
+        let mut left = tokens * 4;
+        let mut prompt = true;
+        while left > 0 {
+            let take = left.min(4_000);
+            left -= take;
+            let text = "x".repeat(take);
+            items.push(if prompt {
+                Item::User(text)
+            } else {
+                Item::Assistant(vec![Part::Text(text)])
+            });
+            prompt = !prompt;
+        }
+        items
+    }
 }
 
 #[cfg(test)]

@@ -261,6 +261,9 @@ pub struct CompactionView {
     pub reasoning: String,
     pub summary: String,
     pub state: CompactState,
+    /// Whether it stopped the turn. A background one does not, so it never claims the activity
+    /// line, not even when it lands (D78).
+    pub blocks: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -641,8 +644,12 @@ impl App {
                     reasoning: String::new(),
                     summary: String::new(),
                     state: CompactState::Running,
+                    blocks: reason.blocks(),
                 })));
-                if self.busy.is_some() {
+                // A background compaction does not stop the turn, so it must not claim the
+                // activity line: saying "compacting" while the model writes would be a lie about
+                // what the terminal is waiting for (D78).
+                if self.busy.is_some() && reason.blocks() {
                     self.busy = Some(Activity::Compacting);
                 }
             }
@@ -668,9 +675,11 @@ impl App {
                 before,
                 after,
             } => {
+                let mut blocks = true;
                 if let Some(i) = current
                     && let Entry::Compaction(v) = &mut self.entries[i]
                 {
+                    blocks = v.blocks;
                     v.state = CompactState::Done(format!(
                         "{summarized} messages summarized, {kept} kept · ~{} → ~{} tokens",
                         short_tokens(before),
@@ -679,7 +688,7 @@ impl App {
                     self.cache[i] = None;
                 }
                 self.context = after;
-                if self.busy.is_some() {
+                if self.busy.is_some() && blocks {
                     self.busy = Some(Activity::Waiting);
                 }
             }
@@ -1773,6 +1782,7 @@ pub fn entries_from(items: &[Item]) -> Vec<Entry> {
                 reasoning: String::new(),
                 summary: display(text),
                 state: CompactState::Done(String::new()),
+                blocks: false,
             }))),
         }
     }

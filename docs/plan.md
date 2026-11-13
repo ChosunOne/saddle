@@ -1663,6 +1663,72 @@ running interface is not safe, and shipping it was a mistake worth a decision.
 - **A flavour is a starting point.** `[themes.catppuccin-mocha]` overrides the roles it names and
   keeps the rest, like any other built-in (D72).
 
+**D77.** A session left alone is compacted once it is half full.
+
+- **The rule is a function of the conversation and the clock**, `Agent::idle_compaction_due(idle_for)`,
+  so it can be argued with and tested without waiting two minutes. It fires when: `auto` and `idle`
+  are on, a provider is there, nothing else is compacting, `idle_for >= idle-seconds` (120s), the
+  estimate is at least `idle-fraction` (0.5) of the window, and `cut_point` finds something to
+  summarize. That last condition is why an idle session does not ask the model to summarize nothing.
+- **Idle is measured from when the work finished, not when it was asked for.** A turn that took ten
+  minutes has been busy for ten minutes; stamping the clock at the command's arrival would make the
+  session "left alone" the instant it stopped. The worker loop is the only clock, so this is one
+  line, and it is the line a reader should check.
+- **One attempt per idle stretch.** The countdown restarts after an attempt, so a session that stays
+  half full does not ask the model the same question every tick — and one that was compacted is
+  below the threshold anyway.
+- **The agent thread wakes to notice.** `work` used to block in `for command in commands`; it now
+  waits with a 500 ms timeout and looks at the clock when nothing arrives. All agent state stays on
+  one thread, which is the property the whole design rests on — nothing here introduces a second
+  writer.
+- **It costs a request**, which is the point: paying for it while nobody is waiting is better than
+  paying for a full window when somebody comes back. It is a config switch (`idle = false`) and a
+  `/settings` row, because spending money while a person is away should be something they chose.
+- **A session that is not open cannot be idle.** This is the TUI's, and `saddle run` exits after its
+  turn: line mode reads a line, answers it, and stops. A daemon that compacts saved sessions between
+  runs is a different feature.
+- **Neither pi nor opencode has this**, so there is no reference behaviour to match. Both features
+  here are saddle's own, which is why each is specified rather than compared (D2 defines the feature
+  inventory; it does not forbid an addition).
+
+**D78.** The summary is written in the background while the turn carries on.
+
+Above `background-fraction` (0.75) of the window the turn no longer stops to compact. It starts the
+summary on another thread and keeps generating.
+
+- **Silent until it lands.** The background request's reasoning and text are *not* streamed into the
+  transcript: two voices writing at once is worse than a note. The user sees "compacting, the context
+  passed three quarters" when it starts and the finished summary when it lands.
+- **It is given a snapshot and nothing else** — a cloned provider, the serialized prefix, the
+  workspace path. No `&Agent`, no session, no UI can be reached from that thread, so it cannot
+  disturb the turn by construction rather than by discipline. Only text, a model and a usage come
+  back, over a channel.
+- **The identity rule, not a length rule.** The summary replaces the prefix only if the items being
+  replaced are still exactly the items that were summarized (`with_summary`). A turn that appends
+  leaves the prefix alone, so the summary still fits and whatever the turn added is kept. A
+  conversation that was cleared, rewound, resumed or already compacted does not, and the summary is
+  discarded. Length alone would have been a bug: a rewind can leave a conversation the same length
+  with different text in it.
+- **It lands only at a safe point** — the top of the turn loop between requests, the idle tick, and
+  once when a turn ends. Nothing is spliced into the conversation while a request is being built
+  from it.
+- **One at a time, and the hard threshold waits for it.** A second background compaction is refused
+  rather than queued. If the conversation reaches `window - reserve` while one is in flight, the turn
+  waits for that summary instead of asking for the same work twice — bounded by the request's own
+  timeouts (30s connect, 600s response), which is the same wait a synchronous compaction would have
+  had.
+- **It does not claim the activity line.** `Reason::blocks()` is false for a background compaction,
+  so the interface never says "compacting" while the model is writing. That is what keeps it
+  asynchronous from the user's point of view, not just from the code's.
+- **A discarded summary is still paid for.** `record_spend` runs whether the summary is used or not:
+  a cost display that hides a request it made is a cost display that lies.
+- **The thread is not joined on quit.** Its result is dropped when the agent is, and a compaction
+  writes nothing but the summary it hands back.
+- **What is not verified here**: the request itself. It needs sockets, and the sandbox this is
+  developed in has none, so the tests cover the decisions, the identity rule, the start-and-land
+  bookkeeping against an injected job, and the type-level proof that a provider can cross threads.
+  The end-to-end path is exercised by hand.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

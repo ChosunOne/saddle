@@ -59,6 +59,72 @@ impl Sink for CompactSink<'_> {
     }
 }
 
+/// The conversation after `summary` replaces its first `cut` items, or `None` when that would be
+/// wrong (D78).
+///
+/// The rule is identity, not length: the items being replaced must still be the items that were
+/// summarized. A turn that appends while the summary is written leaves the prefix alone, so the
+/// summary still fits and whatever was appended is kept. A conversation that was cleared, rewound or
+/// replaced does not, and pasting a summary of the old text over the new would lose it.
+fn with_summary(items: &[Item], cut: usize, prefix: &[Item], summary: &str) -> Option<Vec<Item>> {
+    if cut == 0 || items.len() < cut || items[..cut] != *prefix {
+        return None;
+    }
+    let mut out = Vec::with_capacity(items.len() - cut + 1);
+    out.push(Item::Summary(summary.to_owned()));
+    out.extend_from_slice(&items[cut..]);
+    Some(out)
+}
+
+/// A stream nobody reads: a background summary is silent until it lands (D78).
+///
+/// Streaming its reasoning into the transcript beside the foreground reply would be two voices
+/// talking at once. The user is told it started and told when it is done; what was written in
+/// between is in the summary.
+struct Silent;
+
+impl Sink for Silent {
+    fn text(&mut self, _s: &str) {}
+    fn note(&mut self, _s: &str) {}
+}
+
+/// A summary asked for on another thread (D78).
+struct Summary {
+    text: String,
+    model: String,
+    usage: Usage,
+}
+
+/// A finished compaction, ready to be installed (D78).
+///
+/// One value rather than five parameters, because the synchronous and the background path both
+/// build it and a field left out of one of them would be a silent difference between two things
+/// that must behave the same.
+struct Landed<'a> {
+    reason: Reason,
+    cut: usize,
+    before: u64,
+    summary: &'a Summary,
+    /// The conversation after the summary replaces its first `cut` items.
+    new_items: Vec<Item>,
+}
+
+/// A compaction running on another thread (D78).
+///
+/// It is given a snapshot of the conversation's prefix and nothing else — no `&Agent`, no session,
+/// no UI — so it cannot disturb the turn that carries on while it runs. Only text, a model and a
+/// usage come back.
+struct Background {
+    done: std::sync::mpsc::Receiver<Result<Summary, String>>,
+    /// The prefix that was summarized, kept exactly, so the answer can be checked against the
+    /// conversation before it is applied: a summary of text that is no longer there is discarded
+    /// rather than pasted over something else.
+    prefix: Vec<Item>,
+    /// The conversation's tokens when the request started, for the note when it lands.
+    before: u64,
+    cut: usize,
+}
+
 /// How a compaction ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compacted {
@@ -200,6 +266,8 @@ pub struct Agent {
     pub cost: f64,
     /// Whether a reply's cache went unused, which the user is told and the model is not (D50).
     misses: cache::Watcher,
+    /// A compaction running on another thread, if one is (D78).
+    background: Option<Background>,
 }
 
 impl Agent {
@@ -228,6 +296,7 @@ impl Agent {
             turn_usage: Usage::default(),
             cost: 0.0,
             misses: cache::Watcher::default(),
+            background: None,
         }
     }
 
@@ -329,6 +398,351 @@ impl Agent {
 
     /// Replaces the older part of the conversation with a summary the model writes. The model's
     /// reasoning and the summary stream to the UI as they come in.
+    /// Compacts before a request when the conversation needs it, and starts a background summary
+    /// when it only wants one (D77, D78).
+    ///
+    /// Three cases, in order: the conversation cannot take another request, so it is compacted now
+    /// — waiting for a background compaction that is already running rather than doing the work
+    /// twice; or it has passed the background threshold, so one is started and the turn carries on.
+    fn compact_before_request(
+        &mut self,
+        session: &mut Session,
+        ui: &mut dyn Ui,
+    ) -> Result<Option<End>> {
+        if !self.compaction.auto {
+            return Ok(None);
+        }
+        let hard = self
+            .context_window()
+            .saturating_sub(self.compaction.reserve);
+        if self.context_estimate() > hard {
+            // A summary already being written is the same work as the one this would start, so
+            // wait for it rather than ask twice.
+            if self.background.is_some() {
+                self.wait_background(session, ui)?;
+            }
+            // Checked again rather than assumed: it may have landed and made room, or been
+            // discarded because the conversation changed under it.
+            if self.context_estimate() > hard
+                && self.compact(session, Reason::Threshold, None, ui)? == Compacted::Cancelled
+            {
+                return Ok(Some(End::Cancelled));
+            }
+            return Ok(None);
+        }
+        if self.background_due() {
+            // Started, not awaited: the turn keeps generating while it is written (D78).
+            self.start_background(session, ui);
+        }
+        Ok(None)
+    }
+
+    /// Whether a session left alone should be compacted now (D77).
+    ///
+    /// The decision is a function of the conversation and the clock, so it can be argued with and
+    /// tested without waiting two minutes. `idle_for` is how long nothing has happened.
+    pub fn idle_compaction_due(&self, idle_for: std::time::Duration) -> bool {
+        self.compaction.auto
+            && self.compaction.idle
+            && self.provider.is_some()
+            // One compaction at a time: a background one already in flight is the same work.
+            && self.background.is_none()
+            && idle_for >= self.compaction.idle_after
+            && self.context_estimate() as f64
+                >= self.compaction.idle_fraction * self.context_window() as f64
+            // Nothing to summarize is not a reason to ask the model to summarize it.
+            && compact::cut_point(&self.items, self.compaction.keep_recent) > 0
+    }
+
+    /// Whether the context has passed the point where a summary should start in the background
+    /// (D78).
+    pub fn background_due(&self) -> bool {
+        self.compaction.auto
+            && self.compaction.background
+            && self.provider.is_some()
+            && self.background.is_none()
+            && self.context_estimate() as f64
+                >= self.compaction.background_fraction * self.context_window() as f64
+    }
+
+    /// Starts a background compaction, if there is one to start (D78).
+    ///
+    /// The turn carries on afterwards: nothing is replaced until the summary comes back.
+    pub fn start_background(&mut self, session: &Session, ui: &mut dyn Ui) -> bool {
+        let Some(provider) = self.provider.as_ref() else {
+            return false;
+        };
+        if self.background.is_some() {
+            return false;
+        }
+        let cut = compact::cut_point(&self.items, self.compaction.keep_recent);
+        if cut == 0 {
+            return false;
+        }
+        let window = self.context_window();
+        let before = self.context_estimate();
+        let room = window.saturating_sub(self.compaction.reserve).max(8_000) as usize * 3;
+        let prefix: Vec<Item> = self.items[..cut].to_vec();
+        let text = compact::serialize(&prefix, room);
+        let request = compact::request(&text, &session.setup.workspace, None);
+        let twin = provider.twin();
+        let job = move || {
+            let items = [Item::User(request)];
+            let conv = Conversation {
+                system: compact::SYSTEM,
+                tools: &[],
+                items: &items,
+            };
+            let reply = twin.complete(&conv, &mut Silent).map_err(|e| {
+                if e.is::<Cancelled>() {
+                    "cancelled".to_owned()
+                } else {
+                    format!("{e:#}")
+                }
+            })?;
+            let text: String = reply
+                .parts
+                .iter()
+                .filter_map(|p| match p {
+                    Part::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+                .trim()
+                .to_owned();
+            if text.is_empty() || reply.stop == Stop::Refusal {
+                return Err(format!(
+                    "the model returned no summary ({})",
+                    reply.stop_raw
+                ));
+            }
+            Ok(Summary {
+                text,
+                model: reply.model,
+                usage: reply.usage,
+            })
+        };
+        self.begin_background(Reason::Background, cut, prefix, before, ui, job)
+    }
+
+    /// Puts a compaction in flight from `job`, which produces the summary (D78).
+    ///
+    /// Separate from [`start_background`] so the bookkeeping — the snapshot the answer is checked
+    /// against, the one-at-a-time guard, the thread — can be tested without a model to talk to.
+    fn begin_background<F>(
+        &mut self,
+        reason: Reason,
+        cut: usize,
+        prefix: Vec<Item>,
+        before: u64,
+        ui: &mut dyn Ui,
+        job: F,
+    ) -> bool
+    where
+        F: FnOnce() -> Result<Summary, String> + Send + 'static,
+    {
+        if self.background.is_some() {
+            return false;
+        }
+        ui.compaction(compact::Event::Started {
+            reason,
+            tokens: before,
+            window: self.context_window(),
+            messages: cut,
+        });
+        let (tx, done) = std::sync::mpsc::channel();
+        self.background = Some(Background {
+            done,
+            prefix,
+            before,
+            cut,
+        });
+        let spawned = std::thread::Builder::new()
+            .name("saddle-compaction".into())
+            .spawn(move || {
+                let _ = tx.send(job());
+            });
+        if spawned.is_err() {
+            // No thread is no compaction; the turn carries on and the next threshold will try
+            // again. Leaving `background` set would wedge every later attempt.
+            self.background = None;
+            ui.compaction(compact::Event::Failed(
+                "could not start a background compaction".into(),
+            ));
+            return false;
+        }
+        true
+    }
+
+    /// Applies a background compaction that has finished, if one has (D78).
+    ///
+    /// `false` when none was waiting. It is called at a point where the conversation is not being
+    /// written to, so a landed summary is installed exactly as a synchronous one would be.
+    pub fn poll_background(&mut self, session: &mut Session, ui: &mut dyn Ui) -> Result<bool> {
+        let Some(background) = &self.background else {
+            return Ok(false);
+        };
+        match background.done.try_recv() {
+            Ok(result) => {
+                self.finish_landed(result, session, ui)?;
+                Ok(true)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(false),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.finish_landed(
+                    Err("the background compaction stopped without an answer".into()),
+                    session,
+                    ui,
+                )?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Waits for a background compaction to land, for the case where the conversation cannot take
+    /// another request until it has (D78).
+    pub fn wait_background(&mut self, session: &mut Session, ui: &mut dyn Ui) -> Result<bool> {
+        let Some(background) = &self.background else {
+            return Ok(false);
+        };
+        let result = background
+            .done
+            .recv()
+            .unwrap_or_else(|_| Err("the background compaction stopped without an answer".into()));
+        self.finish_landed(result, session, ui)?;
+        Ok(true)
+    }
+
+    /// Takes the finished compaction, applies it or discards it, and says which (D78).
+    fn finish_landed(
+        &mut self,
+        result: Result<Summary, String>,
+        session: &mut Session,
+        ui: &mut dyn Ui,
+    ) -> Result<()> {
+        let Some(background) = self.background.take() else {
+            return Ok(());
+        };
+        let summary = match result {
+            Ok(summary) => summary,
+            Err(msg) => {
+                self.log(
+                    session,
+                    json!({ "compaction": format!("{:?}", Reason::Background), "error": msg }),
+                    "background compaction failed",
+                )?;
+                ui.compaction(compact::Event::Failed(msg));
+                return Ok(());
+            }
+        };
+        // The conversation may have moved on while the summary was being written. If the prefix it
+        // described is no longer the prefix in front of us, the summary is about text that is not
+        // here any more, and pasting it over the conversation would lose whatever replaced it.
+        if with_summary(&self.items, background.cut, &background.prefix, "").is_none() {
+            // The request was made and paid for even though its answer is unusable (D78).
+            self.record_spend(&summary.usage, ui);
+            self.log(
+                session,
+                json!({ "compaction": "BackgroundDiscarded", "usage": summary.usage }),
+                "background compaction discarded: the conversation changed under it",
+            )?;
+            ui.note("a background compaction finished, but the conversation had changed; it was discarded");
+            return Ok(());
+        }
+        let Some(new_items) = with_summary(
+            &self.items,
+            background.cut,
+            &background.prefix,
+            &summary.text,
+        ) else {
+            return Ok(());
+        };
+        self.install_summary(
+            session,
+            Landed {
+                reason: Reason::Background,
+                cut: background.cut,
+                before: background.before,
+                summary: &summary,
+                new_items,
+            },
+            ui,
+        )
+    }
+
+    /// Puts a finished summary in place of the first `cut` items (D33, D78).
+    ///
+    /// Shared by the synchronous and the background path: a summary is installed one way, whether
+    /// the model was asked while the turn waited or while it carried on.
+    fn install_summary(
+        &mut self,
+        session: &mut Session,
+        landed: Landed<'_>,
+        ui: &mut dyn Ui,
+    ) -> Result<()> {
+        let Landed {
+            reason,
+            cut,
+            before,
+            summary,
+            new_items,
+        } = landed;
+        self.log(
+            session,
+            json!({
+                "compaction": format!("{reason:?}"),
+                "model": summary.model,
+                "usage": summary.usage,
+                "summarized": cut,
+            }),
+            "conversation compacted",
+        )?;
+        self.record_spend(&summary.usage, ui);
+        let kept_len = new_items.len() - 1;
+        // A background summary is silent while it is written, so the text arrives here (D78).
+        if reason == Reason::Background {
+            ui.compaction(compact::Event::Text(summary.text.clone()));
+        }
+        self.items = new_items;
+        if let (Some(store), Some(id)) = (&self.store, &self.saved)
+            && let Err(e) = store.compaction(id, &summary.text, kept_len)
+        {
+            self.saving_failed(e, ui);
+        }
+        self.context_tokens = 0;
+        self.measured = 0;
+        let after = self.context_estimate();
+        ui.compaction(compact::Event::Done {
+            summarized: cut,
+            kept: kept_len,
+            before,
+            after,
+        });
+        Ok(())
+    }
+
+    /// Records what a compaction request cost, whether or not its summary was used (D78).
+    ///
+    /// A discarded summary was still a request the user paid for, so the session's total has to
+    /// include it: a cost display that hides it is a cost display that lies.
+    fn record_spend(&mut self, usage: &Usage, ui: &mut dyn Ui) {
+        let cost = self.cost_of(usage);
+        self.cost += cost;
+        if let (Some(store), Some(id)) = (&self.store, &self.saved)
+            && let Err(e) = store.usage(id, usage, cost)
+        {
+            self.saving_failed(e, ui);
+        }
+    }
+
+    /// What a usage cost, from whatever price the config or the endpoint gave (D36).
+    fn cost_of(&self, usage: &Usage) -> f64 {
+        self.provider
+            .as_ref()
+            .and_then(Provider::price)
+            .map_or(0.0, |p| p.cost(usage))
+    }
+
     pub fn compact(
         &mut self,
         session: &mut Session,
@@ -401,50 +815,35 @@ impl Agent {
             .collect::<String>()
             .trim()
             .to_owned();
-        self.log(
-            session,
-            json!({
-                "compaction": format!("{reason:?}"),
-                "model": reply.model,
-                "usage": reply.usage,
-                "summarized": cut,
-            }),
-            "conversation compacted",
-        )?;
-        let cost = self
-            .provider
-            .as_ref()
-            .and_then(Provider::price)
-            .map_or(0.0, |p| p.cost(&reply.usage));
-        self.cost += cost;
-        if let (Some(store), Some(id)) = (&self.store, &self.saved)
-            && let Err(e) = store.usage(id, &reply.usage, cost)
-        {
-            self.saving_failed(e, ui);
-        }
         if summary.is_empty() || reply.stop == Stop::Refusal {
             let why = format!("the model returned no summary ({})", reply.stop_raw);
+            self.log(
+                session,
+                json!({ "compaction": format!("{reason:?}"), "error": why }),
+                "compaction failed",
+            )?;
             ui.compaction(compact::Event::Failed(why));
             return Ok(Compacted::Failed);
         }
         let kept = self.items.split_off(cut);
-        let kept_len = kept.len();
-        self.items = vec![Item::Summary(summary.clone())];
-        self.items.extend(kept);
-        if let (Some(store), Some(id)) = (&self.store, &self.saved)
-            && let Err(e) = store.compaction(id, &summary, kept_len)
-        {
-            self.saving_failed(e, ui);
-        }
-        self.context_tokens = 0;
-        self.measured = 0;
-        let after = self.context_estimate();
-        ui.compaction(compact::Event::Done {
-            summarized: cut,
-            kept: kept_len,
-            before,
-            after,
-        });
+        let mut new_items = Vec::with_capacity(kept.len() + 1);
+        new_items.push(Item::Summary(summary.clone()));
+        new_items.extend(kept);
+        self.install_summary(
+            session,
+            Landed {
+                reason,
+                cut,
+                before,
+                summary: &Summary {
+                    text: summary,
+                    model: reply.model,
+                    usage: reply.usage,
+                },
+                new_items,
+            },
+            ui,
+        )?;
         Ok(Compacted::Done)
     }
 
@@ -945,14 +1344,11 @@ impl Agent {
             if ui.cancelled() {
                 return Ok(End::Cancelled);
             }
-            let threshold = self
-                .context_window()
-                .saturating_sub(self.compaction.reserve);
-            if self.compaction.auto
-                && self.context_estimate() > threshold
-                && self.compact(session, Reason::Threshold, None, ui)? == Compacted::Cancelled
-            {
-                return Ok(End::Cancelled);
+            // Nothing is written to the conversation between here and the request, so this is
+            // where a background summary can be installed and where one is started (D78).
+            self.poll_background(session, ui)?;
+            if let Some(end) = self.compact_before_request(session, ui)? {
+                return Ok(end);
             }
             let conv = Conversation {
                 system: &self.system,
@@ -1333,6 +1729,300 @@ mod tests {
             "{:?}",
             agent.items[0]
         );
+    }
+
+    /// A provider that is never asked anything: the decisions under test only need one to exist,
+    /// with a window compaction can take a share of.
+    fn a_provider(window: u64) -> Provider {
+        Provider::new(
+            "mock",
+            crate::provider::ProviderConfig {
+                api: crate::provider::Api::Openai,
+                base_url: "http://127.0.0.1:1/v1".into(),
+                model: "mock-model".into(),
+                api_key_env: None,
+                max_tokens: None,
+                context_window: Some(window),
+                effort: None,
+                price: None,
+                usage_url: None,
+            },
+            Some("key"),
+            &crate::provider::Reported::default(),
+        )
+    }
+
+    /// An agent with a conversation of `tokens` estimated tokens and a window of `window`.
+    fn sized(tokens: usize, window: u64, settings: crate::compact::Settings) -> Agent {
+        let mut agent = Agent::new(
+            None,
+            String::new(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            settings,
+        );
+        agent.provider = Some(a_provider(window));
+        agent.set_window(window);
+        // Four characters a token, as the estimate counts (D33), spread over items small enough
+        // that `keep_recent` can keep some of them: a real conversation is many small items, not
+        // two enormous ones, and a cut point has to fall between two of them to exist at all.
+        agent.items = crate::compact::tests_support::conversation(tokens);
+        agent
+    }
+
+    fn settings() -> crate::compact::Settings {
+        crate::compact::Settings::default()
+    }
+
+    #[test]
+    fn an_idle_session_is_compacted_only_when_it_is_half_full_and_left_alone() {
+        // D77. The window is 100k, so half is 50k.
+        let window = 100_000;
+        let idle = settings().idle_after;
+        let agent = sized(60_000, window, settings());
+        assert!(
+            agent.idle_compaction_due(idle),
+            "half full and idle is the case it exists for"
+        );
+        assert!(
+            !agent.idle_compaction_due(idle - std::time::Duration::from_secs(1)),
+            "one second before the threshold is not idle"
+        );
+        let quiet = sized(10_000, window, settings());
+        assert!(
+            !quiet.idle_compaction_due(idle * 10),
+            "a small conversation is not worth a request, however long it idles"
+        );
+        assert!(
+            !sized(60_000, window, settings())
+                .clone_for_off()
+                .idle_compaction_due(idle),
+            "with idle compaction turned off it never happens"
+        );
+        assert!(
+            !Agent::new(
+                None,
+                String::new(),
+                String::new(),
+                Vec::new(),
+                None,
+                None,
+                settings()
+            )
+            .idle_compaction_due(idle),
+            "no provider, nobody to summarize"
+        );
+    }
+
+    impl Agent {
+        /// The same conversation with idle compaction switched off.
+        fn clone_for_off(&self) -> Agent {
+            let mut other = Agent::new(
+                None,
+                String::new(),
+                String::new(),
+                Vec::new(),
+                None,
+                None,
+                crate::compact::Settings {
+                    idle: false,
+                    ..self.compaction
+                },
+            );
+            other.provider = Some(a_provider(self.context_window()));
+            other.set_window(self.context_window());
+            other.items = self.items.clone();
+            other
+        }
+    }
+
+    #[test]
+    fn a_background_summary_starts_at_three_quarters_of_the_window() {
+        // D78: the turn carries on, so this fires earlier than the hard threshold and never
+        // instead of it.
+        let window = 100_000;
+        let mut agent = sized(74_000, window, settings());
+        assert!(!agent.background_due(), "74% is not yet three quarters");
+        agent.items = sized(76_000, window, settings()).items;
+        assert!(agent.background_due(), "76% is");
+        // Without the setting it does not happen; the turn compacts synchronously instead.
+        let off = crate::compact::Settings {
+            background: false,
+            ..settings()
+        };
+        assert!(!sized(76_000, window, off).background_due());
+        // And it is behind the master switch like everything else.
+        let manual = crate::compact::Settings {
+            auto: false,
+            ..settings()
+        };
+        assert!(!sized(99_000, window, manual).background_due());
+    }
+
+    #[test]
+    fn a_summary_is_installed_over_the_text_it_summarized_and_nothing_else() {
+        // D78. The conversation is append-only within a turn, so a summary written while the turn
+        // ran still fits, and what the turn added is kept.
+        let prefix = vec![
+            Item::User("one".into()),
+            Item::Assistant(vec![Part::Text("two".into())]),
+        ];
+        let grown = {
+            let mut items = prefix.clone();
+            items.push(Item::User("three".into()));
+            items.push(Item::Assistant(vec![Part::Text("four".into())]));
+            items
+        };
+        let out = with_summary(&grown, 2, &prefix, "the summary").expect("it still fits");
+        assert_eq!(out.len(), 3, "one summary and the two new items");
+        assert_eq!(out[0], Item::Summary("the summary".into()));
+        assert_eq!(out[1], Item::User("three".into()));
+        assert_eq!(out[2], Item::Assistant(vec![Part::Text("four".into())]));
+    }
+
+    #[test]
+    fn a_summary_of_text_that_is_no_longer_there_is_refused() {
+        // The case the check exists for: the conversation was cleared, rewound or replaced while
+        // the summary was being written. Pasting it over the new text would lose it.
+        let prefix = vec![
+            Item::User("one".into()),
+            Item::Assistant(vec![Part::Text("two".into())]),
+        ];
+        let same_length = vec![
+            Item::User("one".into()),
+            Item::Assistant(vec![Part::Text("different".into())]),
+        ];
+        assert!(
+            with_summary(&same_length, 2, &prefix, "s").is_none(),
+            "the same length, different text"
+        );
+        let shortened = vec![Item::User("one".into())];
+        assert!(
+            with_summary(&shortened, 2, &prefix, "s").is_none(),
+            "the conversation shrank"
+        );
+        let emptied: Vec<Item> = Vec::new();
+        assert!(
+            with_summary(&emptied, 2, &prefix, "s").is_none(),
+            "it was cleared"
+        );
+        // A rewind that leaves a different prompt in the same slot.
+        let rewound = vec![
+            Item::User("another question".into()),
+            Item::Assistant(vec![Part::Text("two".into())]),
+        ];
+        assert!(with_summary(&rewound, 2, &prefix, "s").is_none());
+        // Cutting nothing is never a summary.
+        assert!(with_summary(&prefix, 0, &[], "s").is_none());
+    }
+
+    #[test]
+    fn a_background_compaction_is_booked_asked_for_and_waited_on() {
+        // D78: started without blocking, one at a time, and landable when it is asked for.
+        let mut agent = sized(80_000, 100_000, settings());
+        let mut ui = Recording::default();
+        let items: Vec<Item> = agent.items[..1].to_vec();
+        let job = || {
+            Ok(Summary {
+                text: "a summary".into(),
+                model: "m".into(),
+                usage: Usage::default(),
+            })
+        };
+        assert!(agent.begin_background(Reason::Background, 1, items.clone(), 80_000, &mut ui, job));
+        assert!(agent.background.is_some(), "it is running");
+        assert!(
+            !agent.background_due(),
+            "no second one starts while the first is in flight"
+        );
+        assert!(
+            !agent.idle_compaction_due(std::time::Duration::from_secs(3_600)),
+            "and idle compaction does not repeat the same work"
+        );
+        // It says so, in the transcript, with the reason that does not claim the turn stopped.
+        let started = ui.events.first().expect("a Started event");
+        assert!(
+            matches!(
+                started,
+                compact::Event::Started {
+                    reason: Reason::Background,
+                    messages: 1,
+                    ..
+                }
+            ),
+            "{started:?}"
+        );
+        assert!(!Reason::Background.blocks(), "the turn is still answering");
+    }
+
+    #[test]
+    fn a_second_background_compaction_is_refused_while_one_runs() {
+        let mut agent = sized(80_000, 100_000, settings());
+        let mut ui = Recording::default();
+        let items: Vec<Item> = agent.items[..1].to_vec();
+        let quiet = || {
+            Ok(Summary {
+                text: "s".into(),
+                model: "m".into(),
+                usage: Usage::default(),
+            })
+        };
+        assert!(agent.begin_background(Reason::Background, 1, items.clone(), 1, &mut ui, quiet));
+        assert!(
+            !agent.begin_background(Reason::Background, 1, items, 1, &mut ui, || Err(
+                "second".into()
+            )),
+            "the second is refused rather than queued"
+        );
+    }
+
+    #[test]
+    fn the_shares_of_the_window_are_read_as_a_person_meant_them() {
+        // A share of 0 would compact a conversation with one message in it, and 1 would never fire
+        // before the hard threshold; both are read as unset (D77, D78).
+        let c = |idle: Option<f64>, background: Option<f64>| crate::config::CompactionConfig {
+            auto: None,
+            reserve_tokens: None,
+            keep_recent_tokens: None,
+            idle: None,
+            idle_fraction: idle,
+            idle_seconds: None,
+            background: None,
+            background_fraction: background,
+        };
+        let s = crate::compact::Settings::from_config(&c(Some(0.0), Some(1.0)));
+        assert_eq!(s.idle_fraction, crate::compact::DEFAULT_IDLE_FRACTION);
+        assert_eq!(
+            s.background_fraction,
+            crate::compact::DEFAULT_BACKGROUND_FRACTION
+        );
+        let s = crate::compact::Settings::from_config(&c(Some(0.3), Some(0.8)));
+        assert_eq!(s.idle_fraction, 0.3);
+        assert_eq!(s.background_fraction, 0.8);
+        // Both features are on unless a config says otherwise.
+        assert!(s.idle && s.background);
+    }
+
+    /// A [`Ui`] that keeps what it was told, for the tests that check what the transcript would say.
+    #[derive(Default)]
+    struct Recording {
+        events: Vec<compact::Event>,
+    }
+
+    impl Sink for Recording {
+        fn text(&mut self, _s: &str) {}
+        fn note(&mut self, _s: &str) {}
+    }
+
+    impl Ui for Recording {
+        fn call(&mut self, _call: &ToolCall) {}
+        fn result(&mut self, _out: &ToolOutput) {}
+        fn reply(&mut self, _reply: &Reply, _cost: f64) {}
+        fn compaction(&mut self, event: compact::Event) {
+            self.events.push(event);
+        }
     }
 
     fn call(name: &str, input: serde_json::Value) -> ToolCall {

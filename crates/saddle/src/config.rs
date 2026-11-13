@@ -143,6 +143,17 @@ pub struct CompactionConfig {
     pub reserve_tokens: Option<u64>,
     /// Recent conversation kept word for word beside the summary.
     pub keep_recent_tokens: Option<u64>,
+    /// Compact a session that has been left alone once it is half full, so coming back to it does
+    /// not spend the whole window on a prompt typed before a break (D77).
+    pub idle: Option<bool>,
+    /// The share of the window at which an idle session is compacted, 0 to 1.
+    pub idle_fraction: Option<f64>,
+    /// How long a session is left alone before that happens.
+    pub idle_seconds: Option<u64>,
+    /// Summarize in the background while the turn carries on, rather than stopping it (D78).
+    pub background: Option<bool>,
+    /// The share of the window at which that starts, 0 to 1.
+    pub background_fraction: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
