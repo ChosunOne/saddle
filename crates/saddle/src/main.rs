@@ -450,6 +450,8 @@ fn run_agent(
     };
     if let Some(path) = &latest {
         let saved = agent.resume(path)?;
+        session.mcp.restore(&saved.declared);
+        agent.refresh_tools(session.mcp.declared());
         out.info(&format!(
             "continuing a session of {} messages, {} tokens in and {} out so far",
             saved.items.len(),

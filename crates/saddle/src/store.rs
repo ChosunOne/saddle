@@ -34,6 +34,9 @@ mod kind {
     pub const TURN: &str = "turn";
     /// A summary that replaced the items before it.
     pub const COMPACTION: &str = "compaction";
+    /// Tools an MCP search declared (D108, D109). Bookkeeping like `usage`, not conversation: it
+    /// is replayed as a declaration, never as a message.
+    pub const DECLARED: &str = "declared";
 }
 
 /// Which provider and model a conversation was last working in (D91).
@@ -354,6 +357,15 @@ impl Store {
         Ok(())
     }
 
+    /// Records that a search declared these tools on `session`'s current branch (D109). A node
+    /// rather than a column, so a rewind to before the declaration drops it with everything else
+    /// the branch left behind.
+    pub fn declare(&self, session: &str, names: &[String]) -> Result<()> {
+        let body = serde_json::json!({ "names": names });
+        self.push(session, kind::DECLARED, &body.to_string())?;
+        Ok(())
+    }
+
     pub fn compaction(&self, session: &str, summary: &str, kept: usize) -> Result<()> {
         let body = serde_json::json!({ "summary": summary, "kept": kept });
         self.push(session, kind::COMPACTION, &body.to_string())?;
@@ -505,6 +517,7 @@ impl Store {
         let mut items = Vec::new();
         let mut usage = Usage::default();
         let mut cost = 0.0;
+        let mut declared = Vec::new();
         for node in self.branch(session)? {
             match node.kind.as_str() {
                 kind::ITEM => match serde_json::from_str::<Item>(&node.body) {
@@ -531,11 +544,26 @@ impl Store {
                     items = vec![Item::Summary(summary)];
                     items.extend(kept);
                 }
+                kind::DECLARED => {
+                    let v: serde_json::Value = serde_json::from_str(&node.body).unwrap_or_default();
+                    if let Some(names) = v["names"].as_array() {
+                        for name in names.iter().filter_map(serde_json::Value::as_str) {
+                            if !declared.iter().any(|d| d == name) {
+                                declared.push(name.to_owned());
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
         repair(&mut items);
-        Ok(Loaded { items, usage, cost })
+        Ok(Loaded {
+            items,
+            usage,
+            cost,
+            declared,
+        })
     }
 
     /// This workspace's conversations, most recently updated first.
@@ -873,6 +901,8 @@ pub struct Loaded {
     pub items: Vec<Item>,
     pub usage: Usage,
     pub cost: f64,
+    /// What this branch declared, in the order it was declared (D109).
+    pub declared: Vec<String>,
 }
 
 /// One saved conversation, as a listing shows it.
@@ -1567,6 +1597,52 @@ mod tests {
         assert_eq!(rows[1].preview, "Here is what I found.");
         // The whole prompt is kept for the editor, blank lines and all.
         assert_eq!(rows[0].text, "\n\n  the real prompt  \nsecond line");
+    }
+
+    #[test]
+    fn a_declaration_is_recorded_on_the_branch_and_rewinds_with_it() {
+        // D109: what a search declared is branch state, so a resume brings it back, a fork carries
+        // it, and a jump to before it forgets it — the conversation itself never changes.
+        let s = store();
+        let id = s.begin("p", "m").unwrap();
+        s.append(&id, &Item::User("find me a tool".into())).unwrap();
+        s.declare(&id, &["mcp__fake__search".to_owned()]).unwrap();
+        assert_eq!(
+            s.load(&id).unwrap().declared,
+            ["mcp__fake__search".to_owned()],
+            "a resume puts back what the branch declared"
+        );
+        assert_eq!(
+            s.load(&id).unwrap().items.len(),
+            1,
+            "and it is not a message: replaying it costs nothing"
+        );
+
+        // A point in the tree is a place a conversation can continue from, so a declaration is
+        // not one.
+        assert!(
+            s.rows(&id)
+                .unwrap()
+                .iter()
+                .all(|p| p.preview != "declared" && !p.preview.is_empty()),
+            "a declaration does not appear as a node a person could pick"
+        );
+
+        // Forking copies the branch, declaration included.
+        let nodes = entries(&s, &id);
+        let fork = s.fork(&id, Some(nodes[0])).unwrap();
+        assert!(
+            s.load(&fork).unwrap().declared.is_empty(),
+            "the fork was taken before it"
+        );
+
+        // Rewinding to before the declaration forgets it, without touching the conversation.
+        s.rewind(&id, Some(nodes[0])).unwrap();
+        assert!(s.load(&id).unwrap().declared.is_empty());
+        assert_eq!(
+            s.load(&id).unwrap().items,
+            [Item::User("find me a tool".into())]
+        );
     }
 
     #[test]

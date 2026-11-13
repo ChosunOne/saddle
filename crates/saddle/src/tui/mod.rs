@@ -322,7 +322,11 @@ fn work(
                     }
                 },
             },
-            Command::Clear => agent.clear(),
+            Command::Clear => {
+                agent.clear();
+                session.mcp.restore(&[]);
+                agent.refresh_tools(session.mcp.declared());
+            }
             Command::SetMaxSteps(n) => agent.set_max_steps(n),
             Command::SetWindow(window) => agent.set_window(window),
             Command::SetPrice(price) => agent.set_price(price),
@@ -425,6 +429,8 @@ fn work(
             }
             Command::Resume(id) => match agent.resume(&id) {
                 Ok(saved) => {
+                    session.mcp.restore(&saved.declared);
+                    agent.refresh_tools(session.mcp.declared());
                     let _ = events.send(AgentEvent::Resumed(saved));
                 }
                 Err(e) => {
@@ -501,12 +507,16 @@ fn work(
                     // The branch being left is worth a note on the one entered, so what it found
                     // is not wasted. A failure here does not undo the move (D54).
                     let mut resumed = left.resumed;
+                    session.mcp.restore(&resumed.declared);
+                    agent.refresh_tools(session.mcp.declared());
                     if !left.abandoned.is_empty()
                         && agent
                             .summarize_left_behind(&mut session, &mut ui, &left.abandoned)
                             .unwrap_or(false)
                     {
                         resumed = agent.state()?;
+                        session.mcp.restore(&resumed.declared);
+                        agent.refresh_tools(session.mcp.declared());
                     }
                     let _ = events.send(AgentEvent::Resumed(resumed));
                 }
@@ -2533,6 +2543,7 @@ mod tests {
         app.header.model = "a-new-default".into();
         let event = AgentEvent::Resumed(crate::agent::Resumed {
             items: Vec::new(),
+            declared: Vec::new(),
             usage: crate::provider::Usage::default(),
             cost: 0.0,
             context: 0,

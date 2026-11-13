@@ -23,6 +23,14 @@ pub const PREFIX: &str = "mcp__";
 /// How many matches one search declares, so a broad query cannot fill the context.
 const MATCHES: usize = 8;
 
+/// The server and tool a declared name stands for. A name that does not split is not a tool of
+/// ours; one that splits wrongly can only ever be refused, because the grant lookup that follows
+/// is exact — so a server whose own name holds `__` loses its declarations rather than widening.
+fn parse(key: &str) -> Option<(&str, &str)> {
+    let (server, tool) = key.strip_prefix(PREFIX)?.split_once("__")?;
+    (!server.is_empty() && !tool.is_empty()).then_some((server, tool))
+}
+
 /// One running server and its relay.
 pub struct Running {
     client: Client,
@@ -200,6 +208,26 @@ impl Registry {
             .collect()
     }
 
+    /// What this session has declared, in name order, for the store to record (D109).
+    pub fn loaded(&self) -> Vec<String> {
+        self.loaded.iter().cloned().collect()
+    }
+
+    /// Puts back the declarations a branch was saved with, keeping only those the grant in force
+    /// still names (D109). A branch recorded under a wider policy therefore confers nothing under
+    /// a narrower one, which is why this is a filter and not an assignment.
+    pub fn restore(&mut self, names: &[String]) {
+        let kept: BTreeSet<String> = names
+            .iter()
+            .filter(|name| match parse(name) {
+                Some((server, tool)) => self.granted(server, tool),
+                None => false,
+            })
+            .cloned()
+            .collect();
+        self.loaded = kept;
+    }
+
     /// Calls one declared tool. A granted tool that was never declared is a host error rather than
     /// a denial: the model named something it cannot see, which is a protocol mistake, not a
     /// permission one.
@@ -273,6 +301,25 @@ impl Registry {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_restored_declaration_is_checked_against_the_grant_again() {
+        // D109: a branch carries names, not authority. Restoring them under a narrower policy —
+        // or under a name that is not a tool of ours at all — keeps only what is still granted.
+        let mut registry = Registry::new(
+            vec![granted("fake", &["search"])],
+            BTreeMap::new(),
+            Vec::new(),
+            None,
+        );
+        registry.restore(&[
+            Registry::name("fake", "search"),
+            Registry::name("fake", "rm_rf"),
+            Registry::name("other", "search"),
+            "not a tool".to_owned(),
+        ]);
+        assert_eq!(registry.loaded(), [Registry::name("fake", "search")]);
+    }
 
     fn granted(server: &str, tools: &[&str]) -> saddle_cap::McpGrant {
         let list: String = tools.iter().map(|t| format!("\"{t}\",")).collect();

@@ -2108,6 +2108,7 @@ mod tests {
         assert_eq!((a.usage.input, a.context), (0, 0));
         a.agent(AgentEvent::Resumed(Resumed {
             items: vec![Item::User("earlier".into())],
+            declared: Vec::new(),
             usage: crate::provider::Usage {
                 input: 1_500,
                 output: 200,
@@ -2678,6 +2679,7 @@ mod tests {
         let mut a = app();
         a.agent(AgentEvent::Resumed(Resumed {
             items,
+            declared: Vec::new(),
             usage: crate::provider::Usage::default(),
             cost: 0.0,
             context: 0,

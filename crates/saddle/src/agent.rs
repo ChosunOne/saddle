@@ -226,6 +226,8 @@ fn digest(results: &[ToolOutput]) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Resumed {
     pub items: Vec<Item>,
+    /// The tools this branch had declared, for the session to put back (D109).
+    pub declared: Vec<String>,
     pub usage: Usage,
     /// Dollars spent before this run, summed from what each reply recorded (D36).
     pub cost: f64,
@@ -995,6 +997,13 @@ impl Agent {
         Ok((out, images))
     }
 
+    /// Rebuilds the tool list from the built-ins and what the session has declared (D108, D109).
+    pub fn refresh_tools(&mut self, declared: Vec<ToolDef>) {
+        let mut tools = tools::definitions();
+        tools.extend(declared);
+        self.tools = tools;
+    }
+
     /// Continues a saved conversation: its items become the history, and new ones are appended
     /// to the same file.
     ///
@@ -1014,6 +1023,7 @@ impl Agent {
         self.cost = loaded.cost;
         Ok(Resumed {
             items: loaded.items,
+            declared: loaded.declared,
             usage: loaded.usage,
             cost: loaded.cost,
             context,
@@ -1243,6 +1253,7 @@ impl Agent {
         };
         let resumed = Resumed {
             items: loaded.items,
+            declared: loaded.declared,
             usage: loaded.usage,
             cost: loaded.cost,
             context: self.context_estimate(),
@@ -1256,12 +1267,16 @@ impl Agent {
 
     /// What the conversation looks like now, for a caller that changed it and has to say so.
     pub fn state(&mut self) -> Result<Resumed> {
-        let usage = match (&self.store, &self.saved) {
-            (Some(store), Some(id)) => store.load(id)?.usage,
-            _ => Usage::default(),
+        let (usage, declared) = match (&self.store, &self.saved) {
+            (Some(store), Some(id)) => {
+                let loaded = store.load(id)?;
+                (loaded.usage, loaded.declared)
+            }
+            _ => (Usage::default(), Vec::new()),
         };
         Ok(Resumed {
             items: self.items.clone(),
+            declared,
             usage,
             cost: self.cost,
             context: self.context_estimate(),
@@ -1518,6 +1533,7 @@ impl Agent {
             // Every call gets a result, so the history stays valid for the next request. A call
             // in a reply that was cut off or declined may be incomplete and is not run.
             let mut outputs = Vec::with_capacity(calls.len());
+            let mut declared_before: Vec<String> = session.mcp.loaded();
             let mut results = Vec::with_capacity(calls.len());
             for call in &calls {
                 let out = match stop {
@@ -1540,9 +1556,7 @@ impl Agent {
                         // A search may have declared a tool (D108). The list is rebuilt rather than
                         // appended to, so a declaration that was refused for want of a grant never
                         // reaches the prompt.
-                        let mut declared = tools::definitions();
-                        declared.extend(session.mcp.declared());
-                        self.tools = declared;
+                        self.refresh_tools(session.mcp.declared());
                         out?
                     }
                 };
@@ -1562,6 +1576,21 @@ impl Agent {
                 outputs.push(seen);
             }
             self.record(Item::ToolResults(results), ui);
+            // D109: what a search declared goes on the branch beside the results, so a resume, a
+            // fork or a jump in the tree brings it back — and a rewind to before this point
+            // forgets it with everything else.
+            let now: Vec<String> = session.mcp.loaded();
+            let fresh: Vec<String> = now
+                .into_iter()
+                .filter(|name| !declared_before.iter().any(|b| b == name))
+                .collect();
+            if !fresh.is_empty()
+                && let (Some(store), Some(id)) = (&self.store, &self.saved)
+                && let Err(e) = store.declare(id, &fresh)
+            {
+                self.saving_failed(e, ui);
+            }
+            declared_before = session.mcp.loaded();
             if stop == Stop::Refusal {
                 ui.note("the model declined to continue");
                 return Ok(End::Declined);

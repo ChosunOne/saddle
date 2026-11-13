@@ -2637,6 +2637,18 @@ rather than a denial. The registry lives on the session because starting a serve
 and the audit log, so it is taken out for the call and put back, which is the price of a tool call
 and a policy decision being the same object.
 
+**D109.** What a search declared is state of a branch, not of the process. The declaration is
+written as a node beside the tool results that arrived with it — a bookkeeping node like `usage`,
+never a message, so replaying a branch costs no tokens and the conversation the provider is sent is
+byte-identical to the one before it. A resume, a fork taken after the declaration, and a jump in
+the tree all bring it back, and a rewind to before it forgets it along with the messages that
+followed. Restoring is a filter and not an assignment: a name is put back only if the grant in
+force still names that tool of that server, so a branch recorded under a wider policy confers
+nothing under a narrower one, and a name that is not a tool of ours at all is dropped rather than
+trusted. The stored row is a name, never a schema or a reach: what a tool does is read from the
+server afresh, so a server that changed its arguments cannot have a stale definition called with
+an old shape. A new conversation declares nothing, whatever the process still has running.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
