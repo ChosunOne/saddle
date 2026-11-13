@@ -1101,7 +1101,6 @@ impl Controller {
                 search_url: None,
                 headers: Default::default(),
                 key_header: None,
-                models: Vec::new(),
                 auth: provider::Auth::ApiKey,
                 oauth: None,
             },

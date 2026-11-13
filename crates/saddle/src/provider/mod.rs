@@ -462,9 +462,6 @@ pub struct ProviderEntry {
     /// an `Authorization: Bearer` key is the norm; Azure wants `api-key` and no prefix, which is the
     /// case this exists for (D84).
     pub key_header: Option<String>,
-    /// Models to offer when the server lists none, because a subscription backend serves no
-    /// listing to a third-party client (D85).
-    pub models: Option<Vec<String>>,
     /// How the provider authenticates (D85). An OAuth provider has no key: its access token comes
     /// from the store `/login` writes, and is refreshed when it expires.
     pub auth: Option<Auth>,
@@ -502,8 +499,6 @@ pub struct ProviderConfig {
     pub headers: BTreeMap<String, String>,
     /// The header the key goes in, when it is not the default for this `api` (D84).
     pub key_header: Option<String>,
-    /// Models to offer when the server lists none, so `/login` can still show a picker (D85).
-    pub models: Vec<String>,
     /// How the provider authenticates, and where, when it is OAuth (D85).
     pub auth: Auth,
     pub oauth: Option<crate::provider::oauth::Flow>,
@@ -563,24 +558,6 @@ fn presets() -> BTreeMap<&'static str, ProviderEntry> {
                     verification_url: Some(oauth::OPENAI_VERIFICATION_URL.into()),
                     ..oauth::Flow::default()
                 }),
-                // No listing: the one route wants a `client_version` that is documented nowhere
-                // and answers a validation error without it, which is what made `/login` end in a
-                // fragment of JSON. The names are the catalogue the service publishes, and a listing
-                // that does work still wins over them (D85).
-                models: Some(
-                    [
-                        "gpt-5.6-luna",
-                        "gpt-5.6-sol",
-                        "gpt-5.6-terra",
-                        "gpt-6-astra",
-                        "gpt-6-luna",
-                        "gpt-6-sol",
-                        "gpt-6.1-sol",
-                        "gpt-6.1-terra",
-                    ]
-                    .map(str::to_owned)
-                    .to_vec(),
-                ),
                 // The subscription backend wants both, and states so in its own clients.
                 headers: [(
                     "OpenAI-Beta".to_owned(),
@@ -675,10 +652,6 @@ pub fn endpoint(name: &str, user: &BTreeMap<String, ProviderEntry>) -> Result<Pr
             .or_else(|| preset.map(|e| e.headers.clone()))
             .unwrap_or_default(),
         key_header: pick(|e| &e.key_header).filter(|h| !h.is_empty()),
-        models: mine
-            .and_then(|e| e.models.clone())
-            .or_else(|| preset.and_then(|e| e.models.clone()))
-            .unwrap_or_default(),
         auth: mine
             .and_then(|e| e.auth)
             .or_else(|| preset.and_then(|e| e.auth))
@@ -740,7 +713,6 @@ pub fn catalog(user: &BTreeMap<String, ProviderEntry>) -> Vec<(String, ProviderE
                 m.headers.clone()
             },
             key_header: m.key_header.clone().or(base.key_header),
-            models: m.models.clone().or(base.models),
             auth: m.auth.or(base.auth),
             oauth: m.oauth.clone().or(base.oauth),
         }
@@ -1254,7 +1226,6 @@ model = "qwen"
             search_url: None,
             headers: BTreeMap::new(),
             key_header: None,
-            models: Vec::new(),
             auth: Auth::ApiKey,
             oauth: None,
         }
@@ -1354,40 +1325,6 @@ model = "qwen"
         assert_eq!(official.api, Api::Anthropic);
         assert_eq!(official.base_url, "https://api.anthropic.com");
         assert_eq!(official.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
-    }
-
-    #[test]
-    fn a_subscription_ships_the_models_its_backend_will_not_list() {
-        // D85: the subscription backend serves no listing to a third-party client — the one route
-        // wants a `client_version` that is documented nowhere — so the names come from the service's
-        // published catalogue, and `/login` has a picker instead of a JSON fragment.
-        let config = endpoint("openai-chatgpt", &Default::default()).unwrap();
-        assert!(
-            config.models.iter().any(|m| m == "gpt-5.6-sol"),
-            "{:?}",
-            config.models
-        );
-        // Every other preset lists nothing, so a server that does list is believed.
-        let openai = endpoint("openai", &Default::default()).unwrap();
-        assert!(openai.models.is_empty());
-
-        // A user's own list replaces it, which is the way out when the catalogue moves on.
-        let user: BTreeMap<String, ProviderEntry> = toml::from_str(
-            r#"
-[openai-chatgpt]
-models = ["mine-1", "mine-2"]
-"#,
-        )
-        .unwrap();
-        let config = endpoint("openai-chatgpt", &user).unwrap();
-        assert_eq!(config.models, ["mine-1", "mine-2"]);
-        // And it survives the merge a dialog's catalogue does.
-        let entry = catalog(&user)
-            .into_iter()
-            .find(|(name, _)| name == "openai-chatgpt")
-            .map(|(_, e)| e)
-            .unwrap();
-        assert_eq!(entry.models.unwrap(), ["mine-1", "mine-2"]);
     }
 
     #[test]

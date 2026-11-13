@@ -2011,13 +2011,18 @@ than deltas on a choice. That is a second client (`provider/responses.rs`), not 
   URLs, client id, scopes and redirect. `openai-chatgpt` is a preset filling it in, and an empty
   table is *incomplete* rather than silently OpenAI's — a provider that says `auth = "oauth"` and
   nothing else must not log in to another service.
-- **A subscription backend serves no model listing, so the preset ships one.** The one route
-  (`/backend-api/codex/models`, and `/backend-api/models`) is GET-only — a POST answers 405 — and
-  with a valid token it wants a `client_version` that is documented nowhere, answering FastAPI's
-  validation body instead of a list. That body is what `/login` used to show as a fragment of JSON.
-  The names are therefore the catalogue the service publishes, on the preset's `models`; a user's
-  own `models = [...]` replaces them, a listing that does work still wins over them, and a name
-  typed by hand still works when neither exists.
+- **The served catalogue is asked for, not shipped.** `GET /backend-api/codex/models` returns
+  `{"models": [{"slug": …}]}` — the list is the service's to change, so a copy of it in this tree
+  would be a guess that goes stale and silently keeps a model the backend has retired. The request
+  is the same one a turn makes, with `?client_version=<semver>` added.
+- **That version is the one claim the client makes about itself, and the list is gated on it.** The
+  backend does not reject an old `client_version`: it answers a *shorter* list, or `{"models": []}`
+  with no error at all, and the required-field validation error it gives when the parameter is
+  missing is what `/login` was showing as a fragment of JSON. So the constant is a Codex CLI
+  version, checked against the published releases, and an empty answer becomes the message that says
+  which version was asked with — otherwise the picker is simply blank with nothing to explain it.
+  This is the distinction that matters: a version is a fact about the client and is honest to pin; a
+  list of models is a fact about the service and is not this tree's to assert.
 - **There are two redirect addresses, and a device flow must exchange with its own.**
   `redirect-uri` is where a browser flow's code comes back (`http://localhost:1455/auth/callback`);
   `device-redirect-uri` is the address the server issued a device code for

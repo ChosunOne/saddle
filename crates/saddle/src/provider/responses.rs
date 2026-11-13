@@ -18,6 +18,17 @@ use serde_json::{Value, json};
 use super::{Api, Conversation, Item, Part, Provider, Reply, Sink, Stop, ToolCall, Usage, http};
 use super::{Cancelled, SUMMARY_INTRO, sse};
 
+/// The Codex CLI version this client reports when it asks what the backend serves (D85).
+///
+/// The catalogue is gated on it: the backend answers a version it does not recognise with an empty
+/// list and no error, and an older one with a shorter list, so a stale number here is a picker that
+/// quietly loses models. It is a version and not a list of models on purpose — the list is the
+/// service's to change, and this is the only claim saddle makes about being a client of it.
+///
+/// Bump it when the list comes back empty or short. `CODEX_CLIENT_VERSION` is checked against
+/// `npm view @openai/codex version`, and there is a test below that notices when it is old.
+pub const CLIENT_VERSION: &str = "0.169.0";
+
 pub fn complete(p: &Provider, conv: &Conversation<'_>, sink: &mut dyn Sink) -> Result<Reply> {
     let url = format!("{}/responses", p.config.base_url.trim_end_matches('/'));
     let headers = p.request_headers();
@@ -380,7 +391,6 @@ mod tests {
             search_url: None,
             headers: Default::default(),
             key_header: None,
-            models: Vec::new(),
             auth: crate::provider::Auth::ApiKey,
             oauth: None,
         }

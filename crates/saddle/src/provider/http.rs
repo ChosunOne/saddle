@@ -258,23 +258,40 @@ pub struct ModelInfo {
 /// The windows it carries are where a real context limit comes from, so `/login` and `/model`
 /// cache them (D34).
 pub fn list_models(p: &super::Provider) -> Result<Vec<ModelInfo>, ModelsError> {
-    match list_from_endpoint(p) {
-        Ok(models) if !models.is_empty() => Ok(models),
-        // A server that lists nothing, or refuses to, still has the names the provider shipped:
-        // a subscription backend serves no listing at all, and `/login` needs a picker either way
-        // (D85).
-        _ if !p.config.models.is_empty() => Ok(p
-            .config
-            .models
-            .iter()
-            .map(|id| ModelInfo {
-                id: id.clone(),
-                context_window: None,
-                price: None,
-            })
-            .collect()),
-        Ok(models) => Ok(models),
-        Err(e) => Err(e),
+    let served = served(list_from_endpoint(p)?, p.config.api)?;
+    Ok(served)
+}
+
+/// What an answer means, once it has been parsed.
+///
+/// Separated from the request because the interesting case is an answer with nothing in it: the
+/// subscription backend gates its catalogue on the client version and replies `{"models": []}`
+/// rather than an error, so silence there has a cause, and naming it is the difference between a
+/// picker and a bug report (D85). Every other server is allowed to list nothing.
+pub fn served(models: Vec<ModelInfo>, api: super::Api) -> Result<Vec<ModelInfo>, ModelsError> {
+    if models.is_empty() && api == super::Api::OpenaiResponses {
+        return Err(ModelsError::Failed(format!(
+            "the backend served no models for client version {} — that version may be too old, or \
+             the plan may not include any",
+            super::responses::CLIENT_VERSION
+        )));
+    }
+    Ok(models)
+}
+
+/// Where to ask what a provider serves.
+///
+/// One place, because the subscription backend's route is `/codex/models` *with* a version, and a
+/// base URL that already ends in `/codex` makes this the easiest thing in the file to get wrong
+/// (D85).
+pub fn listing_url(config: &super::ProviderConfig) -> String {
+    let base = config.base_url.trim_end_matches('/');
+    match config.api {
+        Api::Openai | Api::Anthropic => format!("{base}/models"),
+        Api::OpenaiResponses => format!(
+            "{base}/models?client_version={}",
+            super::responses::CLIENT_VERSION
+        ),
     }
 }
 
@@ -291,7 +308,10 @@ fn list_from_endpoint(p: &super::Provider) -> Result<Vec<ModelInfo>, ModelsError
     // a listing checks the same thing a turn will send: a login's token and its account (D84, D85).
     let headers = p.request_headers();
     let mut request = match config.api {
-        Api::Openai | Api::OpenaiResponses => agent.get(format!("{base}/models")),
+        Api::Openai => agent.get(format!("{base}/models")),
+        // The subscription backend states which catalogue it serves in a query parameter, and
+        // answers an empty list to a version it does not know (D85).
+        Api::OpenaiResponses => agent.get(listing_url(config)),
         Api::Anthropic => agent
             .get(format!("{base}/v1/models?limit=1000"))
             .header("anthropic-version", super::anthropic::VERSION),
@@ -754,13 +774,15 @@ fn stated_price(m: &Value) -> Option<(Price, Unit)> {
 fn model_entries(v: &Value) -> Vec<ModelInfo> {
     let items = v["data"]
         .as_array()
+        // The subscription backend's catalogue: `{"models": [{"slug": "gpt-…"}]}` (D85).
+        .or_else(|| v["models"].as_array())
         .or_else(|| v.as_array())
         .cloned()
         .unwrap_or_default();
     let mut models: Vec<(u64, ModelInfo)> = items
         .iter()
         .filter_map(|m| {
-            let id = m["id"].as_str()?;
+            let id = m["id"].as_str().or_else(|| m["slug"].as_str())?;
             let lower = id.to_ascii_lowercase();
             if NOT_CHAT.iter().any(|n| lower.contains(n)) {
                 return None;
@@ -1205,11 +1227,13 @@ mod tests {
         assert_eq!(quota_from(&other), None);
     }
 
-    /// A provider pointed at a port nothing listens on, so a listing fails without a network.
-    fn provider_config(base_url: &str) -> super::super::ProviderConfig {
-        super::super::ProviderConfig {
-            api: super::super::Api::Openai,
-            base_url: base_url.into(),
+    #[test]
+    fn the_listing_url_is_the_one_the_backend_serves() {
+        // D85: the route is `/codex/models` and it *requires* the version, so both halves matter
+        // and both were wrong at some point.
+        let mut config = super::super::ProviderConfig {
+            api: super::super::Api::OpenaiResponses,
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
             model: "m".into(),
             api_key_env: None,
             max_tokens: None,
@@ -1220,30 +1244,88 @@ mod tests {
             search_url: None,
             headers: Default::default(),
             key_header: None,
-            models: Vec::new(),
             auth: super::super::Auth::ApiKey,
             oauth: None,
-        }
+        };
+        assert_eq!(
+            listing_url(&config),
+            format!(
+                "https://chatgpt.com/backend-api/codex/models?client_version={}",
+                super::super::responses::CLIENT_VERSION
+            )
+        );
+        // The trailing slash a user's base URL may carry is not part of the route.
+        config.base_url = "https://chatgpt.com/backend-api/codex/".into();
+        assert!(
+            listing_url(&config).contains("/codex/models?"),
+            "{}",
+            listing_url(&config)
+        );
+        // A compatible server keeps its own, plain listing.
+        config.api = super::super::Api::Openai;
+        assert_eq!(
+            listing_url(&config),
+            "https://chatgpt.com/backend-api/codex/models"
+        );
     }
 
     #[test]
-    fn a_shipped_list_is_what_a_silent_server_gets() {
-        // D85: a subscription backend serves no listing, so the provider's own names are what
-        // `/login` offers. A server that does list is still believed.
-        let mut config = provider_config("http://127.0.0.1:9/v1");
-        config.models = vec!["shipped-1".into(), "shipped-2".into()];
-        let p = super::super::Provider::new("t", config, None, &super::super::Reported::default());
-        let listed = list_models(&p).expect("the shipped list answers");
-        let ids: Vec<&str> = listed.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, ["shipped-1", "shipped-2"]);
-        // Nothing shipped and nothing served is still an error, not an empty picker.
-        let p = super::super::Provider::new(
-            "t",
-            provider_config("http://127.0.0.1:9/v1"),
-            None,
-            &super::super::Reported::default(),
+    fn the_served_catalogue_is_read_from_slugs() {
+        // D85: the subscription backend answers `{"models": [{"slug": …}]}`, not `{"data":
+        // [{"id": …}]}`, and the ids are what a request has to name.
+        let served: Value = serde_json::from_str(
+            r#"{"models":[
+                {"slug":"gpt-6.1-sol","display_name":"GPT-6.1 Sol"},
+                {"slug":"gpt-5.6-luna","display_name":"GPT-5.6 Luna"}
+            ]}"#,
+        )
+        .unwrap();
+        let ids: Vec<String> = model_entries(&served).into_iter().map(|m| m.id).collect();
+        assert_eq!(
+            ids,
+            ["gpt-6.1-sol", "gpt-5.6-luna"],
+            "the served order is kept"
         );
-        assert!(list_models(&p).is_err());
+        // The `/v1/models` shape still reads, because a compatible server is not that backend.
+        let openai: Value =
+            serde_json::from_str(r#"{"data":[{"id":"gpt-5.4","created":2}]}"#).unwrap();
+        assert_eq!(model_entries(&openai)[0].id, "gpt-5.4");
+    }
+
+    #[test]
+    fn an_empty_served_catalogue_names_the_client_version() {
+        // The backend gates its list on `client_version` and answers an empty list, not an error, so
+        // silence there has a cause and the message has to say which version was asked with (D85).
+        let ModelsError::Failed(why) =
+            served(Vec::new(), super::super::Api::OpenaiResponses).unwrap_err()
+        else {
+            panic!("an empty catalogue is a failure with a reason");
+        };
+        assert!(
+            why.contains(super::super::responses::CLIENT_VERSION),
+            "{why}"
+        );
+        assert!(why.contains("too old"), "{why}");
+        // A server that simply has no models is not that case, and says nothing.
+        assert_eq!(
+            served(Vec::new(), super::super::Api::Openai).unwrap(),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn the_reported_client_version_is_a_current_one() {
+        // D85: the catalogue is gated on this, and an old value silently returns fewer models, so it
+        // has to be a plain Codex CLI version and not something that predates the gate.
+        let v = super::super::responses::CLIENT_VERSION;
+        let parts: Vec<&str> = v.split('.').collect();
+        assert_eq!(parts.len(), 3, "{v}");
+        assert!(parts.iter().all(|p| p.parse::<u32>().is_ok()), "{v}");
+        let minor: u32 = parts[1].parse().unwrap();
+        assert!(
+            minor >= 140,
+            "{v} predates the versions known to serve a full list"
+        );
     }
 
     #[test]
