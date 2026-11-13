@@ -451,6 +451,37 @@ pub fn listing(skills: &[Skill]) -> String {
     s
 }
 
+/// What `/skill:name` turns into: the skill's instructions, then the rest of the line as the request
+/// (D69). The body was read and recorded when the skill was discovered, so invoking it is not a new
+/// access — it puts text the session already holds into the conversation.
+pub fn invocation(skill: &Skill, args: &str) -> String {
+    let file = skill.dir.join(FILE);
+    let mut out = format!(
+        "<skill name=\"{}\" file=\"{}\">\n{}\n</skill>",
+        escape(&skill.name),
+        escape(&file.display().to_string()),
+        skill.text.trim_end()
+    );
+    let args = args.trim();
+    if !args.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(args);
+    }
+    out
+}
+
+/// The names a session offers, for a message that has to list them.
+pub fn names(skills: &[Skill]) -> String {
+    if skills.is_empty() {
+        return "there are no skills in this session".to_owned();
+    }
+    skills
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Escapes the five XML metacharacters, so a description cannot close the block it sits in.
 ///
 /// A skill's text is written by whoever wrote the skill, and a project skill is written by whoever
@@ -611,6 +642,34 @@ mod tests {
         assert!(block.contains("&apos;quoted&apos;"), "{block}");
         // The block itself still ends exactly once.
         assert_eq!(block.matches("</skills>").count(), 1, "{block}");
+    }
+
+    #[test]
+    fn an_invocation_carries_the_body_and_then_the_request() {
+        // pi's rule: the arguments follow the instructions as the request.
+        let skill = Skill {
+            name: "pdf-tools".into(),
+            description: "d".into(),
+            dir: PathBuf::from("/ws/.agents/skills/pdf-tools"),
+            label: ".agents/skills/pdf-tools/SKILL.md".into(),
+            text: "---\nname: pdf-tools\n---\nRead formats.md.".into(),
+            hidden: false,
+        };
+        let text = invocation(&skill, " extract report.pdf ");
+        assert!(
+            text.contains("Read formats.md."),
+            "the body is there: {text}"
+        );
+        assert!(
+            text.contains("file=\"/ws/.agents/skills/pdf-tools/SKILL.md\""),
+            "{text}"
+        );
+        assert!(
+            text.trim_end().ends_with("extract report.pdf"),
+            "the request follows: {text}"
+        );
+        // No arguments leaves no trailing separator.
+        assert!(!invocation(&skill, "   ").ends_with("\n\n"));
     }
 
     #[test]

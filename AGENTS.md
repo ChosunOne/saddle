@@ -29,7 +29,7 @@ Inside `crates/saddle/src`:
 | `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch` | the nine built-in tools (`fetch` is host-side network, D39; `patch` is D56) |
 | `tools/diff` | line diffs of edited files, for the transcript only — the model never sees them |
 | `context` | instruction files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md` fallback), read through the policy |
-| `skills` | `SKILL.md` skills: discovery through the `read` gate, the prompt listing (D64, D67, D68) |
+| `skills` | `SKILL.md` skills: discovery through the `read` gate, the prompt listing, `/skill:name` (D64, D67, D68, D69) |
 | `ignore` | ignore-file matching (`.gitignore`, `.ignore`, `.fdignore`), shared by `tools/search` and `skills` (D68) |
 | `compact` | replacing the older part of a long conversation with a model-written summary (D33) |
 | `store` | the saved conversations: a SQLite tree of messages per workspace (D53), imported from the older JSON Lines files once |
@@ -97,7 +97,11 @@ its file under `policies/` — what it sets replaces the base grant for that sco
 and takes effect in the next session. `--grant`/`--revoke` do it for one run. `/permissions` in the TUI edits the same file, and `a`
 there adds a grant by typing what it is (`net <host>`, `root <name>`, `exec`, …); it is a person's
 tool and no tool exposes it (D45, D46), and a change there applies at once, with the model told on
-its next request (D47). Editing `saddle.toml` in a repository has no effect (D42, D43). `/thinking` (or shift+tab) changes the reasoning effort for the session (D57), `/name` and
+its next request (D47). Editing `saddle.toml` in a repository has no effect (D42, D43).
+`/skill:<name> <request>` loads a skill's instructions into the conversation followed by the
+request, in the TUI and in line mode, and is the only way to reach a skill marked
+`disable-model-invocation` (D69). `/thinking` (or shift+tab) changes the reasoning effort for the
+session (D57), `/name` and
 `/session` name and describe it (D55), and escape twice on an empty prompt opens the message tree (D54), where a prompt can be sent again to
 make another branch; `/clone` copies the branch into a separate session instead. There is no
 trust step (D44): nothing the agent runs can write a policy file, so `saddle check` is the whole
@@ -136,8 +140,8 @@ exists to prevent. Two concrete consequences worth restating, because they are t
 A **skill** (D64) is instructions and never authority: its `allowed-tools` is ignored, because a
 pre-approval written by whoever wrote the skill would be a second source of authority. A skill is
 loaded with `read` on its `SKILL.md`, and there is no tool of its own (D67): discovery reads through
-the same gate, so a refused skill is never advertised. The audit's `skill` record is what a session
-offered, with a hash per skill.
+the same gate, so a refused skill is never advertised. The audit's `skill` records are what a
+session offered and what was loaded, each with a hash.
 
 Deny is the default everywhere: a decision is a lookup over grants, with no ordering, no fallthrough
 and no deny rules. A grant may carry a `why`, which `saddle check` shows and the audit log records; it
@@ -145,7 +149,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D68 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D69 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

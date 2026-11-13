@@ -583,6 +583,36 @@ impl Session {
         self.tool_roots.iter().any(|r| &r.name == root)
     }
 
+    /// Records that a skill's instructions entered the conversation (D69). Discovery already
+    /// recorded the read and its hash; this is the other half — that the body was put in front of
+    /// the model, and by which name.
+    pub fn record_skill_load(&mut self, name: &str) -> Result<()> {
+        let skill = self.skills.iter().find(|s| s.name == name);
+        let args = match skill {
+            Some(skill) => json!({
+                "loaded": {
+                    "name": skill.name,
+                    "file": skill.label,
+                    "bytes": skill.text.len(),
+                    "sha256": sha256_hex(skill.text.as_bytes()),
+                }
+            }),
+            // A prompt that says it came from a skill the session does not have is worth a record
+            // of its own rather than a silent pass.
+            None => json!({ "loaded": { "name": name, "missing": true } }),
+        };
+        self.audit
+            .event(
+                Kind::Skill,
+                Some(&Principal::Agent),
+                None,
+                None,
+                args,
+                format!("skill `{name}` loaded into the conversation"),
+            )
+            .context("writing the audit log")
+    }
+
     /// Closes the audit log. An allowance is *not* dropped here: it outlives the session so it can
     /// be picked again later, and is removed with `saddle session revoke` (D61).
     pub fn close(self) -> Result<String> {

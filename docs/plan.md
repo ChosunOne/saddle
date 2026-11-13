@@ -1387,8 +1387,32 @@ one place at its root.
 - **A refusal is said out loud.** `saddle tool` prints discovery's notes to stderr. Until it did, a
   skill refused by the policy or skipped by a rule vanished with no output at all, the same silence
   as "there are none".
-- **What this does not have yet**: `/skill:name`, so a hidden skill cannot be invoked at all — the
-  flag is honoured in the prompt today and reachable only by asking for the file by path (§8).
+- **`disable-model-invocation` is honoured**: the skill is kept out of the prompt and reachable
+  through `/skill:name` (D69), which is what the flag is for.
+
+**D69.** `/skill:name` loads a skill into the conversation, in the TUI and in line mode.
+
+- **The command is the forcing function.** A model can miss a skill whose description applies, and
+  a person who knows better needs a way to say so. `/skill:<name> <request>` puts the skill's
+  instructions into the conversation followed by the rest of the line as the request, which is what
+  pi does. It is also the only way to reach a skill marked `disable-model-invocation` — the flag
+  hides it from the prompt, and a hidden skill nothing can invoke would just be a broken skill.
+- **Served from what discovery already read.** The body is in the session, read through the gate and
+  hashed at open, so the command needs no new access and no new authority: it moves text the session
+  holds into the conversation. That is also why it can be expanded in the interface thread without
+  asking the policy a second time.
+- **The conversation holds what was sent.** The expanded text is the user message, so the transcript
+  shows it and a resumed session rebuilds the same thing from the store. The alternative — the typed
+  `/skill:x` line in the transcript and the body in the store — makes the transcript a different
+  document from the conversation, which is worse than a long entry.
+- **Both halves are in the audit.** Discovery records what was offered, with a hash per skill; a load
+  records that the body went in front of the model, with the same hash, so the two can be joined. A
+  prompt that says it came from a skill the session does not have is recorded rather than passed
+  over.
+- **The names are discoverable.** Skill commands are in the `/` menu beside the builtin ones, with
+  the routing description as the line's explanation, and `/help` lists them for the session. A
+  mistyped name answers with the names that do exist, because a silent no-op is the failure mode
+  this project keeps having to remove.
 
 ## 4. Scope enumeration
 
@@ -1477,10 +1501,8 @@ model is decorative.
   survives the group kill in D19.
 - An external append-only sink for the audit log.
 - Input widgets in `ui`.
-- `/skill:name` in the TUI: forcing a skill when the model missed it, with the rest of the line as
-  the request (D64). The tool is enough to load one; the command is for a person who knows better
-  than the description. A skill's bundled files are likewise not listed by the `skill` tool: that
-  would be a directory read the policy does not decide, and the skill's own text names them.
+- A skill's bundled files are not listed by anything: the skill's own text names them, and listing
+  them would be a directory read the policy does not decide.
 
 ## 9. Known risks
 

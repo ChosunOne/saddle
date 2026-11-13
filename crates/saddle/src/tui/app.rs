@@ -79,6 +79,11 @@ pub enum Effort {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Send(String),
+    /// A prompt built from a skill by `/skill:name`, and the skill it came from (D69).
+    Skill {
+        name: String,
+        prompt: String,
+    },
     Clear,
     Cancel,
     Quit,
@@ -301,6 +306,15 @@ pub struct Cached {
     pub lines: Vec<Line<'static>>,
 }
 
+/// One line of the `/` menu. Owned, because a skill's command is built from what the session
+/// discovered rather than from the static table (D69).
+#[derive(Clone)]
+pub struct Menu {
+    pub name: String,
+    pub args: String,
+    pub about: String,
+}
+
 pub struct SlashCommand {
     pub name: &'static str,
     pub args: &'static str,
@@ -388,6 +402,9 @@ pub const COMMANDS: &[SlashCommand] = &[
 
 pub struct App {
     pub header: Header,
+    /// What discovery offered, so `/skill:name` can put a body into the conversation without going
+    /// back to the agent thread (D69). The text was read and recorded at discovery.
+    pub skills: Vec<crate::skills::Skill>,
     pub entries: Vec<Entry>,
     /// Parallel to `entries`; `None` means re-render.
     pub cache: Vec<Option<Cached>>,
@@ -499,6 +516,7 @@ impl App {
             (header.show_reasoning, header.expand_tools, header.max_steps);
         let mut app = Self {
             header,
+            skills: Vec::new(),
             entries: Vec::new(),
             cache: Vec::new(),
             editor: Editor::default(),
@@ -681,7 +699,7 @@ impl App {
 
     /// Commands matching what is typed, while the editor holds only a command name: those that
     /// start with it first, then those that contain it.
-    pub fn menu(&self) -> Vec<&'static SlashCommand> {
+    pub fn menu(&self) -> Vec<Menu> {
         let text = self.editor.text();
         if self.dialog_open()
             || !text.starts_with('/')
@@ -691,13 +709,28 @@ impl App {
             return Vec::new();
         }
         let typed = text.to_lowercase();
-        let mut found: Vec<&SlashCommand> = COMMANDS
+        // The static commands, then one per skill: `/skill:name` is how a skill is forced when the
+        // model did not pick it from its description (D69).
+        let mut all: Vec<Menu> = COMMANDS
+            .iter()
+            .map(|c| Menu {
+                name: c.name.to_owned(),
+                args: c.args.to_owned(),
+                about: c.about.to_owned(),
+            })
+            .collect();
+        all.extend(self.skills.iter().map(|s| Menu {
+            name: format!("/skill:{}", s.name),
+            args: "[request]".to_owned(),
+            about: s.description.clone(),
+        }));
+        let mut found: Vec<Menu> = all
             .iter()
             .filter(|c| c.name.starts_with(&typed))
+            .cloned()
             .collect();
         found.extend(
-            COMMANDS
-                .iter()
+            all.into_iter()
                 .filter(|c| !c.name.starts_with(&typed) && c.name.contains(&typed[1..])),
         );
         found
@@ -762,7 +795,7 @@ impl App {
                 selected: self.menu_selected().min(menu.len() - 1),
                 items: menu
                     .iter()
-                    .map(|c| (format!("{} {}", c.name, c.args), c.about.to_owned()))
+                    .map(|c| (format!("{} {}", c.name, c.args), c.about.clone()))
                     .collect(),
                 hint: " ↑↓ select · tab complete · enter run · esc hide ",
             });
@@ -822,18 +855,18 @@ impl App {
             return None;
         }
         let selected = self.menu_selected().min(menu.len() - 1);
-        let chosen = menu[selected];
+        let chosen = menu[selected].clone();
         match key.code {
             KeyCode::Up => self.select((selected + menu.len() - 1) % menu.len()),
             KeyCode::Down => self.select((selected + 1) % menu.len()),
-            KeyCode::Tab => self.complete(chosen),
+            KeyCode::Tab => self.complete(&chosen),
             KeyCode::Enter if !newline => {
                 // Runs the command, unless it takes an argument that has not been typed yet.
                 if chosen.args.is_empty() || self.editor.text() == chosen.name {
-                    self.editor.set(chosen.name.to_owned());
+                    self.editor.set(chosen.name.clone());
                     return Some(self.submit());
                 }
-                self.complete(chosen);
+                self.complete(&chosen);
             }
             KeyCode::Esc => self.menu_dismissed = Some(self.editor.text().to_owned()),
             _ => return None,
@@ -841,9 +874,9 @@ impl App {
         Some(None)
     }
 
-    fn complete(&mut self, command: &SlashCommand) {
+    fn complete(&mut self, command: &Menu) {
         let text = if command.args.is_empty() {
-            command.name.to_owned()
+            command.name.clone()
         } else {
             format!("{} ", command.name)
         };
@@ -1263,12 +1296,48 @@ impl App {
     }
 
     fn command(&mut self, text: &str) -> Option<Action> {
+        // `/skill:name request` becomes the skill's instructions followed by the request, which is
+        // how a skill is forced when the model did not pick it from its description (D69). It is
+        // also the only way to reach a skill marked `disable-model-invocation`, which is what that
+        // flag means. The expanded text is what the conversation holds, so the transcript and a
+        // resumed session show what the model was actually sent.
+        if let Some(rest) = text.strip_prefix("/skill:") {
+            let name = rest.split_whitespace().next().unwrap_or_default();
+            let args = rest[name.len()..].trim();
+            let Some(skill) = self.skills.iter().find(|s| s.name == name) else {
+                self.note(
+                    NoteKind::Error,
+                    &format!(
+                        "no skill `{name}`; this session has {}",
+                        crate::skills::names(&self.skills)
+                    ),
+                );
+                return None;
+            };
+            let prompt = crate::skills::invocation(skill, args);
+            let name = skill.name.clone();
+            self.push(Entry::User(prompt.clone()));
+            self.busy = Some(Activity::Waiting);
+            return Some(Action::Skill { name, prompt });
+        }
         let mut words = text.split_whitespace();
         let command = words.next().unwrap_or_default();
         let arg = words.next().map(str::to_owned);
         match command {
             "/help" => {
-                self.info(&help());
+                // The skill commands are per session, so they are listed from what was discovered
+                // rather than from the static table (D69).
+                let mut text = help();
+                if !self.skills.is_empty() {
+                    text.push_str("\n\nSkills this session offers:");
+                    for skill in &self.skills {
+                        text.push_str(&format!(
+                            "\n/skill:{:<12}  {}",
+                            skill.name, skill.description
+                        ));
+                    }
+                }
+                self.info(&text);
                 None
             }
             "/exit" | "/quit" => Some(Action::Quit),
@@ -1916,8 +1985,94 @@ mod tests {
     }
 
     #[test]
+    fn a_skill_is_in_the_menu_and_its_command_loads_the_body() {
+        // D69: `/skill:name` puts the instructions into the conversation and the rest of the line
+        // after them as the request, which is how pi forces a skill the model did not pick.
+        let mut a = app();
+        a.skills = vec![crate::skills::Skill {
+            name: "manim".into(),
+            description: "Animate a proof.".into(),
+            dir: PathBuf::from("/ws/.agents/skills/manim"),
+            label: ".agents/skills/manim/SKILL.md".into(),
+            text: "---\nname: manim\n---\nRender with Scene.".into(),
+            hidden: false,
+        }];
+
+        // It is offered by the menu, with the description as its about text.
+        type_text(&mut a, "/skill");
+        let menu = a.menu();
+        assert_eq!(
+            menu.len(),
+            1,
+            "{:?}",
+            menu.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+        assert_eq!(menu[0].name, "/skill:manim");
+        assert!(menu[0].about.contains("Animate a proof."));
+
+        // Running it sends the body and the request, and the transcript holds what was sent.
+        a.editor.set("/skill:manim animate it".into());
+        let action = a.key(key(KeyCode::Enter)).expect("an action");
+        let Action::Skill { name, prompt } = action else {
+            panic!("expected a skill action");
+        };
+        assert_eq!(name, "manim");
+        assert!(prompt.contains("Render with Scene."), "{prompt}");
+        assert!(prompt.trim_end().ends_with("animate it"), "{prompt}");
+        assert!(
+            matches!(a.entries.last(), Some(Entry::User(t)) if t.contains("Render with Scene.")),
+            "the conversation holds the expanded prompt"
+        );
+        assert!(a.busy.is_some(), "the turn starts");
+    }
+
+    #[test]
+    fn a_hidden_skill_is_reachable_only_by_its_command() {
+        // `disable-model-invocation` keeps a skill out of the prompt; the command is the point of
+        // it, so it must still appear in the menu and still load.
+        let mut a = app();
+        a.skills = vec![crate::skills::Skill {
+            name: "forced".into(),
+            description: "Only when asked for.".into(),
+            dir: PathBuf::from("/ws/.agents/skills/forced"),
+            label: ".agents/skills/forced/SKILL.md".into(),
+            text: "---\nname: forced\n---\nbody".into(),
+            hidden: true,
+        }];
+        assert_eq!(
+            crate::skills::listing(&a.skills),
+            "",
+            "not advertised in the prompt"
+        );
+        type_text(&mut a, "/skill:forced");
+        assert!(
+            matches!(a.key(key(KeyCode::Enter)), Some(Action::Skill { name, .. }) if name == "forced")
+        );
+    }
+
+    #[test]
+    fn an_unknown_skill_name_says_which_exist() {
+        let mut a = app();
+        a.skills = vec![crate::skills::Skill {
+            name: "manim".into(),
+            description: "d".into(),
+            dir: PathBuf::from("/ws/.agents/skills/manim"),
+            label: ".agents/skills/manim/SKILL.md".into(),
+            text: "body".into(),
+            hidden: false,
+        }];
+        type_text(&mut a, "/skill:nope");
+        assert_eq!(a.key(key(KeyCode::Enter)), None, "nothing is sent");
+        assert!(
+            matches!(a.entries.last(), Some(Entry::Note(_, t)) if t.contains("no skill `nope`") && t.contains("manim")),
+            "{:?}",
+            a.entries.last()
+        );
+    }
+
+    #[test]
     fn the_slash_menu_filters_completes_and_runs() {
-        let names = |a: &App| a.menu().iter().map(|c| c.name).collect::<Vec<_>>();
+        let names = |a: &App| a.menu().iter().map(|c| c.name.clone()).collect::<Vec<_>>();
         let mut a = app();
         type_text(&mut a, "/");
         assert_eq!(names(&a).len(), COMMANDS.len());

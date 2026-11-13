@@ -51,7 +51,11 @@ use settings::{Change, SettingsDialog, Values};
 use status::Template;
 
 enum Command {
-    Prompt(String),
+    /// A prompt, and the skill it came from when it was a `/skill:` command (D69).
+    Prompt {
+        text: String,
+        skill: Option<String>,
+    },
     Clear,
     /// Applied between turns: the commands queue behind a running turn.
     SetProvider(Box<Provider>),
@@ -112,6 +116,9 @@ pub fn run(
     start: Start,
     resume: Option<String>,
 ) -> Result<()> {
+    // What discovery offered, kept here so `/skill:name` can expand without the agent thread: the
+    // bodies were read and recorded when the session opened (D69).
+    let skills = session.skills.clone();
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (ev_tx, ev_rx) = mpsc::channel();
     let ev_tx_ui = ev_tx.clone();
@@ -122,6 +129,7 @@ pub fn run(
 
     let store = store::Store::open(&paths.session_db(), header.workspace.clone())?;
     let mut app = App::new(header);
+    app.skills = skills;
     // What this terminal can draw is decided once, from the setting and the environment (D59).
     app.protocol = image::detect(app.header.images.as_deref(), &|k| std::env::var(k).ok());
     let control = Controller {
@@ -201,16 +209,27 @@ fn work(
     let mut fatal = None;
     for command in commands {
         match command {
-            Command::Prompt(text) => match agent.turn(&mut session, &text, &mut ui) {
-                Ok(end) => {
-                    let _ = events.send(AgentEvent::TurnEnd(end));
-                }
+            Command::Prompt { text, skill } => match skill
+                .map(|name| session.record_skill_load(&name))
+                .transpose()
+            {
                 Err(e) => {
                     let msg = format!("{e:#}");
                     let _ = events.send(AgentEvent::Fatal(msg.clone()));
                     fatal = Some(msg);
                     break;
                 }
+                Ok(_) => match agent.turn(&mut session, &text, &mut ui) {
+                    Ok(end) => {
+                        let _ = events.send(AgentEvent::TurnEnd(end));
+                    }
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        let _ = events.send(AgentEvent::Fatal(msg.clone()));
+                        fatal = Some(msg);
+                        break;
+                    }
+                },
             },
             Command::Clear => agent.clear(),
             Command::SetMaxSteps(n) => agent.set_max_steps(n),
@@ -624,7 +643,18 @@ impl Controller {
             Action::Send(text) => {
                 // Reset here, before the turn starts, so an Esc pressed right after Enter counts.
                 cancel::reset();
-                self.send(app, Command::Prompt(text));
+                self.send(app, Command::Prompt { text, skill: None });
+                Ok(())
+            }
+            Action::Skill { name, prompt } => {
+                cancel::reset();
+                self.send(
+                    app,
+                    Command::Prompt {
+                        text: prompt,
+                        skill: Some(name),
+                    },
+                );
                 Ok(())
             }
             Action::Clear => {

@@ -448,6 +448,29 @@ fn line_turn(
                 agent::Compacted::Cancelled => End::Cancelled,
                 agent::Compacted::Failed => End::Failed,
             }
+        } else if let Some(rest) = text.strip_prefix("/skill:") {
+            // The same expansion as the TUI's, from the skills the session discovered (D69). A
+            // prompt written as a skill command works the same way in line mode, so a piped prompt
+            // does not need a different spelling.
+            let name = rest.split_whitespace().next().unwrap_or_default();
+            let args = rest[name.len()..].trim();
+            match session.skills.iter().find(|s| s.name == name) {
+                Some(skill) => {
+                    let prompt = skills::invocation(skill, args);
+                    let name = skill.name.clone();
+                    session.record_skill_load(&name)?;
+                    let end = agent.turn(session, &prompt, out)?;
+                    out.usage(agent.turn_usage);
+                    end
+                }
+                None => {
+                    out.info(&format!(
+                        "no skill `{name}`; this session has {}",
+                        skills::names(&session.skills)
+                    ));
+                    End::Answered
+                }
+            }
         } else {
             let end = agent.turn(session, text, out)?;
             out.usage(agent.turn_usage);

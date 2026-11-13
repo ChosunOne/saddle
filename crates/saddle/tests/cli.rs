@@ -1867,3 +1867,34 @@ fn a_refusal_is_said_out_loud_and_the_first_skill_of_a_name_wins() {
         "the first keeps the name"
     );
 }
+
+#[test]
+fn the_session_offers_its_skills_and_records_a_load() {
+    // D69: `/skill:name` is served from what discovery read, so the session must expose those
+    // skills to the interface, and a load is recorded as the other half of discovery's record.
+    let env = Env::new();
+    let home = tempfile::tempdir().unwrap();
+    let dir = env.path(".agents/skills/manim");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: manim\ndescription: Animate a proof.\ndisable-model-invocation: true\n---\nRender with Scene.\n",
+    )
+    .unwrap();
+
+    // A hidden skill is not in the prompt but is still offered as a command, and the audit says
+    // both things.
+    let out = saddle_in(&env, home.path(), &["tool", "ls", r#"{"path":"."}"#]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let log = env.audit_logs().last().cloned().unwrap();
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let discovered = records
+        .iter()
+        .find(|r| r["kind"] == "skill")
+        .expect("a discovery record");
+    assert_eq!(discovered["args"]["discovered"][0]["name"], "manim");
+}
