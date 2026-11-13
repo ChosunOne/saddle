@@ -220,6 +220,24 @@ pub struct BudgetGrant {
     pub tokens_per_session: u64,
 }
 
+/// One MCP server, and the tools of it the model may reach (D103). The server's own tool list is
+/// never authority: it can only contain names written here.
+#[derive(Debug, Clone)]
+pub struct McpGrant {
+    pub rule: RuleId,
+    pub why: String,
+    pub server: String,
+    /// Every tool named, never a pattern: a server that grows a tool overnight does not grow it
+    /// into the callable set.
+    pub tools: Vec<String>,
+}
+
+impl McpGrant {
+    pub fn allows(&self, tool: &str) -> bool {
+        self.tools.iter().any(|t| t == tool)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PlainGrant {
     pub rule: RuleId,
@@ -233,6 +251,7 @@ pub struct Grants {
     pub fs_write: Vec<FsGrant>,
     pub exec: Option<ExecGrant>,
     pub net: Vec<NetGrant>,
+    pub mcp: Vec<McpGrant>,
     pub model_invoke: Option<BudgetGrant>,
     /// Scopes whose grant carries no parameters: transcript-read, context-contribute, tool, veto,
     /// ui, persist.
@@ -262,10 +281,18 @@ impl Grants {
         if !self.net.is_empty() {
             out.insert(Scope::Net);
         }
+        if !self.mcp.is_empty() {
+            out.insert(Scope::Mcp);
+        }
         if self.model_invoke.is_some() {
             out.insert(Scope::ModelInvoke);
         }
         out
+    }
+
+    /// The grant for one server, which is what decides every call to it (D103).
+    pub fn mcp_server(&self, server: &str) -> Option<&McpGrant> {
+        self.mcp.iter().find(|g| g.server == server)
     }
 }
 
@@ -349,6 +376,8 @@ struct RawGrants {
     exec: Option<RawExec>,
     #[serde(default)]
     net: Vec<RawNet>,
+    #[serde(default)]
+    mcp: Vec<RawMcp>,
     model_invoke: Option<RawBudget>,
     transcript_read: Option<RawPlain>,
     context_contribute: Option<RawPlain>,
@@ -384,6 +413,16 @@ struct RawNet {
     host: String,
     scheme: Option<UrlScheme>,
     port: Option<u16>,
+    #[serde(default)]
+    why: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMcp {
+    server: String,
+    #[serde(default)]
+    tools: Vec<String>,
     #[serde(default)]
     why: Option<String>,
 }
@@ -473,6 +512,17 @@ impl Policy {
                 lines.push(with_why(
                     format!("{} = {}://{}:{port}", n.rule, n.scheme.as_str(), n.host),
                     &n.why,
+                ));
+            }
+            for m in &g.mcp {
+                lines.push(with_why(
+                    format!(
+                        "{} = server {} tools [{}]",
+                        m.rule,
+                        m.server,
+                        m.tools.join(", ")
+                    ),
+                    &m.why,
                 ));
             }
             if let Some(b) = &g.model_invoke {
@@ -579,6 +629,39 @@ fn lower(who: &Principal, raw: RawGrants, roots: &Roots) -> Result<Grants, Polic
             why: why(b.why),
             rule,
             tokens_per_session: b.tokens_per_session,
+        });
+    }
+
+    for (i, m) in raw.mcp.into_iter().enumerate() {
+        let rule = RuleId::new(who, Scope::Mcp, Some(i));
+        let server = m.server.trim();
+        if server.is_empty() {
+            return Err(invalid(&rule, "an mcp grant must name a server"));
+        }
+        if m.tools.is_empty() {
+            return Err(invalid(
+                &rule,
+                format!("`{server}` grants no tools, so nothing could be called through it"),
+            ));
+        }
+        let mut tools: Vec<String> = Vec::new();
+        for tool in &m.tools {
+            let tool = tool.trim();
+            if tool.is_empty() || tool == "*" {
+                return Err(invalid(
+                    &rule,
+                    format!("`{server}` must name each tool, never a pattern"),
+                ));
+            }
+            if !tools.iter().any(|t| t == tool) {
+                tools.push(tool.to_owned());
+            }
+        }
+        grants.mcp.push(McpGrant {
+            why: why(m.why),
+            rule,
+            server: server.to_owned(),
+            tools,
         });
     }
 
@@ -865,5 +948,53 @@ exec = { timeout-secs = 60 }
         assert!(HostPattern::parse("127.0.0.1").is_ok());
         assert!(HostPattern::parse("not a host").is_err());
         assert!(HostPattern::parse("*.").is_err());
+    }
+
+    #[test]
+    fn an_mcp_grant_names_a_server_and_each_of_its_tools() {
+        // D103: the grant is what makes a server and its tools reachable, and both the prompt and
+        // `saddle check` print it because both read these lines.
+        let (_d, roots) = roots();
+        let policy = Policy::parse(
+            r#"
+version = 1
+
+[agent]
+mcp = [{ server = "job-scout", tools = ["search", "fetch-posting", "search"], why = "scrapes boards" }]
+"#,
+            &roots,
+        )
+        .unwrap();
+        let agent = policy.grants(&Principal::Agent).unwrap();
+        assert!(agent.scopes().contains(&Scope::Mcp));
+        let grant = agent.mcp_server("job-scout").unwrap();
+        assert!(grant.allows("search"));
+        assert!(grant.allows("fetch-posting"));
+        assert!(!grant.allows("delete-everything"));
+        assert_eq!(
+            grant.tools,
+            ["search", "fetch-posting"],
+            "a repeat is one tool"
+        );
+        assert!(agent.mcp_server("other").is_none());
+        assert_eq!(
+            policy.describe(),
+            ["agent.mcp[0] = server job-scout tools [search, fetch-posting]  # scrapes boards"]
+        );
+    }
+
+    #[test]
+    fn an_mcp_grant_must_name_its_tools_rather_than_a_pattern() {
+        // D103: no wildcard, so a tool the server grows overnight is not callable on its own.
+        let (_d, roots) = roots();
+        for body in [
+            r#"mcp = [{ server = "x" }]"#,
+            r#"mcp = [{ server = "x", tools = ["*"] }]"#,
+            r#"mcp = [{ server = "", tools = ["a"] }]"#,
+        ] {
+            let text = format!("version = 1\n\n[agent]\n{body}\n");
+            let err = Policy::parse(&text, &roots).unwrap_err().to_string();
+            assert!(err.contains("agent.mcp[0]"), "{err}");
+        }
     }
 }

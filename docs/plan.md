@@ -2572,6 +2572,15 @@ without putting transport diagnostics in the model's conversation. Neither a del
 connection reuse guarantees cached token accounting; the server's reported usage remains the
 evidence of a hit.
 
+**D103.** An MCP server reaches the model only through a grant that names the server and each of
+its tools: `mcp = [{ server = "job-scout", tools = ["search"], why = "scrapes boards" }]`. There is
+no wildcard and no pattern, because a server's advertised tool list is never authority: a tool it
+grows overnight is not callable until a person writes it down. A grant naming no tools, an empty
+server name, or `*` for a tool is a load error rather than a grant that can call nothing. This one
+line is what says a server and its tools exist at all — the system prompt and `saddle check` both
+print `Policy::describe`, so the model is told what it may reach through the same record a person
+reviews (D41, D47).
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
@@ -2587,6 +2596,7 @@ evidence of a hit.
 | `model-invoke` | spending tokens on the session provider | `saddle:host/model-invoke` import | policy per call, against a budget |
 | `ui` | rendering widgets in the terminal | `saddle:plugin/ui` export | widget vocabulary (D27) |
 | `persist` | storing state between calls | `saddle:host/persist` import | per-plugin storage namespace |
+| `mcp` | reaching a declared MCP server, and calling the tools of it that a grant names | `mcp` grant (D103) | policy per call |
 
 ## 5. Enforcement architecture
 

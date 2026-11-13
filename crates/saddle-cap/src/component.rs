@@ -184,7 +184,9 @@ pub fn host_interfaces(granted: &BTreeSet<Scope>) -> Vec<&'static str> {
             Scope::ModelInvoke => "saddle:host/model-invoke",
             Scope::Persist => "saddle:host/persist",
             Scope::Net => "wasi:http/outgoing-handler",
-            Scope::Tool | Scope::Veto | Scope::Ui => continue,
+            // An MCP grant declares no component import: the client is host-side and reached
+            // through built-in tools (D103). A plugin calling one needs `saddle:host/mcp`.
+            Scope::Tool | Scope::Veto | Scope::Ui | Scope::Mcp => continue,
         });
     }
     out

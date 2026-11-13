@@ -19,10 +19,11 @@ pub enum Scope {
     ModelInvoke,
     Ui,
     Persist,
+    Mcp,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 11] = [
+    pub const ALL: [Scope; 12] = [
         Scope::Exec,
         Scope::FsRead,
         Scope::FsWrite,
@@ -34,6 +35,7 @@ impl Scope {
         Scope::ModelInvoke,
         Scope::Ui,
         Scope::Persist,
+        Scope::Mcp,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -49,6 +51,7 @@ impl Scope {
             Scope::ModelInvoke => "model-invoke",
             Scope::Ui => "ui",
             Scope::Persist => "persist",
+            Scope::Mcp => "mcp",
         }
     }
 }
