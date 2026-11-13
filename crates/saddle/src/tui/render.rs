@@ -1427,29 +1427,78 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     draw_menu(frame, app, editor_area);
 
+    // A dialog owns the screen while it is open, and its text is selected and copied the way the
+    // transcript's is, so the text it drew is kept for the mouse (D87).
+    let mut surface = None;
     if let Some(picker) = &app.resume {
-        draw_resume(frame, picker, area, &app.theme);
+        surface = Some(draw_resume(frame, picker, area, &app.theme));
     }
     if let Some(tree) = &app.tree {
-        draw_tree(frame, tree, area, &app.theme);
+        surface = Some(draw_tree(frame, tree, area, &app.theme));
     }
     if let Some(dialog) = &app.settings {
-        draw_settings(frame, dialog, area, &app.theme);
+        surface = Some(draw_settings(frame, dialog, area, &app.theme));
     }
     if let Some(dialog) = &app.permissions {
-        draw_permissions(frame, dialog, area, &app.theme);
+        surface = Some(draw_permissions(frame, dialog, area, &app.theme));
     }
     if let Some(picker) = &app.themes {
         // Drawn in the theme the highlight offers, which is the point of the preview (D74).
-        draw_themes(frame, picker, area, &app.theme);
+        surface = Some(draw_themes(frame, picker, area, &app.theme));
     }
-    if app.login.is_some() {
-        let at = app
-            .login
-            .as_ref()
-            .and_then(|login| draw_login(frame, login, area, app.spinner, &app.theme));
+    app.open_url_at = None;
+    if let Some(login) = &app.login {
+        let (seen, link) = draw_login(frame, login, area, app.spinner, &app.theme);
         // Kept for the click: a link drawn on the screen is not the terminal's to click (D86).
-        app.open_url_at = at;
+        app.open_url_at = link;
+        surface = Some(seen);
+    }
+    let had_dialog = app.dialog_seen.is_some();
+    let opened = !had_dialog && surface.is_some();
+    app.dialog_seen = surface;
+    if opened || (had_dialog && app.dialog_seen.is_none()) {
+        // The selection belonged to the surface that has just changed, and its line numbers mean
+        // nothing on the other one: keeping it would highlight unrelated text and copy it (D87).
+        app.selection = None;
+    }
+    shade_dialog(frame, app);
+}
+
+/// Puts the selection's background behind the dialog's cells, on the buffer itself (D87).
+///
+/// The transcript's selection is shaded by splitting spans before they are drawn. A dialog is built
+/// by a dozen functions that each own their lines, so its selection is painted where it ended up
+/// instead: the cells of the box the drag covered, which is the same thing from the reader's side.
+fn shade_dialog(frame: &mut Frame<'_>, app: &App) {
+    let (Some(seen), Some(sel)) = (app.dialog_seen.as_ref(), app.selection) else {
+        return;
+    };
+    if sel.is_empty() {
+        return;
+    }
+    let (first, last) = sel.ends();
+    let buf = frame.buffer_mut();
+    let height = seen.lines.len() as u16;
+    for line in first.line..=last.line.min(seen.lines.len().saturating_sub(1)) {
+        let row = seen.area.y.saturating_add(line as u16);
+        if line as u16 >= height || row >= seen.area.bottom() {
+            break;
+        }
+        let chars = seen.lines[line].chars().count();
+        let from = if line == first.line { first.ch } else { 0 };
+        let to = if line == last.line {
+            last.ch.min(chars)
+        } else {
+            chars
+        };
+        for ch in from..to {
+            let col = seen.area.x.saturating_add(ch as u16);
+            if col >= seen.area.right() {
+                break;
+            }
+            let cell = &mut buf[(col, row)];
+            cell.set_style(cell.style().patch(selected_style(&app.theme)));
+        }
     }
 }
 
@@ -1532,7 +1581,7 @@ fn draw_login(
     area: Rect,
     spinner: usize,
     theme: &Theme,
-) -> Option<Rect> {
+) -> (Seen, Option<Rect>) {
     let mut link_at = None;
     let width = area.width.saturating_sub(4).min(76);
     let inner = width.saturating_sub(2) as usize;
@@ -1774,16 +1823,17 @@ fn draw_login(
     };
     let at = modal(frame, area, width, &title, lines, cursor, theme);
     // A row inside the box, and a column inside the address that was drawn there.
-    link_at.map(|(row, col, len)| {
-        let x = at.x.saturating_add(1).saturating_add(col as u16);
-        let room = at.right().saturating_sub(1).saturating_sub(x);
+    let link = link_at.map(|(row, col, len)| {
+        let x = at.rect.x.saturating_add(1).saturating_add(col as u16);
+        let room = at.rect.right().saturating_sub(1).saturating_sub(x);
         Rect::new(
             x,
-            at.y.saturating_add(1).saturating_add(row as u16),
+            at.rect.y.saturating_add(1).saturating_add(row as u16),
             (len as u16).min(room),
             1,
         )
-    })
+    });
+    (at.seen, link)
 }
 
 /// A bordered box centred over `area`, with an optional cursor at (row, column) inside it.
@@ -1795,8 +1845,15 @@ fn modal(
     lines: Vec<Line<'_>>,
     cursor: Option<(usize, usize)>,
     theme: &Theme,
-) -> Rect {
+) -> Surface {
     let height = (lines.len() as u16 + 2).min(area.height);
+    // What each row says, cut to the cells it occupies: a dialog clips its text at the border, so
+    // the part that was never drawn is not selectable either (D87).
+    let inner = width.saturating_sub(2) as usize;
+    let text: Vec<String> = lines
+        .iter()
+        .map(|line| plain(line).chars().take(inner).collect())
+        .collect();
     let rect = Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 3,
@@ -1819,12 +1876,31 @@ fn modal(
             rect.y + 1 + row as u16,
         ));
     }
-    rect
+    Surface {
+        seen: Seen {
+            // The text, not the border: a drag that starts on the frame selects the line it is on.
+            area: Rect::new(
+                rect.x.saturating_add(1),
+                rect.y.saturating_add(1),
+                rect.width.saturating_sub(2),
+                rect.height.saturating_sub(2),
+            ),
+            top: 0,
+            lines: text,
+        },
+        rect,
+    }
+}
+
+/// What a modal put on the screen: the box it drew in, and the text inside it (D87).
+struct Surface {
+    seen: Seen,
+    rect: Rect,
 }
 
 /// `/tree`: every message on the branch, the one the conversation is at, and where another branch
 /// leaves from (D54).
-fn draw_tree(frame: &mut Frame<'_>, tree: &Tree, area: Rect, theme: &Theme) {
+fn draw_tree(frame: &mut Frame<'_>, tree: &Tree, area: Rect, theme: &Theme) -> Seen {
     let width = area.width.saturating_sub(4).min(96);
     let inner = width.saturating_sub(2) as usize;
     let accent = Style::new().fg(theme.accent);
@@ -1871,10 +1947,11 @@ fn draw_tree(frame: &mut Frame<'_>, tree: &Tree, area: Rect, theme: &Theme) {
         lines,
         None,
         theme,
-    );
+    )
+    .seen
 }
 
-fn draw_resume(frame: &mut Frame<'_>, picker: &SessionPicker, area: Rect, theme: &Theme) {
+fn draw_resume(frame: &mut Frame<'_>, picker: &SessionPicker, area: Rect, theme: &Theme) -> Seen {
     let width = area.width.saturating_sub(4).min(96);
     let inner = width.saturating_sub(2) as usize;
     let accent = Style::new().fg(theme.accent);
@@ -1950,10 +2027,16 @@ fn draw_resume(frame: &mut Frame<'_>, picker: &SessionPicker, area: Rect, theme:
         lines,
         cursor,
         theme,
-    );
+    )
+    .seen
 }
 
-fn draw_settings(frame: &mut Frame<'_>, dialog: &SettingsDialog, area: Rect, theme: &Theme) {
+fn draw_settings(
+    frame: &mut Frame<'_>,
+    dialog: &SettingsDialog,
+    area: Rect,
+    theme: &Theme,
+) -> Seen {
     let width = area.width.saturating_sub(4).min(84);
     let inner = width.saturating_sub(2) as usize;
     let accent = Style::new().fg(theme.accent);
@@ -1999,7 +2082,7 @@ fn draw_settings(frame: &mut Frame<'_>, dialog: &SettingsDialog, area: Rect, the
         "↑↓ choose · enter change · esc close"
     };
     lines.push(Line::from(Span::styled(keys, dim(theme))));
-    modal(frame, area, width, " Settings ", lines, cursor, theme);
+    modal(frame, area, width, " Settings ", lines, cursor, theme).seen
 }
 
 /// `/theme`: every theme by name, the highlight previewed on the whole screen (D74).
@@ -2008,7 +2091,7 @@ fn draw_themes(
     picker: &crate::tui::themes::ThemePicker,
     area: Rect,
     theme: &Theme,
-) {
+) -> Seen {
     use crate::tui::themes::ROWS as THEME_ROWS;
     let width = area.width.saturating_sub(4).min(72);
     let inner = width.saturating_sub(2) as usize;
@@ -2075,10 +2158,15 @@ fn draw_themes(
         "* was in force · ↑↓ preview · enter choose · esc back",
         dim(theme),
     )));
-    modal(frame, area, width, " Theme ", lines, None, theme);
+    modal(frame, area, width, " Theme ", lines, None, theme).seen
 }
 
-fn draw_permissions(frame: &mut Frame<'_>, dialog: &Permissions, area: Rect, theme: &Theme) {
+fn draw_permissions(
+    frame: &mut Frame<'_>,
+    dialog: &Permissions,
+    area: Rect,
+    theme: &Theme,
+) -> Seen {
     let width = area.width.saturating_sub(4).min(88);
     let inner = width.saturating_sub(2) as usize;
     let accent = Style::new().fg(theme.accent);
@@ -2185,7 +2273,8 @@ fn draw_permissions(frame: &mut Frame<'_>, dialog: &Permissions, area: Rect, the
         lines,
         cursor,
         theme,
-    );
+    )
+    .seen
 }
 
 /// The start of `s` in at most `max` columns, with `…` marking the cut.
@@ -2996,6 +3085,180 @@ mod tests {
             !text.contains("FPAT-OKEE6"),
             "the old code is gone:\n{text}"
         );
+    }
+
+    #[test]
+    fn a_drag_inside_a_dialog_copies_the_dialog_text() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        // D87: a dialog owns the screen while it is open, so a drag there means its text. Without
+        // this the text was drawn and unselectable, which is what the sign-in screen made obvious.
+        let mut app = bare_app();
+        app.settings = Some(crate::tui::settings::SettingsDialog::new(
+            crate::tui::settings::Values {
+                provider: "synthetic".into(),
+                model: "hf:zai-org/GLM-5.3".into(),
+                effort: None,
+                max_tokens: None,
+                context_window: None,
+                window: 128_000,
+                status: String::new(),
+                max_steps: None,
+                auto_compact: true,
+                idle_compact: true,
+                background_compact: true,
+                show_reasoning: true,
+                expand_tools: false,
+                config_path: "~/.config/saddle/config.toml".into(),
+                policy_path: "~/.config/saddle/config.toml".into(),
+            },
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let seen = app.dialog_seen.clone().expect("the dialog's text was kept");
+        let wanted = seen
+            .lines
+            .iter()
+            .find(|l| l.contains("provider"))
+            .cloned()
+            .unwrap_or_else(|| panic!("no provider row in {:?}", seen.lines));
+        // Drag from the start of that row to its end, the way a mouse would.
+        let row = seen
+            .lines
+            .iter()
+            .position(|l| l.contains("provider"))
+            .unwrap() as u16
+            + seen.area.y;
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: seen.area.x,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: seen.area.right().saturating_sub(1),
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        let copied = app.mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: seen.area.right().saturating_sub(1),
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        let Some(crate::tui::app::Action::Copy(text, what)) = copied else {
+            panic!("a drag in the dialog must copy, got {copied:?}");
+        };
+        assert_eq!(what, "the selection");
+        assert_eq!(text, wanted.trim(), "the whole row, as drawn");
+
+        // The selection is drawn where it is: the highlight is on the buffer, not just in state.
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let at = (seen.area.x, row);
+        assert_eq!(
+            buf[at].bg, app.theme.selected_bg,
+            "the first cell of the row is highlighted"
+        );
+    }
+
+    #[test]
+    fn a_drag_past_a_dialog_stops_at_its_edge_and_closing_drops_it() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut app = bare_app();
+        app.entries.push(Entry::User("a transcript line".into()));
+        app.cache.push(None);
+        app.settings = Some(crate::tui::settings::SettingsDialog::new(
+            crate::tui::settings::Values {
+                provider: "synthetic".into(),
+                model: "m".into(),
+                effort: None,
+                max_tokens: None,
+                context_window: None,
+                window: 1,
+                status: String::new(),
+                max_steps: None,
+                auto_compact: true,
+                idle_compact: true,
+                background_compact: true,
+                show_reasoning: true,
+                expand_tools: false,
+                config_path: "c".into(),
+                policy_path: "c".into(),
+            },
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let seen = app.dialog_seen.clone().unwrap();
+        let first = seen.area.y;
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: seen.area.x,
+            row: first,
+            modifiers: KeyModifiers::NONE,
+        });
+        // Dragged far below the box: the selection stops at the last line it drew rather than
+        // reaching into the transcript underneath, which is not what the mouse was over.
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: seen.area.x + 4,
+            row: 29,
+            modifiers: KeyModifiers::NONE,
+        });
+        let sel = app.selection.expect("a selection");
+        assert_eq!(sel.focus.line, seen.lines.len() - 1);
+        assert!(
+            !app.selected_text()
+                .unwrap_or_default()
+                .contains("a transcript line"),
+            "the transcript must not be in the copy"
+        );
+
+        // A dialog that closes leaves its selection behind: the same indices would land on other
+        // text.
+        app.settings = None;
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.dialog_seen, None);
+        assert_eq!(app.selection, None);
+
+        // And so does a dialog that opens over one the transcript had: the same indices would land
+        // on the dialog's text instead.
+        app.entries
+            .push(Entry::User("another transcript line".into()));
+        app.cache.push(None);
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let transcript = app.seen.clone().unwrap();
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: transcript.area.x,
+            row: transcript.area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            app.selection.is_some(),
+            "the transcript is selectable again"
+        );
+        app.settings = Some(crate::tui::settings::SettingsDialog::new(
+            crate::tui::settings::Values {
+                provider: "synthetic".into(),
+                model: "m".into(),
+                effort: None,
+                max_tokens: None,
+                context_window: None,
+                window: 1,
+                status: String::new(),
+                max_steps: None,
+                auto_compact: true,
+                idle_compact: true,
+                background_compact: true,
+                show_reasoning: true,
+                expand_tools: false,
+                config_path: "c".into(),
+                policy_path: "c".into(),
+            },
+        ));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.selection, None, "the old selection did not survive");
     }
 
     #[test]

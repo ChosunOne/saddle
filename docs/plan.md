@@ -2068,6 +2068,38 @@ unusable, which is what "I can't click the link and I can't select it" was.
   overlays, and the keys above cover what it was wanted for); opening the link from `saddle login`
   in a terminal, where ordinary terminal selection already works.
 
+**D87.** A dialog's text is selected and copied like the transcript's, because a dialog owns the
+screen and everything in it was otherwise dead text.
+
+D86 made this visible by accident: the sign-in address could not be selected, so it could not be
+copied, so the fix had to be a click target and a key. That was a patch over a hole — every dialog
+in the UI had the same hole. `/settings`, `/permissions`, `/theme`, `/resume` and the tree all draw
+text worth taking away: a model name, a policy path, the rule that is denying something.
+
+- **One selection, and one surface.** `App::surface` is the open dialog's text if there is one, else
+  the transcript; the drag, the mapping from a cell to a character, and the copy all go through it.
+  So a dialog needs no selection code of its own, and a new dialog gets this by being drawn through
+  the same `modal`.
+- **What was drawn is what is selected.** A modal reports the lines it put in its box, cut to the
+  cells they occupy: a dialog clips at its border, so the part that never appeared is not
+  selectable. A drag that starts on the frame selects the line it is beside, because the frame is
+  not text.
+- **A drag past the edge stops at the edge.** The transcript scrolls when a drag is pulled out of
+  it, which is how a selection is made longer than the screen. A dialog does not scroll, so there is
+  nothing for the same gesture to mean: the selection goes to the last line drawn and stays there,
+  rather than reaching into the transcript underneath, which the mouse was not over.
+- **The highlight is painted on the buffer.** The transcript's selection is shaded by splitting
+  spans before drawing, which a modal cannot do: a dozen functions build their own lines, and the
+  box is drawn after them. So the selected cells are patched in place after the frame is composed.
+  Same appearance, one implementation, and it works for every dialog without touching any of them.
+- **Closing a dialog drops the selection.** Its line numbers mean nothing in the transcript, so
+  keeping one would highlight unrelated text and copy the wrong thing.
+- **D86's click target stays.** A link is the one thing in a dialog where the gesture is "follow
+  this", not "take this", so it is hit-tested before the selection begins. The two do not fight:
+  the link opens, its neighbours select.
+- **Deferred:** keyboard-only selection inside a dialog (no anchor is set without a mouse); the `/`
+  menu, which is a popup over the editor rather than a dialog and is filtered rather than read.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

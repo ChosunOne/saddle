@@ -464,6 +464,9 @@ pub struct App {
     pub copied_what: &'static str,
     /// Where the sign-in link was drawn, so a click on it opens the browser (D86).
     pub open_url_at: Option<ratatui::layout::Rect>,
+    /// The text of the dialog that is open, as it was drawn, so its text can be selected and copied
+    /// exactly as the transcript's can (D87).
+    pub dialog_seen: Option<Seen>,
     /// When escape was last pressed on an empty editor, so two of them open the tree (D54).
     last_escape: Option<std::time::Instant>,
     pub total_lines: usize,
@@ -523,7 +526,8 @@ ctrl+g       write the prompt in $EDITOR
 @path        attach a file to the prompt (type @ to pick one)
 !cmd         run a command in the sandbox and share its output; !!cmd keeps it to you
 pgup/pgdn    scroll the transcript (also the mouse wheel)
-drag         select text in the transcript; it is highlighted and copied on release
+drag         select text — in the transcript, or in the dialog that is open; it is
+             highlighted and copied on release
 end/home     jump to the end or start of the transcript when the editor is empty
              (ctrl+end and ctrl+home always; clicking the ‘more lines’ badge too)
 ctrl+o       show or hide full tool output
@@ -577,6 +581,7 @@ impl App {
             copied: None,
             copied_what: "the selection",
             open_url_at: None,
+            dialog_seen: None,
             last_escape: None,
             total_lines: 0,
             images: Vec::new(),
@@ -1155,6 +1160,10 @@ impl App {
     /// The mouse: the wheel scrolls, and a drag across the transcript selects text (D35). Text is
     /// copied when the button comes up, so a drag that ends anywhere has already done what it
     /// looked like it would.
+    ///
+    /// A dialog's text is selected the same way while it is open, because a dialog owns the screen
+    /// and nothing in it would otherwise be copyable (D87). The one other pointer target is the
+    /// sign-in link, which opens rather than selects (D86).
     /// Opens the theme list on the theme in force, remembering what to put back (D74).
     pub fn open_themes(&mut self, mut picker: crate::tui::themes::ThemePicker) {
         let name = self
@@ -1268,7 +1277,9 @@ impl App {
                 self.selection = None;
                 None
             }
-            MouseEventKind::Down(MouseButton::Left) if !overlay => {
+            // A drag over a dialog selects the dialog's text, which is the same thing it does over
+            // the transcript; nothing else in an overlay is pointer-driven (D87).
+            MouseEventKind::Down(MouseButton::Left) if !overlay || self.dialog_seen.is_some() => {
                 let cell = self.cell_at(&ev)?;
                 self.selection = Some(Selection {
                     anchor: cell,
@@ -1277,7 +1288,9 @@ impl App {
                 });
                 None
             }
-            MouseEventKind::Drag(MouseButton::Left) if !overlay => self.extend(ev),
+            MouseEventKind::Drag(MouseButton::Left) if !overlay || self.dialog_seen.is_some() => {
+                self.extend(ev)
+            }
             MouseEventKind::Up(MouseButton::Left) => {
                 let mut sel = self.selection?;
                 if !sel.dragging {
@@ -1304,7 +1317,18 @@ impl App {
         if !sel.dragging {
             return None;
         }
-        let (area, top, len) = self.seen.as_ref().map(|s| (s.area, s.top, s.lines.len()))?;
+        let seen = self.surface()?;
+        let (area, top, len) = (seen.area, seen.top, seen.lines.len());
+        // A dialog does not scroll: a drag past its edge selects up to the edge and stops there,
+        // rather than scrolling the transcript underneath it (D87).
+        if self.dialog_seen.is_some() {
+            let row = ev.row.clamp(area.y, area.bottom().saturating_sub(1));
+            let line = (top + usize::from(row - area.y)).min(len.saturating_sub(1));
+            let ch = char_at(&seen.lines[line], ev.column.saturating_sub(area.x));
+            sel.focus = Cell { line, ch };
+            self.selection = Some(sel);
+            return None;
+        }
         if ev.row < area.y {
             self.scroll_by(1);
             sel.focus = Cell {
@@ -1325,8 +1349,16 @@ impl App {
     }
 
     /// The character under the mouse, in the transcript as it was last drawn.
+    /// The surface a selection is over: the open dialog, else the transcript (D87).
+    ///
+    /// A dialog is drawn over the transcript and owns the screen while it is open, so a drag there
+    /// means the dialog's text. Its own `top` is zero: a dialog is not scrolled.
+    fn surface(&self) -> Option<&Seen> {
+        self.dialog_seen.as_ref().or(self.seen.as_ref())
+    }
+
     fn cell_at(&self, ev: &MouseEvent) -> Option<Cell> {
-        let seen = self.seen.as_ref()?;
+        let seen = self.surface()?;
         let area = seen.area;
         if seen.lines.is_empty() || area.height == 0 {
             return None;
@@ -1340,7 +1372,7 @@ impl App {
     /// The text under the selection, as it was drawn.
     pub fn selected_text(&self) -> Option<String> {
         let sel = self.selection?;
-        let seen = self.seen.as_ref()?;
+        let seen = self.surface()?;
         if sel.is_empty() || seen.lines.is_empty() {
             return None;
         }
