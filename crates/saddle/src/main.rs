@@ -7,6 +7,7 @@ mod compact;
 mod config;
 mod context;
 mod defaults;
+mod ignore;
 mod output;
 mod paths;
 mod provider;
@@ -905,6 +906,12 @@ fn tool(
     let picked = gate_workspace(paths, &workspace, session)?;
     let session = picked.as_deref().unwrap_or(session);
     let mut session = Session::open_with(dir, Some(session), overrides)?;
+    // Discovery's notes say why a skill was not advertised. Line mode shows them in its header and
+    // the TUI in its intro; without this a refused or malformed skill is silent here, which is the
+    // shape a silent skip takes (D68).
+    for note in &session.skill_notes {
+        eprintln!("saddle: {note}");
+    }
     let log = session.audit.path().to_path_buf();
     let result = tools::call(&mut session, name, &input);
     session.close()?;

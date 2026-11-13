@@ -1213,9 +1213,9 @@ use it.
   authority from a second source, which is the failure this project exists to prevent (§5). What a
   skill may do is what the policy allows. A hostile skill can therefore only ask for something the
   grants already permit, and every call it causes is in the transcript and the audit log.
-- **Two tiers, and each is read the way its trust warrants.** The user tier (`~/.agents/skills`,
-  then `~/.config/saddle/skills`) is the user's own file, host-read like the global instruction file
-  (D32). The project tier (`.agents/skills` from the workspace root down to the start directory) is
+- **Two tiers, and each is read the way its trust warrants.** The user tier (now `~/.agents/skills`
+  alone; see D66, D67) is the user's own directory, read through the same gate as `read`. The
+  project tier (every `.agents/skills` in the workspace, per D68) is
   written by whoever wrote the repository, so the file is read **through the policy as the agent**
   and a skill the grants refuse is refused and noted, never advertised. The walk that finds a
   `SKILL.md` is the host's and decides nothing, as the existence checks for instruction files do;
@@ -1357,6 +1357,34 @@ tools without being a root or part of the session.
 - **What survives from D64**: the format, the frontmatter subset, `allowed-tools` being ignored and
   said so, the project tier being read through the policy, more specific winning over less, and the
   audit records. What goes is the tool and the host-read tier that justified it.
+
+**D68.** Skill discovery follows pi's rules for a skills directory, and a project skill is found
+anywhere in the workspace.
+
+- **The two halves need each other.** A skill scoped to `crates/saddle` has to be discoverable from
+  the workspace root, which means walking the tree rather than the ancestors of the start directory
+  (what D64 did). Walking a whole tree is only affordable if there is a pruning rule, and there
+  already was one waiting: the project's own ignore files. So the scan honours them, and the cost of
+  the wider search is paid by the metadata the project already maintains.
+- **One ignore matcher, two callers.** `src/ignore.rs` holds the parser and the matcher; the search
+  tools and skill discovery both use it, because "what is ignored" has to mean one thing — a file
+  `grep` skips and discovery walks is a disagreement nobody can see. Which files are read is the
+  caller's choice: both read `.gitignore`, `.ignore` and `.fdignore`. The syntax is the part of
+  `.gitignore` that matters: `#` comments, `!` negation, a trailing `/` for directories, a pattern
+  with a slash anchored to its file's directory and one without matching at any depth, the last
+  match winning.
+- **A skills directory is read the way pi reads one.** A directory holding `SKILL.md` is a skill and
+  is **not** descended into, which is what stops a skill's own `references/` becoming more skills.
+  Otherwise its subdirectories are searched, dot entries and `node_modules` are skipped, and at the
+  top level only a bare `.md` file is a skill too. `MAX_DEPTH` bounds a tree of directories with no
+  skill in it, and the project scan remembers resolved directories so a symlink loop terminates.
+- **The project tier is every `.agents/skills` in the workspace, shallowest first.** A deeper skill
+  replaces a shallower one of the same name, which keeps D64's rule that the more specific file wins,
+  and the note names both. Dot directories are skipped, which is also what stops the scan entering
+  `.agents` itself.
+- **A refusal is said out loud.** `saddle tool` now prints discovery's notes to stderr. Until it did,
+  a skill refused by the policy or skipped by a rule vanished with no output at all, which is the
+  worst shape a bug takes: the same silence as "there are none".
 
 ## 4. Scope enumeration
 

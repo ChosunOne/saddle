@@ -18,6 +18,7 @@ use serde_json::Value;
 
 use super::ToolOutput;
 use super::fs::{gate, open_root};
+use crate::ignore::Rules;
 use crate::session::Session;
 
 pub const MAX_LIST: usize = 500;
@@ -29,77 +30,6 @@ const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_VISITED: usize = 100_000;
 
 /// One `.gitignore` line, matched against paths relative to the root.
-struct Rule {
-    glob: GlobMatcher,
-    negate: bool,
-    dir_only: bool,
-}
-
-#[derive(Default)]
-struct Ignores {
-    rules: Vec<Rule>,
-}
-
-impl Ignores {
-    /// Adds the rules of `<base>/.gitignore`, if there is one.
-    fn load(&mut self, root: &Dir, base: &str) {
-        let file = if base.is_empty() {
-            ".gitignore".to_owned()
-        } else {
-            format!("{base}/.gitignore")
-        };
-        let Ok(text) = root.read_to_string(&file) else {
-            return;
-        };
-        for line in text.lines() {
-            let line = line.trim_end();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let (negate, line) = match line.strip_prefix('!') {
-                Some(rest) => (true, rest),
-                None => (false, line),
-            };
-            let (dir_only, line) = match line.strip_suffix('/') {
-                Some(rest) => (true, rest),
-                None => (false, line),
-            };
-            // A pattern with a slash is anchored to its .gitignore; one without matches at any
-            // depth below it.
-            let anchored = line.contains('/');
-            let line = line.trim_start_matches('/');
-            let prefix = if base.is_empty() {
-                String::new()
-            } else {
-                format!("{base}/")
-            };
-            let pattern = if anchored {
-                format!("{prefix}{line}")
-            } else {
-                format!("{prefix}**/{line}")
-            };
-            if let Ok(glob) = GlobBuilder::new(&pattern).literal_separator(true).build() {
-                self.rules.push(Rule {
-                    glob: glob.compile_matcher(),
-                    negate,
-                    dir_only,
-                });
-            }
-        }
-    }
-
-    /// The last matching rule decides.
-    fn ignored(&self, rel: &str, is_dir: bool) -> bool {
-        let mut ignored = false;
-        for r in &self.rules {
-            if (!r.dir_only || is_dir) && r.glob.is_match(rel) {
-                ignored = !r.negate;
-            }
-        }
-        ignored
-    }
-}
-
 /// A file found by a walk: its path relative to the root.
 struct Found {
     rel: String,
@@ -111,6 +41,20 @@ struct Walk {
     cut_short: bool,
 }
 
+/// Adds the rules of every ignore file in `base`, which is a directory relative to `root`.
+fn load_ignores(root: &Dir, rules: &mut Rules, base: &str) {
+    for name in crate::ignore::FILES {
+        let file = if base.is_empty() {
+            (*name).to_owned()
+        } else {
+            format!("{base}/{name}")
+        };
+        if let Ok(text) = root.read_to_string(&file) {
+            rules.add(&text, base);
+        }
+    }
+}
+
 /// Walks the files beneath `start` (a directory relative to the root), skipping `.git`, ignored
 /// paths, symlinks, and any path `allowed` refuses. Stops after `limit` files.
 fn walk(
@@ -120,17 +64,17 @@ fn walk(
     gitignore: bool,
     allowed: &dyn Fn(&str) -> bool,
 ) -> Walk {
-    let mut ignores = Ignores::default();
+    let mut ignores = Rules::default();
     if gitignore {
         // Rules from the root down to the start apply too.
+        load_ignores(root, &mut ignores, "");
         let mut base = String::new();
-        ignores.load(root, &base);
         for part in start.split('/').filter(|p| !p.is_empty()) {
             if !base.is_empty() {
                 base.push('/');
             }
             base.push_str(part);
-            ignores.load(root, &base);
+            load_ignores(root, &mut ignores, &base);
         }
     }
     let mut out = Walk {
@@ -182,7 +126,7 @@ fn walk(
             }
             if is_dir {
                 if gitignore {
-                    ignores.load(root, &rel);
+                    load_ignores(root, &mut ignores, &rel);
                 }
                 subdirs.push(rel);
             } else {

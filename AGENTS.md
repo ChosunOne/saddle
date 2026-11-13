@@ -29,7 +29,8 @@ Inside `crates/saddle/src`:
 | `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch` | the nine built-in tools (`fetch` is host-side network, D39; `patch` is D56) |
 | `tools/diff` | line diffs of edited files, for the transcript only — the model never sees them |
 | `context` | instruction files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md` fallback), read through the policy |
-| `skills` | `SKILL.md` skills: discovery through the `read` gate, the prompt listing (D64, D67) |
+| `skills` | `SKILL.md` skills: discovery through the `read` gate, the prompt listing (D64, D67, D68) |
+| `ignore` | ignore-file matching (`.gitignore`, `.ignore`, `.fdignore`), shared by `tools/search` and `skills` (D68) |
 | `compact` | replacing the older part of a long conversation with a model-written summary (D33) |
 | `store` | the saved conversations: a SQLite tree of messages per workspace (D53), imported from the older JSON Lines files once |
 | `output` | line-mode output: a terminal, or one JSON object per line for a program (D52) |
@@ -144,7 +145,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D67 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D68 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

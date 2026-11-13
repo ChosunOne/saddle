@@ -27,7 +27,8 @@ use saddle_policy::audit::sha256_hex;
 use serde_json::json;
 
 use crate::config::SkillsConfig;
-use crate::context::{cap, directories, home, label_of};
+use crate::context::{cap, home, label_of};
+use crate::ignore::Rules;
 use crate::session::Session;
 use crate::tools::fs::read_text;
 
@@ -35,8 +36,12 @@ use crate::tools::fs::read_text;
 pub const FILE: &str = "SKILL.md";
 /// The longest description advertised, which is the routing signal and so must stay short.
 pub const MAX_DESCRIPTION: usize = 1024;
-/// The most a directory tree is walked below a skills directory, so a deep tree costs a bound.
-const MAX_DEPTH: usize = 4;
+/// How deep a skills directory or the project scan descends. pi has no bound, because a directory
+/// holding `SKILL.md` ends the walk; this bounds the pathological case of a tree of directories
+/// with none.
+const MAX_DEPTH: usize = 32;
+/// Directories visited in one scan before it gives up, so a huge tree cannot stall a session.
+const MAX_VISITED: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
@@ -62,27 +67,35 @@ pub fn discover(session: &mut Session, cfg: &SkillsConfig) -> Result<(Vec<Skill>
     // point at a denial. The user tier is `~/.agents/skills`, which is a default tool path (D66);
     // the project tier is read through the policy, so an excluded one is refused here.
     let mut skills: Vec<Skill> = Vec::new();
-    let mut bases: Vec<PathBuf> = Vec::new();
     if let Some(home) = home() {
-        bases.push(home.join(".agents/skills"));
+        let base = home.join(".agents/skills");
+        if base.is_dir() {
+            load_dir(
+                session,
+                &base,
+                "",
+                &mut Rules::default(),
+                &mut skills,
+                &mut notes,
+                cfg.max,
+            )?;
+        }
     }
+    // A project skill may sit in any directory of the workspace, so the scan finds every
+    // `.agents/skills` in the tree rather than only the ancestors of the start directory (D68).
+    // Shallowest first, so a deeper one of the same name wins, as a more specific instruction file
+    // does.
     let workspace = session.setup.workspace.clone();
-    for dir in directories(&workspace, &session.setup.start) {
-        bases.push(workspace.join(&dir).join(".agents/skills"));
-    }
-    for base in bases {
-        // Host stat: a missing directory is not a problem, and deciding nothing is the point.
-        if base.symlink_metadata().is_err() {
-            continue;
-        }
-        for file in walk(&base) {
-            let label = label_of(&file);
-            let raw = file.display().to_string();
-            match read_text(session, &raw)? {
-                Ok(text) => add(&mut skills, &mut notes, &file, label, text, cfg.max),
-                Err(out) => notes.push(format!("{label} was not advertised: {}", out.content)),
-            }
-        }
+    for base in project_bases(&workspace) {
+        load_dir(
+            session,
+            &base,
+            "",
+            &mut Rules::default(),
+            &mut skills,
+            &mut notes,
+            cfg.max,
+        )?;
     }
     // Advertised in the prompt, in the order found: general first, more specific later.
     skills.truncate(cfg.max.max(1));
@@ -104,40 +117,175 @@ pub fn discover(session: &mut Session, cfg: &SkillsConfig) -> Result<(Vec<Skill>
     Ok((skills, notes))
 }
 
-/// Every `SKILL.md` below `base`, depth-capped.
+/// Every `.agents/skills` directory in the workspace, shallowest first (D68).
 ///
-/// Symlinks are followed, unlike the file tools' walk: a skill installed by linking it into
-/// `~/.agents/skills` is the usual way to share one, and discovery is a host read of the user's own
-/// directory rather than a path the model chose. The price is a cycle, so a directory already
-/// visited is skipped; the depth cap bounds the rest. A project skill is still read through the
-/// policy afterwards, so a link leading out of the workspace is refused there rather than here.
-fn walk(base: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
+/// Walking the whole tree is what makes a skill scoped to a subdirectory discoverable from the
+/// root, and the ignore files are what make that affordable: a build directory that a project
+/// already ignores is not walked. Dot directories are skipped, which also stops the scan entering
+/// `.agents` itself.
+fn project_bases(workspace: &Path) -> Vec<PathBuf> {
+    let mut bases = Vec::new();
+    let mut rules = Rules::default();
+    let mut stack = vec![(workspace.to_path_buf(), String::new(), 0usize)];
     let mut seen = std::collections::HashSet::new();
-    let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
-        std::collections::VecDeque::from([(base.to_path_buf(), 0)]);
-    while let Some((dir, depth)) = queue.pop_front() {
-        // The resolved directory is what a cycle repeats, so that is what is remembered.
+    let mut visited = 0;
+    while let Some((dir, rel, depth)) = stack.pop() {
+        visited += 1;
+        if visited > MAX_VISITED {
+            break;
+        }
+        // A symlinked directory can point back at an ancestor; the resolved path is what repeats.
         let real = dir.canonicalize().unwrap_or_else(|_| dir.clone());
         if !seen.insert(real) {
+            continue;
+        }
+        load_ignores(&dir, &rel, &mut rules);
+        let candidate = dir.join(SKILLS_DIR);
+        if candidate.is_dir() {
+            bases.push(candidate);
+        }
+        if depth >= MAX_DEPTH {
             continue;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-        children.sort();
-        for child in children {
-            // `is_file` follows a link, so a linked skill is found even though the entry itself is
-            // not a directory.
-            if child.join(FILE).is_file() {
-                found.push(child.join(FILE));
-            } else if depth < MAX_DEPTH && std::fs::metadata(&child).is_ok_and(|m| m.is_dir()) {
-                queue.push_back((child, depth + 1));
+        let mut names: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        for name in names {
+            if skip_name(&name) {
+                continue;
             }
+            let child = dir.join(&name);
+            let child_rel = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            let Ok(meta) = std::fs::metadata(&child) else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+            if rules.ignored(&child_rel, true) {
+                continue;
+            }
+            stack.push((child, child_rel, depth + 1));
         }
     }
-    found
+    // Shallowest first, so a deeper skill of the same name replaces a shallower one.
+    bases.sort_by_key(|p| (p.components().count(), p.clone()));
+    bases
+}
+
+/// Where a project's skills live, relative to the directory that scopes them.
+const SKILLS_DIR: &str = ".agents/skills";
+
+/// A name discovery never looks at: dot entries (which covers `.git` and the ignore files
+/// themselves) and `node_modules`, whose skills are a dependency's rather than the project's.
+fn skip_name(name: &str) -> bool {
+    name.starts_with('.') || name == "node_modules"
+}
+
+/// Adds the rules of every ignore file in `dir`, which sits at `rel` below the scan root.
+fn load_ignores(dir: &Path, rel: &str, rules: &mut Rules) {
+    for name in crate::ignore::FILES {
+        if let Ok(text) = std::fs::read_to_string(dir.join(name)) {
+            rules.add(&text, rel);
+        }
+    }
+}
+
+/// One skills directory, with pi's rules: a directory holding `SKILL.md` is a skill and is not
+/// descended into; otherwise its subdirectories are searched, and at the top level a bare `.md`
+/// file is a skill too (D68).
+///
+/// Symlinks are followed, unlike the file tools' walk: a skill installed by linking it in is the
+/// usual way to share one, and discovery is a host read of the user's own directory rather than a
+/// path the model chose. The depth cap bounds a tree of directories with no skill in it; a project
+/// skill is still read through the policy, so a link leading out of the workspace is refused there.
+fn load_dir(
+    session: &mut Session,
+    dir: &Path,
+    rel: &str,
+    rules: &mut Rules,
+    skills: &mut Vec<Skill>,
+    notes: &mut Vec<String>,
+    max: usize,
+) -> Result<()> {
+    load_ignores(dir, rel, rules);
+    let declared = dir.join(FILE);
+    // `is_file` follows a link, so a linked skill is found even though the entry is not a
+    // directory. A directory with SKILL.md is a skill root: nothing beneath it is searched, which
+    // is what stops a skill's own `references/` being mistaken for more skills.
+    if declared.is_file() {
+        let child_rel = if rel.is_empty() {
+            FILE.to_owned()
+        } else {
+            format!("{rel}/{FILE}")
+        };
+        if rel.is_empty() || !rules.ignored(&child_rel, false) {
+            load_file(session, &declared, skills, notes, max)?;
+        }
+        return Ok(());
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    for name in names {
+        if skip_name(&name) {
+            continue;
+        }
+        let child = dir.join(&name);
+        let child_rel = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
+        // `metadata` follows a link, so a linked directory is searched and a linked file read.
+        let Ok(meta) = std::fs::metadata(&child) else {
+            continue;
+        };
+        if meta.is_dir() {
+            if rel.matches('/').count() >= MAX_DEPTH {
+                continue;
+            }
+            if !rules.ignored(&child_rel, true) {
+                load_dir(session, &child, &child_rel, rules, skills, notes, max)?;
+            }
+        } else if rel.is_empty() && name.ends_with(".md") && !rules.ignored(&child_rel, false) {
+            // A bare markdown file in the top level of a skills directory is a skill too, which is
+            // the portable-enough form pi accepts beside the directory layout.
+            load_file(session, &child, skills, notes, max)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reads one skill file through the gate and offers it to [`add`].
+fn load_file(
+    session: &mut Session,
+    file: &Path,
+    skills: &mut Vec<Skill>,
+    notes: &mut Vec<String>,
+    max: usize,
+) -> Result<()> {
+    let label = label_of(file);
+    let raw = file.display().to_string();
+    match read_text(session, &raw)? {
+        Ok(text) => add(skills, notes, file, label, text, max),
+        Err(out) => notes.push(format!("{label} was not advertised: {}", out.content)),
+    }
+    Ok(())
 }
 
 /// Parses one skill, takes it or explains why not, and replaces a weaker one of the same name.
@@ -473,28 +621,69 @@ mod tests {
     }
 
     #[test]
-    fn a_skill_installed_by_linking_it_in_is_found() {
-        // A skill shared by symlinking it into the skills directory is the usual arrangement, and
-        // this walk used to skip it: the entry is not a directory, so the filter dropped it before
-        // the SKILL.md check and the skill vanished with no note at all.
+    fn a_project_skill_is_found_in_any_directory_of_the_workspace() {
+        // D68: the project tier used to be the ancestors of the start directory only, so a skill
+        // scoped to `crates/saddle` was invisible from the root. The scan finds them all.
         let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("elsewhere/prose-lint");
-        std::fs::create_dir_all(&real).unwrap();
+        let ws = dir.path();
+        for base in ["", "crates", "crates/saddle", "tmp"] {
+            let skills = ws.join(base).join(SKILLS_DIR);
+            std::fs::create_dir_all(&skills).unwrap();
+            std::fs::write(skills.join(FILE), "---\nname: x\ndescription: d\n---\n").unwrap();
+        }
+        std::fs::create_dir_all(ws.join("no-skills-here")).unwrap();
+        let found = project_bases(ws);
+        assert_eq!(
+            found,
+            [
+                ws.join(SKILLS_DIR),
+                ws.join("crates").join(SKILLS_DIR),
+                ws.join("tmp").join(SKILLS_DIR),
+                ws.join("crates/saddle").join(SKILLS_DIR),
+            ],
+            "every directory, shallowest first"
+        );
+    }
+
+    #[test]
+    fn the_project_scan_skips_dot_directories_node_modules_and_ignored_paths() {
+        // The ignore files are what make a whole-tree scan affordable, and the dot rule is what
+        // stops the scan entering `.agents` and re-reading the skills it is looking for.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(ws.join(".gitignore"), "build/\nvendor\n").unwrap();
+        for base in ["build", "vendor", "node_modules/pkg", ".hidden", "keep"] {
+            let skills = ws.join(base).join(SKILLS_DIR);
+            std::fs::create_dir_all(&skills).unwrap();
+            std::fs::write(skills.join(FILE), "---\nname: x\ndescription: d\n---\n").unwrap();
+        }
+        assert_eq!(
+            project_bases(ws),
+            [ws.join("keep").join(SKILLS_DIR)],
+            "only the directory nothing excludes"
+        );
+    }
+
+    #[test]
+    fn a_linked_skills_directory_is_read_and_a_loop_terminates() {
+        // A skill installed by linking it in is the usual arrangement, and the entry is not a
+        // directory, so a filter on the file type drops it before the SKILL.md check.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let real = dir.path().join("elsewhere/skills");
+        std::fs::create_dir_all(real.join("prose-lint")).unwrap();
         std::fs::write(
-            real.join(FILE),
-            "---\nname: prose-lint\ndescription: d\n---\nbody\n",
+            real.join("prose-lint").join(FILE),
+            "---\nname: prose-lint\ndescription: d\n---\n",
         )
         .unwrap();
-        let skills_dir = dir.path().join("skills");
-        std::fs::create_dir_all(&skills_dir).unwrap();
-        std::os::unix::fs::symlink(&real, skills_dir.join("prose-lint")).unwrap();
-
-        let found = walk(&skills_dir);
-        assert_eq!(found, [skills_dir.join("prose-lint").join(FILE)]);
+        std::fs::create_dir_all(ws.join(".agents")).unwrap();
+        std::os::unix::fs::symlink(&real, ws.join(SKILLS_DIR)).unwrap();
+        assert_eq!(project_bases(&ws), [ws.join(SKILLS_DIR)]);
 
         // A link that loops must not walk for ever.
-        std::os::unix::fs::symlink(&skills_dir, skills_dir.join("loop")).unwrap();
-        assert_eq!(walk(&skills_dir).len(), 1, "the cycle is visited once");
+        std::os::unix::fs::symlink(&ws, ws.join("loop")).unwrap();
+        assert_eq!(project_bases(&ws).len(), 1, "the cycle is visited once");
     }
 
     #[test]
