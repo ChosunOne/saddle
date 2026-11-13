@@ -977,7 +977,7 @@ fn check(dir: &std::path::Path, overrides: &config::Overrides) -> Result<ExitCod
                 if let Some(url) = &p.config.usage_url {
                     // D36: the same figures the status line shows, so a shape that does not parse
                     // can be seen without opening a session.
-                    match provider::fetch_usage(&p.config, auth.key(name), url) {
+                    match p.usage(url) {
                         Ok(page) => {
                             let (quota, spent) = provider::quota_from_page(&page);
                             println!(
@@ -1034,6 +1034,17 @@ fn models_error(e: &provider::ModelsError) -> String {
 /// a shape the parser does not know is the likeliest reason a figure does not appear (D36).
 fn usage_line(quota: &provider::Quota, spent: Option<f64>, now: std::time::SystemTime) -> String {
     let mut parts = Vec::new();
+    for window in &quota.windows {
+        let mut text = format!("{} {:.0}% left", window.label, window.percent);
+        if let Some(reset) = &window.reset {
+            text.push_str(&format!(
+                "; resets {} (in {})",
+                reset,
+                provider::reset_left(reset, now)
+            ));
+        }
+        parts.push(text);
+    }
     if let Some(tokens) = quota.tokens {
         parts.push(match quota.tokens_limit {
             Some(limit) => format!("{tokens} of {limit} tokens left"),

@@ -304,6 +304,16 @@ impl StatusData<'_> {
         if let Some(percent) = q.percent {
             parts.push(format!("{percent:.0}%"));
         }
+        for window in &q.windows {
+            let mut text = format!("{} {:.0}%", window.label, window.percent);
+            if let Some(reset) = &window.reset {
+                text.push_str(&format!(
+                    " ↺{}",
+                    crate::provider::reset_left(reset, self.now)
+                ));
+            }
+            parts.push(text);
+        }
         let text = parts.join(", ");
         // The refill rides on the figure it belongs to, with no separator: `94% ↺1h` reads as one
         // fact, and `↺` says "until" without a word (D49).
@@ -341,7 +351,8 @@ pub fn tokens(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{Price, Quota};
+    use crate::provider::{Price, Quota, quota_from_page};
+    use serde_json::json;
 
     fn data<'a>(usage: Usage, cost: f64, quota: Option<&'a Quota>) -> StatusData<'a> {
         StatusData {
@@ -532,6 +543,18 @@ mod tests {
                 .unwrap()
                 .render(&data(Usage::default(), 0.0, Some(&pool)));
         assert_eq!(line, "499/500 req");
+    }
+
+    #[test]
+    fn both_plan_windows_show_their_own_reset_countdown() {
+        let q = quota_from_page(&json!({"rate_limit": {
+            "primary_window": {"used_percent": 25, "limit_window_seconds": 18000, "reset_at": 1800000000},
+            "secondary_window": {"used_percent": 100, "limit_window_seconds": 604800, "reset_at": 1800600000}
+        }})).0;
+        let mut d = data(Usage::default(), 0.0, Some(&q));
+        d.now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1799996400);
+        let rendered = Template::parse("{quota}").unwrap().render(&d);
+        assert_eq!(rendered, "5h 75% ↺1h, weekly 0% ↺7d");
     }
 
     #[test]

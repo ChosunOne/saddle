@@ -503,6 +503,62 @@ fn fetch_needs_a_net_grant_and_says_which_one() {
 }
 
 #[test]
+fn a_private_fetch_refusal_is_audited_without_header_values_or_query_secrets() {
+    let env = Env::new();
+    env.edit_agent(|agent| {
+        agent.insert(
+            "net".into(),
+            toml::from_str::<toml::Value>("net = [{ host = \"*\" }]")
+                .unwrap()
+                .get("net")
+                .cloned()
+                .unwrap(),
+        );
+    });
+    let (ok, text) = env.tool(
+        "fetch",
+        serde_json::json!({
+            "url": "https://127.0.0.1/private?token=query-secret",
+            "headers": {"authorization": "Bearer header-secret"},
+        }),
+    );
+    assert!(!ok, "{text}");
+    assert!(text.starts_with("denied:"), "{text}");
+    let logs = env.audit_logs();
+    let log = std::fs::read_to_string(logs.last().unwrap()).unwrap();
+    let decisions: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|r| r["kind"] == "decision" && r["scope"] == "net")
+        .collect();
+    assert_eq!(decisions.len(), 1, "{log}");
+    let decision = &decisions[0];
+    assert_eq!(decision["allow"], false);
+    assert_eq!(decision["principal"], "agent");
+    assert_eq!(decision["args"]["method"], "GET");
+    assert_eq!(
+        decision["args"]["url"],
+        "https://127.0.0.1:443/private?token=…"
+    );
+    assert_eq!(
+        decision["args"]["headers"],
+        serde_json::json!(["authorization"])
+    );
+    assert!(text.starts_with(&format!(
+        "denied: {}",
+        decision["explanation"].as_str().unwrap()
+    )));
+    assert!(!log.contains("query-secret"), "{log}");
+    assert!(!log.contains("header-secret"), "{log}");
+    let out = env.saddle(&["audit", "verify", logs.last().unwrap().to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn a_wildcard_net_grant_allows_any_host_but_not_the_local_machine() {
     // `*` covers every public host without naming one, which is the point of it (D40).
     let env = Env::new();

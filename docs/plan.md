@@ -30,13 +30,15 @@ set is the authority declaration.
 **D2.** Parity means the extension-point inventory of pi and opencode, mapped one-to-one onto scopes.
 The extension API and the capability taxonomy are the same artifact.
 
-**D3.** No per-use approvals. Policy is declared, versioned in the repository, and reviewed like code.
+**D3.** No per-use approvals. Policy is declared and reviewed by a person. It originally lived in
+the repository; D42 moved it outside the tree, and D63 defines the current layout.
 
 **D4.** Scopes are a small closed enumeration. Each hook a plugin can register is a grant.
 
 **D5.** `exec` runs commands in a kernel sandbox derived from the principal's other grants (D18, D19).
-The child sees the principal's filesystem roots and has no network, so `exec` lets a principal run
-programs without widening its reach over files or hosts. A manifest pairing `exec` with `fs-read` or
+The child sees the principal's filesystem roots and originally had no network (D79 supersedes that
+with a policy-checked proxy), so `exec` lets a principal run programs without widening its reach over
+files or hosts. A manifest pairing `exec` with `fs-read` or
 `fs-write` is the normal case.
 
 **D6.** The host has no subagent feature. A plugin builds subagents from `model-invoke` plus the tool
@@ -223,8 +225,8 @@ D42 moved it out of the tree, at which point the kernel took over.) Git
 hooks and settings such as `core.fsmonitor` and `core.sshCommand` run later as the user, outside any
 sandbox. D20 covers writes from `exec`.
 
-Rewriting instructions cannot be granted (D7), and `exec` with network cannot be granted in v1 (D19),
-so neither needs a runtime gate.
+Rewriting instructions cannot be granted (D7). The original no-network rule for `exec` (D19) is
+superseded by D79: a command's network connections now pass the same policy gate as host requests.
 
 **D24.** The audit log is JSON Lines at `$XDG_STATE_HOME/saddle/audit/<session-id>.jsonl`. Each record
 holds `seq`, timestamp, session, kind, principal, scope, resolved arguments, decision, rule,
@@ -268,8 +270,8 @@ only unless the grant sets `scheme = "http"`, and may restrict the port. The hos
 `wasmtime-wasi-http`'s outgoing-request hook, so the host makes every connection and logs every
 request. Raw `wasi:sockets` is not offered (D11). The host resolves DNS itself, refuses loopback,
 RFC 1918, link-local and `169.254.169.254` unless a grant names that address, and connects to the
-address it checked, which closes DNS rebinding. Grants do not take CIDR ranges. Child processes have no
-network (D19).
+address it checked, which closes DNS rebinding. Grants do not take CIDR ranges. Child processes
+originally had no network (D19); D79 supersedes that rule with a policy-checked proxy.
 
 ### Model providers
 
@@ -278,7 +280,8 @@ cloned repository cannot point the session at another endpoint or pick which key
 built-in providers are Synthetic and OpenAI, both over OpenAI-compatible chat completions; a provider
 defined in `config.toml` can use that format or the Anthropic Messages API. There is no default
 provider: the first run opens the provider list, and `/login` checks the key by listing the
-provider's models, then saves the chosen provider and model. The host holds the conversation in one
+provider's models. D91 supersedes saving that choice as the default: the choice belongs to this
+conversation, and only ctrl+s in the model list saves a default. The host holds the conversation in one
 neutral form and renders it for each request. A block the loop does not interpret, such as an
 Anthropic thinking block, is kept and sent back unchanged in its original position. Reasoning from
 an OpenAI-compatible thinking model goes back as `reasoning_content` within the turn that produced
@@ -289,8 +292,8 @@ it and is dropped after.
   directory is outside every root, so neither the agent nor a sandboxed command can read the store.
   Every variable that may hold a provider key is removed from the environment a sandboxed child
   inherits, even when an `exec` grant lists it.
-- `/login` and `/model` edit `config.toml` in place and keep its comments. An edit that would leave
-  the file invalid is refused.
+- D91 supersedes the original `/login` and `/model` config writes: only saving a default or adding
+  a server writes `config.toml`. Those edits keep its comments and refuse an invalid result.
 - A tool call in a reply that hit the output limit or was declined may be incomplete. The host does
   not run it and returns an error result in its place.
 - Each model request is logged with its model, stop reason and token counts, or with its error.
@@ -2270,6 +2273,52 @@ changed came back on a model it had never used.
   one key away inside it, and the list says so.
 
 
+**D92.** `session_query` retrieves the current branch without granting access to the session store.
+
+- It requires `transcript-read`; every call is decided and audited with its conversation id and SQL.
+  No filesystem grant implies transcript authority. First-run defaults and the fallback for a config
+  with no `[agent]` table include `transcript-read`, so searching one's own conversation works out
+  of the box. Existing explicit `[agent]` tables are never widened or rewritten: omitting the grant
+  there still denies access, and `--revoke transcript-read` disables it for one run.
+- The host exports only the active conversation's branch, including original pre-compaction messages,
+  into a fresh in-memory SQLite snapshot. SQL never runs on the saved database connection. Abandoned
+  branches, other conversations, state paths, usage records, native provider blocks and image bytes
+  are not exported. Tool-result diffs are omitted as they are elsewhere in model context.
+- The sole public view is `messages(ordinal INTEGER, id INTEGER, role TEXT, text TEXT)`. Roles are
+  `user`, `assistant`, `tool`, `summary`; ordinal is one-based branch order. Replies include text
+  and serialized tool calls; tool results include call ids and content. A clone's copied history
+  belongs to its branch too. A missing saved conversation yields an ordinary tool error.
+- Only read-only queries are accepted. SQLite's authorizer denies writes, schema inspection,
+  attachment, pragmas, direct backing-table access and functions outside an explicit safe list.
+  `query_only` and statement read-only checks add defense in depth; neither is the sole boundary.
+- SQL is capped at 16 KiB, results at 100 rows and 50 KiB, individual SQLite values at 1 MiB and
+  execution at about one million VM instructions. Temporary tables stay in memory. Output uses
+  column names and row arrays, with a truncation flag; callers page or narrow their query.
+- No transcript mutation capability is provided. A successful search cannot edit, delete or replace
+  a saved message, nor can it expose the database directory as a filesystem resource.
+
+**D93.** OpenAI API cost estimates and ChatGPT subscription allowances are different figures.
+
+- The official API's `/models` catalogue does not publish prices. After config and endpoint prices,
+  the official `https://api.openai.com/v1` API-key endpoint may fall back to published standard token
+  rates, with cached-input rates. Matching is exact or a dated snapshot, never a substring that
+  would mistake a pro/mini variant for its parent. Unknown and tiered long-context models stay
+  unpriced rather than displaying a wrong charge. The source is OpenAI's pricing documentation,
+  recorded alongside the table. Compatible endpoints do not inherit these prices.
+- A ChatGPT login is a subscription, not an API bill. No published API-rate estimate is presented
+  as money charged to that subscription. Config/endpoint prices retain their existing precedence.
+- `openai-chatgpt` defaults its usage URL to `https://chatgpt.com/backend-api/wham/usage`, the GET
+  used by OpenAI's Codex client. Usage requests refresh OAuth and carry the same account and provider
+  headers as model requests. No credentials are read by tools or passed to children.
+- The usage page's `rate_limit.primary_window` and `secondary_window` carry `used_percent`,
+  `limit_window_seconds` and `reset_at` (Unix seconds). Windows are independent: the status shows
+  remaining percentages labelled `5h` and `weekly` when those are the actual durations, each with
+  its own reset countdown. `saddle check` also prints the absolute UTC reset stamps. Missing windows
+  stay absent; a zero remaining allowance is real, not a missing value. Additional unrelated pools
+  are not confused with the main limits. Model response `x-codex-*` headers update the same windows.
+- The existing off-thread usage lookup at startup and after turns serves both providers. API-key
+  OpenAI keeps ordinary request/token rate-limit headers; they are not subscription allowances.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
@@ -2330,9 +2379,9 @@ Roughly the union of what pi and opencode let an extension do, with the scope ea
 ## 7. Milestones
 
 **v0.** Harness with built-in tools and no plugin loader. Every tool invocation passes the policy gate.
-Deliverable is the gate, with a session that can read, edit and run commands under a policy file. The
-trust gate (D23) and the audit log (D24) ship in v0, because without them nobody can review what the
-gate allowed.
+Deliverable is the gate, with a session that can read, edit and run commands under a policy file,
+and the audit log (D24) showing what the gate allowed. The original trust gate (D23) shipped in v0
+but was removed by D44 after D42 moved policy outside the agent's reach.
 
 **v1.** One plugin, one scope, one load-time refusal. Deliverable is a hostile plugin that imports
 `saddle:host/fs-read` without the grant and fails to instantiate, plus a test asserting the failure.

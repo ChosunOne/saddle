@@ -1,19 +1,19 @@
 //! `fetch`: one HTTP GET, made by the host rather than by a child process (D39).
 //!
-//! This is the only way saddle itself reaches the network, and it exists because giving `exec`
-//! sockets would hand a capability to everything a command can start (D19). The host makes the
-//! connection, so the grant is checked once, per request, against the URL, and logged once.
+//! The host makes the connection, checks the grant against the URL and logs the decision (D10).
+//! `websearch` also makes host-side requests (D82); commands reach the host's policy-checking proxy
+//! through their own network namespace (D79), never through unrestricted host sockets.
 //!
-//! D28's rules are enforced here rather than in the engine, because they are about the address and
-//! only this module resolves one: loopback, RFC 1918, link-local, unique-local, CGNAT and the cloud
-//! metadata address are refused unless the grant named that address itself, and ureq is given the
-//! addresses that were checked rather than the name, so DNS rebinding cannot swap one underneath.
+//! D28's address rules are shared with the command network bridge: loopback, RFC 1918,
+//! link-local, unique-local, CGNAT and the cloud metadata address are refused unless a grant names
+//! that address itself. ureq receives checked addresses rather than resolving the name again, so
+//! DNS rebinding cannot swap one underneath.
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
 use anyhow::Result;
-use saddle_cap::Principal;
-use saddle_policy::Request;
+use saddle_cap::{Principal, Scope};
+use saddle_policy::{Kind, Request};
 use serde_json::Value;
 
 #[cfg(test)]
@@ -127,6 +127,14 @@ pub fn fetch(session: &mut Session, input: &Value) -> Result<ToolOutput> {
     // covering http://127.0.0.1:8080" says what is actually missing. It is refused here with the
     // grant to write.
     if !named && let Some(why) = local(&target) {
+        session.audit.event(
+            Kind::Decision,
+            Some(&who),
+            Some(Scope::Net),
+            Some(false),
+            req.args(),
+            &why,
+        )?;
         return Ok(ToolOutput::denied(&why));
     }
     let decision = session.decide(&who, &req)?;

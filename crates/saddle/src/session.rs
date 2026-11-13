@@ -114,11 +114,8 @@ impl Setup {
         // what a child may reach is a list rather than a pattern (D62).
         let (extras, tool_paths) = user.sandbox_extras(&roots, &paths.protected())?;
 
-        // One file holds everything (D63): `[agent]` is the base every workspace inherits, and
-        // `[workspaces.<key>]` is this workspace's own grants, layered on top of it rather than
-        // copied from it, so a change to the base reaches every workspace that does not override
-        // that key. It lives in the config directory, which no root contains, so the kernel
-        // protects it (D42).
+        // `[agent]` in config.toml is the base; a separate file per workspace overrides only the
+        // scopes it names (D63). Both live outside every root, protected by the kernel (D42).
         let config_path = paths.user_config();
         let mut notes = Vec::new();
         let user = UserConfig::load(&config_path)?;
@@ -329,6 +326,9 @@ pub struct Session {
     /// again. Held here rather than in the tool because a result's number only means the page the
     /// model was shown, and that is a property of the session (D82).
     pub last_search: Option<crate::tools::websearch::LastSearch>,
+    /// A host-built, branch-only snapshot, supplied by the agent for one query (D92).
+    pub query_snapshot: Option<Vec<(i64, String, String)>>,
+    pub query_conversation: Option<String>,
     _tmp: PrivateTmp,
 }
 
@@ -389,6 +389,8 @@ impl Session {
             // a provider (`-p`, or one picked with /login) replaces this with that one's (D82).
             search,
             last_search: None,
+            query_snapshot: None,
+            query_conversation: None,
             _tmp: tmp,
         };
         // An internal name per tool-visible directory, skipping any name a root already uses, so a

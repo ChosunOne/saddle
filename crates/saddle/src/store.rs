@@ -284,6 +284,51 @@ impl Store {
         self.branch_to(self.leaf(session)?)
     }
 
+    /// Exports only the current branch's text, before compaction as well as after it (D92).
+    pub fn query_messages(&self, session: &str) -> Result<Vec<(i64, String, String)>> {
+        let mut out = Vec::new();
+        for node in self.branch(session)? {
+            if node.kind == kind::ITEM {
+                let item: Item = serde_json::from_str(&node.body)?;
+                let (role, text) = match item {
+                    Item::User(text) | Item::Attached { text, .. } => ("user", text),
+                    Item::Summary(text) => ("summary", text),
+                    Item::Assistant(parts) => (
+                        "assistant",
+                        parts
+                            .into_iter()
+                            .filter_map(|part| match part {
+                                Part::Text(text) => Some(text),
+                                Part::Call(call) => {
+                                    Some(serde_json::to_string(&call).unwrap_or_default())
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                    Item::ToolResults(results) => (
+                        "tool",
+                        results
+                            .into_iter()
+                            .map(|r| format!("{}: {}", r.id, r.content))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                };
+                out.push((node.id, role.to_owned(), text));
+            } else if node.kind == kind::COMPACTION {
+                let body: serde_json::Value = serde_json::from_str(&node.body)?;
+                out.push((
+                    node.id,
+                    "summary".into(),
+                    body["summary"].as_str().unwrap_or_default().into(),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     /// The current leaf, for a caller that needs to name a point in the tree (D54).
     pub fn current(&self, session: &str) -> Result<Option<i64>> {
         self.leaf(session)
@@ -993,6 +1038,29 @@ mod tests {
         let from = listed.iter().find(|x| x.id == fork).unwrap();
         assert_eq!(from.forked_from.as_deref(), Some(id.as_str()));
         assert_eq!(from.title, "first");
+    }
+
+    #[test]
+    fn query_history_keeps_compacted_text_but_not_other_branches_or_sessions() {
+        let s = store();
+        let id = s.begin("p", "m").unwrap();
+        s.append(&id, &Item::User("original secret word".into()))
+            .unwrap();
+        let first = s.current(&id).unwrap();
+        s.append(&id, &Item::User("abandoned".into())).unwrap();
+        s.rewind(&id, first).unwrap();
+        s.compaction(&id, "short summary", 0).unwrap();
+        s.append(&id, &Item::User("current".into())).unwrap();
+        let other = s.begin("p", "m").unwrap();
+        s.append(&other, &Item::User("other conversation".into()))
+            .unwrap();
+        let text: Vec<_> = s
+            .query_messages(&id)
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, text)| text)
+            .collect();
+        assert_eq!(text, ["original secret word", "short summary", "current"]);
     }
 
     /// The node ids of the rows that are messages, in order.

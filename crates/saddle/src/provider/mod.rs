@@ -9,11 +9,12 @@ mod anthropic;
 mod http;
 pub(crate) mod oauth;
 mod openai;
+mod openai_account;
 mod reported;
 mod responses;
 mod sse;
 
-pub use http::{ModelInfo, ModelsError, fetch_usage, list_models, page_paths, quota_from_page};
+pub use http::{ModelInfo, ModelsError, list_models, page_paths, quota_from_page};
 pub use oauth::Tokens;
 pub use reported::Reported;
 
@@ -338,6 +339,8 @@ impl PriceEntry {
 /// whichever parts they count, so every field is optional and a session shows only what it was told.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Quota {
+    /// Independent plan windows, each with its own remaining percentage and reset (D93).
+    pub windows: Vec<QuotaWindow>,
     pub tokens: Option<u64>,
     pub tokens_limit: Option<u64>,
     pub requests: Option<u64>,
@@ -351,12 +354,20 @@ pub struct Quota {
     pub percent: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QuotaWindow {
+    pub label: String,
+    pub percent: f64,
+    pub reset: Option<String>,
+}
+
 impl Quota {
     pub fn is_empty(&self) -> bool {
         self.tokens.is_none()
             && self.requests.is_none()
             && self.credits.is_none()
             && self.percent.is_none()
+            && self.windows.is_empty()
     }
 }
 
@@ -543,6 +554,7 @@ fn presets() -> BTreeMap<&'static str, ProviderEntry> {
             ProviderEntry {
                 api: Some(Api::OpenaiResponses),
                 base_url: Some(oauth::OPENAI_API_BASE.into()),
+                usage_url: Some("https://chatgpt.com/backend-api/wham/usage".into()),
                 auth: Some(Auth::Oauth),
                 oauth: Some(oauth::Flow {
                     method: Some(oauth::Method::Device),
@@ -960,7 +972,8 @@ impl Provider {
         let key = available_key(&config, stored_key);
         let price = config
             .price
-            .or_else(|| reported.price(&config.base_url, &config.model));
+            .or_else(|| reported.price(&config.base_url, &config.model))
+            .or_else(|| openai_account::price(&config));
         Self {
             oauth: None,
             name: name.to_owned(),
@@ -1091,6 +1104,13 @@ impl Provider {
             headers.extend(oauth::headers(&tokens));
         }
         headers
+    }
+
+    /// Usage uses the same refreshed credential and account headers as model requests (D93).
+    pub fn usage(&self, url: &str) -> Result<Value, ModelsError> {
+        self.refresh_tokens()
+            .map_err(|e| ModelsError::Failed(format!("{e:#}")))?;
+        http::fetch_usage_headers(url, &self.request_headers())
     }
 
     /// Refreshes an expired OAuth token before a request, and remembers the new one (D85).

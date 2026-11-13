@@ -43,4 +43,4 @@ toml_edit = "0.25"
 similar = "3"
 regex = "1"
 # The session store (D53). Bundled, so no system SQLite is required to build or run.
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled", "hooks", "limits"] }

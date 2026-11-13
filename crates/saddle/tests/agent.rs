@@ -3,10 +3,10 @@
 //! model, and what reached the audit log.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Output};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use serde_json::{Value, json};
@@ -28,7 +28,34 @@ struct Seen {
     body: Value,
 }
 
-/// Answers one connection per canned response, in order, and records each request.
+/// Answers catalogue probes without consuming a canned model response (D34).
+fn model_request(listener: &TcpListener) -> (TcpStream, BufReader<TcpStream>, String) {
+    loop {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            head.push_str(&line.to_ascii_lowercase());
+        }
+        if head.starts_with("get ") {
+            let path = head.split_whitespace().nth(1).unwrap();
+            assert!(matches!(path, "/models" | "/v1/models?limit=1000"));
+            stream
+                .write_all(error_response("200 OK", None, &json!({"data": []})).as_bytes())
+                .unwrap();
+            continue;
+        }
+        assert!(head.starts_with("post "), "{head}");
+        return (stream, reader, head);
+    }
+}
+
+/// Answers one model request per canned response, in order, and records it.
 fn serve(responses: Vec<String>) -> (String, Arc<Mutex<Vec<Seen>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -36,17 +63,7 @@ fn serve(responses: Vec<String>) -> (String, Arc<Mutex<Vec<Seen>>>) {
     let record = seen.clone();
     thread::spawn(move || {
         for response in responses {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut head = String::new();
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" || line.is_empty() {
-                    break;
-                }
-                head.push_str(&line.to_ascii_lowercase());
-            }
+            let (mut stream, mut reader, head) = model_request(&listener);
             let len = head
                 .lines()
                 .find_map(|l| l.strip_prefix("content-length:"))
@@ -190,15 +207,17 @@ impl Env {
         };
         let ws = env.ws.path();
         std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+        std::fs::create_dir_all(env.xdg.path().join("state/saddle")).unwrap();
+        std::fs::create_dir_all(env.xdg.path().join("home")).unwrap();
         let config = env.xdg.path().join("config/saddle");
         std::fs::create_dir_all(&config).unwrap();
-        // The policy lives in the config directory and is layered per workspace (D42, D43).
-        std::fs::write(config.join("policy.toml"), POLICY).unwrap();
+        let policy: toml::Table = POLICY.parse().unwrap();
         std::fs::write(
             config.join("config.toml"),
             format!(
-                "provider = \"mock\"\n\n[providers.mock]\napi = \"{}\"\nbase-url = \"{base}\"\n\
+                "provider = \"mock\"\n{}\n[providers.mock]\napi = \"{}\"\nbase-url = \"{base}\"\n\
                  model = \"mock-model\"\napi-key-env = \"SADDLE_TEST_KEY\"\n",
+                toml::to_string(&json!({"agent": policy["agent"]})).unwrap(),
                 api.name()
             ),
         )
@@ -209,19 +228,17 @@ impl Env {
     /// This workspace's own policy, layered on the global one.
     fn write_override(&self, text: &str) {
         let ws = self.ws.path().canonicalize().unwrap();
-        let key: String = ws
+        let key = ws
             .to_string_lossy()
             .trim_start_matches('/')
-            .chars()
-            .map(|c| match c {
-                '/' => '%',
-                c if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '%') => c,
-                _ => '_',
-            })
-            .collect();
+            .replace(['/', '\\', ':'], "-");
         let dir = self.xdg.path().join("config/saddle/policies");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{key}.toml")), text).unwrap();
+        std::fs::write(
+            dir.join(format!("--{key}--.toml")),
+            format!("workspace = {:?}\n{text}", ws.display().to_string()),
+        )
+        .unwrap();
     }
 
     fn command(&self, args: &[&str]) -> Command {
@@ -229,6 +246,7 @@ impl Env {
         cmd.arg("-C")
             .arg(self.ws.path())
             .args(args)
+            .env("HOME", self.xdg.path().join("home"))
             .env("XDG_STATE_HOME", self.xdg.path().join("state"))
             .env("XDG_CONFIG_HOME", self.xdg.path().join("config"))
             .env("SADDLE_TEST_KEY", KEY);
@@ -340,7 +358,19 @@ fn tool_loop(api: Api) {
         .collect();
     assert_eq!(
         names,
-        ["read", "write", "edit", "ls", "find", "grep", "bash"]
+        [
+            "session_query",
+            "read",
+            "write",
+            "edit",
+            "patch",
+            "ls",
+            "find",
+            "grep",
+            "bash",
+            "fetch",
+            "websearch"
+        ]
     );
     let mut first_text = String::new();
     strings(first, &mut first_text);
@@ -382,6 +412,79 @@ fn tool_loop(api: Api) {
     assert_eq!(denied, 1);
     let verify = env.saddle(&["audit", "verify", log.to_str().unwrap()]);
     assert!(verify.status.success(), "{}", text(&verify.stdout));
+}
+
+#[test]
+fn session_queries_are_scoped_read_only_and_audited() {
+    let sql = "SELECT text FROM messages WHERE role='user'";
+    let calls = [
+        ("q1", "session_query", json!({"sql": sql})),
+        (
+            "q2",
+            "session_query",
+            json!({"sql": "DELETE FROM messages"}),
+        ),
+        ("q3", "session_query", json!({"sql": sql})),
+    ];
+    let (base, seen) = serve(vec![
+        sse_response(&openai_sse("", &calls)),
+        sse_response(&openai_sse("done", &[])),
+    ]);
+    let env = Env::new(Api::Openai, &base);
+    env.write_override("[agent]\ntranscript-read = {}\n");
+    let out = env.saddle(&["run", "remember teal"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let seen = seen.lock().unwrap();
+    let messages = seen[1].body["messages"].as_array().unwrap();
+    let results: Vec<_> = messages.iter().filter(|m| m["role"] == "tool").collect();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["content"], results[2]["content"]);
+    let result: Value = serde_json::from_str(results[0]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(result["rows"], json!([["remember teal"]]));
+    assert!(
+        results[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("session query failed")
+    );
+    let records = records(&env.audit_log());
+    let decisions: Vec<_> = records
+        .iter()
+        .filter(|r| r["scope"] == "transcript-read")
+        .collect();
+    assert_eq!(decisions.len(), 3);
+    assert!(
+        decisions
+            .iter()
+            .all(|r| r["allow"] == true && r["args"]["session"].is_string())
+    );
+}
+
+#[test]
+fn session_queries_require_a_transcript_grant() {
+    let calls = [(
+        "q",
+        "session_query",
+        json!({"sql": "SELECT * FROM messages"}),
+    )];
+    let (base, seen) = serve(vec![
+        sse_response(&openai_sse("", &calls)),
+        sse_response(&openai_sse("done", &[])),
+    ]);
+    let env = Env::new(Api::Openai, &base);
+    let out = env.saddle(&["run", "hello"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let mut request = String::new();
+    strings(&seen.lock().unwrap()[1].body, &mut request);
+    assert!(
+        request.contains("denied: agent has no transcript-read grant"),
+        "{request}"
+    );
+    assert!(
+        records(&env.audit_log())
+            .iter()
+            .any(|r| r["scope"] == "transcript-read" && r["allow"] == false)
+    );
 }
 
 #[test]
@@ -440,6 +543,7 @@ fn missing_key_stops_before_the_session_opens() {
         .arg("-C")
         .arg(env.ws.path())
         .args(["run", "hi"])
+        .env("HOME", env.xdg.path().join("home"))
         .env("XDG_STATE_HOME", env.xdg.path().join("state"))
         .env("XDG_CONFIG_HOME", env.xdg.path().join("config"))
         .env_remove("SADDLE_TEST_KEY")
@@ -507,11 +611,14 @@ fn a_workspace_with_no_override_uses_the_global_policy() {
     let check = env.saddle(&["check"]);
     let stdout = text(&check.stdout);
     assert!(
-        stdout.contains("policy     layered: ") && stdout.contains("policy.toml"),
+        stdout.contains("grants     ") && stdout.contains("config.toml"),
         "{stdout}"
     );
     // The override is created on first use, and adds nothing of its own.
-    assert!(stdout.contains("this workspace's own grants"), "{stdout}");
+    assert!(
+        stdout.contains("has no grants for this directory: it inherits the base"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -609,8 +716,10 @@ fn cancel_is_immediate_while_the_server_is_silent() {
     // Accepts the request and never answers, like a server still reading a long prompt.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
+    let (ready, accepted) = mpsc::channel();
     thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let (stream, _reader, _head) = model_request(&listener);
+        ready.send(()).unwrap();
         thread::sleep(std::time::Duration::from_secs(60));
         drop(stream);
     });
@@ -621,7 +730,9 @@ fn cancel_is_immediate_while_the_server_is_silent() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    thread::sleep(std::time::Duration::from_millis(800));
+    accepted
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
     let start = std::time::Instant::now();
     let killed = Command::new("kill")
         .args(["-INT", &child.id().to_string()])
@@ -668,6 +779,7 @@ fn instruction_files_prefer_agents_md_and_stay_inside_the_workspace() {
         .arg("-C")
         .arg(ws.join("sub/deeper"))
         .args(["run", "hi"])
+        .env("HOME", env.xdg.path().join("home"))
         .env("XDG_STATE_HOME", env.xdg.path().join("state"))
         .env("XDG_CONFIG_HOME", env.xdg.path().join("config"))
         .env("SADDLE_TEST_KEY", KEY)

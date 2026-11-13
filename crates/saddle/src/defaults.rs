@@ -15,6 +15,7 @@ pub const DEFAULT_AGENT: &str = r#"
 fs-read  = [{ root = "workspace", exclude = [".env*"], why = "reads the project" }]
 fs-write = [{ root = "workspace", exclude = [".env*"], why = "edits the project" }]
 exec     = { why = "runs builds, tests and git" }
+transcript-read = { why = "searches this conversation's history" }
 "#;
 
 /// A directory under `$HOME` that confined commands need: its root name, and whether they may
@@ -64,6 +65,7 @@ pub fn config_text(home: Option<&Path>) -> String {
 fs-read  = [{{ root = "workspace", exclude = [".env*"], why = "reads the project" }}]
 fs-write = [{{ root = "workspace", exclude = [".env*"], why = "edits the project" }}]
 exec     = {{ why = "runs builds, tests and git" }}
+transcript-read = {{ why = "searches this conversation's history" }}
 
 # Directories outside the workspace, by name, so a policy can grant them to the tools. A root is
 # what read, ls, find, grep, write and edit decide over: a tool path has to fall inside one, and the
@@ -454,6 +456,26 @@ mod tests {
             "proj",
         ] {
             assert!(!withheld(rel), "{rel} must stay readable");
+        }
+    }
+
+    #[test]
+    fn transcript_search_is_default_but_explicit_grants_are_not_widened() {
+        for text in [String::new(), config_text(None)] {
+            let cfg: UserConfig = toml::from_str(&text).unwrap();
+            assert!(
+                cfg.global_policy()["agent"]
+                    .get("transcript-read")
+                    .is_some()
+            );
+        }
+        for text in ["[agent]\n", "[agent]\nexec = {}\n"] {
+            let cfg: UserConfig = toml::from_str(text).unwrap();
+            assert!(
+                cfg.global_policy()["agent"]
+                    .get("transcript-read")
+                    .is_none()
+            );
         }
     }
 

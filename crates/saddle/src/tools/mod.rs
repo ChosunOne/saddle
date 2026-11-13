@@ -7,6 +7,7 @@ pub(crate) mod fetch;
 pub mod fs;
 mod patch;
 pub mod search;
+pub(crate) mod session_query;
 pub(crate) mod websearch;
 
 use anyhow::{Result, bail};
@@ -61,6 +62,7 @@ pub const NAMES: &[&str] = &[
     "bash",
     "fetch",
     "websearch",
+    "session_query",
 ];
 
 /// The tools as the model sees them. The descriptions say when to use each one.
@@ -70,6 +72,21 @@ pub fn definitions() -> Vec<ToolDef> {
         "description": "Absolute, or relative to the workspace root",
     });
     vec![
+        ToolDef {
+            name: "session_query",
+            description: "Read-only SQL over messages(ordinal INTEGER, id INTEGER, role TEXT, text TEXT) \
+                in the current conversation branch, including pre-compaction history. Roles: user, \
+                assistant, tool, summary. No other conversations, images, internal tables or files \
+                are accessible. Requires transcript-read. Results are capped at 100 rows and 50 KiB; \
+                use WHERE, ORDER BY ordinal and LIMIT/OFFSET to search and page. Example: \
+                SELECT ordinal, role, text FROM messages WHERE text LIKE '%decision%' LIMIT 10",
+            schema: json!({
+                "type": "object",
+                "properties": {"sql": {"type": "string", "description": "A read-only SQLite query"}},
+                "required": ["sql"],
+                "additionalProperties": false,
+            }),
+        },
         ToolDef {
             name: "read",
             description: "Read a UTF-8 text file, or a PNG, JPEG, GIF or WebP image. Text comes \
@@ -300,6 +317,7 @@ pub fn call(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutp
         "fetch" => fetch::fetch(session, input),
         "patch" => patch::patch(session, input),
         "websearch" => websearch::search(session, input),
+        "session_query" => session_query::run(session, input),
         _ => bail!("unknown tool `{name}` (known: {})", NAMES.join(", ")),
     }
 }

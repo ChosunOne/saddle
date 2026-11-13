@@ -5,13 +5,13 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
-use super::{Api, Cancelled, Price, Provider, ProviderConfig, Quota, Sink, sse};
+use super::{Api, Cancelled, Price, Provider, Quota, Sink, sse};
 
 const ATTEMPTS: u32 = 4;
 /// A reply larger than this is cut off rather than buffered without bound.
@@ -358,27 +358,20 @@ fn list_from_endpoint(p: &super::Provider) -> Result<Vec<ModelInfo>, ModelsError
 /// A usage endpoint is not standardised, so this takes the URL from the config and reads the answer
 /// for the fields in use rather than for one documented shape. The JSON is walked, so a figure
 /// nested under `data`, `usage` or `quota` is found where a server puts it.
-pub fn fetch_usage(
-    config: &ProviderConfig,
-    key: Option<&str>,
+pub(super) fn fetch_usage_headers(
     url: &str,
+    headers: &[(String, String)],
 ) -> Result<Value, ModelsError> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
+        .max_redirects(0)
         .timeout_global(Some(Duration::from_secs(20)))
         .user_agent(concat!("saddle/", env!("CARGO_PKG_VERSION")))
         .build()
         .into();
     let mut req = agent.get(url).header("accept", "application/json");
-    if let Some(k) = key {
-        req = match config.api {
-            Api::Openai | Api::OpenaiResponses => {
-                req.header("authorization", format!("Bearer {k}"))
-            }
-            Api::Anthropic => req
-                .header("x-api-key", k)
-                .header("anthropic-version", super::anthropic::VERSION),
-        };
+    for (name, value) in headers {
+        req = req.header(name.as_str(), value.as_str());
     }
     let mut resp = req.call().map_err(|e| ModelsError::Failed(e.to_string()))?;
     let status = resp.status().as_u16();
@@ -495,6 +488,9 @@ fn known_quota(page: &Value) -> Option<Quota> {
 /// `quota.tokens_left` are the same figure. Anything not found stays absent rather than becoming a
 /// zero.
 pub fn quota_from_page(page: &Value) -> (Quota, Option<f64>) {
+    if let Some(quota) = super::openai_account::quota(page) {
+        return (quota, None);
+    }
     if let Some(quota) = known_quota(page) {
         // What was spent is not on this page, so there is nothing to add to it (D49).
         return (quota, None);
@@ -590,6 +586,7 @@ pub fn quota_from_page(page: &Value) -> (Quota, Option<f64>) {
     );
 
     let quota = Quota {
+        windows: Vec::new(),
         tokens: left(
             find(
                 &["remaining_tokens", "tokens_remaining", "tokens_left"],
@@ -831,6 +828,36 @@ fn retryable(status: u16) -> bool {
 /// the field. Both are read from whichever header the server actually sent, since a server that
 /// states only one of the four is common.
 fn quota_from(headers: &ureq::http::HeaderMap) -> Option<Quota> {
+    let mut primary = serde_json::Map::new();
+    let mut secondary = serde_json::Map::new();
+    for (prefix, window) in [("primary", &mut primary), ("secondary", &mut secondary)] {
+        for (suffix, key, multiplier) in [
+            ("used-percent", "used_percent", 1.0),
+            ("window-minutes", "limit_window_seconds", 60.0),
+            ("reset-at", "reset_at", 1.0),
+        ] {
+            if let Some(n) = headers
+                .get(format!("x-codex-{prefix}-{suffix}"))
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|n| n.is_finite() && *n >= 0.0)
+            {
+                let value = if key == "used_percent" {
+                    json!(n)
+                } else {
+                    json!((n * multiplier) as u64)
+                };
+                window.insert(key.into(), value);
+            }
+        }
+    }
+    if let Some(q) = super::openai_account::quota(&json!({"rate_limit": {
+        "primary_window": primary, "secondary_window": secondary
+    }}))
+    .filter(|q| !q.is_empty())
+    {
+        return Some(q);
+    }
     let get = |name: &str| {
         headers
             .get(name)
@@ -842,6 +869,7 @@ fn quota_from(headers: &ureq::http::HeaderMap) -> Option<Quota> {
     let first = |names: &[&str]| names.iter().find_map(|n| count(n));
     let reset = |names: &[&str]| names.iter().find_map(|n| get(n)).map(str::to_owned);
     let quota = Quota {
+        windows: Vec::new(),
         tokens: first(&[
             "x-ratelimit-remaining-tokens",
             "anthropic-ratelimit-tokens-remaining",
@@ -1236,6 +1264,27 @@ mod tests {
         let mut other = ureq::http::HeaderMap::new();
         other.insert("retry-after", "3".parse().unwrap());
         assert_eq!(quota_from(&other), None);
+    }
+
+    #[test]
+    fn codex_headers_preserve_both_windows() {
+        let mut headers = ureq::http::HeaderMap::new();
+        for (name, value) in [
+            ("x-codex-primary-used-percent", "12.5"),
+            ("x-codex-primary-window-minutes", "300"),
+            ("x-codex-primary-reset-at", "1800000000"),
+            ("x-codex-secondary-used-percent", "100"),
+            ("x-codex-secondary-window-minutes", "10080"),
+            ("x-codex-secondary-reset-at", "1800600000"),
+        ] {
+            headers.insert(name, value.parse().unwrap());
+        }
+        let quota = quota_from(&headers).unwrap();
+        assert_eq!(quota.windows[0].percent, 87.5);
+        assert_eq!(quota.windows[0].label, "5h");
+        assert_eq!(quota.windows[1].percent, 0.0);
+        assert_eq!(quota.windows[1].label, "weekly");
+        assert_ne!(quota.windows[0].reset, quota.windows[1].reset);
     }
 
     #[test]

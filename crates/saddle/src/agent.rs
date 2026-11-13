@@ -1491,7 +1491,19 @@ impl Agent {
                         "not run: the reply hit the output limit, so this call may be incomplete",
                     ),
                     _ if ui.cancelled() => ToolOutput::err("not run: cancelled by the user"),
-                    _ => run_call(session, call, ui)?,
+                    _ => {
+                        if call.name == "session_query" {
+                            session.query_conversation = self.saved.clone();
+                            session.query_snapshot = match (&self.store, &self.saved) {
+                                (Some(store), Some(id)) => Some(store.query_messages(id)?),
+                                _ => None,
+                            };
+                        }
+                        let out = run_call(session, call, ui);
+                        session.query_snapshot = None;
+                        session.query_conversation = None;
+                        out?
+                    }
                 };
                 let content = limit(out.content.clone());
                 // The diff is for the transcript only; the guard compares what the model saw.

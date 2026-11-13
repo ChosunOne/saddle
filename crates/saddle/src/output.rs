@@ -141,6 +141,7 @@ impl Sink for Output {
                 "credits": quota.credits,
                 "percent": quota.percent,
                 "reset": quota.reset,
+                "windows": quota.windows,
             })),
         }
     }

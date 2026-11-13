@@ -1846,13 +1846,12 @@ impl Controller {
         let Some(url) = config.usage_url.clone() else {
             return Ok(());
         };
-        let auth = AuthStore::load(&self.paths.auth_store())?;
-        let key = provider::available_key(&config, auth.key(&name));
+        let p = self.build_model(&name, Some(&app.header.model))?;
         let events = self.events.clone();
         thread::Builder::new()
             .name("saddle-usage".into())
             .spawn(move || {
-                if let Ok(page) = provider::fetch_usage(&config, key.as_deref(), &url) {
+                if let Ok(page) = p.usage(&url) {
                     let (quota, _spent) = provider::quota_from_page(&page);
                     if !quota.is_empty() {
                         let _ = events.send(AgentEvent::Quota(quota));

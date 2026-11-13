@@ -35,6 +35,10 @@ pub enum Request<'a> {
     ModelInvoke {
         tokens: u64,
     },
+    TranscriptQuery {
+        session: &'a str,
+        sql: &'a str,
+    },
     /// Scopes without arguments: transcript-read, context-contribute, tool, veto, ui, persist.
     Plain(Scope),
 }
@@ -47,6 +51,7 @@ impl Request<'_> {
             Request::Exec { .. } => Scope::Exec,
             Request::Net { .. } => Scope::Net,
             Request::ModelInvoke { .. } => Scope::ModelInvoke,
+            Request::TranscriptQuery { .. } => Scope::TranscriptRead,
             Request::Plain(s) => *s,
         }
     }
@@ -77,6 +82,7 @@ impl Request<'_> {
                 args
             }
             Request::ModelInvoke { tokens } => json!({ "tokens": tokens }),
+            Request::TranscriptQuery { session, sql } => json!({ "session": session, "sql": sql }),
             Request::Plain(_) => json!({}),
         }
     }
@@ -249,6 +255,9 @@ impl Engine {
                 }
                 *used += tokens;
                 Decision::allow(scope, &g.rule, &g.why)
+            }
+            Request::TranscriptQuery { .. } => {
+                self.decide(who, &Request::Plain(Scope::TranscriptRead))
             }
             Request::Plain(s) => match grants.plain.get(s) {
                 Some(g) => Decision::allow(scope, &g.rule, &g.why),

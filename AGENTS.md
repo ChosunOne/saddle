@@ -1,14 +1,15 @@
 # Working in this repository
 
-Saddle is a coding-agent harness in Rust. Its distinguishing property is that plugins are WASI
-components whose authority is a *declared* scope set, checked before the component is instantiated.
+Saddle is a coding-agent harness in Rust. Its planned plugin boundary is WASI components whose
+authority is a *declared* scope set, checked before instantiation. The current v0 has built-in tools
+and the component interface checker, but no plugin loader yet.
 `docs/plan.md` is the specification; read it before changing behaviour in the policy, sandbox or tool
 layer.
 
 There is no README. `docs/plan.md` is the design document, the rationale and the milestone list.
 
 This file is one of the instruction files saddle loads into its own prompt (the workspace root
-`AGENTS.md`; `src/context.rs`, D32). Keep it accurate — a stale instruction file is worse than none,
+`AGENTS.md`; `crates/saddle/src/context.rs`, D32). Keep it accurate — a stale instruction file is worse than none,
 because it is followed.
 
 ## Layout
@@ -26,7 +27,7 @@ Inside `crates/saddle/src`:
 | --- | --- |
 | `agent` | the model loop (no request limit unless one is set, D37; a turn stops on a repeated call and answer, D38), the system prompt (base plus grants, so a policy reload replaces only the grants, D47), tool dispatch, and compaction — synchronous at the hard threshold, started in the background at three quarters (D78), and run by the worker thread when the session is idle (D77) |
 | `session` | opening the workspace, resolving roots, the policy engine and audit log for a session |
-| `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch`, `tools/websearch` | the ten built-in tools (`fetch` is host-side network, D39; `patch` is D56; `websearch` asks the provider, or Exa, D82) |
+| `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch`, `tools/websearch`, `tools/session_query` | the eleven built-in tools (`fetch` is host-side network, D39; `patch` is D56; `websearch` asks the provider, or Exa, D82; `session_query` is branch-only read-only SQL, D92) |
 | `net` | the command network (D79): `hello` reads a hostname out of a TLS handshake, `head` out of a `CONNECT` line or a `Host` header, `proxy` decides and carries a connection, `bridge` joins the proxy's threads to the one engine and the one audit log |
 | `tools/diff` | line diffs of edited files, for the transcript only — the model never sees them |
 | `context` | instruction files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md` fallback), read through the policy |
@@ -45,7 +46,7 @@ and intercepts `__sandbox` before clap parses anything — that is the helper pr
 stay first in `main`.
 
 Built-in tools are `read`, `write`, `edit`, `patch`, `ls`, `find`, `grep`, `bash`, `fetch` and
-`websearch` (`tools::NAMES`). `patch` applies one apply-patch document across several files, deciding
+`websearch` and `session_query` (`tools::NAMES`). `patch` applies one apply-patch document across several files, deciding
 every path before writing any of them, and refuses the whole patch if one is denied (D56).
 `fetch` gets a URL that is already known and `websearch` finds one that is not: both are made by the
 **host** after the engine allows them (D39, D82), and both name their host in a `net` grant — `fetch`
@@ -61,6 +62,21 @@ because that exemption needs a grant that names the address. `saddle tool <name>
 of them as the agent through the gate, which is the most direct way to check a policy change by hand.
 
 Planned but not yet present: `saddle-wit`, `saddle-loader`, `saddle-sdk` (v1, D15).
+
+OpenAI API-key sessions use published standard token prices for known non-tiered models when the
+config and catalogue state none (D93); compatible servers do not inherit them. ChatGPT login uses
+its subscription quota instead, not a fabricated API bill: `{quota}` shows each reported window's
+remaining percentage and reset countdown (`5h`, `weekly`). `saddle check` includes absolute reset
+timestamps. Usage GETs use refreshed OAuth and the same account headers as model requests.
+
+`session_query` requires `transcript-read = {}` in the agent grants. First-run defaults include it;
+existing explicit `[agent]` tables remain as written, and `--revoke transcript-read` disables it
+for one run. It queries only the active
+conversation branch, including pre-compaction messages, through the in-memory view
+`messages(ordinal, id, role, text)`. It never runs SQL on the saved database, grants filesystem
+access to state, or permits transcript mutation (D92). Results are capped at 100 rows and 50 KiB;
+SQL and execution are bounded too. A standalone `saddle tool session_query` has no active
+conversation and reports that rather than picking another session.
 
 ## Commands
 
@@ -95,9 +111,12 @@ cargo clippy --all-targets                   # must stay clean
 - **A failure stops the run** unless `--no-fail-fast` is given, so use
   `cargo nextest run --no-fail-fast` to see every failure in one pass.
 
-`crates/saddle/tests/agent.rs` still fails under a sandboxed agent that blocks `socket()`/`bind()` —
-that is the environment, not the code (`cargo nextest run --no-fail-fast` and look at whether every
-failure is in `saddle::agent`). One binary at a time is `--lib` or `--test <name>`, as in
+`crates/saddle/tests/agent.rs` needs loopback `socket()`/`bind()`. D79 lets it run when the command's
+network namespace is available; the no-network fallback cannot run those tests. Diagnose the actual
+failure rather than assuming every failure in `saddle::agent` is environmental: mock HTTP parsing or
+fixture failures are code defects. The mock serves startup catalogue GETs separately from canned
+model POSTs (D34), and every fixture uses throwaway home, config and state directories.
+One binary at a time is `--lib` or `--test <name>`, as in
 `cargo nextest run --test cli`; the binary's own unit tests are `--bin saddle`.
 
 There is no CI config in the tree, no `rust-toolchain` pin and no `rustfmt.toml`. Edition 2024,
@@ -232,7 +251,7 @@ exists to prevent. Two concrete consequences worth restating, because they are t
   because a root is nameable by any workspace policy. Content the harness chooses — the global
   `AGENTS.md`, an attachment — is host-read with no root at all; a skill is not, since `read` loads
   it (D67).
-- Built-in tools are not privileged. None of the ten is a bypass: each passes through the same
+- Built-in tools are not privileged. None of the eleven is a bypass: each passes through the same
   engine, the same audit log and the same sandbox as a plugin call (D17). `ls`, `find` and `grep`
   decide and log one read of the directory they start from, then filter everything beneath it through
   the same policy without a record per file, so an excluded file is skipped rather than shown
@@ -250,7 +269,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D91 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D93 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
@@ -293,9 +312,9 @@ nearly every module header names the ones it implements, for example:
   `XDG_STATE_HOME` — never against the developer's real config or state.
 - `crates/saddle/tests/cli.rs` covers the gate through the binary (policy layering, denials,
   reserved paths, the exec sandbox, network grants, the audit chain). `crates/saddle/tests/agent.rs` drives the model loop with
-  a mock provider that answers over a loopback `TcpListener`; those tests need `socket()`/`bind()` to
-  be permitted, so they fail in a sandbox that blocks it — that failure is the environment, not the
-  code.
+  a mock provider that answers catalogue GETs and model POSTs over a loopback `TcpListener`; those
+  tests need `socket()`/`bind()` to be permitted. A bind permission error is environmental; other
+  failures still need investigation. They use a throwaway home as well as config and state.
 - `crates/saddle-sandbox/tests/confinement.rs` re-executes its own test binary as the probe
   (`SADDLE_SANDBOX_PROBE`). It needs real landlock, and skips or fails on kernels below ABI 3.
 
