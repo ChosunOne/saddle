@@ -1915,8 +1915,6 @@ answer "what is the current version of X".
   outside every root and buys nothing a second search does not.
 
 ## 4. Scope enumeration
-## 4. Scope enumeration
-## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
 | --- | --- | --- | --- |
@@ -1995,8 +1993,6 @@ model is decorative.
 
 - Long-lived plugin instances (`lifetime = "session"`, D13).
 - `exec` on macOS through Seatbelt.
-- Network for child processes: a network namespace that routes only to the host's HTTP client, which
-  enforces the same per-host grants.
 - A mount namespace with read-only bind mounts for reserved paths and empty mounts over excluded
   paths, replacing the D20 snapshot and making `exclude` bind `exec`.
 - Tracking child processes by cgroup. A child that calls `setsid` leaves its process group and
