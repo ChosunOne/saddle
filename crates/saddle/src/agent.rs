@@ -230,6 +230,9 @@ pub struct Resumed {
     pub cost: f64,
     /// Tokens the next request would carry, from the same estimate compaction uses.
     pub context: u64,
+    /// The provider and model this conversation was last working in, so it comes back on that one
+    /// rather than on whatever the default has become since (D91).
+    pub model: Option<store::Model>,
 }
 
 /// What a rewind did: the conversation it moved to, and the items it left behind (D54).
@@ -977,6 +980,7 @@ impl Agent {
             usage: loaded.usage,
             cost: loaded.cost,
             context,
+            model: store.model_of(id)?,
         })
     }
 
@@ -1020,12 +1024,42 @@ impl Agent {
     }
 
     /// Switches provider or model between turns, and logs the change.
-    pub fn set_provider(&mut self, session: &mut Session, provider: Provider) -> Result<()> {
+    ///
+    /// The conversation it happens in keeps it: a switch is written to the saved session, so
+    /// resuming that conversation comes back on this model rather than on the default (D91). A
+    /// conversation that has not been saved yet records it at its first prompt, which is the only
+    /// row there is.
+    pub fn set_provider(
+        &mut self,
+        session: &mut Session,
+        provider: Provider,
+        ui: &mut dyn Ui,
+    ) -> Result<()> {
         let model = provider.config.model.clone();
+        let name = provider.name.clone();
         // A provider that searches brings its search with it, so the tool follows /login (D82).
         session.search = provider.search_target();
         self.provider = Some(provider);
+        self.note_model(&name, &model, ui);
         self.log(session, json!({ "model": model }), "provider changed")
+    }
+
+    /// Writes the model the conversation is now working in, so a resume comes back on it (D91).
+    fn note_model(&mut self, name: &str, model: &str, ui: &mut dyn Ui) {
+        if let (Some(store), Some(id)) = (&self.store, &self.saved)
+            && let Err(e) = store.model_change(id, name, model)
+        {
+            // The same rule as any other write to the transcript: said once, and saving stops
+            // rather than the conversation silently diverging from what is on disk.
+            self.saving_failed(e, ui);
+        }
+    }
+
+    /// The provider and model this conversation is saved as working in (D91).
+    fn saved_model(&self) -> Option<store::Model> {
+        let store = self.store.as_ref()?;
+        let id = self.saved.as_deref()?;
+        store.model_of(id).ok().flatten()
     }
 
     /// Starts a new conversation: what the last one spent and how large it had grown are not
@@ -1175,6 +1209,7 @@ impl Agent {
             usage: loaded.usage,
             cost: loaded.cost,
             context: self.context_estimate(),
+            model: store.model_of(&id)?,
         };
         Ok(Rewound {
             resumed,
@@ -1193,6 +1228,7 @@ impl Agent {
             usage,
             cost: self.cost,
             context: self.context_estimate(),
+            model: self.saved_model(),
         })
     }
 
@@ -2254,6 +2290,67 @@ mod tests {
         // number rather than on zero (D35).
         assert!(saved.context > 0);
         assert_eq!(saved.context, agent.context_estimate());
+    }
+
+    #[test]
+    fn a_model_chosen_in_a_conversation_is_written_to_it() {
+        // D91: the switch is saved with the conversation, which is what makes the resume below
+        // come back on it. Nothing here touches config.toml — that is the point.
+        let store = Store::in_memory("/ws").unwrap();
+        let id = store.begin("synthetic", "before").unwrap();
+        store.append(&id, &Item::User("hello".into())).unwrap();
+        let mut agent = Agent::new(
+            None,
+            String::new(),
+            String::new(),
+            Vec::new(),
+            None,
+            Some(store),
+            compact::Settings::default(),
+        );
+        agent.resume(&id).unwrap();
+        let mut ui = Recording::default();
+        agent.note_model("openai", "after", &mut ui);
+        assert_eq!(
+            agent.store.as_ref().unwrap().model_of(&id).unwrap(),
+            Some(store::Model {
+                provider: "openai".into(),
+                model: "after".into(),
+            })
+        );
+        // And the conversation now reads back as that one.
+        assert_eq!(
+            agent.resume(&id).unwrap().model.map(|m| m.model),
+            Some("after".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_resumed_conversation_comes_back_on_the_model_it_was_working_in() {
+        // D91: the model is a property of the conversation, not of config.toml. What it was last
+        // using is read back with it, so a default changed since does not move it.
+        let store = Store::in_memory("/ws").unwrap();
+        let id = store.begin("synthetic", "m").unwrap();
+        store.append(&id, &Item::User("hello".into())).unwrap();
+        store.model_change(&id, "synthetic", "chosen-here").unwrap();
+        let mut agent = Agent::new(
+            None,
+            String::new(),
+            String::new(),
+            Vec::new(),
+            None,
+            Some(store),
+            compact::Settings::default(),
+        );
+        let saved = agent.resume(&id).unwrap();
+        // The change is what comes back, not the model the conversation began on.
+        assert_eq!(
+            saved.model,
+            Some(store::Model {
+                provider: "synthetic".into(),
+                model: "chosen-here".into(),
+            })
+        );
     }
 
     fn agent_with(store: Store, id: &str) -> Agent {

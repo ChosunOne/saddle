@@ -515,7 +515,7 @@ fn work(
                 }
             },
             Command::SetProvider(provider) => {
-                if let Err(e) = agent.set_provider(&mut session, *provider) {
+                if let Err(e) = agent.set_provider(&mut session, *provider, &mut ui) {
                     let msg = format!("{e:#}");
                     let _ = events.send(AgentEvent::Fatal(msg.clone()));
                     fatal = Some(msg);
@@ -867,6 +867,12 @@ impl Controller {
             Action::Login(req) => self.login(app, &req),
             Action::Logout(name) => self.logout(app, name),
             Action::Model(name) => self.model(app, name),
+            Action::Use(pick) => self.use_model(app, pick),
+            Action::Default(pick) => self.save_default(app, pick),
+            Action::Restore(pick) => {
+                self.restore_model(app, &pick);
+                Ok(())
+            }
             Action::SettleWindow => self.settle_window(app),
             // The dialog asks for one change and stays open, so a person can do several.
             Action::Grant(change) => {
@@ -1635,16 +1641,18 @@ impl Controller {
         self.send(app, Command::SetMaxSteps(app.max_steps));
         let compaction = crate::compact::Settings::from_config(&user.compaction);
         self.send(app, Command::SetCompaction(compaction));
-        // The provider is rebuilt only when the file names a different one; otherwise the session
-        // keeps the provider it has, with the effort and the window it has settled on.
-        let named = user.provider.clone();
-        if let Some(name) = named
-            && name != app.header.provider
-        {
-            match self.build(&name) {
-                Ok(p) => self.switch(app, p),
-                Err(e) => app.note(NoteKind::Error, &format!("{e:#}")),
-            }
+        // The provider and the model are this conversation's own (D91), so a file that now names
+        // another provider is what the next session starts with, not a command to move this one.
+        // Said out loud, because the file changed and nothing else will mention it.
+        if let Some(name) = user.provider.clone().filter(|n| *n != app.header.provider) {
+            app.note(
+                NoteKind::Info,
+                &format!(
+                    "config.toml now names {name}; this session stays on {} with its model, and \
+                     /model switches it",
+                    app.header.provider
+                ),
+            );
         }
         app.note(NoteKind::Info, "settings reloaded from config.toml");
     }
@@ -1669,12 +1677,14 @@ impl Controller {
         self.send(app, Command::SetMaxSteps(app.max_steps));
         let compaction = crate::compact::Settings::from_config(&user.compaction);
         self.send(app, Command::SetCompaction(compaction));
-        let name = user
-            .provider
-            .clone()
-            .or_else(|| Some(app.header.provider.clone()).filter(|p| !p.is_empty()));
-        if let Some(name) = name {
-            match self.build(&name) {
+        // What the file says about the provider in force — effort, limits, the address — is what
+        // was just edited, so it is re-read; its model is the default for new sessions, so the
+        // model this conversation is working in is handed back in rather than taken from the file
+        // (D91). The file's `provider =` is the next session's default for the same reason.
+        let name = app.header.provider.clone();
+        if !name.is_empty() {
+            let model = Some(app.header.model.clone()).filter(|m| !m.is_empty());
+            match self.build_model(&name, model.as_deref()) {
                 Ok(p) => self.switch(app, p),
                 Err(e) => return app.note(NoteKind::Error, &format!("{e:#}")),
             }
@@ -1881,10 +1891,16 @@ impl Controller {
 
     /// The provider as the config, the key store and the model cache now describe it.
     fn build(&self, name: &str) -> Result<Provider> {
+        self.build_model(name, None)
+    }
+
+    /// A provider as config.toml has it, except for the model: a model chosen for one conversation
+    /// is not in the file, so it is handed in rather than read back (D91).
+    fn build_model(&self, name: &str, model: Option<&str>) -> Result<Provider> {
         let user = UserConfig::load(&self.paths.user_config())?;
         let auth = AuthStore::load(&self.paths.auth_store())?;
         let reported = provider::Reported::stored(&self.paths.reported_windows());
-        let config = provider::resolve(name, &user.providers, None)?;
+        let config = provider::resolve(name, &user.providers, model)?;
         Ok(Provider::new(name, config, auth.key(name), &reported)
             .with_stored_oauth(&self.paths.auth_store()))
     }
@@ -1960,23 +1976,81 @@ impl Controller {
     }
 
     fn model(&self, app: &mut App, name: Option<String>) -> Result<()> {
-        let provider_name = app.header.provider.clone();
         let Some(model) = name else {
             // No name: the list, filtered by typing, rather than a name to remember (D88).
             return self.open_models(app);
         };
-        config::edit(&self.paths.user_config(), |doc| {
-            config::provider_table(doc, &provider_name)?["model"] =
-                toml_edit::value(model.as_str());
-            Ok(())
-        })?;
-        let provider = self.build(&provider_name)?;
-        self.switch(app, provider);
+        // No provider in force yet, so there is nothing to name a model against: the list asks
+        // which provider first, which is what `/model` with no provider has always done.
+        if app.header.provider.is_empty() {
+            return self.open_models(app);
+        }
+        // A name is a choice about this conversation, like picking one from the list: it is not
+        // written to config.toml, so it cannot move the next session too (D91).
+        self.use_model(
+            app,
+            Pick {
+                provider: app.header.provider.clone(),
+                model,
+            },
+        )
+    }
+
+    /// Switches this conversation to a provider and model (D91).
+    fn use_model(&self, app: &mut App, pick: Pick) -> Result<()> {
+        let (provider, model) = self.switch_to(app, &pick)?;
         app.note(
             NoteKind::Info,
-            &format!("now using {model} on {provider_name}; saved as its default"),
+            &format!(
+                "now using {model} on {provider} in this conversation · \
+                 ctrl+s in the model list makes it the default"
+            ),
         );
         Ok(())
+    }
+
+    /// Switches to a provider and model and writes both to config.toml, which is what a new session
+    /// starts with (D91).
+    fn save_default(&self, app: &mut App, pick: Pick) -> Result<()> {
+        config::edit(&self.paths.user_config(), |doc| {
+            doc["provider"] = toml_edit::value(pick.provider.as_str());
+            config::provider_table(doc, &pick.provider)?["model"] =
+                toml_edit::value(pick.model.as_str());
+            Ok(())
+        })?;
+        let (provider, model) = self.switch_to(app, &pick)?;
+        app.note(
+            NoteKind::Info,
+            &format!("now using {model} on {provider}; saved as the default"),
+        );
+        Ok(())
+    }
+
+    /// Puts a resumed conversation back on the model it was working in (D91).
+    ///
+    /// Quiet when it works: the resume note has already said which conversation came back. Loud
+    /// when it does not, because a conversation quietly continuing on a model it was not using is
+    /// exactly the surprise this is here to prevent.
+    fn restore_model(&self, app: &mut App, pick: &Pick) {
+        let Err(e) = self.switch_to(app, pick) else {
+            return;
+        };
+        app.note(
+            NoteKind::Error,
+            &format!(
+                "this conversation was last using {} on {}, which is not available now: {e:#}; \
+                 staying on {} on {}",
+                pick.model, pick.provider, app.header.model, app.header.provider
+            ),
+        );
+    }
+
+    /// Builds the provider for a choice and switches to it, answering with what was chosen.
+    fn switch_to(&self, app: &mut App, pick: &Pick) -> Result<(String, String)> {
+        let provider = self.build_model(&pick.provider, Some(&pick.model))?;
+        let model = provider.config.model.clone();
+        self.switch(app, provider);
+        Ok((pick.provider.clone(), model))
     }
 }
 
@@ -2119,6 +2193,7 @@ mod tests {
 
     use super::*;
     use crate::auth::AuthStore;
+    use crate::tui::app::Entry;
 
     /// A controller over a throwaway config, so a slash command can be followed all the way to
     /// what it does (D74).
@@ -2305,16 +2380,102 @@ mod tests {
             login.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
             login.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         };
-        let login::Outcome::Submit(req) = action else {
-            panic!("expected a submission, got {action:?}");
+        // D91: choosing a model is a choice about this conversation, so it does not write the file
+        // a new session starts from.
+        let login::Outcome::Use(pick) = action else {
+            panic!("expected a choice for this conversation, got {action:?}");
         };
-        assert_eq!(req.provider, "synthetic");
-        assert_eq!(req.model, "picked-b");
-        assert_eq!(req.key, None);
-        c.perform(&mut app, Action::Login(req));
+        assert_eq!(pick.provider, "synthetic");
+        assert_eq!(pick.model, "picked-b");
+        c.perform(&mut app, Action::Use(pick));
         assert_eq!(app.header.model, "picked-b");
         let written = std::fs::read_to_string(c.paths.user_config()).unwrap();
-        assert!(written.contains("picked-b"), "{written}");
+        assert!(
+            written.contains("hf:zai-org/GLM-5.3"),
+            "the default is still the one it was: {written}"
+        );
+        assert!(!written.contains("picked-b"), "{written}");
+    }
+
+    #[test]
+    fn reloading_the_settings_does_not_move_a_session_to_the_files_provider() {
+        // D91: `/reload` reads the settings again, and the default in the file is what the next
+        // session starts with. This one keeps the provider and model it is working in — a reload
+        // in the middle of a task must not quietly start spending on another account.
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller(
+            dir.path(),
+            "provider = \"synthetic\"\n[providers.synthetic]\nmodel = \"the-default\"\n",
+        );
+        let mut app = an_app();
+        app.header.provider = "openai-chatgpt".into();
+        app.header.model = "session-model".into();
+        c.reload_settings(&mut app);
+        assert_eq!(app.header.provider, "openai-chatgpt");
+        assert_eq!(app.header.model, "session-model");
+        assert!(
+            app.entries
+                .iter()
+                .any(|e| matches!(e, Entry::Note(NoteKind::Info, t)
+                if t.contains("config.toml now names synthetic") && t.contains("stays on"))),
+            "the file changed, so it is said: {:?}",
+            app.entries
+        );
+    }
+
+    #[test]
+    fn ctrl_s_writes_the_choice_where_a_new_session_reads_it() {
+        // The other half of D91: the default is not gone, it just cannot be changed by accident.
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller(
+            dir.path(),
+            "provider = \"synthetic\"\n[providers.synthetic]\nmodel = \"hf:zai-org/GLM-5.3\"\n",
+        );
+        let mut app = an_app();
+        app.header.provider = "synthetic".into();
+        c.perform(
+            &mut app,
+            Action::Default(Pick {
+                provider: "synthetic".into(),
+                model: "kept".into(),
+            }),
+        );
+        assert_eq!(app.header.model, "kept");
+        let written = std::fs::read_to_string(c.paths.user_config()).unwrap();
+        assert!(written.contains("kept"), "{written}");
+    }
+
+    #[test]
+    fn a_default_changed_elsewhere_does_not_move_a_conversation_that_already_chose() {
+        // D91: the resume is where the two used to meet. A conversation saved on one model comes
+        // back on it, even though the file now names another one.
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller(
+            dir.path(),
+            "provider = \"synthetic\"\n[providers.synthetic]\nmodel = \"a-new-default\"\n",
+        );
+        let mut app = an_app();
+        app.header.provider = "synthetic".into();
+        app.header.model = "a-new-default".into();
+        let event = AgentEvent::Resumed(crate::agent::Resumed {
+            items: Vec::new(),
+            usage: crate::provider::Usage::default(),
+            cost: 0.0,
+            context: 0,
+            model: Some(store::Model {
+                provider: "synthetic".into(),
+                model: "what-it-was-using".into(),
+            }),
+        });
+        let action = app.agent(event).expect("a switch back to its own model");
+        c.perform(&mut app, action);
+        assert_eq!(app.header.model, "what-it-was-using");
+        assert_eq!(app.header.provider, "synthetic");
+        let written = std::fs::read_to_string(c.paths.user_config()).unwrap();
+        assert!(
+            written.contains("a-new-default"),
+            "the default is what another session set it to: {written}"
+        );
     }
 
     #[test]

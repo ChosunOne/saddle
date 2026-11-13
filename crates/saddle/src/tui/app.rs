@@ -11,7 +11,7 @@ use ratatui::text::Line;
 use unicode_width::UnicodeWidthChar;
 
 use super::editor::Editor;
-use super::login::{Draft, Listed, Login, LoginRequest, Outcome};
+use super::login::{Draft, Listed, Login, LoginRequest, Outcome, Pick};
 use super::render::home_relative;
 use super::sessions::{PickOutcome, SessionPicker};
 use super::settings::{Change, SettingsDialog, SettingsOutcome};
@@ -118,6 +118,12 @@ pub enum Action {
     Logout(Option<String>),
     /// Show the model, or switch to the named one.
     Model(Option<String>),
+    /// Use this provider and model in this conversation, leaving the default alone (D91).
+    Use(Pick),
+    /// Use it, and write it to config.toml as what a new session starts with (D91).
+    Default(Pick),
+    /// Come back to the model a resumed conversation was last using (D91).
+    Restore(Pick),
     /// Settle the context window again now that the endpoint has answered.
     SettleWindow,
     /// One change from the permissions editor.
@@ -362,7 +368,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/model",
         args: "[name]",
-        about: "list this provider's models to choose from, or switch to the one named",
+        about: "choose a model from any provider, or switch to the one named; this session only",
     },
     SlashCommand {
         name: "/settings",
@@ -984,6 +990,14 @@ impl App {
                 Outcome::Submit(req) => {
                     self.login = None;
                     Some(Action::Login(req))
+                }
+                Outcome::Use(pick) => {
+                    self.login = None;
+                    Some(Action::Use(pick))
+                }
+                Outcome::Default(pick) => {
+                    self.login = None;
+                    Some(Action::Default(pick))
                 }
             };
         }
@@ -1802,6 +1816,18 @@ impl App {
                 self.usage = saved.usage;
                 self.cost = saved.cost;
                 self.context = saved.context;
+                // A conversation comes back on the model it was working in, so a default chosen
+                // since — here or in another session — does not move it (D91). Asks only when it
+                // is a different one, so resuming the usual case stays quiet.
+                if let Some(saved) = saved.model {
+                    let pick = Pick {
+                        provider: saved.provider,
+                        model: saved.model,
+                    };
+                    if pick.provider != self.header.provider || pick.model != self.header.model {
+                        return Some(Action::Restore(pick));
+                    }
+                }
             }
             AgentEvent::Tree(points) => {
                 if points.is_empty() {
@@ -2090,7 +2116,17 @@ mod tests {
             },
             cost: 0.42,
             context: 2_600,
+            // The same model this session is already on, so resuming asks for no switch (D91).
+            model: Some(crate::store::Model {
+                provider: "mock".into(),
+                model: "m".into(),
+            }),
         }));
+        assert_eq!(
+            a.agent(AgentEvent::Listed),
+            Some(Action::SettleWindow),
+            "a conversation on the model in force needs no switch"
+        );
         assert_eq!(a.usage.input, 1_500);
         assert_eq!(a.usage.output, 200);
         assert_eq!(a.usage.cache_read, 900);
@@ -2645,6 +2681,7 @@ mod tests {
             usage: crate::provider::Usage::default(),
             cost: 0.0,
             context: 0,
+            model: None,
         }));
         assert_eq!(
             a.entries[1..],

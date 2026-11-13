@@ -139,6 +139,11 @@ pub enum Outcome {
     Check(u64, Draft),
     /// List what every provider serves and answer with [`Login::models`] (D89).
     ListAll(u64),
+    /// Use this provider and model in this conversation only (D91).
+    Use(Pick),
+    /// Use it, and make it what a new session starts with: both the provider and the model (D91).
+    Default(Pick),
+    /// The login flow, where the credential and the model entered are the new default (D85).
     Submit(LoginRequest),
     /// Start a device sign-in for this provider (D85).
     SignIn(u64, String),
@@ -486,6 +491,11 @@ impl Login {
                 ..
             } => {
                 let shown = matching(models, filter).len();
+                // Worked out before the match, so both keys agree on what is chosen: ctrl+s is
+                // enter plus "and remember it", never a different entry (D91).
+                let chosen = matches!(key.code, KeyCode::Enter | KeyCode::Char('s'))
+                    .then(|| pick_of(models, filter, *selected, current.as_deref()))
+                    .flatten();
                 match key.code {
                     KeyCode::Esc if self.purpose == Purpose::Model => return Outcome::Close,
                     KeyCode::Esc => self.back(),
@@ -503,25 +513,28 @@ impl Login {
                         filter.clear();
                         *selected = 0;
                     }
+                    // The one key that changes what a later session starts with: everything else
+                    // here is a choice about this conversation (D91). Only in the picker: the
+                    // login flow's list carries the credential that was just entered, and
+                    // submitting it is the whole reason it opened.
+                    KeyCode::Char('s') if ctrl && self.purpose == Purpose::Model => {
+                        if let Some(pick) = chosen {
+                            return Outcome::Default(pick);
+                        }
+                    }
                     KeyCode::Char(c) if !ctrl => {
                         filter.push(c);
                         *selected = 0;
                     }
                     KeyCode::Enter => {
-                        let list = matching(models, filter);
-                        let pick = match list.get(*selected) {
-                            Some(p) => (**p).clone(),
-                            // A name nothing lists goes to the provider in force, which is the one
-                            // a person is switching when they type a name at all (D89).
-                            None if !filter.trim().is_empty() => match current.clone() {
-                                Some(provider) => Pick {
-                                    provider,
-                                    model: filter.trim().to_owned(),
-                                },
-                                None => return Outcome::Stay,
-                            },
-                            None => return Outcome::Stay,
+                        let Some(pick) = chosen else {
+                            return Outcome::Stay;
                         };
+                        // `/model` chooses for the conversation. It used to write the choice into
+                        // config.toml, which silently moved every later session too (D91).
+                        if self.purpose == Purpose::Model {
+                            return Outcome::Use(pick);
+                        }
                         // The key and address entered for a login belong to the provider they were
                         // entered for, and only to that one: the picker's own list has neither, and
                         // taking one from a draft for another provider would save a credential to
@@ -798,6 +811,25 @@ pub fn matching<'a>(models: &'a [Pick], filter: &str) -> Vec<&'a Pick> {
             p.model.to_lowercase().contains(&needle) || p.provider.to_lowercase().contains(&needle)
         })
         .collect()
+}
+
+/// What enter would choose in the model list: the highlighted entry, or the name typed when
+/// nothing lists it (D89).
+///
+/// A name nothing serves goes to the provider in force, which is the one a person is switching when
+/// they type a name at all; with no provider in force there is nothing to send it to.
+fn pick_of(models: &[Pick], filter: &str, selected: usize, current: Option<&str>) -> Option<Pick> {
+    if let Some(pick) = matching(models, filter).get(selected) {
+        return Some((**pick).clone());
+    }
+    let model = filter.trim();
+    if model.is_empty() {
+        return None;
+    }
+    Some(Pick {
+        provider: current?.to_owned(),
+        model: model.to_owned(),
+    })
 }
 
 fn valid_name(s: &str) -> bool {
@@ -1112,14 +1144,42 @@ mod tests {
         assert!(l.fields.is_empty(), "nothing to type but the filter");
 
         l.models(id, Ok(listed("openai", &["gpt-5.4", "gpt-5.5", "o4-mini"])));
-        // Typing narrows the list; enter takes what is highlighted.
+        // Typing narrows the list; enter takes what is highlighted, for this conversation only
+        // (D91).
         type_text(&mut l, "5.5");
-        let Outcome::Submit(req) = press(&mut l, KeyCode::Enter) else {
-            panic!("expected a submission");
+        assert_eq!(
+            press(&mut l, KeyCode::Enter),
+            Outcome::Use(Pick {
+                provider: "openai".into(),
+                model: "gpt-5.5".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn ctrl_s_chooses_the_same_entry_as_enter_and_says_it_is_the_default() {
+        // D91: `/model` used to write the choice into config.toml, so changing the model here moved
+        // every later session too. Both keys are now the same entry, and only ctrl+s is a default.
+        let mut l = Login::for_all_models(choices(), "openai", "m", "auth.json".into());
+        let Some(Outcome::ListAll(id)) = l.take_pending() else {
+            panic!("a listing to ask for");
         };
-        assert_eq!(req.provider, "openai");
-        assert_eq!(req.model, "gpt-5.5");
-        assert_eq!(req.key, None);
+        l.models(id, Ok(listed("openai", &["a", "b"])));
+        press(&mut l, KeyCode::Down);
+        let chosen = Pick {
+            provider: "openai".into(),
+            model: "b".into(),
+        };
+        assert_eq!(press(&mut l, KeyCode::Enter), Outcome::Use(chosen.clone()));
+        let save = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(l.key(save), Outcome::Default(chosen));
+        // A plain `s` is still a letter in the filter, not a key.
+        let typed = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(l.key(typed), Outcome::Stay);
+        let Stage::Models { filter, .. } = &l.stage else {
+            panic!("still a picker");
+        };
+        assert_eq!(filter, "s");
     }
 
     #[test]
@@ -1141,10 +1201,13 @@ mod tests {
         assert!(note.contains("type a model name"), "{note}");
         // And a name typed there still works, which is the way out.
         type_text(&mut l, "a-typed-model");
-        let Outcome::Submit(req) = press(&mut l, KeyCode::Enter) else {
-            panic!("expected a submission");
-        };
-        assert_eq!(req.model, "a-typed-model");
+        assert_eq!(
+            press(&mut l, KeyCode::Enter),
+            Outcome::Use(Pick {
+                provider: "openai".into(),
+                model: "a-typed-model".into(),
+            })
+        );
     }
 
     #[test]
@@ -1189,10 +1252,13 @@ mod tests {
         };
         l.models(id, Ok(Listed::default()));
         type_text(&mut l, "a-model-the-server-does-not-list");
-        let Outcome::Submit(req) = press(&mut l, KeyCode::Enter) else {
-            panic!("expected a submission");
-        };
-        assert_eq!(req.model, "a-model-the-server-does-not-list");
+        assert_eq!(
+            press(&mut l, KeyCode::Enter),
+            Outcome::Use(Pick {
+                provider: "openai".into(),
+                model: "a-model-the-server-does-not-list".into(),
+            })
+        );
     }
 
     #[test]

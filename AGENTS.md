@@ -113,9 +113,14 @@ browser on a click or `o`, and `c` copies it (D85, D86). `saddle login <provider
 provider in force is signed in.
 `/model` with no name is a searchable list of what **every** configured provider serves — each entry
 naming its provider, filterable by provider as well as by name — with the provider and model in force
-named above it and highlighted in the list; `/model <name>` switches straight to one and saves it as
-that provider's default (D88, D89). `/login` ends on the same list, so a model is chosen the same way
-whether or not the credential was just entered.
+named above it and highlighted in the list; `/model <name>` switches straight to one (D88, D89).
+Either way the choice is this conversation's, recorded with it and **not** written to `config.toml`,
+so `ctrl+s` in the list is the only thing that changes what a new session starts with — it saves both
+the provider and the model, and `/login` still does the same for the provider it just set up (D91).
+A resumed conversation therefore comes back on the model it was using, whatever the default has
+become since, and two sessions in one directory keep their own models — `/reload` and a hand edit of
+the file re-read the settings but never switch provider or model (D91). `/login` ends on the same
+list, so a model is chosen the same way whether or not the credential was just entered.
 `/skill:<name> <request>` loads a skill's instructions into the conversation followed by the
 request, in the TUI and in line mode, and is the only way to reach a skill marked
 `disable-model-invocation` (D69). `/reload` reads the instruction files and skills again and rebuilds the
@@ -198,7 +203,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D90 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D91 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

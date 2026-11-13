@@ -1712,7 +1712,7 @@ fn draw_login(
             lines.push(Line::from(vec![
                 Span::styled(format!("{spin} "), Style::new().fg(theme.warning)),
                 Span::raw(if picker {
-                    "listing the models this provider serves…"
+                    "listing what every provider serves…"
                 } else {
                     "checking the key and listing models…"
                 }),
@@ -1866,6 +1866,14 @@ fn draw_login(
                 ),
                 dim(theme),
             )));
+            // The two keys do different things, so which is which is said rather than discovered by
+            // changing the default by accident (D91).
+            if login.purpose() == Purpose::Model {
+                lines.push(Line::from(Span::styled(
+                    "ctrl+s also makes it the default, for new sessions",
+                    dim(theme),
+                )));
+            }
             login_title(login)
         }
     };

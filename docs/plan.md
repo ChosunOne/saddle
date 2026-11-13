@@ -2223,6 +2223,43 @@ the menu lists both so neither is a command that has to be remembered.
   it: which directory this fresh session is in, and that the last one is still there to resume.
 
 
+**D91.** The model a conversation is working in belongs to that conversation, and the default in
+`config.toml` is only what a new one starts with.
+
+`/model` — the name form and a chosen entry alike — wrote the model into `config.toml`. That is a
+choice about the conversation being worked in, so it silently moved every later session as well, and
+a conversation resumed after the default had been changed came back on a model it had never used.
+
+- **`/model` changes this conversation.** The name form and enter in the picker both switch the
+  running session and write nothing to the file. The choice is recorded with the conversation, as
+  the `provider`/`model` of its row in the store, and the audit log notes the switch as it always
+  did. A conversation that has not been saved yet records it at its first prompt, which is the row
+  there is.
+- **ctrl+s in the picker is the default.** It chooses the same entry enter would — the code decides
+  the entry once, so the two keys can never disagree — and writes both the provider and the model
+  to `config.toml`, which is what a new session reads. This is pi's split: `enter` says
+  `Model: <id>`, ctrl+s says `Default model: <provider>/<id>`.
+- **`/login` still writes the default.** A credential just entered, and the model chosen for it, are
+  a setup decision about a provider rather than a choice about one conversation, and the provider
+  being in force is what "which provider am I set up with" means. pi persists there too.
+- **A resumed conversation comes back on its own model.** `Resumed` carries the row's
+  `provider`/`model`, and the interface switches to it when it differs from what is in force —
+  silently, because the resume note has already said what came back. A model that is no longer
+  configured is an error note that names it and keeps the current one, rather than a conversation
+  quietly moving to a model nobody chose.
+- **Rewinding, forking and cloning carry it too**, because they read the same row; a fork copies the
+  row as it copies the branch (D53).
+- **A running session is not moved by a config change at all.** `/reload` reads the settings again
+  (D70) and a hand edit of `config.toml` is picked up by the dialog that asked for it, but neither
+  switches provider or model: a file that now names another provider is the next session's default,
+  said out loud once, and the session keeps what it is using. The provider's own table — effort,
+  limits, the address — is still re-read, with the session's model handed back in over the file's.
+  Two sessions in the same directory therefore keep their own models, whatever either of them saves
+  as the default.
+- **`/settings` opens the same picker**, so its model row is a session choice as well; the default is
+  one key away inside it, and the list says so.
+
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

@@ -36,6 +36,17 @@ mod kind {
     pub const COMPACTION: &str = "compaction";
 }
 
+/// Which provider and model a conversation was last working in (D91).
+///
+/// The model is a property of the conversation, not of `config.toml`: what a person switched to
+/// while working on this one is what it comes back on, and a default changed since — in this
+/// session or in another one — does not rewrite a conversation that already exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Model {
+    pub provider: String,
+    pub model: String,
+}
+
 /// The schema version this build writes. A database from a newer build is refused rather than
 /// guessed at, because a wrong guess here loses a conversation. Version 2 added `sessions.name`.
 const VERSION: u32 = 2;
@@ -191,6 +202,34 @@ impl Store {
         let body = serde_json::json!({ "audit": audit, "provider": provider, "model": model });
         self.push(session, kind::TURN, &body.to_string())?;
         Ok(())
+    }
+
+    /// Records that the conversation moved to another model (D91).
+    ///
+    /// The row is what a resumed conversation is read back from, and what the resume list shows, so
+    /// a model chosen and then left behind is still the one the next turn is expected to use.
+    pub fn model_change(&self, session: &str, provider: &str, model: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET provider = ?2, model = ?3, updated = ?4 WHERE id = ?1",
+            params![session, provider, model, now()],
+        )?;
+        Ok(())
+    }
+
+    /// The provider and model this conversation was last working in, if it has been saved and
+    /// something was recorded (D91).
+    pub fn model_of(&self, session: &str) -> Result<Option<Model>> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT provider, model FROM sessions WHERE id = ?1",
+                params![session],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(provider, model)| {
+            (!provider.is_empty() && !model.is_empty()).then_some(Model { provider, model })
+        }))
     }
 
     pub fn usage(&self, session: &str, usage: &Usage, cost: f64) -> Result<()> {
@@ -1198,6 +1237,35 @@ mod tests {
         let rows = s.rows(&id).unwrap();
         assert_eq!(rows.len(), 2);
         assert!(!rows.iter().any(|p| p.here));
+    }
+
+    #[test]
+    fn a_model_change_is_what_the_conversation_is_read_back_as_using() {
+        // D91: the row a resumed conversation is read from says which model it was last working in,
+        // so a default changed since does not follow it there.
+        let s = store();
+        let id = s.begin("synthetic", "begun-on").unwrap();
+        assert_eq!(
+            s.model_of(&id).unwrap(),
+            Some(Model {
+                provider: "synthetic".into(),
+                model: "begun-on".into(),
+            })
+        );
+        s.append(&id, &Item::User("a prompt".into())).unwrap();
+        s.model_change(&id, "openai", "moved-to").unwrap();
+        assert_eq!(
+            s.model_of(&id).unwrap().map(|m| m.model),
+            Some("moved-to".into())
+        );
+        assert_eq!(
+            s.model_of(&id).unwrap().map(|m| m.provider),
+            Some("openai".into())
+        );
+        // The resume list shows the same thing, because it reads the same row.
+        assert_eq!(s.list().unwrap()[0].model, "moved-to");
+        // A conversation nothing is known about has no model rather than an empty one.
+        assert_eq!(s.model_of("no-such-session").unwrap(), None);
     }
 
     #[test]
