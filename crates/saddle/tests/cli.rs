@@ -17,6 +17,9 @@ struct Env {
     ws: tempfile::TempDir,
     xdg: tempfile::TempDir,
     outside: tempfile::TempDir,
+    /// A throwaway home for every call, so the suite never reads the developer's own `~/.agents`,
+    /// `~/.cargo` or config. A test that needs a home of its own passes one to `saddle_in`.
+    home: tempfile::TempDir,
 }
 
 impl Env {
@@ -25,6 +28,7 @@ impl Env {
             ws: tempfile::tempdir().unwrap(),
             xdg: tempfile::tempdir().unwrap(),
             outside: tempfile::tempdir().unwrap(),
+            home: tempfile::tempdir().unwrap(),
         };
         let ws = env.ws.path();
         std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
@@ -105,6 +109,7 @@ impl Env {
             .arg("-C")
             .arg(self.ws.path())
             .args(args)
+            .env("HOME", self.home.path())
             .env("XDG_STATE_HOME", self.xdg.path().join("state"))
             .env("XDG_CONFIG_HOME", self.xdg.path().join("config"))
             .output()
@@ -125,6 +130,34 @@ impl Env {
 
     fn path(&self, rel: &str) -> PathBuf {
         self.ws.path().join(rel)
+    }
+
+    /// The skills a run advertised: discovery writes one `skill` record, which is what the prompt
+    /// listing is built from, so this is the observable form of "the model was told about it".
+    fn advertised(&self, home: &std::path::Path) -> Vec<String> {
+        let out = saddle_in(self, home, &["tool", "ls", r#"{"path":"."}"#]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let log = self
+            .audit_logs()
+            .last()
+            .cloned()
+            .expect("a log was written");
+        std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|r| r["kind"] == "skill")
+            .flat_map(|r| {
+                r["args"]["discovered"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s["name"].as_str().map(str::to_owned))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     fn audit_logs(&self) -> Vec<PathBuf> {
@@ -1017,57 +1050,60 @@ fn a_grants_file_that_names_another_directory_is_refused() {
 }
 
 #[test]
-fn a_skill_is_advertised_by_name_and_loaded_on_demand() {
-    // D64: the prompt carries the name, the description and the directory; the body is a tool
-    // call, so a directory of skills costs a few lines rather than all of their text.
+fn a_skill_is_loaded_with_the_read_tool() {
+    // D67: a skill is a file, and `read` is how a file is loaded. Discovery advertises the name,
+    // the description and the file to read; there is no tool of its own.
     let env = Env::new();
-    std::fs::create_dir_all(env.path(".agents/skills/house")).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let dir = env.path(".agents/skills/house");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("SKILL.md");
     std::fs::write(
-        env.path(".agents/skills/house/SKILL.md"),
+        &file,
         "---\nname: house\ndescription: House style. Use when editing Rust here.\n---\n\n\
          lowercase doc comments.\n",
     )
     .unwrap();
 
-    // A throwaway HOME throughout: the user tier would otherwise be the developer's own skills.
-    let home = tempfile::tempdir().unwrap();
-    let skill = |input: &str| {
-        let out = saddle_in(&env, home.path(), &["tool", "skill", input]);
-        let text = if out.status.success() {
-            String::from_utf8_lossy(&out.stdout).into_owned()
-        } else {
-            stderr(&out)
-        };
-        (out.status.success(), text)
-    };
-
-    let (ok, text) = skill("{}");
-    assert!(ok, "{text}");
-    assert!(text.contains("house"), "advertised, not loaded: {text}");
-    assert!(text.contains("House style."), "{text}");
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "read",
+            &format!(r#"{{"path":"{}"}}"#, file.display()),
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
     assert!(
-        !text.contains("lowercase doc comments"),
-        "the body is not the list"
+        String::from_utf8_lossy(&out.stdout).contains("lowercase doc comments"),
+        "the body is the file"
     );
 
-    let (ok, text) = skill(r#"{"name":"house"}"#);
-    assert!(ok, "{text}");
-    assert!(text.contains("lowercase doc comments"), "{text}");
+    // Advertised, so the model knows it exists and which file to read.
+    assert_eq!(env.advertised(home.path()), ["house"]);
 
-    // A name is an identifier, so there is no path to traverse.
-    let (ok, text) = skill(r#"{"name":"../../../etc/passwd"}"#);
-    assert!(!ok, "{text}");
-    assert!(text.contains("no skill `../../../etc/passwd`"), "{text}");
+    // There is no `skill` tool: it was removed rather than kept beside `read`.
+    let out = saddle_in(&env, home.path(), &["tool", "skill", r#"{"name":"house"}"#]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("unknown tool `skill`"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]
 fn a_skill_the_policy_refuses_is_not_advertised() {
-    // D64: a project skill is read through the policy as the agent, so an excluded one is refused
-    // and noted rather than offered — the same rule as an instruction file (D32).
+    // D67: discovery reads through the same gate as `read`, so a skill the grants refuse is never
+    // pointed at by the prompt. The listing and the tool agree by construction, not by a second
+    // reachability check that could drift.
     let env = Env::new();
-    std::fs::create_dir_all(env.path(".agents/skills/house")).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let dir = env.path(".agents/skills/house");
+    std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
-        env.path(".agents/skills/house/SKILL.md"),
+        dir.join("SKILL.md"),
         "---\nname: house\ndescription: House style.\n---\nlowercase doc comments.\n",
     )
     .unwrap();
@@ -1082,20 +1118,26 @@ fn a_skill_the_policy_refuses_is_not_advertised() {
             )]),
         );
     });
-    // A throwaway HOME, so the developer's own ~/.agents/skills cannot leak into the assertion.
-    let home = tempfile::tempdir().unwrap();
-    let out = saddle_in(&env, home.path(), &["tool", "skill", "{}"]);
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert!(out.status.success(), "{text}");
-    assert!(text.contains("there are no skills"), "{text}");
+    assert!(
+        env.advertised(home.path()).is_empty(),
+        "refused, so not advertised"
+    );
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "read",
+            &format!(r#"{{"path":"{}"}}"#, dir.join("SKILL.md").display()),
+        ],
+    );
+    assert_ne!(out.status.code(), Some(0), "{}", stderr(&out));
 }
 
 #[test]
-fn a_skill_under_the_config_directory_loads_although_nothing_can_read_it() {
-    // D64: the user's own skills are read by the host like the global instruction file, so the tool
-    // works for a skill the file tools can never reach. `~/.agents` became tool-readable by default
-    // (D66), but the other user tier -- the config directory -- is protected from every root and
-    // from every sandbox entry alike (D16), so this is where the reason for a tool still lives.
+fn a_skill_under_the_config_directory_is_not_advertised() {
+    // D67 removed the one reason the config-directory tier existed: a dedicated tool that could
+    // read what no root reaches. Now nothing can read it, so advertising it would point at a denial.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let dir = env.xdg.path().join("config/saddle/skills/pdf-tools");
@@ -1103,20 +1145,14 @@ fn a_skill_under_the_config_directory_loads_although_nothing_can_read_it() {
     let file = dir.join("SKILL.md");
     std::fs::write(
         &file,
-        "---\nname: pdf-tools\ndescription: Extract text from PDFs.\n---\nRead formats.md.\n",
+        "---\nname: pdf-tools\ndescription: Extract text.\n---\nbody\n",
     )
     .unwrap();
 
-    let out = saddle_in(
-        &env,
-        home.path(),
-        &["tool", "skill", r#"{"name":"pdf-tools"}"#],
+    assert!(
+        env.advertised(home.path()).is_empty(),
+        "nothing can read it"
     );
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert!(out.status.success(), "{text}");
-    assert!(text.contains("Read formats.md."), "{text}");
-
-    // Nothing else reaches it: not a root, not a sandbox entry, not the tools.
     let out = saddle_in(
         &env,
         home.path(),

@@ -26,10 +26,10 @@ Inside `crates/saddle/src`:
 | --- | --- |
 | `agent` | the model loop (no request limit unless one is set, D37; a turn stops on a repeated call and answer, D38), the system prompt (base plus grants, so a policy reload replaces only the grants, D47), tool dispatch |
 | `session` | opening the workspace, resolving roots, the policy engine and audit log for a session |
-| `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch` | the ten built-in tools (`fetch` is host-side network, D39; `patch` is D56; `skill` loads a skill, D64) |
+| `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch` | the nine built-in tools (`fetch` is host-side network, D39; `patch` is D56) |
 | `tools/diff` | line diffs of edited files, for the transcript only — the model never sees them |
 | `context` | instruction files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md` fallback), read through the policy |
-| `skills` | `SKILL.md` skills: discovery, the prompt listing, the `skill` tool (D64) |
+| `skills` | `SKILL.md` skills: discovery through the `read` gate, the prompt listing (D64, D67) |
 | `compact` | replacing the older part of a long conversation with a model-written summary (D33) |
 | `store` | the saved conversations: a SQLite tree of messages per workspace (D53), imported from the older JSON Lines files once |
 | `output` | line-mode output: a terminal, or one JSON object per line for a program (D52) |
@@ -43,7 +43,7 @@ and intercepts `__sandbox` before clap parses anything — that is the helper pr
 stay first in `main`.
 
 Built-in tools are `read`, `write`, `edit`, `patch`, `ls`, `find`, `grep`, `bash`, `fetch`,
-`skill` (`tools::NAMES`). `patch` applies one apply-patch document across several files, deciding every path
+(`tools::NAMES`). `patch` applies one apply-patch document across several files, deciding every path
 before writing any of them, and refuses the whole patch if one is denied (D56).
 `fetch` is the only one that reaches the network, and the **host** makes the request after the engine
 allows it (D39): `exec` children never have sockets, so `curl` in `bash` fails by design. It may send
@@ -123,19 +123,20 @@ exists to prevent. Two concrete consequences worth restating, because they are t
   never widen `read`, `ls` or `grep`: that would be a second source of authority for a decision.
   `bash` therefore reaches more than the tools (`~` minus the withheld stores), which the prompt
   states in those words. Shared read-only content (`~/.agents`, a toolchain) must not become a root,
-  because a root is nameable by any workspace policy. Content the harness chooses — `AGENTS.md`, a
-  skill body, an attachment — is host-read with no root at all.
-- Built-in tools are not privileged. None of the ten is a bypass: each passes through the same
+  because a root is nameable by any workspace policy. Content the harness chooses — the global
+  `AGENTS.md`, an attachment — is host-read with no root at all; a skill is not, since `read` loads
+  it (D67).
+- Built-in tools are not privileged. None of the nine is a bypass: each passes through the same
   engine, the same audit log and the same sandbox as a plugin call (D17). `ls`, `find` and `grep`
   decide and log one read of the directory they start from, then filter everything beneath it through
   the same policy without a record per file, so an excluded file is skipped rather than shown
   (`tools/search.rs`).
 
 A **skill** (D64) is instructions and never authority: its `allowed-tools` is ignored, because a
-pre-approval written by whoever wrote the skill would be a second source of authority. A project
-skill is read through the policy, so a refused one is never advertised; `saddle tool skill '{}'`
-lists what this session would offer, and `saddle tool skill '{"name":"…"}'` loads a body the way the
-model does.
+pre-approval written by whoever wrote the skill would be a second source of authority. A skill is
+loaded with `read` on its `SKILL.md`, and there is no tool of its own (D67): discovery reads through
+the same gate, so a refused skill is never advertised. The audit's `skill` record is what a session
+offered, with a hash per skill.
 
 Deny is the default everywhere: a decision is a lookup over grants, with no ordering, no fallthrough
 and no deny rules. A grant may carry a `why`, which `saddle check` shows and the audit log records; it
@@ -143,7 +144,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D66 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D67 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

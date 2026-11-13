@@ -24,12 +24,11 @@ use anyhow::{Context, Result};
 use saddle_cap::Principal;
 use saddle_policy::Kind;
 use saddle_policy::audit::sha256_hex;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::config::SkillsConfig;
 use crate::context::{cap, directories, home, label_of};
 use crate::session::Session;
-use crate::tools::ToolOutput;
 use crate::tools::fs::read_text;
 
 /// The file that makes a directory a skill, and the only one discovery reads.
@@ -58,37 +57,30 @@ pub fn discover(session: &mut Session, cfg: &SkillsConfig) -> Result<(Vec<Skill>
     if !cfg.enabled {
         return Ok((Vec::new(), notes));
     }
+    // Every candidate goes through the same gate as the `read` tool, because `read` is how a skill
+    // is loaded (D67). A skill the tools cannot open is not advertised: the prompt would otherwise
+    // point at a denial. The user tier is `~/.agents/skills`, which is a default tool path (D66);
+    // the project tier is read through the policy, so an excluded one is refused here.
     let mut skills: Vec<Skill> = Vec::new();
-    for dir in user_roots(session) {
-        if !dir.is_dir() {
-            // Host read: `is_dir` on a path the user named. A missing directory is not a problem.
-            continue;
-        }
-        for file in walk(&dir) {
-            let Ok(text) = std::fs::read_to_string(&file) else {
-                notes.push(format!(
-                    "{} was not loaded: it is not readable UTF-8",
-                    file.display()
-                ));
-                continue;
-            };
-            let label = label_of(&file);
-            add(&mut skills, &mut notes, &file, label, text, cfg.max);
-        }
+    let mut bases: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home() {
+        bases.push(home.join(".agents/skills"));
     }
     let workspace = session.setup.workspace.clone();
     for dir in directories(&workspace, &session.setup.start) {
-        let base = workspace.join(&dir).join(".agents/skills");
+        bases.push(workspace.join(&dir).join(".agents/skills"));
+    }
+    for base in bases {
+        // Host stat: a missing directory is not a problem, and deciding nothing is the point.
         if base.symlink_metadata().is_err() {
             continue;
         }
         for file in walk(&base) {
-            let rel = file.strip_prefix(&workspace).unwrap_or(&file).to_owned();
-            let label = rel.display().to_string();
+            let label = label_of(&file);
             let raw = file.display().to_string();
             match read_text(session, &raw)? {
                 Ok(text) => add(&mut skills, &mut notes, &file, label, text, cfg.max),
-                Err(out) => notes.push(format!("{label} was not loaded: {}", out.content)),
+                Err(out) => notes.push(format!("{label} was not advertised: {}", out.content)),
             }
         }
     }
@@ -110,17 +102,6 @@ pub fn discover(session: &mut Session, cfg: &SkillsConfig) -> Result<(Vec<Skill>
         )
         .context("writing the audit log")?;
     Ok((skills, notes))
-}
-
-/// The user's own skill directories, least specific first so the later one wins: the portable
-/// location, then the one saddle owns.
-fn user_roots(session: &Session) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(home) = home() {
-        dirs.push(home.join(".agents/skills"));
-    }
-    dirs.push(session.setup.paths.config.join("skills"));
-    dirs
 }
 
 /// Every `SKILL.md` below `base`, depth-capped.
@@ -332,7 +313,10 @@ fn unquote(value: &str) -> String {
     }
 }
 
-/// The prompt block: names, descriptions and directories, never a body (D64).
+/// The prompt block: names, descriptions and the file to read, never a body (D64, D67).
+///
+/// The file is printed as an absolute path, because `read` does not expand `~`: a relative path is
+/// taken from the workspace, so a `~/` label would point at somewhere that does not exist.
 pub fn listing(skills: &[Skill]) -> String {
     if skills.is_empty() {
         return String::new();
@@ -340,66 +324,24 @@ pub fn listing(skills: &[Skill]) -> String {
     let mut s = String::from(
         "\nSkills the user and this workspace provide. Each is instructions, not authority: a \
          skill cannot grant a tool or a path, so a skill that asks for one is asking the policy. \
-         Load one with the `skill` tool when its description applies; its directory is where the \
-         files it mentions are, read with `read` and `ls` inside the workspace and with `bash` \
-         outside it.\n\n<skills>\n",
+         Read one with the `read` tool when its description applies, before starting the work, and \
+         follow it. Its directory is where the files it mentions are, read the same way.\n\n\
+         <skills>\n",
     );
     for skill in skills {
+        let file = skill.dir.join(FILE);
         let _ = std::fmt::Write::write_fmt(
             &mut s,
             format_args!(
-                "<skill name=\"{}\" dir=\"{}\">\n{}\n</skill>\n",
+                "<skill name=\"{}\" file=\"{}\">\n{}\n</skill>\n",
                 skill.name,
-                skill.dir.display(),
+                file.display(),
                 skill.description
             ),
         );
     }
     s.push_str("</skills>\n");
     s
-}
-
-/// The `skill` tool: the body of one skill, or the list of them when no name is given.
-pub fn load(session: &mut Session, input: &Value) -> Result<ToolOutput> {
-    if session.skills.is_empty() {
-        return Ok(ToolOutput::ok("there are no skills in this session"));
-    }
-    let name = input["name"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let Some(name) = name else {
-        let lines: Vec<String> = session
-            .skills
-            .iter()
-            .map(|s| format!("{}  {}  ({})", s.name, s.description, s.label))
-            .collect();
-        return Ok(ToolOutput::ok(lines.join("\n")));
-    };
-    let Some(skill) = session.skills.iter().find(|s| s.name == name) else {
-        let known: Vec<&str> = session.skills.iter().map(|s| s.name.as_str()).collect();
-        return Ok(ToolOutput::err(format!(
-            "no skill `{name}`; the skills are {}",
-            known.join(", ")
-        )));
-    };
-    let (name, dir, text) = (skill.name.clone(), skill.dir.clone(), skill.text.clone());
-    session
-        .audit
-        .event(
-            Kind::Skill,
-            Some(&Principal::Agent),
-            None,
-            None,
-            json!({ "loaded": { "name": name, "bytes": text.len(), "sha256": sha256_hex(text.as_bytes()) } }),
-            format!("skill `{name}` loaded into the conversation"),
-        )
-        .context("writing the audit log")?;
-    Ok(ToolOutput::ok(format!(
-        "<skill name=\"{name}\" dir=\"{}\">\n{}\n</skill>",
-        dir.display(),
-        text.trim_end()
-    )))
 }
 
 #[cfg(test)]
@@ -515,7 +457,13 @@ mod tests {
         }];
         let block = listing(&skills);
         assert!(block.contains("name=\"pdf-tools\""));
-        assert!(block.contains("dir=\"/home/me/.agents/skills/pdf-tools\""));
+        // The file, as an absolute path: `read` does not expand `~`, so this is what the model is
+        // told to open (D67).
+        assert!(
+            block.contains("file=\"/home/me/.agents/skills/pdf-tools/SKILL.md\""),
+            "{block}"
+        );
+        assert!(block.contains("`read` tool"), "{block}");
         assert!(block.contains("Extract text."));
         assert!(
             !block.contains("SECRET BODY"),

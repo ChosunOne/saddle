@@ -1197,7 +1197,9 @@ use it.
   directory of ten skills costs a few lines of prompt instead of all of their text, and the model
   decides what to load from the description, which is why a skill without one is not loaded at all:
   the description *is* the routing signal.
-- **Loading is the `skill` tool, not "read SKILL.md".** One user tier is the config directory, which
+- **Loading was the `skill` tool, not "read SKILL.md"** — superseded by D67, which removed the tool
+  once the reason for it (a host read of a directory no root reaches) was gone. As it stood: one
+  user tier is the config directory, which
   no root and no sandbox entry may reach (D16), so `read` on a skill there is denied while `bash`
   can reach it only because D62 enumerates `~` for children. Telling the model to read a file that
   the gate refuses would be a prompt that does not work. The other tier, `~/.agents`, became
@@ -1241,11 +1243,13 @@ use it.
   `outside every root`. *`[sandbox] read`/`write`* and the include rules are what a **child
   process** reaches under landlock: enumerated at startup, one list per process, no per-call
   decision and no per-call record. *Host-read content* is what the harness fetches itself:
-  instruction files (D32), a skill's body (D64), a URL through `fetch` (D39).
+  the global instruction file (D32), an attachment, a URL through `fetch` (D39). A skill's body used
+  to be here; D67 made it a `read`.
 - **What places a need is who chooses the path.** The model chooses → a root and a grant, because
   the decision is a lookup over grants naming that root. The harness chooses → a host read, because
-  there is no model-chosen path to decide. That is why a skill's body is served by a tool rather
-  than by making `~/.agents` a root.
+  there is no model-chosen path to decide. That is why a skill's body was served by a tool until
+  D67, rather than by making `~/.agents` a root — and why the answer, once `read` could reach it,
+  was to delete the tool.
 - **Shared read-only content must not become a root.** A root is nameable by any policy in a
   workspace, so a root for `~/.agents` would let a repository's grants file write
   `fs-write = [{ root = "agents" }]` and rewrite the skills every workspace loads — authority over
@@ -1328,6 +1332,31 @@ tools without being a root or part of the session.
   with the path, the outcome and an explanation naming the entry. The engine is unchanged, and no
   grant can produce this outcome — which is what keeps it one config file rather than a second
   authority a workspace could reach.
+
+**D67.** A skill is a file, and `read` loads it; there is no `skill` tool.
+
+- **One way to read a file.** The `skill` tool existed for one reason: the config-directory tier was
+  reachable by no root, so a host call was the only way to serve a body. Two ways to read a file is
+  a second authority with its own gate, its own audit record and its own chance to drift from
+  `read` — and a tool that takes a *name* is a lookup table the model must be taught, when the
+  prompt can simply name the file. So the tool is gone, the config-directory tier went with it
+  (nothing can reach it, so advertising it would point at a denial), and the prompt lists each
+  skill's `SKILL.md` as an **absolute path** — `read` does not expand `~`, and a relative path is
+  taken from the workspace.
+- **Discovery reads through the gate `read` uses.** That is what keeps the listing honest: a skill
+  the grants refuse, or one whose link target is not declared (D66), is refused during discovery and
+  never advertised. The alternative — a separate reachability check — would be a second opinion
+  about the same decision, which is how a prompt and a tool come to disagree. Each discovery read is
+  an ordinary `decision` record; the listing itself is the `skill` record.
+- **The user tier is `~/.agents/skills` only.** That is a default tool path (D66) and one of the
+  Agent Skills locations, so it is readable and discoverable without configuration. A skills
+  directory somewhere else — pi raises its own under `~/.pi` — is reachable by linking it into
+  `~/.agents/skills` and declaring the target as a tool path; a skill that is merely *present* under
+  a declared directory is readable but not advertised, because discovery walks the two spec
+  locations and nothing else.
+- **What survives from D64**: the format, the frontmatter subset, `allowed-tools` being ignored and
+  said so, the project tier being read through the policy, more specific winning over less, and the
+  audit records. What goes is the tool and the host-read tier that justified it.
 
 ## 4. Scope enumeration
 
