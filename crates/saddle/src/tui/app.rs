@@ -355,7 +355,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/model",
         args: "[name]",
-        about: "show the model, or switch to another and save it",
+        about: "list this provider's models to choose from, or switch to the one named",
     },
     SlashCommand {
         name: "/settings",

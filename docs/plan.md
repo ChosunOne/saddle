@@ -2144,6 +2144,30 @@ text worth taking away: a model name, a policy path, the rule that is denying so
 - **Deferred:** keyboard-only selection inside a dialog (no anchor is set without a mouse); the `/`
   menu, which is a popup over the editor rather than a dialog and is filtered rather than read.
 
+**D88.** `/model` with no name is a searchable list of what the provider serves, not a prompt
+asking for a name the person may not know.
+
+`/model <name>` still works and skips the dialog, because someone who knows the name should not wait
+for a listing to come back. But the name is often not knowable: a subscription backend renames its
+models, a gateway decides its own, and a listing is the only authority on what a request may ask for.
+
+- **It is the list `/login` already ends on**, opened for one provider. No second picker and no
+  second filter: the dialog gained a *purpose* — sign in, or choose a model — and the purpose
+  decides what the choice means (list this provider's models), what esc does (close, because a
+  picker has nothing behind it to step back into), and what the box is titled.
+- **A picker asks for nothing already known.** The key the provider has is used, the address is the
+  provider's own, and nothing is offered to type but the filter — so `Draft.key` stays empty and the
+  listing is sent with the stored credential, which for an OAuth provider means the token and its
+  account header (D85).
+- **The model in force is named in the title** and is where the highlight starts, so the list is read
+  against something and enter without moving keeps what is there rather than picking the first
+  alphabetically.
+- **A name that is not served can still be typed**, exactly as before: the filter line is the way to
+  a model the server lists nothing about, which is what a listing that comes back empty leaves.
+- **`/settings` → Model is the same dialog.** It was opened through the login path and could land on
+  a key field the provider did not need; the one picker serves both, so there is one behaviour to
+  describe and to test.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

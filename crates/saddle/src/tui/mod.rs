@@ -945,7 +945,11 @@ impl Controller {
         }
     }
 
-    fn open_login(&self, app: &mut App, preselect: Option<String>, direct: bool) -> Result<()> {
+    /// The providers `/login` offers, with what each one's credential looks like from here.
+    ///
+    /// Built once, because two dialogs read it: `/login`, and the model picker, which needs the
+    /// provider's configured model and nothing else (D88).
+    fn login_choices(&self) -> Result<(Vec<Choice>, Vec<String>)> {
         let user = UserConfig::load(&self.paths.user_config())?;
         let auth = AuthStore::load(&self.paths.auth_store())?;
         let builtin = provider::builtin_names();
@@ -1002,6 +1006,11 @@ impl Controller {
             custom: true,
             oauth: false,
         });
+        Ok((choices, builtin))
+    }
+
+    fn open_login(&self, app: &mut App, preselect: Option<String>, direct: bool) -> Result<()> {
+        let (choices, builtin) = self.login_choices()?;
         let auth_path = render::home_relative(&self.paths.auth_store());
         let mut login = Login::new(choices, builtin, preselect.as_deref(), direct, auth_path);
         // Opened straight at a provider, the dialog owes it something at once: a sign-in to start, or
@@ -1082,6 +1091,32 @@ impl Controller {
                 ));
             })
             .context("starting the sign-in")?;
+        Ok(())
+    }
+
+    /// Opens the model list for the provider in force, searchable, with the current one selected
+    /// (D88).
+    ///
+    /// `/model <name>` is still there for someone who knows the name; this is for everyone else,
+    /// and for the case the name is not knowable — a subscription backend renames models, and a
+    /// gateway decides what it serves.
+    fn open_models(&self, app: &mut App) -> Result<()> {
+        let provider = app.header.provider.clone();
+        if provider.is_empty() {
+            // No provider yet, so the question is really which one, and `/login` asks it.
+            return self.open_login(app, None, false);
+        }
+        let (choices, _) = self.login_choices()?;
+        if !choices.iter().any(|c| !c.custom && c.name == provider) {
+            bail!("{provider} is not a configured provider; /login to choose one");
+        }
+        let auth_path = render::home_relative(&self.paths.auth_store());
+        let mut login = Login::for_model(choices, &provider, auth_path);
+        let pending = login.take_pending();
+        app.open_login(login);
+        if let Some(login::Outcome::Check(id, draft)) = pending {
+            self.check_models(id, draft)?;
+        }
         Ok(())
     }
 
@@ -1266,14 +1301,7 @@ impl Controller {
             Change::ChooseModel if provider.is_empty() => {
                 return self.open_login(app, None, false);
             }
-            Change::ChooseModel => {
-                self.open_login(app, Some(provider), true)?;
-                // The current key is kept, so go straight to the model list.
-                if let Some((id, draft)) = app.login.as_mut().and_then(|l| l.start_check()) {
-                    self.check_models(id, draft)?;
-                }
-                return Ok(());
-            }
+            Change::ChooseModel => return self.open_models(app),
             Change::Effort(effort) => {
                 config::edit(&path, |doc| {
                     let t = config::provider_table(doc, &provider)?;
@@ -1799,13 +1827,8 @@ impl Controller {
     fn model(&self, app: &mut App, name: Option<String>) -> Result<()> {
         let provider_name = app.header.provider.clone();
         let Some(model) = name else {
-            let msg = format!(
-                "model: {} on {provider_name}. /model <name> switches to another and saves it as \
-                 {provider_name}'s default.",
-                app.header.model
-            );
-            app.note(NoteKind::Info, &msg);
-            return Ok(());
+            // No name: the list, filtered by typing, rather than a name to remember (D88).
+            return self.open_models(app);
         };
         config::edit(&self.paths.user_config(), |doc| {
             config::provider_table(doc, &provider_name)?["model"] =
@@ -2095,6 +2118,75 @@ mod tests {
             ratatui::crossterm::event::KeyCode::Esc,
             ratatui::crossterm::event::KeyModifiers::NONE,
         ));
+    }
+
+    #[test]
+    fn slash_model_with_no_name_opens_the_list_for_the_provider_in_force() {
+        // D88: `/model` on its own is the picker. This walks the whole way — the command, the
+        // dialog, the listing it asks for — because the point is what happens when it is typed.
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller(
+            dir.path(),
+            "provider = \"synthetic\"\n[providers.synthetic]\nmodel = \"hf:zai-org/GLM-5.3\"\n",
+        );
+        // A stored key, so choosing a model is the only thing that could fail.
+        let mut auth = crate::auth::AuthStore::load(&c.paths.auth_store()).unwrap();
+        auth.set("synthetic", "sk-test".into());
+        auth.save(&c.paths.auth_store()).unwrap();
+        let mut app = an_app();
+        // The dialog is opened for the provider in force, and it owes the host a listing.
+        app.header.provider = "synthetic".into();
+        c.perform(&mut app, Action::Model(None));
+        let login = app.login.as_ref().expect("the picker is open");
+        assert_eq!(login.purpose(), login::Purpose::Model);
+        assert_eq!(login.choice().name, "synthetic");
+        assert!(
+            matches!(login.stage, login::Stage::Checking { .. }),
+            "the list is being asked for"
+        );
+        // Choosing writes the model and switches to it, exactly as `/model <name>` does.
+        let id = match login.stage {
+            login::Stage::Checking { id } => id,
+            _ => unreachable!(),
+        };
+        app.login
+            .as_mut()
+            .unwrap()
+            .models(id, Ok(vec!["picked-a".into(), "picked-b".into()]));
+        let action = {
+            let login = app.login.as_mut().unwrap();
+            login.key(ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Down,
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ));
+            login.key(ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Enter,
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ))
+        };
+        let login::Outcome::Submit(req) = action else {
+            panic!("expected a submission, got {action:?}");
+        };
+        assert_eq!(req.provider, "synthetic");
+        assert_eq!(req.model, "picked-b");
+        assert_eq!(req.key, None);
+        c.perform(&mut app, Action::Login(req));
+        assert_eq!(app.header.model, "picked-b");
+        let written = std::fs::read_to_string(c.paths.user_config()).unwrap();
+        assert!(written.contains("picked-b"), "{written}");
+    }
+
+    #[test]
+    fn slash_model_with_a_name_still_switches_straight_to_it() {
+        // The picker is for not knowing the name; someone who knows it should not have to wait for
+        // a listing to come back (D88).
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller(dir.path(), "provider = \"synthetic\"\n");
+        let mut app = an_app();
+        app.header.provider = "synthetic".into();
+        c.perform(&mut app, Action::Model(Some("named".into())));
+        assert!(app.login.is_none(), "no dialog for a name");
+        assert_eq!(app.header.model, "named");
     }
 
     #[test]

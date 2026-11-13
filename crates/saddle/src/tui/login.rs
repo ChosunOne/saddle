@@ -86,6 +86,13 @@ pub struct LoginRequest {
     pub base_url: Option<String>,
 }
 
+/// Why the dialog is open: to sign in, or to choose the model of a provider already set up (D88).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    Login,
+    Model,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stage {
     Pick,
@@ -135,6 +142,8 @@ pub struct Login {
     /// What the host owes this dialog, when it was opened straight at a provider: a sign-in to
     /// start, or the model list to ask for (D85).
     pending: Option<Outcome>,
+    /// Signing in, or only picking a model (D88).
+    purpose: Purpose,
     /// Where keys are stored, shown under the key field.
     pub auth_path: String,
     /// Opened at a provider's fields directly; esc there closes instead of going back.
@@ -167,6 +176,7 @@ impl Login {
             error: None,
             device: Device::default(),
             pending: None,
+            purpose: Purpose::Login,
             auth_path,
             direct: false,
             builtin,
@@ -185,6 +195,25 @@ impl Login {
         login
     }
 
+    /// The model picker: the list `/login` ends on, opened at one provider's models (D88).
+    ///
+    /// Nothing is asked for here that the provider already has — no key, no address — so the list
+    /// is the whole dialog. What it owes the host is the listing, which is taken like any other
+    /// pending outcome.
+    pub fn for_model(choices: Vec<Choice>, provider: &str, auth_path: String) -> Self {
+        let mut login = Self::new(choices, Vec::new(), Some(provider), false, auth_path);
+        login.purpose = Purpose::Model;
+        let outcome = login.choose();
+        if outcome != Outcome::Stay {
+            login.pending = Some(outcome);
+        }
+        login
+    }
+
+    pub fn purpose(&self) -> Purpose {
+        self.purpose
+    }
+
     pub fn choice(&self) -> &Choice {
         &self.choices[self.selected]
     }
@@ -195,10 +224,17 @@ impl Login {
 
     /// Esc closes the dialog rather than stepping back.
     pub fn esc_closes(&self) -> bool {
-        self.stage == Stage::Pick || (self.direct && self.stage == Stage::Fill && self.at == 0)
+        self.purpose == Purpose::Model
+            || self.stage == Stage::Pick
+            || (self.direct && self.stage == Stage::Fill && self.at == 0)
     }
 
     fn choose(&mut self) -> Outcome {
+        // Picking a model for a provider that is already set up: there is nothing to type, so the
+        // listing is the only question (D88).
+        if self.purpose == Purpose::Model {
+            return self.ask_models();
+        }
         if self.choices[self.selected].oauth {
             // Already signed in: there is nothing to type and nothing to wait for, so the model
             // list is the only question left (D85).
@@ -310,19 +346,6 @@ impl Login {
         self.pending.take()
     }
 
-    /// With an optional, empty key field (a key is already stored), skips straight to listing
-    /// the models.
-    pub fn start_check(&mut self) -> Option<(u64, Draft)> {
-        let skippable = self.stage == Stage::Fill
-            && self.fields.len() == 1
-            && self.fields[0].optional
-            && self.fields[0].value.is_empty();
-        match skippable.then(|| self.advance()) {
-            Some(Outcome::Check(id, draft)) => Some((id, draft)),
-            _ => None,
-        }
-    }
-
     pub fn key(&mut self, key: KeyEvent) -> Outcome {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Outcome::Stay;
@@ -365,6 +388,10 @@ impl Login {
             },
             Stage::Checking { .. } => {
                 if key.code == KeyCode::Esc {
+                    // A picker has nothing behind it to step back to (D88).
+                    if self.purpose == Purpose::Model {
+                        return Outcome::Close;
+                    }
                     self.back();
                 }
             }
@@ -402,6 +429,7 @@ impl Login {
             } => {
                 let shown = matching(models, filter).len();
                 match key.code {
+                    KeyCode::Esc if self.purpose == Purpose::Model => return Outcome::Close,
                     KeyCode::Esc => self.back(),
                     KeyCode::Up => *selected = selected.saturating_sub(1),
                     KeyCode::Down => *selected = (*selected + 1).min(shown.saturating_sub(1)),
@@ -823,6 +851,63 @@ mod tests {
             panic!("expected a second sign-in");
         };
         assert_ne!(again, id, "an abandoned attempt's id must not be reused");
+    }
+
+    #[test]
+    fn the_model_picker_goes_straight_to_the_list_and_filters_as_you_type() {
+        // D88: `/model` with no name must not need the name. The list is the dialog, typing is the
+        // filter, and choosing submits without a key.
+        let mut list = choices();
+        list[0].model = Some("synthetic-model".into());
+        let mut l = Login::for_model(list, "openai", "auth.json".into());
+        assert_eq!(l.purpose(), Purpose::Model);
+        let pending = l.take_pending().expect("the listing to ask for");
+        let Outcome::Check(id, draft) = pending else {
+            panic!("expected a listing, got {pending:?}");
+        };
+        assert_eq!(draft.provider, "openai");
+        assert_eq!(draft.key, None, "the key the provider has is used");
+        assert_eq!(l.stage, Stage::Checking { id });
+        assert!(l.fields.is_empty(), "nothing to type but the filter");
+
+        l.models(
+            id,
+            Ok(vec!["gpt-5.4".into(), "gpt-5.5".into(), "o4-mini".into()]),
+        );
+        // Typing narrows the list; enter takes what is highlighted.
+        type_text(&mut l, "5.5");
+        let Outcome::Submit(req) = press(&mut l, KeyCode::Enter) else {
+            panic!("expected a submission");
+        };
+        assert_eq!(req.provider, "openai");
+        assert_eq!(req.model, "gpt-5.5");
+        assert_eq!(req.key, None);
+    }
+
+    #[test]
+    fn the_model_picker_closes_rather_than_backing_into_a_key_field() {
+        // It was opened for a model, so there is nothing behind it: esc closes from the wait and
+        // from the list, and never lands on a field asking for a key that already exists (D88).
+        let mut l = Login::for_model(choices(), "openai", "auth.json".into());
+        let Some(Outcome::Check(id, _)) = l.take_pending() else {
+            panic!("a listing to ask for");
+        };
+        assert_eq!(press(&mut l, KeyCode::Esc), Outcome::Close);
+        l.models(id, Ok(vec!["m".into()]));
+        assert!(matches!(l.stage, Stage::Models { .. }));
+        assert_eq!(press(&mut l, KeyCode::Esc), Outcome::Close);
+        // A name typed that the server does not list is still usable, which is the way out when a
+        // listing is empty.
+        let mut l = Login::for_model(choices(), "openai", "auth.json".into());
+        let Some(Outcome::Check(id, _)) = l.take_pending() else {
+            panic!("a listing to ask for");
+        };
+        l.models(id, Ok(Vec::new()));
+        type_text(&mut l, "a-model-the-server-does-not-list");
+        let Outcome::Submit(req) = press(&mut l, KeyCode::Enter) else {
+            panic!("expected a submission");
+        };
+        assert_eq!(req.model, "a-model-the-server-does-not-list");
     }
 
     #[test]

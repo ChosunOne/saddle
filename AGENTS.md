@@ -38,7 +38,7 @@ Inside `crates/saddle/src`:
 | `cache` | the cache-miss notice: one line to the user when a prompt is re-read at full price (D50) |
 | `reserved` | the D20 snapshot and restore of reserved paths around `exec` |
 | `provider/` | the neutral conversation form, the Anthropic, OpenAI-compatible and Responses renderers (every other server is a `[providers.<name>]` table naming which one it imitates, D84), OAuth login and token refresh (D85), the model list, the cached context windows and prices (D34, D36) |
-| `tui/` | the full-screen UI: app state, rendering (a prompt is markdown in the user's colour, D81; tables are fitted to the width, D83), editor, login (a key or an OAuth sign-in, D85), selection (a drag copies the transcript's text or the open dialog's, D87), settings, session list, `permissions` (the grants editor, D45), `tree` (the message tree, D54), `image` (drawing a picture: kitty and iTerm2, D59), `status` (the `[ui] status` template, D36), `theme` (the colour roles, D71), `palette` (pi's role vocabulary, colour forms and the palette derived from the terminal, D72, D73), `terminal` (asking the terminal for its colours, D73), `syntax` (code blocks: syntect's grammars, nine roles, the theme's colours, D80) and `themes` (the `/theme` picker, D74), and `browser` (opening the link a sign-in shows, D86) |
+| `tui/` | the full-screen UI: app state, rendering (a prompt is markdown in the user's colour, D81; tables are fitted to the width, D83), editor, login (a key or an OAuth sign-in, D85; the searchable model picker `/model` opens, D88), selection (a drag copies the transcript's text or the open dialog's, D87), settings, session list, `permissions` (the grants editor, D45), `tree` (the message tree, D54), `image` (drawing a picture: kitty and iTerm2, D59), `status` (the `[ui] status` template, D36), `theme` (the colour roles, D71), `palette` (pi's role vocabulary, colour forms and the palette derived from the terminal, D72, D73), `terminal` (asking the terminal for its colours, D73), `syntax` (code blocks: syntect's grammars, nine roles, the theme's colours, D80) and `themes` (the `/theme` picker, D74), and `browser` (opening the link a sign-in shows, D86) |
 
 `crates/saddle/src/main.rs` dispatches subcommands (`run`, `check`, `tool`, `audit verify`)
 and intercepts `__sandbox` before clap parses anything — that is the helper process path, and it must
@@ -111,6 +111,10 @@ the code is put on the clipboard as it arrives, the link is underlined and opens
 browser on a click or `o`, and `c` copies it (D85, D86). `saddle login <provider>` and
 `saddle logout <provider>` are the same thing without the interface, and `check` says whether the
 provider in force is signed in.
+`/model` with no name is a searchable list of what the provider serves, with the model in force
+named above it and highlighted in the list; `/model <name>` switches straight to one and saves it as
+that provider's default (D88). `/login` ends on the same list, so a model is chosen the same way
+whether or not the credential was just entered.
 `/skill:<name> <request>` loads a skill's instructions into the conversation followed by the
 request, in the TUI and in line mode, and is the only way to reach a skill marked
 `disable-model-invocation` (D69). `/reload` reads the instruction files and skills again and rebuilds the
@@ -190,7 +194,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D87 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D88 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

@@ -1566,9 +1566,15 @@ fn draw_menu(frame: &mut Frame<'_>, app: &mut App, editor_area: Rect) {
 fn login_title(login: &Login) -> String {
     let c = login.choice();
     if c.custom {
-        " Add an OpenAI-compatible server ".to_owned()
-    } else {
-        format!(" Log in to {} ", c.name)
+        return " Add an OpenAI-compatible server ".to_owned();
+    }
+    // The picker names the model in force, so the list is read against something (D88).
+    match (login.purpose(), c.model.as_deref()) {
+        (crate::tui::login::Purpose::Model, Some(model)) if !model.is_empty() => {
+            format!(" Model for {} · {model} ", c.name)
+        }
+        (crate::tui::login::Purpose::Model, _) => format!(" Model for {} ", c.name),
+        _ => format!(" Log in to {} ", c.name),
     }
 }
 
@@ -1695,13 +1701,21 @@ fn draw_login(
             login_title(login)
         }
         Stage::Checking { .. } => {
+            let picker = login.purpose() == crate::tui::login::Purpose::Model;
             let spin = SPINNER[spinner % SPINNER.len()];
             lines.push(Line::from(vec![
                 Span::styled(format!("{spin} "), Style::new().fg(theme.warning)),
-                Span::raw("checking the key and listing models…"),
+                Span::raw(if picker {
+                    "listing the models this provider serves…"
+                } else {
+                    "checking the key and listing models…"
+                }),
             ]));
             lines.push(Line::default());
-            lines.push(Line::from(Span::styled("esc back", dim(theme))));
+            lines.push(Line::from(Span::styled(
+                if picker { "esc close" } else { "esc back" },
+                dim(theme),
+            )));
             login_title(login)
         }
         Stage::SigningIn { .. } => {
@@ -1819,9 +1833,14 @@ fn draw_login(
                 )));
             }
             lines.push(Line::default());
+            let esc = if login.purpose() == crate::tui::login::Purpose::Model {
+                "esc close"
+            } else {
+                "esc back"
+            };
             lines.push(Line::from(Span::styled(
                 format!(
-                    "{} of {} · type to filter · enter choose · esc back",
+                    "{} of {} · type to filter · enter choose · {esc}",
                     list.len(),
                     models.len()
                 ),
@@ -3374,6 +3393,84 @@ mod tests {
         ));
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         assert_eq!(app.selection, None, "the old selection did not survive");
+    }
+
+    #[test]
+    fn the_model_picker_shows_a_filtered_list_and_names_the_model_in_force() {
+        // D88: the point of the picker is that the name does not have to be known, so the screen has
+        // to show the served list, the filter being typed, and which model is current.
+        let mut app = bare_app();
+        let mut choice = crate::tui::login::Choice {
+            name: "synthetic".into(),
+            detail: String::new(),
+            status: "logged in".into(),
+            needs_key: true,
+            has_key: true,
+            model: Some("gpt-5.6-sol".into()),
+            custom: false,
+            oauth: false,
+        };
+        choice.model = Some("gpt-5.6-sol".into());
+        let mut login =
+            crate::tui::login::Login::for_model(vec![choice], "synthetic", "auth.json".into());
+        let Some(crate::tui::login::Outcome::Check(id, _)) = login.take_pending() else {
+            panic!("a listing to ask for");
+        };
+        login.models(
+            id,
+            Ok(vec![
+                "gpt-5.6-luna".into(),
+                "gpt-5.6-sol".into(),
+                "gpt-6.1-terra".into(),
+            ]),
+        );
+        app.open_login(login);
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("Model for synthetic"), "{text}");
+        assert!(
+            text.contains("gpt-5.6-sol"),
+            "the model in force is named:\n{text}"
+        );
+        for m in ["gpt-5.6-luna", "gpt-6.1-terra"] {
+            assert!(text.contains(m), "{m} is missing:\n{text}");
+        }
+        assert!(text.contains("type to filter"), "{text}");
+        assert!(
+            text.contains("esc close"),
+            "a picker has nothing behind it:\n{text}"
+        );
+        // The current model is where the highlight starts, so enter keeps it by accident only if
+        // nothing was chosen.
+        assert_eq!(
+            app.login.as_ref().unwrap().stage,
+            crate::tui::login::Stage::Models {
+                models: vec![
+                    "gpt-5.6-luna".into(),
+                    "gpt-5.6-sol".into(),
+                    "gpt-6.1-terra".into()
+                ],
+                filter: String::new(),
+                selected: 1,
+                note: None,
+            }
+        );
+        // Typing narrows what is drawn.
+        for c in "terra".chars() {
+            app.key(ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Char(c),
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("filter  › terra"), "{text}");
+        assert!(
+            !text.contains("gpt-5.6-luna"),
+            "the filter hides the rest:\n{text}"
+        );
+        assert!(text.contains("gpt-6.1-terra"), "{text}");
     }
 
     #[test]
