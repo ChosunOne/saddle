@@ -33,6 +33,7 @@ Inside `crates/saddle/src`:
 | `context` | instruction files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md` fallback), read through the policy |
 | `skills` | `SKILL.md` skills: discovery through the `read` gate, the prompt listing, `/skill:name` (D64, D67, D68, D69) |
 | `ignore` | ignore-file matching (`.gitignore`, `.ignore`, `.fdignore`), shared by `tools/search` and `skills` (D68) |
+| `mcp` | the MCP servers a person declared in `config.toml` (`[mcp.<name>]`): the transport fields, their validation, and the `check` lines that compare them with the grants (D104) |
 | `compact` | replacing the older part of a long conversation with a model-written summary (D33), of a session left alone (D77) or written while the turn carries on (D78) |
 | `store` | the saved conversations: a SQLite tree of messages per workspace (D53), imported from the older JSON Lines files once, with one row per model request recording what it used and which model answered (D94) |
 | `output` | line-mode output: a terminal, or one JSON object per line for a program (D52) |
@@ -280,7 +281,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D103 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D104 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

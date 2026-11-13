@@ -727,6 +727,47 @@ fn check_says_what_network_a_command_will_get() {
 }
 
 #[test]
+fn check_says_which_mcp_servers_are_declared_and_granted() {
+    // D104: a server that is declared and not granted, or granted and not declared, would
+    // otherwise show up as a server that silently never starts.
+    let env = Env::new();
+    env.write_config(
+        r#"
+[mcp.scout]
+description = "scrapes boards"
+command = "npx"
+args = ["-y", "job-scout"]
+
+[mcp.remote]
+url = "https://mcp.example.com/mcp"
+"#,
+    );
+    env.write_policy(
+        r#"
+version = 1
+
+[agent]
+fs-read = [{ root = "workspace" }]
+mcp     = [{ server = "scout", tools = ["search"] }, { server = "ghost", tools = ["x"] }]
+"#,
+    );
+    let out = env.saddle(&["check"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("mcp        scout · stdio npx · granted [search]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("mcp        remote · http https://mcp.example.com/mcp · not granted"),
+        "{text}"
+    );
+    assert!(
+        text.contains("ghost · granted, but no [mcp.ghost] table"),
+        "{text}"
+    );
+}
+
+#[test]
 fn fetch_refuses_a_url_it_should_not_follow() {
     let env = Env::new();
     assert!(env.saddle(&["check"]).status.success());

@@ -12,6 +12,7 @@ use saddle_policy::{AuditLog, Decision, Engine, Kind, Request};
 use serde_json::json;
 
 use crate::config::UserConfig;
+use crate::mcp::Transport;
 use crate::paths::{Paths, find_workspace};
 use crate::store::Snapshot;
 
@@ -90,6 +91,10 @@ pub struct Setup {
     /// The sensitive directories this workspace puts in reach, which is what the person is asked
     /// about before the session opens (D60). Empty for an ordinary project.
     pub exposed: Vec<String>,
+    /// The MCP servers this config declares, and which of them a grant enables (D104). `check`
+    /// prints these lines, so a server that was declared but never granted is visible rather than
+    /// silently idle.
+    pub mcp: Vec<String>,
 }
 
 impl Setup {
@@ -226,6 +231,34 @@ impl Setup {
         let merged = Policy::layer(&global_text, &policy_text, &roots)
             .with_context(|| format!("reading the grants in {}", policy_path.display()))?;
         let merged_lines = merged.describe();
+        // D104: what config declares, against what the grants enable. A granted server that no
+        // table declares is the mistake that would otherwise show up as a server that never
+        // starts, so it is named here.
+        let agent_grants = merged.grants(&Principal::Agent);
+        let mut mcp = Vec::new();
+        for (name, entry) in &user.mcp {
+            let what = match entry.transport() {
+                Ok(Transport::Stdio { command, .. }) => format!("stdio {command}"),
+                Ok(Transport::Http { url }) => format!("http {url}"),
+                Err(_) => "no transport".to_owned(),
+            };
+            let access = agent_grants
+                .and_then(|g| g.mcp_server(name))
+                .map(|g| format!("granted [{}]", g.tools.join(", ")))
+                .unwrap_or_else(|| "not granted".to_owned());
+            let deadline = entry.timeout().as_secs();
+            mcp.push(format!("{name} · {what} · {access} · {deadline}s per call"));
+        }
+        if let Some(grants) = agent_grants {
+            for grant in &grants.mcp {
+                if !user.mcp.contains_key(&grant.server) {
+                    mcp.push(format!(
+                        "{} · granted, but no [mcp.{}] table in config.toml",
+                        grant.server, grant.server
+                    ));
+                }
+            }
+        }
         // The hash names the grants, not the file: a provider change is not a policy change.
         let policy_sha256 = sha256_hex(format!("{global_text}\n---\n{policy_text}").as_bytes());
         Ok(Self {
@@ -245,6 +278,7 @@ impl Setup {
             exposed,
             overrides: overrides.clone(),
             tool_paths,
+            mcp,
             skills: skills_cfg,
             context: context_cfg,
         })

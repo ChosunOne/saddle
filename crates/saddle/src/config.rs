@@ -30,6 +30,7 @@ use saddle_cap::sandbox::SandboxExtras;
 use saddle_cap::{RootName, Roots};
 use serde::Deserialize;
 
+use crate::mcp::McpTable;
 use crate::provider::ProviderEntry;
 
 #[derive(Debug, Default, Deserialize)]
@@ -74,6 +75,10 @@ pub struct UserConfig {
     pub compaction: CompactionConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderEntry>,
+    /// The MCP servers a person declared, `[mcp.<name>]` (D104). A grant (D103) still decides
+    /// whether any of them runs.
+    #[serde(default)]
+    pub mcp: McpTable,
 }
 
 /// How the TUI starts; ctrl+t and ctrl+o change these for the session only.
@@ -428,11 +433,13 @@ pub fn provider_table<'a>(
 
 impl UserConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("{}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e).with_context(|| format!("{}", path.display())),
-        }
+        let config: Self = match std::fs::read_to_string(path) {
+            Ok(text) => toml::from_str(&text).with_context(|| format!("{}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
+        };
+        crate::mcp::validate(&config.mcp).with_context(|| format!("{}", path.display()))?;
+        Ok(config)
     }
 
     pub fn root_entries(&self) -> Result<Vec<(RootName, PathBuf)>> {

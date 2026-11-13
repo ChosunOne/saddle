@@ -2581,6 +2581,16 @@ line is what says a server and its tools exist at all — the system prompt and 
 print `Policy::describe`, so the model is told what it may reach through the same record a person
 reviews (D41, D47).
 
+**D104.** An MCP server is declared, not discovered: an `[mcp.<name>]` table in `config.toml` names
+what to run (`command`, `args`, `env`, `cwd`) or where to reach it (`url`), and exactly one of the
+two. A table naming both or neither, a plain-http URL off this machine, a `url` carrying `args`,
+`env` or `cwd`, an empty `command`, a description longer than 200 characters, or a zero timeout is
+a load error naming the table, reported when the session opens rather than when the model first
+reaches for a server. Config is outside every root (D42), so no server arrives with a repository,
+and the grant (D103) still decides whether it runs: `saddle check` prints the tables against the
+grants, naming both a server that is declared and not granted and one that is granted and not
+declared.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

@@ -8,6 +8,7 @@ mod config;
 mod context;
 mod defaults;
 mod ignore;
+mod mcp;
 mod net;
 mod output;
 mod paths;
@@ -905,6 +906,11 @@ fn check(dir: &std::path::Path, overrides: &config::Overrides) -> Result<ExitCod
     println!("effective");
     for line in &setup.merged {
         println!("  {line}");
+    }
+    // D104: the servers a person declared, and which of them a grant enables. A server that is
+    // declared and not granted, or granted and not declared, is the mistake worth seeing here.
+    for line in &setup.mcp {
+        println!("mcp        {line}");
     }
     // D66: directories the file tools reach outside every root, and the tools on each. Not roots:
     // no policy can name one, and they are not part of the session.
