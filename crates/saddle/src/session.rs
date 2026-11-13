@@ -78,6 +78,8 @@ pub struct Setup {
     pub notes: Vec<String>,
     /// This run's grant overrides, kept so a policy reload does not silently drop them (D63).
     pub overrides: crate::config::Overrides,
+    /// Whether and how many skills to look for (D64), read with the rest of the config.
+    pub skills: crate::config::SkillsConfig,
     /// The sensitive directories this workspace puts in reach, which is what the person is asked
     /// about before the session opens (D60). Empty for an ordinary project.
     pub exposed: Vec<String>,
@@ -114,6 +116,7 @@ impl Setup {
         let config_path = paths.user_config();
         let mut notes = Vec::new();
         let user = UserConfig::load(&config_path)?;
+        let skills_cfg = user.skills.clone();
         // This workspace's own grants are their own file (D63), so a directory's authority is
         // named after the directory and the global file does not grow a key per workspace.
         let own_path = paths.workspace_policy(&workspace);
@@ -236,6 +239,7 @@ impl Setup {
             notes,
             exposed,
             overrides: overrides.clone(),
+            skills: skills_cfg,
         })
     }
 
@@ -277,6 +281,11 @@ pub struct Session {
     /// `Ok(landlock ABI)` or the reason exec is unavailable.
     pub sandbox: Result<i32, String>,
     pub host_env: Vec<(String, String)>,
+    /// Skills advertised to the model and loaded on demand (D64), read once at open like the
+    /// instruction files.
+    pub skills: Vec<crate::skills::Skill>,
+    /// Notes for the person about a skill that was refused, shadowed or ignored.
+    pub skill_notes: Vec<String>,
     _tmp: PrivateTmp,
 }
 
@@ -323,14 +332,24 @@ impl Session {
             "session opened",
         )?;
 
-        Ok(Self {
+        let mut session = Self {
             setup,
             engine: Engine::new(policy),
             audit,
             sandbox,
             host_env: std::env::vars().collect(),
+            skills: Vec::new(),
+            skill_notes: Vec::new(),
             _tmp: tmp,
-        })
+        };
+        // Discovered before the first request so the prompt can advertise them, and once only: a
+        // skill is read at startup as an instruction file is, so a grants reload does not change
+        // what the conversation was built from.
+        let cfg = session.setup.skills.clone();
+        let (found, notes) = crate::skills::discover(&mut session, &cfg)?;
+        session.skills = found;
+        session.skill_notes = notes;
+        Ok(session)
     }
 
     pub fn roots(&self) -> &Roots {

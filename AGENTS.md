@@ -26,9 +26,10 @@ Inside `crates/saddle/src`:
 | --- | --- |
 | `agent` | the model loop (no request limit unless one is set, D37; a turn stops on a repeated call and answer, D38), the system prompt (base plus grants, so a policy reload replaces only the grants, D47), tool dispatch |
 | `session` | opening the workspace, resolving roots, the policy engine and audit log for a session |
-| `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch` | the nine built-in tools (`fetch` is host-side network, D39; `patch` is D56) |
+| `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch` | the ten built-in tools (`fetch` is host-side network, D39; `patch` is D56; `skill` loads a skill, D64) |
 | `tools/diff` | line diffs of edited files, for the transcript only — the model never sees them |
 | `context` | instruction files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md` fallback), read through the policy |
+| `skills` | `SKILL.md` skills: discovery, the prompt listing, the `skill` tool (D64) |
 | `compact` | replacing the older part of a long conversation with a model-written summary (D33) |
 | `store` | the saved conversations: a SQLite tree of messages per workspace (D53), imported from the older JSON Lines files once |
 | `output` | line-mode output: a terminal, or one JSON object per line for a program (D52) |
@@ -41,8 +42,8 @@ Inside `crates/saddle/src`:
 and intercepts `__sandbox` before clap parses anything — that is the helper process path, and it must
 stay first in `main`.
 
-Built-in tools are `read`, `write`, `edit`, `patch`, `ls`, `find`, `grep`, `bash`, `fetch`
-(`tools::NAMES`). `patch` applies one apply-patch document across several files, deciding every path
+Built-in tools are `read`, `write`, `edit`, `patch`, `ls`, `find`, `grep`, `bash`, `fetch`,
+`skill` (`tools::NAMES`). `patch` applies one apply-patch document across several files, deciding every path
 before writing any of them, and refuses the whole patch if one is denied (D56).
 `fetch` is the only one that reaches the network, and the **host** makes the request after the engine
 allows it (D39): `exec` children never have sockets, so `curl` in `bash` fails by design. It may send
@@ -114,11 +115,17 @@ exists to prevent. Two concrete consequences worth restating, because they are t
 
 - The exec sandbox spec is *derived* from the same grants as the policy decisions. A principal without
   `net` must not reach the network through `curl` in a child process.
-- Built-in tools are not privileged. None of the nine is a bypass: each passes through the same
+- Built-in tools are not privileged. None of the ten is a bypass: each passes through the same
   engine, the same audit log and the same sandbox as a plugin call (D17). `ls`, `find` and `grep`
   decide and log one read of the directory they start from, then filter everything beneath it through
   the same policy without a record per file, so an excluded file is skipped rather than shown
   (`tools/search.rs`).
+
+A **skill** (D64) is instructions and never authority: its `allowed-tools` is ignored, because a
+pre-approval written by whoever wrote the skill would be a second source of authority. A project
+skill is read through the policy, so a refused one is never advertised; `saddle tool skill '{}'`
+lists what this session would offer, and `saddle tool skill '{"name":"…"}'` loads a body the way the
+model does.
 
 Deny is the default everywhere: a decision is a lookup over grants, with no ordering, no fallthrough
 and no deny rules. A grant may carry a `why`, which `saddle check` shows and the audit log records; it
@@ -126,7 +133,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D63 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D64 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

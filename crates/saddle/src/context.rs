@@ -29,27 +29,27 @@ pub struct ContextFile {
     pub text: String,
 }
 
-fn home() -> Option<PathBuf> {
+pub(crate) fn home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
 }
 
-fn expand(path: &str) -> PathBuf {
+pub(crate) fn expand(path: &str) -> PathBuf {
     match (path.strip_prefix("~/"), home()) {
         (Some(rest), Some(home)) => home.join(rest),
         _ => PathBuf::from(path),
     }
 }
 
-fn label_of(path: &Path) -> String {
+pub(crate) fn label_of(path: &Path) -> String {
     match home().and_then(|h| path.strip_prefix(h).ok().map(Path::to_owned)) {
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),
     }
 }
 
-fn cap(mut text: String) -> String {
+pub(crate) fn cap(mut text: String) -> String {
     if text.len() > MAX_FILE_BYTES {
         let mut cut = MAX_FILE_BYTES;
         while !text.is_char_boundary(cut) {
@@ -78,7 +78,7 @@ pub fn global_file(cfg: &ContextConfig, paths: &Paths) -> Option<PathBuf> {
 }
 
 /// The workspace-relative directories from the root down to `start`.
-fn directories(workspace: &Path, start: &Path) -> Vec<PathBuf> {
+pub(crate) fn directories(workspace: &Path, start: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![PathBuf::new()];
     if let Ok(rel) = start.strip_prefix(workspace) {
         let mut at = PathBuf::new();

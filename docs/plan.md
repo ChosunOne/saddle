@@ -1188,6 +1188,40 @@ use it.
   the next version; an earlier draft tried to migrate states that only existed in intermediate
   commits, which was work for no user.
 
+**D64.** A skill is instructions, never authority, and its body is loaded rather than advertised.
+
+- **Skills are the Agent Skills format**, which is what a skill written for another harness already
+  is: a directory holding `SKILL.md` with frontmatter, discovered by a walk of a skills directory.
+  Saddle does not invent a format for this any more than it invents one for instruction files.
+- **The prompt carries the name, the description and the directory; the body is a tool call.** A
+  directory of ten skills costs a few lines of prompt instead of all of their text, and the model
+  decides what to load from the description, which is why a skill without one is not loaded at all:
+  the description *is* the routing signal.
+- **Loading is the `skill` tool, not "read SKILL.md".** A user-tier skill lives under `~/.agents` or
+  the config directory, which is outside every root: `read` on it is denied, while `bash` can read
+  it because D62 enumerates `~` for children. Telling the model to read a file that the gate refuses
+  would be a prompt that does not work. The tool takes a **name** and serves the text discovery
+  already admitted, so it cannot become a general file reader, and the directory it returns is how
+  the model finds the bundled files: with `read` and `ls` inside the workspace, with `bash` outside.
+- **`allowed-tools` is ignored, and the person is told so.** Under the specification it is an
+  experimental pre-approval list; a pre-approval written by whoever wrote the skill is a widening of
+  authority from a second source, which is the failure this project exists to prevent (§5). What a
+  skill may do is what the policy allows. A hostile skill can therefore only ask for something the
+  grants already permit, and every call it causes is in the transcript and the audit log.
+- **Two tiers, and each is read the way its trust warrants.** The user tier (`~/.agents/skills`,
+  then `~/.config/saddle/skills`) is the user's own file, host-read like the global instruction file
+  (D32). The project tier (`.agents/skills` from the workspace root down to the start directory) is
+  written by whoever wrote the repository, so the file is read **through the policy as the agent**
+  and a skill the grants refuse is refused and noted, never advertised. The walk that finds a
+  `SKILL.md` is the host's and decides nothing, as the existence checks for instruction files do;
+  what the policy decides is reading the file. More specific wins, as with instruction
+  files: a project skill replaces a user one of the same name and the note says which it replaced.
+- **Discovery happens once, at open**, like the instruction files: the conversation was built from
+  what was there when it started. Both what was advertised and each body loaded are audit records
+  (`kind: skill`, with byte count and hash), so a person can see what entered the context and when
+  (D10). A skill is a name, not a path: names are held to the specification's alphabet, so there is
+  nothing for a traversal to traverse.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
@@ -1275,6 +1309,10 @@ model is decorative.
   survives the group kill in D19.
 - An external append-only sink for the audit log.
 - Input widgets in `ui`.
+- `/skill:name` in the TUI: forcing a skill when the model missed it, with the rest of the line as
+  the request (D64). The tool is enough to load one; the command is for a person who knows better
+  than the description. A skill's bundled files are likewise not listed by the `skill` tool: that
+  would be a directory read the policy does not decide, and the skill's own text names them.
 
 ## 9. Known risks
 

@@ -1175,8 +1175,10 @@ impl App {
         // A drag pulled below the transcript points past its end; take what is there.
         let last_line = last.line.min(seen.lines.len() - 1);
         let mut out = String::new();
-        for line in first.line..=last_line {
-            let chars: Vec<char> = seen.lines[line].chars().collect();
+        let rows = seen.lines.get(first.line..=last_line).unwrap_or_default();
+        for (offset, text) in rows.iter().enumerate() {
+            let line = first.line + offset;
+            let chars: Vec<char> = text.chars().collect();
             let from = if line == first.line {
                 first.ch.min(chars.len())
             } else {

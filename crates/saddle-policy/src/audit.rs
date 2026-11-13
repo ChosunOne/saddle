@@ -26,6 +26,8 @@ pub enum Kind {
     Restore,
     /// Instruction files added to the system prompt (D32), with their hashes.
     Context,
+    /// A skill (D64): the ones advertised at startup, and each body loaded into the conversation.
+    Skill,
     /// The policy changed during the session (D47): its path, and the hash before and after.
     Policy,
     /// A request to the session's model provider: model, stop reason and token usage, or the

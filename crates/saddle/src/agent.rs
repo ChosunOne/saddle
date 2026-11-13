@@ -1168,6 +1168,7 @@ pub fn base_prompt(session: &Session, context: &[ContextFile]) -> String {
     for (name, path) in session.roots().iter() {
         let _ = writeln!(s, "  {:<10} {}", name.as_str(), path.display());
     }
+    s.push_str(&crate::skills::listing(&session.skills));
     if !context.is_empty() {
         s.push_str(
             "\nInstructions from the user and the project follow, general first. Where they \

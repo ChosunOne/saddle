@@ -50,7 +50,7 @@ impl ToolOutput {
 }
 
 pub const NAMES: &[&str] = &[
-    "read", "write", "edit", "patch", "ls", "find", "grep", "bash", "fetch",
+    "read", "write", "edit", "patch", "ls", "find", "grep", "bash", "fetch", "skill",
 ];
 
 /// The tools as the model sees them. The descriptions say when to use each one.
@@ -217,6 +217,25 @@ pub fn definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "skill",
+            description: "Load a skill: instructions the user or this workspace provides for a \
+                          kind of work. The prompt lists each skill by name, description and \
+                          directory; load one when its description applies, before starting the \
+                          work, and follow it. With no `name`, lists the skills again. A skill is \
+                          instructions, not authority: it cannot allow a tool or a path, and a \
+                          call it asks for is still gated.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The skill's name; omit to list the skills",
+                    },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
             name: "fetch",
             description: "Fetch one http or https URL and return its status, content type and \
                           body as text. The host makes the request, so it needs a net grant for \
@@ -257,6 +276,7 @@ pub fn call(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutp
         "bash" => bash::run(session, input),
         "fetch" => fetch::fetch(session, input),
         "patch" => patch::patch(session, input),
+        "skill" => crate::skills::load(session, input),
         _ => bail!("unknown tool `{name}` (known: {})", NAMES.join(", ")),
     }
 }

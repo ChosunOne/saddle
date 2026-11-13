@@ -12,6 +12,7 @@ mod paths;
 mod provider;
 mod reserved;
 mod session;
+mod skills;
 mod store;
 mod term;
 mod tools;
@@ -292,6 +293,11 @@ fn run_agent(
         notes.push(format!("instructions from {}", names.join(", ")));
     }
     notes.extend(refused);
+    if !session.skills.is_empty() {
+        let names: Vec<&str> = session.skills.iter().map(|s| s.name.as_str()).collect();
+        notes.push(format!("skills: {}", names.join(", ")));
+    }
+    notes.extend(session.skill_notes.clone());
 
     // A bad `[ui] status` is reported where it can be seen, and the session keeps the default.
     let status = match user.ui.status.as_deref() {

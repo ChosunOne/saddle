@@ -383,8 +383,10 @@ fn every_decision_is_logged_and_the_chain_verifies() {
         .iter()
         .map(|r| r["kind"].as_str().unwrap())
         .collect();
-    assert_eq!(kinds, ["session-start", "decision", "session-end"]);
-    let d = &records[1];
+    // D64: discovery is a record of its own, before any call is decided, so what was advertised
+    // is in the log even when nothing loads a skill.
+    assert_eq!(kinds, ["session-start", "skill", "decision", "session-end"]);
+    let d = &records[2];
     assert_eq!(d["allow"], false);
     assert_eq!(d["scope"], "fs-write");
     assert_eq!(d["args"]["path"], "workspace:.env");
@@ -1011,4 +1013,108 @@ fn a_grants_file_that_names_another_directory_is_refused() {
     assert!(out.status.success(), "{}", stderr(&out));
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(text.contains("agent.net[0]"), "{text}");
+}
+
+#[test]
+fn a_skill_is_advertised_by_name_and_loaded_on_demand() {
+    // D64: the prompt carries the name, the description and the directory; the body is a tool
+    // call, so a directory of skills costs a few lines rather than all of their text.
+    let env = Env::new();
+    std::fs::create_dir_all(env.path(".agents/skills/house")).unwrap();
+    std::fs::write(
+        env.path(".agents/skills/house/SKILL.md"),
+        "---\nname: house\ndescription: House style. Use when editing Rust here.\n---\n\n\
+         lowercase doc comments.\n",
+    )
+    .unwrap();
+
+    let (ok, text) = env.tool("skill", serde_json::json!({}));
+    assert!(ok, "{text}");
+    assert!(text.contains("house"), "advertised, not loaded: {text}");
+    assert!(text.contains("House style."), "{text}");
+    assert!(
+        !text.contains("lowercase doc comments"),
+        "the body is not the list"
+    );
+
+    let (ok, text) = env.tool("skill", serde_json::json!({ "name": "house" }));
+    assert!(ok, "{text}");
+    assert!(text.contains("lowercase doc comments"), "{text}");
+
+    // A name is an identifier, so there is no path to traverse.
+    let (ok, text) = env.tool(
+        "skill",
+        serde_json::json!({ "name": "../../../etc/passwd" }),
+    );
+    assert!(!ok, "{text}");
+    assert!(text.contains("no skill `../../../etc/passwd`"), "{text}");
+}
+
+#[test]
+fn a_skill_the_policy_refuses_is_not_advertised() {
+    // D64: a project skill is read through the policy as the agent, so an excluded one is refused
+    // and noted rather than offered — the same rule as an instruction file (D32).
+    let env = Env::new();
+    std::fs::create_dir_all(env.path(".agents/skills/house")).unwrap();
+    std::fs::write(
+        env.path(".agents/skills/house/SKILL.md"),
+        "---\nname: house\ndescription: House style.\n---\nlowercase doc comments.\n",
+    )
+    .unwrap();
+    env.edit_agent(|agent| {
+        agent.insert(
+            "fs-read".into(),
+            toml::Value::Array(vec![toml::Value::Table(
+                r#"root = "workspace"
+                   exclude = [".agents/skills/house/**"]"#
+                    .parse()
+                    .unwrap(),
+            )]),
+        );
+    });
+    let (ok, text) = env.tool("skill", serde_json::json!({}));
+    assert!(ok, "{text}");
+    assert!(text.contains("there are no skills"), "{text}");
+}
+
+#[test]
+fn a_user_level_skill_loads_even_though_read_cannot_reach_it() {
+    // D64: the user's own skills are read by the host like the global instruction file, and their
+    // directory is outside every root. This is why loading is a tool rather than "read SKILL.md".
+    let env = Env::new();
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join(".agents/skills/pdf-tools");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("SKILL.md");
+    std::fs::write(
+        &file,
+        "---\nname: pdf-tools\ndescription: Extract text from PDFs.\n---\nRead formats.md.\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_saddle"))
+            .arg("-C")
+            .arg(env.ws.path())
+            .args(args)
+            .env("HOME", home.path())
+            .env("XDG_STATE_HOME", env.xdg.path().join("state"))
+            .env("XDG_CONFIG_HOME", env.xdg.path().join("config"))
+            .output()
+            .unwrap()
+    };
+
+    let out = run(&["tool", "skill", r#"{"name":"pdf-tools"}"#]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("Read formats.md."), "{text}");
+
+    // The read tool still cannot reach it: a skill is instructions, not a new root.
+    let out = run(&[
+        "tool",
+        "read",
+        &format!(r#"{{"path":"{}"}}"#, file.display()),
+    ]);
+    let text = stderr(&out);
+    assert_ne!(out.status.code(), Some(0), "{}", text);
+    assert!(text.contains("outside every root"), "{text}");
 }

@@ -66,6 +66,8 @@ pub struct UserConfig {
     #[serde(default)]
     pub context: ContextConfig,
     #[serde(default)]
+    pub skills: SkillsConfig,
+    #[serde(default)]
     pub compaction: CompactionConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderEntry>,
@@ -97,6 +99,32 @@ pub struct ContextConfig {
     /// Read CLAUDE.md where no AGENTS.md exists (and `~/.claude/CLAUDE.md` when there is no
     /// global AGENTS.md). Defaults to on.
     pub claude_fallback: Option<bool>,
+}
+
+/// Skills (D64). The locations are fixed and portable; this only says whether to look and how many
+/// to advertise.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct SkillsConfig {
+    /// Whether skills are discovered at all. Defaults to on.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// How many skills are advertised in the prompt. Defaults to 32.
+    #[serde(default = "skill_limit")]
+    pub max: usize,
+}
+
+fn skill_limit() -> usize {
+    32
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max: skill_limit(),
+        }
+    }
 }
 
 /// Compaction (D33).
