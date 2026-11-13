@@ -820,8 +820,9 @@ pub fn window_and_source(config: &ProviderConfig, reported: &Reported) -> (u64, 
 /// The listing is the provider's own word on its limits, so a session asks for it rather than
 /// carrying a guess into its first turn. Failing is silence: a server that is unreachable, has no
 /// models endpoint, or states no window leaves the caller with the best answer it already had.
-pub fn ask_endpoint(config: &ProviderConfig, key: Option<&str>, cache: &Path) -> Option<Stated> {
-    let models = list_models(config, key).ok()?;
+pub fn ask_endpoint(p: &Provider, cache: &Path) -> Option<Stated> {
+    let config = &p.config;
+    let models = list_models(p).ok()?;
     let mut reported = Reported::stored(cache);
     reported.record(&config.base_url, &models);
     let _ = reported.save(cache);

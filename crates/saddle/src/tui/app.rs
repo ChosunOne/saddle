@@ -55,6 +55,10 @@ pub enum AgentEvent {
     Closed,
     /// The answer to a model listing started by the login dialog.
     Models(u64, Result<Vec<String>, ModelsError>),
+    /// The code to type for a device sign-in: where to go, and what to enter there (D85).
+    DeviceCode(u64, Result<(String, String), String>),
+    /// That sign-in finished, or failed with a reason to show (D85).
+    SignedIn(u64, Result<(), String>),
     /// A listing asked for at session start stated a window for the current model, so the session
     /// can drop the guess it opened with (D34). The answer is in the model cache by now.
     Listed,
@@ -94,6 +98,9 @@ pub enum Action {
     Cancel,
     Quit,
     OpenLogin,
+    /// Start a device sign-in for this provider, answering with [`AgentEvent::DeviceCode`] and
+    /// then [`AgentEvent::SignedIn`] (D85).
+    SignIn(u64, String),
     /// List the draft's models, answering with [`AgentEvent::Models`].
     CheckModels(u64, Draft),
     Login(LoginRequest),
@@ -939,6 +946,10 @@ impl App {
                     None
                 }
                 Outcome::Check(id, draft) => Some(Action::CheckModels(id, draft)),
+                Outcome::SignIn(id, provider) => Some(Action::SignIn(id, provider)),
+                // Cancelling is the dialog saying stop asking; the answer is only ever for it, so
+                // there is nothing for the interface to do with it.
+                Outcome::CancelSignIn(_) => None,
                 Outcome::Submit(req) => {
                     self.login = None;
                     Some(Action::Login(req))
@@ -1665,6 +1676,21 @@ impl App {
             AgentEvent::Models(id, result) => {
                 if let Some(login) = &mut self.login {
                     login.models(id, result);
+                }
+            }
+            AgentEvent::DeviceCode(id, result) => {
+                if let Some(login) = &mut self.login {
+                    login.device_code(id, result);
+                }
+            }
+            AgentEvent::SignedIn(id, result) => {
+                let next = self
+                    .login
+                    .as_mut()
+                    .and_then(|login| login.signed_in(id, result));
+                if let Some((id, draft)) = next {
+                    // The token is stored, so the listing proves it and picks the model.
+                    return Some(Action::CheckModels(id, draft));
                 }
             }
             AgentEvent::Listed => return Some(Action::SettleWindow),

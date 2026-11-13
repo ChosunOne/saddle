@@ -1633,6 +1633,44 @@ fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize, 
             lines.push(Line::from(Span::styled("esc back", dim(theme))));
             login_title(login)
         }
+        Stage::SigningIn { .. } => {
+            let d = &login.device;
+            if let Some(why) = &d.error {
+                lines.push(Line::from(Span::styled(
+                    keep_tail(why, inner),
+                    Style::new().fg(theme.error),
+                )));
+            } else if let Some(code) = &d.code {
+                lines.push(Line::from("A browser on any device signs this in".bold()));
+                lines.push(Line::default());
+                lines.push(Line::from(vec![
+                    Span::styled("  1. open  ", dim(theme)),
+                    Span::styled(d.url.clone(), Style::new().fg(theme.accent)),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("  2. enter ", dim(theme)),
+                    Span::styled(
+                        code.clone(),
+                        Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                let spin = SPINNER[spinner % SPINNER.len()];
+                lines.push(Line::default());
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{spin} "), Style::new().fg(theme.warning)),
+                    Span::raw("waiting for the sign-in…"),
+                ]));
+            } else {
+                let spin = SPINNER[spinner % SPINNER.len()];
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{spin} "), Style::new().fg(theme.warning)),
+                    Span::raw("asking for a sign-in code…"),
+                ]));
+            }
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled("esc cancel", dim(theme))));
+            login_title(login)
+        }
         Stage::Models {
             models,
             filter,
@@ -2826,6 +2864,76 @@ mod tests {
         assert!(
             !seen.contains(&Color::Rgb(165, 214, 255)),
             "the previous palette's string colour is gone"
+        );
+    }
+
+    #[test]
+    fn a_sign_in_on_screen_shows_the_address_and_the_code() {
+        // D85: the code is the whole point of the screen, so it has to be legible there rather than
+        // only in a log. The dialog is drawn with the code the host reported, and with the error
+        // where the code was when the sign-in fails.
+        let mut app = bare_app();
+        let choice = |name: &str, oauth: bool| crate::tui::login::Choice {
+            name: name.into(),
+            detail: String::new(),
+            status: if oauth {
+                "not signed in".into()
+            } else {
+                String::new()
+            },
+            needs_key: !oauth,
+            has_key: false,
+            model: None,
+            custom: false,
+            oauth,
+        };
+        let mut login = crate::tui::login::Login::new(
+            vec![choice("openai", false), choice("openai-chatgpt", true)],
+            vec![],
+            Some("openai-chatgpt"),
+            true,
+            "~/.local/state/saddle/auth.json".into(),
+        );
+        let Some(crate::tui::login::Outcome::SignIn(id, _)) = login.take_pending() else {
+            panic!("a sign-in to start");
+        };
+        app.open_login(login);
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("Log in to openai-chatgpt"), "{text}");
+        assert!(text.contains("asking for a sign-in code"), "{text}");
+
+        app.login.as_mut().unwrap().device_code(
+            id,
+            Ok((
+                "https://auth.openai.com/codex/device".into(),
+                "FPAT-OKEE6".into(),
+            )),
+        );
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(
+            text.contains("https://auth.openai.com/codex/device"),
+            "{text}"
+        );
+        assert!(
+            text.contains("FPAT-OKEE6"),
+            "the code is on screen:\n{text}"
+        );
+        assert!(text.contains("waiting for the sign-in"), "{text}");
+        assert!(text.contains("esc cancel"), "{text}");
+
+        app.login
+            .as_mut()
+            .unwrap()
+            .signed_in(id, Err("the login code expired".into()));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("the login code expired"), "{text}");
+        assert!(
+            !text.contains("FPAT-OKEE6"),
+            "the old code is gone:\n{text}"
         );
     }
 

@@ -2011,13 +2011,30 @@ than deltas on a choice. That is a second client (`provider/responses.rs`), not 
   URLs, client id, scopes and redirect. `openai-chatgpt` is a preset filling it in, and an empty
   table is *incomplete* rather than silently OpenAI's — a provider that says `auth = "oauth"` and
   nothing else must not log in to another service.
-- **`saddle login <provider>` and `saddle logout <provider>`** are the surface. The TUI's `/login`
-  still asks for a key: the device flow needs a prompt that is answered while a poll runs, and the
-  terminal is where a code is read and typed. Wiring it into the dialog is deferred rather than
-  pretended.
-- **Deferred:** the TUI login dialog running the device flow; an OAuth provider other than OpenAI in
-  the presets; refresh on a 401 (the token is refreshed before the request, and a refused one is
-  reported rather than retried); and the browser redirect for OpenAI, which needs a real navigation.
+- **`/login` is the flow, in the dialog, and `saddle login <provider>` is the same flow in a
+  terminal.** A provider chosen in `/login` that authenticates with OAuth has no key field: picking
+  it shows the address and the code, and the poll runs on its own thread while the screen stays
+  live. The dialog never touches the network, so it keeps drawing; the thread says what it found
+  through the same channel a model listing answers on, and every answer carries the attempt's id, so
+  an abandoned sign-in's arrival is ignored rather than taken for the current one. Esc cancels,
+  which is a flag the poll reads between requests — one already in flight finishes first — and the
+  list is one key back, because a retry is a new attempt with a new id. One sign-in runs at a time:
+  starting another raises the first one's flag, since the dialog has one on screen.
+  Opening the dialog straight at a provider has no keystroke to answer to, so the choice leaves what
+  it owes in `pending` and the host takes it once: a sign-in to start, or — for a provider already
+  signed in — the model list to ask for, which is the same thing `/login` does for a provider whose
+  key is already stored. A failure stays on the sign-in screen with the reason where the code was,
+  so what failed and where to go from there are one screen apart.
+- **Approval goes straight to the model list**, and the listing is sent with the token just stored
+  rather than with a key that does not exist. That is why `list_models` and `ask_endpoint` take the
+  `Provider` rather than a `(config, key)` pair: a listing has to send exactly what a turn will,
+  including an OAuth token and its account header, or `/login` would report a 401 for a credential
+  it has just obtained. A backend that lists nothing leaves the person typing the model name, which
+  the dialog already knew how to do.
+- **Deferred:** an OAuth provider other than OpenAI in the presets; refresh on a 401 (the token is
+  refreshed before the request, and a refused one is reported rather than retried); the browser
+  redirect for OpenAI, which needs a real navigation; and a logout inside the dialog (`/logout`
+  already forgets a provider).
 
 ## 4. Scope enumeration
 

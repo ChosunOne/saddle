@@ -257,10 +257,8 @@ pub struct ModelInfo {
 ///
 /// The windows it carries are where a real context limit comes from, so `/login` and `/model`
 /// cache them (D34).
-pub fn list_models(
-    config: &ProviderConfig,
-    key: Option<&str>,
-) -> Result<Vec<ModelInfo>, ModelsError> {
+pub fn list_models(p: &super::Provider) -> Result<Vec<ModelInfo>, ModelsError> {
+    let config = &p.config;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(20)))
@@ -268,25 +266,18 @@ pub fn list_models(
         .build()
         .into();
     let base = &config.base_url;
-    let request = match config.api {
-        // The Responses backend speaks the same bearer token and lists its models the same way.
-        Api::Openai | Api::OpenaiResponses => {
-            let req = agent.get(format!("{base}/models"));
-            match key {
-                Some(k) => req.header("authorization", format!("Bearer {k}")),
-                None => req,
-            }
-        }
-        Api::Anthropic => {
-            let req = agent
-                .get(format!("{base}/v1/models?limit=1000"))
-                .header("anthropic-version", super::anthropic::VERSION);
-            match key {
-                Some(k) => req.header("x-api-key", k),
-                None => req,
-            }
-        }
+    // The credential goes where the provider wants it and the provider's own headers ride along, so
+    // a listing checks the same thing a turn will send: a login's token and its account (D84, D85).
+    let headers = p.request_headers();
+    let mut request = match config.api {
+        Api::Openai | Api::OpenaiResponses => agent.get(format!("{base}/models")),
+        Api::Anthropic => agent
+            .get(format!("{base}/v1/models?limit=1000"))
+            .header("anthropic-version", super::anthropic::VERSION),
     };
+    for (name, value) in &headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
     let mut resp = request
         .call()
         .map_err(|e| ModelsError::Failed(e.to_string()))?;

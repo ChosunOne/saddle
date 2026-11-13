@@ -1,10 +1,15 @@
 //! OAuth login, token storage and refresh for a provider that authenticates that way (D85).
 //!
-//! The flow is the standard authorization-code one with PKCE and a loopback redirect: saddle
-//! generates a verifier and its challenge, opens nothing itself but prints the URL, listens on
+//! Two flows live here. The browser one is a standard authorization code with PKCE and a loopback
+//! redirect: saddle generates a verifier and its challenge, prints the URL, listens on
 //! `127.0.0.1:<port>` for the browser to come back, and exchanges the code for tokens. A user whose
 //! browser is elsewhere can paste the redirect URL instead, which is why the listener failing is not
 //! the end of the login.
+//!
+//! The device one needs no listener and no browser on this machine: the server states a code, the
+//! person types it on their phone or laptop, and saddle polls until it is approved. OpenAI's
+//! subscription login uses it, and the preset says so (`method = "device"`); the browser flow is
+//! there for a provider whose endpoints accept it.
 //!
 //! What is specific to OpenAI is in the preset and the constants below, not in this module's shape:
 //! another provider is a `[providers.<name>.oauth]` table with its own URLs, client id and scopes.
@@ -12,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -369,30 +375,37 @@ pub fn login(
     }
 }
 
-/// Runs a device login to the end: show the code, poll until it is approved, exchange it.
-pub fn device_login(
-    flow: &Flow,
-    tell: &mut dyn FnMut(&str),
+/// Runs a device login to the end, telling the caller what to show: the code, and where to type it.
+///
+/// This is the one implementation of the poll loop, because the timeout and the back-off are the
+/// parts that are easy to get subtly wrong. A terminal prints what `show` says; the login dialog
+/// puts it on the screen (D85).
+///
+/// `stop` is read before each poll, so a cancelled sign-in stops asking; a poll already in flight
+/// finishes first, which is why a cancel takes effect within one interval rather than at once.
+pub fn device_login_step(
+    flow: &Settings,
+    show: &mut dyn FnMut(&DeviceCode, &str),
     pause: &mut dyn FnMut(u64),
+    stop: &AtomicBool,
 ) -> Result<Tokens> {
-    let flow = flow.settings()?;
-    let device = request_device_code(&flow)?;
+    let device = request_device_code(flow)?;
     let where_to_go = flow
         .verification_url
         .clone()
         .unwrap_or_else(|| OPENAI_VERIFICATION_URL.to_owned());
-    tell(&format!(
-        "open {where_to_go} and enter the code {}",
-        device.user_code
-    ));
+    show(&device, &where_to_go);
     let started = now();
     let mut interval = device.interval;
     loop {
-        match poll_device_code(&flow, &device)? {
+        if stop.load(Ordering::Relaxed) {
+            bail!("the login was cancelled");
+        }
+        match poll_device_code(flow, &device)? {
             Poll::Pending => {}
             Poll::SlowDown => interval += 5,
             Poll::Ready { code, verifier } => {
-                return exchange_with(&flow, &code, &verifier);
+                return exchange_with(flow, &code, &verifier);
             }
         }
         if now().saturating_sub(started) > DEVICE_TIMEOUT {
@@ -400,6 +413,22 @@ pub fn device_login(
         }
         pause(interval);
     }
+}
+
+/// The same login, described in a line for a terminal.
+pub fn device_login(
+    flow: &Flow,
+    tell: &mut dyn FnMut(&str),
+    pause: &mut dyn FnMut(u64),
+) -> Result<Tokens> {
+    let settings = flow.settings()?;
+    let mut show = |device: &DeviceCode, url: &str| {
+        tell(&format!(
+            "open {url} and enter the code {}",
+            device.user_code
+        ));
+    };
+    device_login_step(&settings, &mut show, pause, &AtomicBool::new(false))
 }
 
 /// The token exchange, taking the verifier the device flow supplied rather than one of our own.

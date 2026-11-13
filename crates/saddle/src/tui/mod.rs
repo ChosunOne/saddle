@@ -22,6 +22,8 @@ mod tree;
 
 use std::fmt::Write as _;
 use std::io::{Write as _, stdout};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -155,6 +157,7 @@ pub fn run(
         events: ev_tx_ui,
         paths,
         store,
+        signing: std::sync::Mutex::new(None),
     };
     if let Some(path) = resume {
         control.send(&mut app, Command::Resume(path));
@@ -798,6 +801,9 @@ struct Controller {
     paths: Paths,
     /// This workspace's saved sessions, for /resume.
     store: store::Store,
+    /// The sign-in the login dialog is waiting on, so a cancel or a second attempt stops the poll
+    /// that is no longer wanted (D85).
+    signing: std::sync::Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl Controller {
@@ -849,6 +855,10 @@ impl Controller {
                 self.open_login(app, current, false)
             }
             Action::CheckModels(id, draft) => self.check_models(id, draft),
+            Action::SignIn(id, provider) => {
+                self.sign_in(app, id, &provider);
+                Ok(())
+            }
             Action::Login(req) => self.login(app, &req),
             Action::Logout(name) => self.logout(app, name),
             Action::Model(name) => self.model(app, name),
@@ -932,25 +942,38 @@ impl Controller {
                     .clone()
                     .filter(|var| std::env::var(var).is_ok_and(|k| !k.is_empty()));
                 let stored = auth.key(&name).is_some();
-                let status = match (&env, stored, &entry.api_key_env) {
-                    (Some(var), _, _) => format!("key from ${var}"),
-                    (None, true, _) => "logged in".into(),
-                    (None, false, None) => "no key needed".into(),
-                    (None, false, Some(_)) => String::new(),
+                // An OAuth provider's credential is the token a sign-in stored, and it is not a
+                // key: showing "not logged in" beside a key page would send a person looking for
+                // something that provider does not issue (D85).
+                let oauth = entry.auth == Some(provider::Auth::Oauth);
+                let signed_in = oauth && auth.oauth(&name).is_some();
+                let status = match (&env, stored, oauth, &entry.api_key_env) {
+                    (_, _, true, _) if signed_in => "signed in".into(),
+                    (_, _, true, _) => "not signed in".into(),
+                    (Some(var), _, _, _) => format!("key from ${var}"),
+                    (None, true, _, _) => "logged in".into(),
+                    (None, false, _, None) => "no key needed".into(),
+                    (None, false, _, Some(_)) => String::new(),
                 };
-                let detail = match (&entry.model, provider::key_page(&name)) {
-                    (Some(model), _) => model.clone(),
-                    (None, Some(page)) => format!("keys at {page}"),
-                    (None, None) => entry.base_url.clone().unwrap_or_default(),
+                let detail = match (&entry.model, provider::key_page(&name), oauth) {
+                    (Some(model), _, _) => model.clone(),
+                    (None, _, true) => "with a ChatGPT plan".into(),
+                    (None, Some(page), false) => format!("keys at {page}"),
+                    (None, None, false) => entry.base_url.clone().unwrap_or_default(),
                 };
                 Choice {
-                    needs_key: entry.api_key_env.is_some(),
-                    has_key: env.is_some() || stored,
+                    needs_key: entry.api_key_env.is_some() && !oauth,
+                    has_key: if oauth {
+                        signed_in
+                    } else {
+                        env.is_some() || stored
+                    },
                     model: entry.model.clone(),
                     name,
                     detail,
                     status,
                     custom: false,
+                    oauth,
                 }
             })
             .collect();
@@ -962,15 +985,88 @@ impl Controller {
             has_key: false,
             model: None,
             custom: true,
+            oauth: false,
         });
         let auth_path = render::home_relative(&self.paths.auth_store());
-        app.open_login(Login::new(
-            choices,
-            builtin,
-            preselect.as_deref(),
-            direct,
-            auth_path,
-        ));
+        let mut login = Login::new(choices, builtin, preselect.as_deref(), direct, auth_path);
+        // Opened straight at a provider, the dialog owes it something at once: a sign-in to start, or
+        // the model list to ask for, since neither is a key to type (D85).
+        let pending = login.take_pending();
+        app.open_login(login);
+        match pending {
+            Some(login::Outcome::SignIn(id, provider)) => self.sign_in(app, id, &provider),
+            Some(login::Outcome::Check(id, draft)) => self.check_models(id, draft)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Runs a device sign-in on its own thread: the code goes to the dialog, then the poll
+    /// continues until it is approved and the tokens are stored (D85).
+    ///
+    /// The poll belongs on a thread because it is a loop of requests with seconds between them; on
+    /// the interface thread the screen would freeze for as long as the person takes to fetch a
+    /// phone. The flag is what makes esc stop it, rather than leaving a poller talking to the server
+    /// for a sign-in nobody is watching.
+    fn sign_in(&self, app: &mut App, id: u64, provider: &str) {
+        // Anything the config is missing is said in the dialog rather than as a note, because the
+        // dialog is where the person is looking and where esc is (D85).
+        if let Err(e) = self.spawn_sign_in(id, provider)
+            && let Some(login) = &mut app.login
+        {
+            login.device_code(id, Err(format!("{e:#}")));
+        }
+    }
+
+    fn spawn_sign_in(&self, id: u64, provider: &str) -> Result<()> {
+        let user = UserConfig::load(&self.paths.user_config())?;
+        let config = provider::endpoint(provider, &user.providers)?;
+        let flow = config.oauth.clone().with_context(|| {
+            format!("{provider} does not sign in with OAuth; /login expects a key")
+        })?;
+        let settings = flow.settings()?;
+        let events = self.events.clone();
+        let store = self.paths.auth_store();
+        let provider = provider.to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        if let Ok(mut current) = self.signing.lock() {
+            // A second sign-in replaces the first: the dialog has one on screen at a time.
+            if let Some(previous) = current.replace(stop.clone()) {
+                previous.store(true, Ordering::Relaxed);
+            }
+        }
+        thread::Builder::new()
+            .name("saddle-sign-in".into())
+            .spawn(move || {
+                let mut show = |device: &provider::oauth::DeviceCode, url: &str| {
+                    let _ = events.send(AgentEvent::DeviceCode(
+                        id,
+                        Ok((url.to_owned(), device.user_code.clone())),
+                    ));
+                };
+                let mut pause = |seconds: u64| {
+                    // In steps, so a cancel is noticed within a second of the flag going up.
+                    for _ in 0..seconds {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                };
+                let outcome =
+                    provider::oauth::device_login_step(&settings, &mut show, &mut pause, &stop)
+                        .and_then(|tokens| {
+                            let mut auth = AuthStore::load(&store)?;
+                            auth.set_oauth(&provider, tokens);
+                            auth.save(&store)?;
+                            Ok(())
+                        });
+                let _ = events.send(AgentEvent::SignedIn(
+                    id,
+                    outcome.map_err(|e| format!("{e:#}")),
+                ));
+            })
+            .context("starting the sign-in")?;
         Ok(())
     }
 
@@ -1005,18 +1101,32 @@ impl Controller {
                 provider::available_key(&config, auth.key(&draft.provider))
             }
         };
+        let store = self.paths.auth_store();
         let events = self.events.clone();
         let cache = self.paths.reported_windows();
+        let base_url = config.base_url.clone();
+        // Built before the thread so the headers are the ones a turn would send: a key just typed,
+        // or the token the sign-in stored a moment ago (D85).
+        let p = Provider::new(
+            &draft.provider,
+            config,
+            key.as_deref(),
+            &provider::Reported::default(),
+        )
+        .with_stored_oauth(&store);
         thread::Builder::new()
             .name("saddle-models".into())
             .spawn(move || {
-                let listed = provider::list_models(&config, key.as_deref());
+                let listed = p
+                    .refresh_tokens()
+                    .map_err(|e| provider::ModelsError::Failed(format!("{e:#}")))
+                    .and_then(|()| provider::list_models(&p));
                 // A listing is where the server states its real limits, so keep them for the
                 // sessions that never list anything (D34). Failing to cache costs nothing but the
                 // default window next time.
                 if let Ok(models) = &listed {
                     let mut reported = provider::Reported::stored(&cache);
-                    reported.record(&config.base_url, models);
+                    reported.record(&base_url, models);
                     let _ = reported.save(&cache);
                 }
                 let ids = listed.map(|models| models.into_iter().map(|m| m.id).collect());
@@ -1422,16 +1532,13 @@ impl Controller {
         if name.is_empty() {
             return Ok(());
         }
-        let user = UserConfig::load(&self.paths.user_config())?;
-        let config = provider::endpoint(&name, &user.providers)?;
-        let auth = AuthStore::load(&self.paths.auth_store())?;
-        let key = provider::available_key(&config, auth.key(&name));
+        let p = self.build(&name)?;
         let cache = self.paths.reported_windows();
         let events = self.events.clone();
         thread::Builder::new()
             .name("saddle-window".into())
             .spawn(move || {
-                if provider::ask_endpoint(&config, key.as_deref(), &cache).is_some() {
+                if p.refresh_tokens().is_ok() && provider::ask_endpoint(&p, &cache).is_some() {
                     let _ = events.send(AgentEvent::Listed);
                 }
             })
@@ -1853,6 +1960,7 @@ mod tests {
             events,
             store: store::Store::open(&paths.sessions_index(), dir.to_path_buf()).unwrap(),
             paths,
+            signing: std::sync::Mutex::new(None),
         }
     }
 
@@ -1873,6 +1981,104 @@ mod tests {
             images: None,
             theme: None,
         })
+    }
+
+    #[test]
+    fn a_sign_in_runs_off_the_interface_thread_and_answers_on_the_events_channel() {
+        // D85: the poll is a loop of requests with seconds between them, so it cannot run on the
+        // thread that draws the screen. This checks the seam — the dialogs's request starts a
+        // thread, and what that thread finds arrives as an event the interface reads — with the
+        // endpoints pointed at a port nothing is listening on, so no code is ever issued.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            state: dir.path().join("state"),
+            config: dir.path().join("config"),
+        };
+        std::fs::create_dir_all(paths.user_config().parent().unwrap()).unwrap();
+        std::fs::write(
+            paths.user_config(),
+            "[providers.mine]\napi = \"openai\"\n\
+             base-url = \"http://127.0.0.1:9/v1\"\nmodel = \"m\"\n\
+             [providers.mine.oauth]\nmethod = \"device\"\nclient-id = \"cid\"\n\
+             authorize-url = \"http://127.0.0.1:9/authorize\"\n\
+             token-url = \"http://127.0.0.1:9/token\"\n\
+             device-code-url = \"http://127.0.0.1:9/usercode\"\n\
+             device-token-url = \"http://127.0.0.1:9/device-token\"\n",
+        )
+        .unwrap();
+        let (commands, _) = std::sync::mpsc::channel();
+        let (events, answers) = std::sync::mpsc::channel();
+        let c = Controller {
+            commands,
+            events,
+            store: store::Store::open(&paths.sessions_index(), dir.path().to_path_buf()).unwrap(),
+            paths,
+            signing: std::sync::Mutex::new(None),
+        };
+        let mut app = an_app();
+        // An unreachable endpoint is a failure the dialog has to be told about, not a hang: nothing
+        // is left waiting for a code that will never come.
+        c.perform(&mut app, Action::SignIn(7, "mine".into()));
+        let answer = answers
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the sign-in answered on the events channel");
+        match answer {
+            AgentEvent::SignedIn(id, Err(why)) => {
+                assert_eq!(id, 7, "the answer is for the attempt that asked");
+                assert!(!why.is_empty());
+            }
+            other => panic!("expected a failed sign-in, got {other:?}"),
+        }
+        // Nothing was stored, so the provider is still not signed in.
+        assert!(
+            !c.paths.auth_store().exists()
+                || AuthStore::load(&c.paths.auth_store())
+                    .unwrap()
+                    .oauth("mine")
+                    .is_none()
+        );
+    }
+
+    #[test]
+    fn a_sign_in_that_cannot_start_says_so_in_the_dialog() {
+        // D85: a provider the config cannot sign in to must not leave the dialog waiting for a code
+        // that is never coming. The reason belongs on the screen the person is looking at, with esc
+        // right there to leave it.
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller(dir.path(), "provider = \"openai\"\n");
+        let mut app = an_app();
+        let choice = |name: &str, oauth: bool| Choice {
+            name: name.into(),
+            detail: String::new(),
+            status: String::new(),
+            needs_key: !oauth,
+            has_key: false,
+            model: None,
+            custom: false,
+            oauth,
+        };
+        // A name the config does not define, which is what a typo in a provider table looks like.
+        let mut login = Login::new(
+            vec![choice("kimi", true)],
+            vec![],
+            Some("kimi"),
+            true,
+            "auth.json".into(),
+        );
+        let Some(login::Outcome::SignIn(id, _)) = login.take_pending() else {
+            panic!("a sign-in to start");
+        };
+        app.open_login(login);
+        c.perform(&mut app, Action::SignIn(id, "kimi".into()));
+        let login = app.login.as_ref().unwrap();
+        let why = login.device.error.as_deref().unwrap_or_default();
+        assert!(why.contains("kimi"), "{why}");
+        assert!(login.device.code.is_none(), "no code was issued");
+        // Still on the sign-in screen, so a key press cannot index an empty field list.
+        app.key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Esc,
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
     }
 
     #[test]

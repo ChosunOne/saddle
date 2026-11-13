@@ -303,15 +303,17 @@ fn run_agent(
         ),
         Some(name) => match provider::resolve(&name, &user.providers, args.model.as_deref()) {
             Ok(config) => {
+                let mut p = Provider::new(&name, config, auth.key(&name), &reported)
+                    .with_stored_oauth(&paths.auth_store());
                 // Headless there is no session to update later, so the endpoint is asked now
                 // rather than a guess carried into the first turn (D34).
                 if !interactive {
-                    let key = provider::available_key(&config, auth.key(&name));
-                    provider::ask_endpoint(&config, key.as_deref(), &paths.reported_windows());
+                    p.refresh_tokens()?;
+                    provider::ask_endpoint(&p, &paths.reported_windows());
                     reported = provider::Reported::stored(&paths.reported_windows());
+                    p = Provider::new(&name, p.config.clone(), auth.key(&name), &reported)
+                        .with_stored_oauth(&paths.auth_store());
                 }
-                let p = Provider::new(&name, config, auth.key(&name), &reported)
-                    .with_stored_oauth(&paths.auth_store());
                 match p.missing_key() {
                     Some(_) if interactive => (Some(p), tui::Start::LogIn(name)),
                     Some(why) => bail!("{why}"),
