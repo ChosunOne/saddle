@@ -1222,6 +1222,38 @@ use it.
   (D10). A skill is a name, not a path: names are held to the specification's alphabet, so there is
   nothing for a traversal to traverse.
 
+**D65.** A tool's path is a location under a root; a sandbox list is not a grant.
+
+- **Three sets, three jobs, and they are not interchangeable.** *Roots* (`workspace`, `tmp`,
+  `[roots]`) are the namespace the file tools decide over: the model names a path, the host maps it
+  to the root that contains it, and the grant on that root decides, with its exclusions. A path
+  outside every root is refused — not denied by a rule, but unaddressable, and the record says
+  `outside every root`. *`[sandbox] read`/`write`* and the include rules are what a **child
+  process** reaches under landlock: enumerated at startup, one list per process, no per-call
+  decision and no per-call record. *Host-read content* is what the harness fetches itself:
+  instruction files (D32), a skill's body (D64), a URL through `fetch` (D39).
+- **What places a need is who chooses the path.** The model chooses → a root and a grant, because
+  the decision is a lookup over grants naming that root. The harness chooses → a host read, because
+  there is no model-chosen path to decide. That is why a skill's body is served by a tool rather
+  than by making `~/.agents` a root.
+- **Shared read-only content must not become a root.** A root is nameable by any policy in a
+  workspace, so a root for `~/.agents` would let a repository's grants file write
+  `fs-write = [{ root = "agents" }]` and rewrite the skills every workspace loads — authority over
+  shared files handed to whatever was last cloned. The same reason keeps toolchain directories as
+  paths in `[sandbox]` rather than roots (D62).
+- **`[sandbox] read` must not widen a tool.** It is one allow-list for a whole process with no
+  per-call decision, so wiring it into the file tools would make a directory readable with no
+  grant, no exclusion and no record of each access — a second source of authority for a decision,
+  which is the failure §5 exists to prevent. Verified as the boundary: `[sandbox] read = ["~/notes"]`
+  puts `~/notes` in `exec reads` and `bash` reads it, while `read` still refuses it as outside
+  every root. `tests/cli.rs` pins that.
+- **`bash` reaches more than the tools, and the model is told.** The enumeration is `~` minus the
+  withheld stores; the tools see the roots. So "the tool refused it" does not mean "it is
+  unreachable", and a command is the way to read such a file. The system prompt says this in those
+  words, and `check` prints the two sets under separate headings.
+- **Not done, on purpose:** listing or serving a skill's bundled files from the `skill` tool, which
+  would read inside the skill's directory without a grant (§8).
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

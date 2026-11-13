@@ -1118,3 +1118,72 @@ fn a_user_level_skill_loads_even_though_read_cannot_reach_it() {
     assert_ne!(out.status.code(), Some(0), "{}", text);
     assert!(text.contains("outside every root"), "{text}");
 }
+
+#[test]
+fn a_sandbox_path_reaches_commands_and_not_the_file_tools() {
+    // D65: the two sets are different on purpose. `[sandbox] read` is one allow-list per child
+    // process, with no per-call decision and no record per access; wiring it into the file tools
+    // would let a directory be read with no grant, no exclusion and no audit record. So a path
+    // there makes `bash` succeed and leaves `read` refusing, and this test exists to keep it that
+    // way if someone later finds the asymmetry surprising.
+    let env = Env::new();
+    let home = tempfile::tempdir().unwrap();
+    let notes = home.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("a.md"), "hi\n").unwrap();
+
+    // A path in [sandbox] read, not a root and not a grant.
+    let config = env.policy_path();
+    let mut doc: toml::Table = std::fs::read_to_string(&config).unwrap().parse().unwrap();
+    let sandbox = doc
+        .entry("sandbox")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    sandbox
+        .as_table_mut()
+        .unwrap()
+        .insert("read".into(), toml::Value::Array(vec!["~/notes".into()]));
+
+    let run = |args: &[&str]| {
+        let text = toml::to_string(&doc).unwrap();
+        std::fs::write(&config, &text).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_saddle"))
+            .arg("-C")
+            .arg(env.ws.path())
+            .args(args)
+            .env("HOME", home.path())
+            .env("XDG_STATE_HOME", env.xdg.path().join("state"))
+            .env("XDG_CONFIG_HOME", env.xdg.path().join("config"))
+            .output()
+            .unwrap()
+    };
+
+    let out = run(&[
+        "tool",
+        "read",
+        &format!(r#"{{"path":"{}"}}"#, notes.join("a.md").display()),
+    ]);
+    let text = stderr(&out);
+    assert_ne!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("outside every root"), "{text}");
+
+    let out = run(&["tool", "bash", r#"{"command":"head -1 ~/notes/a.md"}"#]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("hi"), "{text}");
+
+    // And `check` names it under exec reads, never under roots.
+    let out = run(&["check"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let notes = notes.display().to_string();
+    let roots = text
+        .split("grants")
+        .next()
+        .filter(|before| before.contains("roots"))
+        .unwrap_or_default();
+    assert!(text.contains("exec reads"), "{text}");
+    assert!(
+        !roots.contains(&notes),
+        "a sandbox path is not a root: {text}"
+    );
+    assert!(text.contains(&notes), "it is listed as exec reach: {text}");
+}

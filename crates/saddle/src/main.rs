@@ -697,7 +697,8 @@ fn check(dir: &std::path::Path, overrides: &config::Overrides) -> Result<ExitCod
         // still succeeds: no directory is invalid, the person decides (D60).
         println!("           in reach: {what}");
     }
-    println!("roots");
+    // D65: the file tools' namespace, which is not the same set as what a child may reach below.
+    println!("roots      what read, ls, find, grep, write and edit decide over");
     for (name, path) in setup.roots.iter() {
         let note = if name.as_str() == "tmp" {
             "  (per session)"

@@ -1156,15 +1156,26 @@ pub fn base_prompt(session: &Session, context: &[ContextFile]) -> String {
     );
     match &session.sandbox {
         Ok(_) => s.push_str(
-            "\nCommands run in a sandbox. They can reach only the roots below, they have no \
-             network access, and they are killed when their time limit passes. Do not try to \
+            // D65: two different sets, said plainly, because they are not the same and a model
+            // that assumes they are will either give up on a file bash can read or be surprised
+            // that read refuses one.
+            "\nCommands run in a sandbox: no network access, killed when their time limit passes. A \
+             command sees more of the machine than these tools do -- a toolchain, and your home \
+             directory with the credential stores left out -- while read, ls, find, grep, write and \
+             edit see only the roots below. So when a tool refuses a path that a command can read, \
+             that is the expected difference and a command is the way to read it. Do not try to \
              download packages or call web services from a command.\n",
         ),
         Err(reason) => {
             let _ = writeln!(s, "\nbash is unavailable in this session: {reason}.");
         }
     }
-    s.push_str("\nRoots:\n");
+    s.push_str(
+        "\nRoots, which the file tools decide over (D65). A tool path is absolute or relative to \
+         the workspace; it has to fall inside one of these, and the grant covering that root then \
+         decides, with its exclusions. A path outside every root is refused rather than asked \
+         about:\n",
+    );
     for (name, path) in session.roots().iter() {
         let _ = writeln!(s, "  {:<10} {}", name.as_str(), path.display());
     }

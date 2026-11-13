@@ -115,6 +115,16 @@ exists to prevent. Two concrete consequences worth restating, because they are t
 
 - The exec sandbox spec is *derived* from the same grants as the policy decisions. A principal without
   `net` must not reach the network through `curl` in a child process.
+- **A tool's path is a location under a root; a sandbox list is not a grant** (D65). The file tools
+  decide over `roots` (the workspace, `tmp`, `[roots]`): a path is mapped to the root containing it
+  and the grant on that root decides, so a path outside every root is refused as unaddressable.
+  `[sandbox] read`/`write` and the include rules are what a **child process** reaches under
+  landlock — one list per process, no per-call decision and no record per access — so they must
+  never widen `read`, `ls` or `grep`: that would be a second source of authority for a decision.
+  `bash` therefore reaches more than the tools (`~` minus the withheld stores), which the prompt
+  states in those words. Shared read-only content (`~/.agents`, a toolchain) must not become a root,
+  because a root is nameable by any workspace policy. Content the harness chooses — `AGENTS.md`, a
+  skill body, an attachment — is host-read with no root at all.
 - Built-in tools are not privileged. None of the ten is a bypass: each passes through the same
   engine, the same audit log and the same sandbox as a plugin call (D17). `ls`, `find` and `grep`
   decide and log one read of the directory they start from, then filter everything beneath it through

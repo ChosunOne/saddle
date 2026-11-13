@@ -63,14 +63,20 @@ fs-read  = [{{ root = "workspace", exclude = [".env*"], why = "reads the project
 fs-write = [{{ root = "workspace", exclude = [".env*"], why = "edits the project" }}]
 exec     = {{ why = "runs builds, tests and git" }}
 
-# Directories outside the workspace, by name, so a policy can grant them. Nothing is here by
-# default: a toolchain directory must not be one, because a root is something any policy in a
-# workspace can name, and `cargo` as a root meant a workspace policy could grant write to it and
-# plant a program in ~/.cargo/bin. Use a path in [sandbox] instead (D62).
+# Directories outside the workspace, by name, so a policy can grant them to the tools. A root is
+# what read, ls, find, grep, write and edit decide over: a tool path has to fall inside one, and the
+# grant naming that root decides. Nothing is here by default. Never make a toolchain directory or a
+# shared directory (~/.cargo, ~/.agents) a root: a root is nameable by any policy in a workspace, so
+# a repository's grants file could then grant write to it and plant a program that runs later,
+# outside the sandbox. A path in [sandbox] is not a substitute for a root -- it reaches commands,
+# not tools (D62, D65).
 # [roots]
 # notes = "~/notes"
-# Roots every sandboxed command gets on top of its policy's grants. Make only caches writable:
-# a command that can write ~/.cargo/bin could plant a program you later run outside the sandbox.
+
+# What a sandboxed command may reach beyond the built-in list. This is not a grant and does not
+# widen read, ls or grep: it is one allow-list per child process, with no per-call decision. Make
+# only caches writable: a command that can write ~/.cargo/bin could plant a program you later run
+# outside the sandbox.
 [sandbox]
 write = [{write}]
 
