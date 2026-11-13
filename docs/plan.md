@@ -1414,6 +1414,27 @@ one place at its root.
   mistyped name answers with the names that do exist, because a silent no-op is the failure mode
   this project keeps having to remove.
 
+**D70.** `/reload` reads the skills again, so one written during the session is advertised.
+
+- **Why it needs a command at all.** Discovery runs once at open (D67), so a skill added or edited
+  mid-session was invisible until restart — and skills are exactly the thing a person writes and then
+  wants to try. `/reload` runs the same discovery again, through the same gate, so the rules do not
+  change: every candidate is read as the agent, and every read is recorded.
+- **The prompt is rebuilt, not patched.** The advertised skills are part of the base prompt, so the
+  agent keeps the instruction files it was built from and rebuilds base and system from the session.
+  A patch would be a second way for the prompt to be assembled; rebuilding keeps one. Grants are
+  rebuilt with it, which is what D47 wants anyway.
+- **A reload changes what is advertised, not what was read.** A body already expanded into the
+  conversation stays there: it is a user message, and rewriting history to remove it would be a lie
+  about what the model was sent. The note says so rather than leaving the person to wonder why the
+  old text still seems to be in play.
+- **The interface gets the list back.** The agent thread owns the session, so it sends the new skills
+  to the interface, which replaces what the `/` menu and `/skill:` resolve against. Only there, and
+  only on request: the queue, turns and the rest of the loop are untouched.
+- **Both interfaces**, line mode included, because a piped prompt should not need a different
+  spelling. `/reload` waits for the turn to end, as `/tree` and `/compact` do: the agent thread is
+  mid-request, and discovery takes the session mutably.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

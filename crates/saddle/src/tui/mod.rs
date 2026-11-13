@@ -68,6 +68,8 @@ enum Command {
     /// Read the policy again after a grant changed, so the session acts on it and the model's next
     /// request carries the new grants (D47).
     ReloadPolicy,
+    /// Read the skills again and rebuild the prompt (D70).
+    ReloadSkills,
     SetCompaction(crate::compact::Settings),
     /// Continue a saved conversation, by its id in the session store (D53).
     Resume(String),
@@ -247,6 +249,29 @@ fn work(
                 Err(e) => {
                     let _ = events.send(AgentEvent::Note(format!(
                         "the policy was not reloaded, so this session keeps its grants: {e:#}"
+                    )));
+                }
+            },
+            Command::ReloadSkills => match session.reload_skills() {
+                Ok(()) => {
+                    // The advertised skills are part of the base prompt, so rebuilding it is what
+                    // makes the change visible to the model on its next request (D70).
+                    agent.rebuild_prompt(&session);
+                    let names = crate::skills::names(&session.skills);
+                    let _ = events.send(AgentEvent::Skills(session.skills.clone()));
+                    if !session.skill_notes.is_empty() {
+                        let _ = events.send(AgentEvent::SkillNotes(session.skill_notes.join("; ")));
+                    }
+                    // Said plainly, because a body already in the conversation is not touched: a
+                    // reload changes what is advertised, not what was read.
+                    let _ = events.send(AgentEvent::Note(format!(
+                        "skills reloaded: {names}; a skill already read into this conversation is \
+                         unchanged"
+                    )));
+                }
+                Err(e) => {
+                    let _ = events.send(AgentEvent::Note(format!(
+                        "the skills were not reloaded: {e:#}"
                     )));
                 }
             },
@@ -644,6 +669,10 @@ impl Controller {
                 // Reset here, before the turn starts, so an Esc pressed right after Enter counts.
                 cancel::reset();
                 self.send(app, Command::Prompt { text, skill: None });
+                Ok(())
+            }
+            Action::ReloadSkills => {
+                self.send(app, Command::ReloadSkills);
                 Ok(())
             }
             Action::Skill { name, prompt } => {

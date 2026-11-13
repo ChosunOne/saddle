@@ -583,6 +583,19 @@ impl Session {
         self.tool_roots.iter().any(|r| &r.name == root)
     }
 
+    /// Runs discovery again, so a skill added or edited during the session is advertised (D70).
+    ///
+    /// The same call as at open, so the rules do not change: each candidate is read through the gate
+    /// and every read is recorded. What it does not do is touch the conversation — a body already
+    /// loaded stays where it was put, which is why the note says so.
+    pub fn reload_skills(&mut self) -> Result<()> {
+        let cfg = self.setup.skills.clone();
+        let (found, notes) = crate::skills::discover(self, &cfg)?;
+        self.skills = found;
+        self.skill_notes = notes;
+        Ok(())
+    }
+
     /// Records that a skill's instructions entered the conversation (D69). Discovery already
     /// recorded the read and its hash; this is the other half — that the body was put in front of
     /// the model, and by which name.

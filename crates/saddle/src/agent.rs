@@ -179,6 +179,9 @@ pub struct Agent {
     system: String,
     /// The prompt without its grants section, so a reload replaces only that part.
     base: String,
+    /// The instruction files the prompt was built from, so it can be built again when discovery
+    /// changes without reading them a second time (D70).
+    context: Vec<ContextFile>,
     tools: Vec<ToolDef>,
     items: Vec<Item>,
     /// Model requests one prompt may take, or `None` for as many as it needs (D37).
@@ -213,6 +216,7 @@ impl Agent {
             provider,
             system,
             base,
+            context: Vec::new(),
             tools,
             items: Vec::new(),
             max_steps,
@@ -242,6 +246,19 @@ impl Agent {
     /// grants, and a call that was refused under the old ones may now be allowed.
     pub fn set_grants(&mut self, grants: String) {
         self.system = format!("{}{grants}", self.base);
+    }
+
+    /// The instruction files, for [`rebuild_prompt`](Self::rebuild_prompt).
+    pub fn set_context(&mut self, context: Vec<ContextFile>) {
+        self.context = context;
+    }
+
+    /// Builds the prompt again from the session, which is what makes a re-discovery visible: the
+    /// advertised skills are part of the base prompt, so a skill added or removed mid-session
+    /// changes the next request rather than waiting for a restart (D70).
+    pub fn rebuild_prompt(&mut self, session: &Session) {
+        self.base = base_prompt(session, &self.context);
+        self.system = system_prompt(session, &self.context);
     }
 
     /// A window the endpoint stated after this session started (D34). It goes to the provider, so

@@ -357,6 +357,8 @@ fn run_agent(
         Some(store),
         compact::Settings::from_config(&user.compaction),
     );
+    // Kept so the prompt can be rebuilt when discovery runs again (D70).
+    agent.set_context(context.clone());
 
     if interactive {
         tui::run(agent, session, header, paths, start, latest)?;
@@ -448,6 +450,20 @@ fn line_turn(
                 agent::Compacted::Cancelled => End::Cancelled,
                 agent::Compacted::Failed => End::Failed,
             }
+        } else if text == "/reload" {
+            // Read the skills again and rebuild the prompt, so a skill written during the session
+            // is advertised on the next request (D70). A body already read stays in the
+            // conversation, which is what the note says.
+            session.reload_skills()?;
+            agent.rebuild_prompt(session);
+            out.info(&format!(
+                "skills reloaded: {}; a skill already read into this conversation is unchanged",
+                skills::names(&session.skills)
+            ));
+            for note in &session.skill_notes {
+                out.info(note);
+            }
+            End::Answered
         } else if let Some(rest) = text.strip_prefix("/skill:") {
             // The same expansion as the TUI's, from the skills the session discovered (D69). A
             // prompt written as a skill command works the same way in line mode, so a piped prompt

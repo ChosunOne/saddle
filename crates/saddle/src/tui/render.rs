@@ -2247,15 +2247,17 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let rows: Vec<String> = screen(&terminal).lines().map(str::to_owned).collect();
-        // Status line at 19, editor at 16..=18, so the menu's last row is 15.
+        // Status line at 19, editor at 16..=18, so the menu's last row is 15. Four matches now
+        // (/login, /logout, /clone, /reload), so the list starts one row higher.
         assert!(rows[15].starts_with("╰ ↑↓ select"), "{}", rows[15]);
         assert!(
-            rows[12].contains("› /login") && rows[12].contains("choose a provider"),
+            rows[11].contains("› /login") && rows[11].contains("choose a provider"),
             "{}",
-            rows[12]
+            rows[11]
         );
-        assert!(rows[13].contains("  /logout [provider]"), "{}", rows[13]);
-        assert!(rows[14].contains("  /clone"), "{}", rows[14]);
+        assert!(rows[12].contains("  /logout [provider]"), "{}", rows[12]);
+        assert!(rows[13].contains("  /clone"), "{}", rows[13]);
+        assert!(rows[14].contains("  /reload"), "{}", rows[14]);
     }
 
     #[test]

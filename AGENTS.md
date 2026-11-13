@@ -100,7 +100,8 @@ tool and no tool exposes it (D45, D46), and a change there applies at once, with
 its next request (D47). Editing `saddle.toml` in a repository has no effect (D42, D43).
 `/skill:<name> <request>` loads a skill's instructions into the conversation followed by the
 request, in the TUI and in line mode, and is the only way to reach a skill marked
-`disable-model-invocation` (D69). `/thinking` (or shift+tab) changes the reasoning effort for the
+`disable-model-invocation` (D69). `/reload` reads the skills again and rebuilds the prompt, so one
+written mid-session is advertised (D70). `/thinking` (or shift+tab) changes the reasoning effort for the
 session (D57), `/name` and
 `/session` name and describe it (D55), and escape twice on an empty prompt opens the message tree (D54), where a prompt can be sent again to
 make another branch; `/clone` copies the branch into a separate session instead. There is no
@@ -149,7 +150,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D69 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D70 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
