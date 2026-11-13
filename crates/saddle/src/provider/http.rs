@@ -1304,6 +1304,8 @@ mod tests {
             search_url: None,
             headers: Default::default(),
             key_header: None,
+            cache_retention: Default::default(),
+            cache_affinity: false,
             auth: Auth::ApiKey,
             oauth: None,
         };

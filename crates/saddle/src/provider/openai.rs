@@ -7,13 +7,13 @@ use serde_json::{Value, json};
 
 use super::{
     Api, Conversation, Item, Part, Provider, ProviderConfig, Reply, Sink, Stop, ToolCall, Usage,
-    http,
+    http, prompt_cache_key, prompt_cache_retention,
 };
 use super::{Cancelled, SUMMARY_INTRO, sse};
 
 pub fn complete(p: &Provider, conv: &Conversation<'_>, sink: &mut dyn Sink) -> Result<Reply> {
     let url = format!("{}/chat/completions", p.config.base_url);
-    let headers = p.request_headers();
+    let headers = p.request_headers_for(conv.session);
     let events = http::stream(p, url, headers, &body(&p.config, conv))?;
     read_stream(events, sink)
 }
@@ -35,6 +35,14 @@ pub fn body(cfg: &ProviderConfig, conv: &Conversation<'_>) -> Value {
         "stream_options": { "include_usage": true },
         "messages": messages(conv.system, conv.items),
     });
+    // D100: one conversation, one cache. Both fields are OpenAI's own, so a server that is not
+    // OpenAI's gets neither.
+    if let Some(key) = prompt_cache_key(cfg, conv.session) {
+        body["prompt_cache_key"] = key.into();
+    }
+    if let Some(ttl) = prompt_cache_retention(cfg) {
+        body["prompt_cache_retention"] = ttl.into();
+    }
     // An empty list is left out: some servers reject `"tools": []`.
     if !tools.is_empty() {
         body["tools"] = tools.into();
@@ -311,7 +319,79 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{Api, ToolResult};
+    use crate::provider::{Api, Auth, CacheRetention, ToolResult};
+
+    fn config(base_url: &str) -> ProviderConfig {
+        ProviderConfig {
+            api: Api::Openai,
+            base_url: base_url.into(),
+            model: "m".into(),
+            api_key_env: None,
+            max_tokens: None,
+            context_window: None,
+            effort: None,
+            price: None,
+            usage_url: None,
+            search_url: None,
+            headers: Default::default(),
+            key_header: None,
+            cache_retention: Default::default(),
+            cache_affinity: false,
+            auth: Auth::ApiKey,
+            oauth: None,
+        }
+    }
+
+    #[test]
+    fn a_request_to_openai_carries_the_cache_key_and_no_other_server_does() {
+        // D100: without the key OpenAI routes a conversation's requests by whatever machine has
+        // room, so a warm prefix is luck. With it, every request of one conversation asks for the
+        // same cache - and nothing is added for a server that would refuse the field.
+        let items = [Item::User("hello".into())];
+        let conv = |session: &'static str| Conversation {
+            system: "s",
+            tools: &[],
+            items: &items,
+            session,
+        };
+        let sent = body(&config("https://api.openai.com/v1"), &conv("s1"));
+        assert_eq!(sent["prompt_cache_key"], "s1");
+        assert_eq!(
+            sent.get("prompt_cache_retention"),
+            None,
+            "short is the default: the field is left out"
+        );
+
+        let long = ProviderConfig {
+            cache_retention: CacheRetention::Long,
+            ..config("https://api.openai.com/v1")
+        };
+        assert_eq!(body(&long, &conv("s1"))["prompt_cache_retention"], "24h");
+        // Signed in, the endpoint rejects that field, so it is not sent.
+        let signed_in = ProviderConfig {
+            auth: Auth::Oauth,
+            ..long
+        };
+        assert_eq!(
+            body(&signed_in, &conv("s1")).get("prompt_cache_retention"),
+            None
+        );
+
+        // A compatible server gets neither field, whatever the configuration says.
+        let other = ProviderConfig {
+            cache_retention: CacheRetention::Long,
+            ..config("https://api.synthetic.new/openai/v1")
+        };
+        let sent = body(&other, &conv("s1"));
+        assert_eq!(sent.get("prompt_cache_key"), None);
+        assert_eq!(sent.get("prompt_cache_retention"), None);
+
+        // No saved conversation, no key.
+        assert_eq!(
+            body(&config("https://api.openai.com/v1"), &conv("")).get("prompt_cache_key"),
+            None
+        );
+    }
 
     #[test]
     fn an_attached_image_is_sent_as_a_data_url_beside_its_text() {

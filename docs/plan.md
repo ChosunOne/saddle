@@ -2489,6 +2489,44 @@ first kind and writes down the second rather than reading it blindly.
   dimension (D36). The first of them to be read has to come with the price dimension that reads it,
   or the number is recorded and the bill stays wrong anyway.
 
+**D100.** A conversation's requests ask for the same cache, where a provider lets them say so.
+
+A prompt cache holds a prefix on one machine, and a request meets it only if it is routed there.
+Until now saddle sent nothing that influenced routing, so a warm prefix was luck: the same
+conversation could be answered by a machine holding nothing, and the miss looked like the provider's
+per-node caching rather than like a request that never asked.
+
+- **The key is the session id.** `prompt_cache_key` on both OpenAI surfaces. It is stored with the
+  conversation, so a resumed conversation keeps the id it had (D53), and it is random, so two
+  sessions in one directory never share a key. A compaction carries it too: it is a request that
+  conversation paid for, and two compactions of one conversation share their prefix.
+- **Two headers say the same thing** to whatever sits in front of the API: `session-id` and
+  `x-client-request-id`, as Codex sends them. A header the configuration sets itself wins, as it
+  does for the key's own header (D84).
+- **Only OpenAI's own API gets any of it by default.** A compatible server implements the wire
+  format, not the routing (D84), and a strict one refuses a body field it does not know — which is
+  why the field is gated on the base URL at all. A proxy in front of `api.openai.com` is, as far as
+  saddle can tell, a different provider, and gets nothing.
+- **A table can force it**: `cache-affinity = true` sends the key and the headers whatever the host
+  is. That is the case the ChatGPT backend needs — its host is `chatgpt.com/backend-api/codex`, and
+  Codex sends these same fields there — and it is exactly the case this build cannot check, so it is
+  never assumed: a server that refused an unknown field would fail every request rather than lose a
+  cache hit. The lifetime stays off for an OAuth endpoint whatever the table says.
+- **`cache-retention = "long"` in a provider table** asks for `prompt_cache_retention: "24h"`. Off by
+  default: for the models that read this field the provider's own default is already 24 hours unless
+  the organization is under zero data retention, where asking is what gets refused. On GPT-5.6 and
+  later the lifetime is set by `prompt_cache_options.ttl` instead, so the field is meaningful only on
+  the earlier models that document it.
+- **Never on a ChatGPT sign-in.** That endpoint rejects the lifetime field, so a subscription
+  conversation carries the key and the headers and no lifetime. Its configured host is not
+  `api.openai.com` either, so today a subscription session sends none of the three until that host
+  is added.
+- **What is still not done**, deliberately: explicit cache breakpoints —
+  `prompt_cache_options.mode: "explicit"` with a `prompt_cache_breakpoint` after each tool result —
+  are what OpenAI recommends for a multi-turn agent, and are the one lever that helps a *branched*
+  conversation (D54) reuse a prefix up to the point it forked. Neither pi nor saddle places them, and
+  nothing here depends on it; it waits for a decision that can test it against a real endpoint.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

@@ -716,6 +716,8 @@ mod tests {
             search_url: None,
             headers: Default::default(),
             key_header: None,
+            cache_retention: Default::default(),
+            cache_affinity: false,
             auth: crate::provider::Auth::ApiKey,
             oauth: None,
         };
@@ -728,6 +730,7 @@ mod tests {
             system: "s",
             tools: &tools,
             items: &[],
+            session: "",
         };
         let b = body(&cfg(OFFICIAL_BASE_URL), &conv);
         assert_eq!(b["fallbacks"], "default");

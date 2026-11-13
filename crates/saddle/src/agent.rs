@@ -489,12 +489,16 @@ impl Agent {
         let text = compact::serialize(&prefix, room);
         let request = compact::request(&text, &session.setup.workspace, None);
         let twin = provider.twin();
+        // D100: a compaction is a request this conversation made, so it carries the same cache
+        // key: two of them share their prefix, and the key is what says so.
+        let saved = self.saved.clone().unwrap_or_default();
         let job = move || {
             let items = [Item::User(request)];
             let conv = Conversation {
                 system: compact::SYSTEM,
                 tools: &[],
                 items: &items,
+                session: &saved,
             };
             let reply = twin.complete(&conv, &mut Silent).map_err(|e| {
                 if e.is::<Cancelled>() {
@@ -815,6 +819,7 @@ impl Agent {
             system: compact::SYSTEM,
             tools: &[],
             items: &request,
+            session: self.saved.as_deref().unwrap_or_default(),
         };
         let result = provider.complete(&conv, &mut CompactSink { ui: &mut *ui });
         let reply = match result {
@@ -1292,6 +1297,7 @@ impl Agent {
             system: compact::SYSTEM,
             tools: &[],
             items: &request,
+            session: self.saved.as_deref().unwrap_or_default(),
         };
         let result = provider.complete(&conv, &mut CompactSink { ui: &mut *ui });
         let reply = match result {
@@ -1434,6 +1440,7 @@ impl Agent {
                 system: &self.system,
                 tools: &self.tools,
                 items: &self.items,
+                session: self.saved.as_deref().unwrap_or_default(),
             };
             let provider = self
                 .provider
@@ -1874,6 +1881,8 @@ mod tests {
                 search_url: None,
                 headers: Default::default(),
                 key_header: None,
+                cache_retention: Default::default(),
+                cache_affinity: false,
                 auth: crate::provider::Auth::ApiKey,
                 oauth: None,
             },

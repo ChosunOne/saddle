@@ -1155,6 +1155,8 @@ impl Controller {
                 search_url: None,
                 headers: Default::default(),
                 key_header: None,
+                cache_retention: provider::CacheRetention::Short,
+                cache_affinity: false,
                 auth: provider::Auth::ApiKey,
                 oauth: None,
             },

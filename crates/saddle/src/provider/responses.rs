@@ -15,7 +15,10 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::{Api, Conversation, Item, Part, Provider, Reply, Sink, Stop, ToolCall, Usage, http};
+use super::{
+    Api, Conversation, Item, Part, Provider, Reply, Sink, Stop, ToolCall, Usage, http,
+    prompt_cache_key, prompt_cache_retention,
+};
 use super::{Cancelled, SUMMARY_INTRO, sse};
 
 /// The Codex CLI version this client reports when it asks what the backend serves (D85).
@@ -31,7 +34,7 @@ pub const CLIENT_VERSION: &str = "0.169.0";
 
 pub fn complete(p: &Provider, conv: &Conversation<'_>, sink: &mut dyn Sink) -> Result<Reply> {
     let url = format!("{}/responses", p.config.base_url.trim_end_matches('/'));
-    let headers = p.request_headers();
+    let headers = p.request_headers_for(conv.session);
     let events = http::stream(p, url, headers, &body(&p.config, conv))?;
     read_stream(events, sink)
 }
@@ -57,6 +60,14 @@ pub fn body(cfg: &super::ProviderConfig, conv: &Conversation<'_>) -> Value {
         // The subscription endpoint keeps no conversation of its own; every request carries it.
         "store": false,
     });
+    // D100: the same key and lifetime the chat-completions surface sends, under this API's own
+    // names. Neither goes to a server that is not OpenAI's.
+    if let Some(key) = prompt_cache_key(cfg, conv.session) {
+        body["prompt_cache_key"] = key.into();
+    }
+    if let Some(ttl) = prompt_cache_retention(cfg) {
+        body["prompt_cache_retention"] = ttl.into();
+    }
     if !tools.is_empty() {
         body["tools"] = tools.into();
     }
@@ -409,6 +420,7 @@ fn message_of(error: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::CacheRetention;
     use crate::provider::{Auth, ProviderConfig, ToolDef, ToolResult};
 
     struct Script(Vec<(&'static str, &'static str)>);
@@ -448,9 +460,44 @@ mod tests {
             search_url: None,
             headers: Default::default(),
             key_header: None,
+            cache_retention: Default::default(),
+            cache_affinity: false,
             auth: Auth::ApiKey,
             oauth: None,
         }
+    }
+
+    #[test]
+    fn a_request_to_openai_carries_the_cache_key_and_no_other_server_does() {
+        // D100: the same two fields under this surface's own names. Its configured host is the
+        // subscription backend, not `api.openai.com`, so the default configuration carries neither.
+        let items = vec![Item::User("hello".into())];
+        let conv = |session: &'static str| Conversation {
+            system: "s",
+            tools: &[],
+            items: &items,
+            session,
+        };
+        assert_eq!(body(&config(), &conv("s1")).get("prompt_cache_key"), None);
+
+        let direct = ProviderConfig {
+            base_url: "https://api.openai.com/v1".into(),
+            ..config()
+        };
+        let sent = body(&direct, &conv("s1"));
+        assert_eq!(sent["prompt_cache_key"], "s1");
+        assert_eq!(sent.get("prompt_cache_retention"), None);
+
+        let long = ProviderConfig {
+            cache_retention: CacheRetention::Long,
+            ..direct
+        };
+        assert_eq!(body(&long, &conv("s1"))["prompt_cache_retention"], "24h");
+        assert_eq!(
+            body(&long, &conv("")).get("prompt_cache_key"),
+            None,
+            "no saved conversation, nothing to route"
+        );
     }
 
     #[test]
@@ -479,6 +526,7 @@ mod tests {
             system: "be brief",
             tools: &[],
             items: &items,
+            session: "",
         };
         let sent_body = body(&config(), &conv);
         assert_eq!(sent_body["instructions"], "be brief");
@@ -508,6 +556,7 @@ mod tests {
                 system: "s",
                 tools: &tools,
                 items: &items,
+                session: "",
             },
         );
         assert_eq!(body["tools"][0]["type"], "function");
@@ -701,6 +750,7 @@ mod tests {
             system: "s",
             tools: &[],
             items: &items,
+            session: "",
         };
         let plain = body(&config(), &conv);
         assert_eq!(plain["reasoning"]["summary"], "auto");

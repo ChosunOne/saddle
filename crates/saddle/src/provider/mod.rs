@@ -474,6 +474,9 @@ pub struct Conversation<'a> {
     pub system: &'a str,
     pub tools: &'a [ToolDef],
     pub items: &'a [Item],
+    /// The saved conversation's id, which is also its prompt cache key (D100). Empty when nothing
+    /// has been saved, which is when there is no cache to route to.
+    pub session: &'a str,
 }
 
 /// Receives a reply while it streams in.
@@ -530,6 +533,11 @@ pub struct ProviderEntry {
     /// OpenRouter's `HTTP-Referer` and `X-Title`, a gateway's routing header, an account id (D84).
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// How long to ask OpenAI to keep a cached prefix: `"short"` (the default) sends nothing and
+    /// takes whatever the provider does, `"long"` asks for twenty-four hours (D100).
+    pub cache_retention: Option<CacheRetention>,
+    /// Send the cache key and headers to this provider whatever its host is (D100).
+    pub cache_affinity: Option<bool>,
     /// The header the API key goes in, when it is not the one its `api` implies. A JSON body with
     /// an `Authorization: Bearer` key is the norm; Azure wants `api-key` and no prefix, which is the
     /// case this exists for (D84).
@@ -542,6 +550,19 @@ pub struct ProviderEntry {
 }
 
 /// How a provider authenticates (D85).
+/// How long a provider should keep a cached prefix, where a request may ask (D100).
+///
+/// [`Short`](CacheRetention::Short) sends nothing, which is the provider's own default: for OpenAI
+/// before GPT-5.6 that is already 24 hours unless the organization is under zero data retention, so
+/// asking for the long lifetime is an opt-in rather than something to do to everyone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CacheRetention {
+    #[default]
+    Short,
+    Long,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Auth {
@@ -571,6 +592,14 @@ pub struct ProviderConfig {
     pub headers: BTreeMap<String, String>,
     /// The header the key goes in, when it is not the default for this `api` (D84).
     pub key_header: Option<String>,
+    /// How long to ask the provider to keep a cached prefix (D100).
+    pub cache_retention: CacheRetention,
+    /// Send the cache-affinity key and headers even to a host that is not `api.openai.com` (D100).
+    ///
+    /// For an endpoint that is OpenAI's without being that host — the ChatGPT backend this build
+    /// already talks to — where the fields are probably accepted and cannot be checked from here.
+    /// Off by default, because a server that refuses an unknown field would fail every request.
+    pub cache_affinity: bool,
     /// How the provider authenticates, and where, when it is OAuth (D85).
     pub auth: Auth,
     pub oauth: Option<crate::provider::oauth::Flow>,
@@ -724,6 +753,14 @@ pub fn endpoint(name: &str, user: &BTreeMap<String, ProviderEntry>) -> Result<Pr
             .map(|e| e.headers.clone())
             .or_else(|| preset.map(|e| e.headers.clone()))
             .unwrap_or_default(),
+        cache_retention: mine
+            .and_then(|e| e.cache_retention)
+            .or_else(|| preset.and_then(|e| e.cache_retention))
+            .unwrap_or_default(),
+        cache_affinity: mine
+            .and_then(|e| e.cache_affinity)
+            .or_else(|| preset.and_then(|e| e.cache_affinity))
+            .unwrap_or(false),
         key_header: pick(|e| &e.key_header).filter(|h| !h.is_empty()),
         auth: mine
             .and_then(|e| e.auth)
@@ -786,6 +823,8 @@ pub fn catalog(user: &BTreeMap<String, ProviderEntry>) -> Vec<(String, ProviderE
                 m.headers.clone()
             },
             key_header: m.key_header.clone().or(base.key_header),
+            cache_retention: m.cache_retention.or(base.cache_retention),
+            cache_affinity: m.cache_affinity.or(base.cache_affinity),
             auth: m.auth.or(base.auth),
             oauth: m.oauth.clone().or(base.oauth),
         }
@@ -928,6 +967,65 @@ pub struct Stated {
 /// The prefix is decided by the header, not by the wire format: a key in `authorization` is a bearer
 /// token, which is what every OAuth token here is too, and a key in a header the server named is
 /// sent as it is. That is what Azure's `api-key` needs.
+/// Whether a base URL points at OpenAI's own API, which is the only place these fields are
+/// documented (D100).
+///
+/// A compatible server implements the chat-completions format, not OpenAI's cache-routing fields,
+/// and a strict one refuses a body field it does not know. So the fields go where the docs are —
+/// and a proxy in front of `api.openai.com` is, as far as this can tell, a different provider.
+fn openai_api(base_url: &str) -> bool {
+    let rest = base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest);
+    let host = rest.split('/').next().unwrap_or_default();
+    host.split(':')
+        .next()
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("api.openai.com")
+}
+
+/// Whether this provider should be asked to route a conversation to one cache (D100).
+///
+/// OpenAI's own API is the documented case. Anything else has to say so in its table, because the
+/// fields are not part of the compatible format and a strict server refuses what it does not know.
+fn routes_cache(config: &ProviderConfig) -> bool {
+    config.cache_affinity || openai_api(&config.base_url)
+}
+
+/// The key that ties one conversation's requests to one cache (D100).
+///
+/// The session id is the key: it is stored with the conversation, so a resumed conversation keeps
+/// the one it had, and it is random, so two sessions in one directory never share a key. OpenAI
+/// routes requests carrying the same key to the machine holding that prefix, which is what makes a
+/// warm cache likely rather than lucky.
+pub fn prompt_cache_key<'a>(config: &ProviderConfig, session: &'a str) -> Option<&'a str> {
+    (routes_cache(config) && !session.is_empty()).then_some(session)
+}
+
+/// How long to ask for the prefix to be kept, when the configuration asks for the long lifetime
+/// (D100).
+///
+/// The ChatGPT sign-in endpoint rejects this field, so it is only ever sent with an API key.
+pub fn prompt_cache_retention(config: &ProviderConfig) -> Option<&'static str> {
+    (routes_cache(config)
+        && config.auth == Auth::ApiKey
+        && config.cache_retention == CacheRetention::Long)
+        .then_some("24h")
+}
+
+/// The headers Codex sends beside the key, for the same routing purpose (D100).
+///
+/// They are a hint rather than a field of the request, so a server that ignores them loses nothing.
+pub fn affinity_headers(config: &ProviderConfig, session: &str) -> Vec<(String, String)> {
+    if !routes_cache(config) || session.is_empty() {
+        return Vec::new();
+    }
+    ["session-id", "x-client-request-id"]
+        .into_iter()
+        .map(|name| (name.to_owned(), session.to_owned()))
+        .collect()
+}
+
 pub fn request_headers(config: &ProviderConfig, key: Option<&str>) -> Vec<(String, String)> {
     let mut headers = Vec::new();
     let default = match config.api {
@@ -1165,6 +1263,21 @@ impl Provider {
         headers
     }
 
+    /// [`Provider::request_headers`] plus the cache affinity a session's requests share (D100).
+    ///
+    /// A usage or catalogue request is not part of the conversation and sends neither: they are
+    /// about which machine answers a prompt, and neither of those is a prompt.
+    pub fn request_headers_for(&self, session: &str) -> Vec<(String, String)> {
+        let mut headers = self.request_headers();
+        for (name, value) in affinity_headers(&self.config, session) {
+            // A header the config sets itself wins, as it does for the key's own header.
+            if !headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                headers.push((name, value));
+            }
+        }
+        headers
+    }
+
     /// Usage uses the same refreshed credential and account headers as model requests (D93).
     pub fn usage(&self, url: &str) -> Result<Value, ModelsError> {
         self.refresh_tokens()
@@ -1356,9 +1469,175 @@ model = "qwen"
             search_url: None,
             headers: BTreeMap::new(),
             key_header: None,
+            cache_retention: CacheRetention::Short,
+            cache_affinity: false,
             auth: Auth::ApiKey,
             oauth: None,
         }
+    }
+
+    #[test]
+    fn a_conversation_routes_its_requests_to_one_cache_only_on_openais_own_api() {
+        // D100: the key is the session id, so a resumed conversation keeps its cache and two
+        // sessions in one directory never share one. The fields and headers are OpenAI's own, and
+        // go only where they are documented: a compatible server implements the wire format, not
+        // the routing, and a strict one refuses a body field it does not know.
+        let openai = config("gpt", "https://api.openai.com/v1");
+        assert_eq!(prompt_cache_key(&openai, "s1"), Some("s1"));
+        assert_eq!(
+            prompt_cache_retention(&openai),
+            None,
+            "short is the default: a request that says nothing takes the provider's own lifetime"
+        );
+        assert_eq!(
+            affinity_headers(&openai, "s1"),
+            vec![
+                ("session-id".to_owned(), "s1".to_owned()),
+                ("x-client-request-id".to_owned(), "s1".to_owned()),
+            ]
+        );
+
+        // The long lifetime is opt-in, and only with an API key: the ChatGPT sign-in endpoint
+        // rejects the field, so a subscription conversation must not carry it.
+        let long = ProviderConfig {
+            cache_retention: CacheRetention::Long,
+            ..config("gpt", "https://api.openai.com/v1")
+        };
+        assert_eq!(prompt_cache_retention(&long), Some("24h"));
+        let signed_in = ProviderConfig {
+            auth: Auth::Oauth,
+            ..long.clone()
+        };
+        assert_eq!(prompt_cache_retention(&signed_in), None);
+        assert_eq!(
+            prompt_cache_key(&signed_in, "s1"),
+            Some("s1"),
+            "the key is accepted"
+        );
+
+        for other in [
+            "https://api.synthetic.new/openai/v1",
+            "https://gateway.test/v1",
+            "http://localhost:8080/v1",
+        ] {
+            let cfg = config("m", other);
+            assert_eq!(prompt_cache_key(&cfg, "s1"), None, "{other}");
+            assert_eq!(prompt_cache_retention(&cfg), None, "{other}");
+            assert!(affinity_headers(&cfg, "s1").is_empty(), "{other}");
+        }
+
+        // Nothing saved means nothing to route.
+        assert_eq!(prompt_cache_key(&openai, ""), None);
+        assert!(affinity_headers(&openai, "").is_empty());
+
+        // An OpenAI endpoint that is not that host has to ask: the ChatGPT backend Codex sends
+        // these same fields to is the case this exists for, and a refusal there would fail every
+        // request, so it is never assumed.
+        let subscription = ProviderConfig {
+            cache_affinity: true,
+            ..config("m", "https://chatgpt.com/backend-api/codex")
+        };
+        assert_eq!(prompt_cache_key(&subscription, "s1"), Some("s1"));
+        assert_eq!(affinity_headers(&subscription, "s1").len(), 2);
+    }
+
+    #[test]
+    fn the_affinity_headers_ride_on_a_model_request_and_nowhere_else() {
+        // D100: the key says which cache; these two say the same thing to the routing layer, which
+        // is what a gateway or a proxy in front of the API would be looking at.
+        let p = Provider::new(
+            "openai",
+            config("gpt", "https://api.openai.com/v1"),
+            Some("sk-1"),
+            &Reported::default(),
+        );
+        let sent = p.request_headers_for("s1");
+        assert!(sent.contains(&("session-id".to_owned(), "s1".to_owned())));
+        assert!(sent.contains(&("x-client-request-id".to_owned(), "s1".to_owned())));
+        assert!(
+            sent.contains(&("authorization".to_owned(), "Bearer sk-1".to_owned())),
+            "the credential is still there"
+        );
+        // A usage or catalogue request is not part of the conversation, so it carries neither.
+        assert!(
+            !p.request_headers()
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("session-id"))
+        );
+
+        // A server that is not OpenAI's is not asked to route anything.
+        let other = Provider::new(
+            "synthetic",
+            config("m", "https://api.synthetic.new/openai/v1"),
+            Some("k"),
+            &Reported::default(),
+        );
+        assert!(
+            !other
+                .request_headers_for("s1")
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("session-id"))
+        );
+
+        // A header the configuration sets itself wins, as it does for the key's own header.
+        let mut headers = BTreeMap::new();
+        headers.insert("session-id".to_owned(), "mine".to_owned());
+        let own = Provider::new(
+            "openai",
+            ProviderConfig {
+                headers,
+                ..config("gpt", "https://api.openai.com/v1")
+            },
+            Some("sk-1"),
+            &Reported::default(),
+        );
+        let sent = own.request_headers_for("s1");
+        assert_eq!(
+            sent.iter()
+                .filter(|(n, _)| n.eq_ignore_ascii_case("session-id"))
+                .count(),
+            1
+        );
+        assert!(sent.contains(&("session-id".to_owned(), "mine".to_owned())));
+    }
+
+    #[test]
+    fn the_long_cache_lifetime_is_a_configuration_choice() {
+        // D100: it is not on by default, because for OpenAI before GPT-5.6 the provider's own
+        // default is already 24 hours unless the organization is under zero data retention - and
+        // there, asking for it is what gets refused.
+        let user: BTreeMap<String, ProviderEntry> = toml::from_str(
+            r#"
+[openai]
+cache-retention = "long"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            endpoint("openai", &user).unwrap().cache_retention,
+            CacheRetention::Long
+        );
+        assert_eq!(
+            endpoint("synthetic", &BTreeMap::new())
+                .unwrap()
+                .cache_retention,
+            CacheRetention::Short
+        );
+        // Forcing the affinity fields onto an endpoint that is not `api.openai.com` is the other
+        // half: the ChatGPT backend, which cannot be checked from here (D100).
+        assert!(
+            !endpoint("openai-chatgpt", &BTreeMap::new())
+                .unwrap()
+                .cache_affinity
+        );
+        let forced: BTreeMap<String, ProviderEntry> = toml::from_str(
+            r#"
+[openai-chatgpt]
+cache-affinity = true
+"#,
+        )
+        .unwrap();
+        assert!(endpoint("openai-chatgpt", &forced).unwrap().cache_affinity);
     }
 
     #[test]
