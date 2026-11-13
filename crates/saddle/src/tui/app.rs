@@ -57,6 +57,9 @@ pub enum AgentEvent {
     Models(u64, Result<Vec<String>, ModelsError>),
     /// The code to type for a device sign-in: where to go, and what to enter there (D85).
     DeviceCode(u64, Result<(String, String), String>),
+    /// A link could not be opened, with the reason (D86). Sent from the thread that watched the
+    /// opener, so the failure a person needs to see is not lost with the click.
+    Unopened(String),
     /// That sign-in finished, or failed with a reason to show (D85).
     SignedIn(u64, Result<(), String>),
     /// A listing asked for at session start stated a window for the current model, so the session
@@ -1248,18 +1251,6 @@ impl App {
             || self.permissions.is_some()
             || self.themes.is_some();
         match ev.kind {
-            // A click on the sign-in link is the one thing a dialog offers the mouse: it is drawn
-            // underlined to invite it, and a terminal gives no other way to follow it (D86).
-            MouseEventKind::Down(MouseButton::Left)
-                if self
-                    .open_url_at
-                    .is_some_and(|r| r.contains(Position::new(ev.column, ev.row))) =>
-            {
-                self.login
-                    .as_ref()
-                    .and_then(|login| login.link())
-                    .map(Action::OpenUrl)
-            }
             MouseEventKind::ScrollUp => {
                 self.scroll_by(3);
                 None
@@ -1292,6 +1283,13 @@ impl App {
                 self.extend(ev)
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                // A click that never moved is a click, not a selection: on the sign-in link that
+                // means follow it (D86). Deciding here rather than on the way down is what lets a
+                // drag that *starts* on the link select it like any other text, which it could not
+                // do while the press was swallowed by the link (D87).
+                let on_link = self
+                    .open_url_at
+                    .is_some_and(|r| r.contains(Position::new(ev.column, ev.row)));
                 let mut sel = self.selection?;
                 if !sel.dragging {
                     return None;
@@ -1301,7 +1299,12 @@ impl App {
                 if sel.is_empty() {
                     // A click that selected nothing is not a copy; drop the empty highlight.
                     self.selection = None;
-                    return None;
+                    return on_link.then(|| {
+                        self.login
+                            .as_ref()
+                            .and_then(|login| login.link())
+                            .map(Action::OpenUrl)
+                    })?;
                 }
                 self.selected_text()
                     .map(|text| Action::Copy(text, "the selection"))
@@ -1734,6 +1737,14 @@ impl App {
                     login.models(id, result);
                 }
             }
+            AgentEvent::Unopened(why) => {
+                // Into the dialog when one is open, because a dialog covers the transcript and a note
+                // pushed there is a message nobody can read (D86).
+                match &mut self.login {
+                    Some(login) => login.device.error = Some(why),
+                    None => self.push(Entry::Note(NoteKind::Warn, display(&why))),
+                }
+            }
             AgentEvent::DeviceCode(id, result) => {
                 let code = match &result {
                     Ok((_, code)) => Some(code.clone()),
@@ -1940,6 +1951,48 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn a_link_that_could_not_be_opened_says_so_where_the_person_is_looking() {
+        // D86: a note goes into the transcript, and a dialog covers it, so the reason a click did
+        // nothing was unreachable exactly when it was needed.
+        let mut app = app();
+        let choice = crate::tui::login::Choice {
+            name: "openai-chatgpt".into(),
+            detail: String::new(),
+            status: "not signed in".into(),
+            needs_key: false,
+            has_key: false,
+            model: None,
+            custom: false,
+            oauth: true,
+        };
+        let mut login = crate::tui::login::Login::new(
+            vec![choice],
+            vec![],
+            Some("openai-chatgpt"),
+            true,
+            "auth.json".into(),
+        );
+        let Some(crate::tui::login::Outcome::SignIn(id, _)) = login.take_pending() else {
+            panic!("a sign-in to start");
+        };
+        login.device_code(id, Ok(("https://auth.test/device".into(), "AB12".into())));
+        app.open_login(login);
+        let why = "this process has no display (DISPLAY and WAYLAND_DISPLAY are unset)";
+        assert_eq!(app.agent(AgentEvent::Unopened(why.into())), None);
+        let login = app.login.as_ref().unwrap();
+        assert_eq!(login.device.error.as_deref(), Some(why));
+        // The address and code stay: what failed is the browser, not the sign-in.
+        assert_eq!(login.device.code.as_deref(), Some("AB12"));
+        assert_eq!(login.link().as_deref(), Some("https://auth.test/device"));
+
+        // With no dialog open it is an ordinary note, which is visible in the transcript.
+        app.login = None;
+        let before = app.entries.len();
+        app.agent(AgentEvent::Unopened(why.into()));
+        assert!(app.entries.len() > before);
     }
 
     #[test]

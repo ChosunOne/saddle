@@ -58,6 +58,30 @@ pub fn is_link(url: &str) -> bool {
         && !lower.contains(char::is_whitespace)
 }
 
+/// Why this process has no display to open a browser on, when it has none.
+///
+/// A program started where there is no graphical session fails with `no method available for
+/// opening` at best, and says nothing at all where `xdg-open` is a shell script with no handler
+/// behind it. Naming the missing variables is the difference between "the click did nothing" and
+/// "this terminal belongs to someone else's session" (D86).
+pub fn no_display(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let set = |name: &str| get(name).is_some_and(|v| !v.trim().is_empty());
+    match std::env::consts::OS {
+        // A window server is the session, and the variables name it.
+        "linux" | "freebsd" | "openbsd" | "netbsd" => {
+            if set("DISPLAY") || set("WAYLAND_DISPLAY") {
+                return None;
+            }
+            Some(
+                "this process has no display (DISPLAY and WAYLAND_DISPLAY are unset), so no browser \
+                 can be started here"
+                    .to_owned(),
+            )
+        }
+        _ => None,
+    }
+}
+
 /// Opens `url` in the default browser, answering with the program that took it.
 ///
 /// A program that starts and then fails (no desktop handler, no display, a `$BROWSER` that is not a
@@ -66,6 +90,9 @@ pub fn is_link(url: &str) -> bool {
 pub fn open(url: &str, report: &Report) -> Result<String> {
     if !is_link(url) {
         bail!("not a web address: {url}");
+    }
+    if let Some(why) = no_display(&|k| std::env::var(k).ok()) {
+        bail!("{why}");
     }
     let browser = std::env::var("BROWSER").ok();
     let mut tried = Vec::new();
@@ -225,11 +252,22 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // SAFETY: the only test in this file that touches the environment, and it sets one variable.
-        unsafe { std::env::set_var("BROWSER", script.to_string_lossy().into_owned()) };
+        // SAFETY: the tests that touch the environment hold `ENV`, and set only these two.
+        let was = std::env::var_os("DISPLAY");
+        unsafe {
+            std::env::set_var("BROWSER", script.to_string_lossy().into_owned());
+            // A display is what makes opening a browser meaningful; this sandbox has none.
+            std::env::set_var("DISPLAY", ":0");
+        }
         let quiet: Report = Arc::new(|_| {});
         let answered = open("https://auth.test/device", &quiet);
-        unsafe { std::env::remove_var("BROWSER") };
+        unsafe {
+            std::env::remove_var("BROWSER");
+            match was {
+                Some(v) => std::env::set_var("DISPLAY", v),
+                None => std::env::remove_var("DISPLAY"),
+            }
+        }
         assert_eq!(answered.unwrap(), script.to_string_lossy());
         // The browser is not waited for, so the file may be written just after `open` returns.
         let mut seen = String::new();
@@ -241,6 +279,30 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(seen.trim(), "https://auth.test/device");
+    }
+
+    #[test]
+    fn a_process_with_no_display_says_so_before_trying() {
+        // D86: the case that had the click do nothing at all. A terminal on another user's session
+        // has no DISPLAY and no WAYLAND_DISPLAY, and every opener fails there; saying which
+        // variable is missing is the whole diagnosis.
+        let none = |_: &str| None;
+        let empty = |_: &str| Some(String::new());
+        let x11 = |k: &str| (k == "DISPLAY").then(|| ":0".to_owned());
+        let wayland = |k: &str| (k == "WAYLAND_DISPLAY").then(|| "wayland-0".to_owned());
+        // The test machine is linux, and the check only applies where a display is a variable.
+        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+            assert!(no_display(&none).is_some());
+            assert!(
+                no_display(&empty).is_some(),
+                "an empty value is not a display"
+            );
+            assert!(no_display(&x11).is_none());
+            assert!(no_display(&wayland).is_none());
+            let why = no_display(&none).unwrap();
+            assert!(why.contains("DISPLAY"), "{why}");
+            assert!(why.contains("WAYLAND_DISPLAY"), "{why}");
+        }
     }
 
     #[test]
@@ -261,10 +323,20 @@ mod tests {
         let said: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = said.clone();
         let report: Report = Arc::new(move |why: String| sink.lock().unwrap().push(why));
-        // SAFETY: this test sets the one variable, and removes it again before returning.
-        unsafe { std::env::set_var("BROWSER", script.to_string_lossy().into_owned()) };
+        // SAFETY: the tests that touch the environment hold `ENV`, and set only these two.
+        let was = std::env::var_os("DISPLAY");
+        unsafe {
+            std::env::set_var("BROWSER", script.to_string_lossy().into_owned());
+            std::env::set_var("DISPLAY", ":0");
+        }
         let started = open("https://auth.test/device", &report);
-        unsafe { std::env::remove_var("BROWSER") };
+        unsafe {
+            std::env::remove_var("BROWSER");
+            match was {
+                Some(v) => std::env::set_var("DISPLAY", v),
+                None => std::env::remove_var("DISPLAY"),
+            }
+        }
         assert!(started.is_ok(), "the program did start");
         // The report comes from the watching thread, so it is waited for.
         let mut seen = Vec::new();

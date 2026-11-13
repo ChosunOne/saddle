@@ -927,7 +927,7 @@ impl Controller {
                 // see (D86).
                 let events = self.events.clone();
                 let say: browser::Report = std::sync::Arc::new(move |why: String| {
-                    let _ = events.send(AgentEvent::Note(why));
+                    let _ = events.send(AgentEvent::Unopened(why));
                 });
                 browser::open_or_say(&url, &say);
                 Ok(())
@@ -1101,6 +1101,7 @@ impl Controller {
                 search_url: None,
                 headers: Default::default(),
                 key_header: None,
+                models: Vec::new(),
                 auth: provider::Auth::ApiKey,
                 oauth: None,
             },

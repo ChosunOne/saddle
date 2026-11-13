@@ -2011,6 +2011,13 @@ than deltas on a choice. That is a second client (`provider/responses.rs`), not 
   URLs, client id, scopes and redirect. `openai-chatgpt` is a preset filling it in, and an empty
   table is *incomplete* rather than silently OpenAI's — a provider that says `auth = "oauth"` and
   nothing else must not log in to another service.
+- **A subscription backend serves no model listing, so the preset ships one.** The one route
+  (`/backend-api/codex/models`, and `/backend-api/models`) is GET-only — a POST answers 405 — and
+  with a valid token it wants a `client_version` that is documented nowhere, answering FastAPI's
+  validation body instead of a list. That body is what `/login` used to show as a fragment of JSON.
+  The names are therefore the catalogue the service publishes, on the preset's `models`; a user's
+  own `models = [...]` replaces them, a listing that does work still wins over them, and a name
+  typed by hand still works when neither exists.
 - **There are two redirect addresses, and a device flow must exchange with its own.**
   `redirect-uri` is where a browser flow's code comes back (`http://localhost:1455/auth/callback`);
   `device-redirect-uri` is the address the server issued a device code for
@@ -2072,6 +2079,19 @@ unusable, which is what "I can't click the link and I can't select it" was.
   `xdg-open`, `gio open`, `sensible-browser`, `open`, or the Windows handler. The address is one
   argument and there is no shell, so nothing in a URL is read as syntax; only `http`/`https` is
   opened, because anything else is not an address a sign-in put there.
+- **A click is a press and a release in the same place.** Deciding on the press meant a drag that
+  *started* on the link opened the browser instead of selecting it, so the link was the one piece of
+  text in a dialog that could not be selected by dragging it. The press starts a selection like any
+  other; the release decides: no movement means a click on the link, and follows it, while movement
+  is a selection of the link like any other text (D87).
+- **The reason a click failed goes into the dialog, not the transcript.** A note is a transcript
+  entry, and a dialog covers the transcript, so the one message a person needs was pushed where they
+  could not see it. A report from the opener is a dialog error while a dialog is open, and an
+  ordinary note otherwise.
+- **A process with no display says so instead of trying.** Where `DISPLAY` and `WAYLAND_DISPLAY` are
+  both unset — a terminal on another user's session, a service, an ssh login — every opener fails
+  and the best of them fails silently. That is diagnosed before a program is started, because it is
+  the one failure no program will explain.
 - **A program that starts and then fails is reported, not swallowed.** `xdg-open` with no desktop
   handler behind it starts, exits 3 and draws nothing, so a click looked like it did nothing at all.
   The child's exit status and its first line of stderr are watched on a thread — not waited for, a
@@ -2112,9 +2132,10 @@ text worth taking away: a model name, a policy path, the rule that is denying so
   Same appearance, one implementation, and it works for every dialog without touching any of them.
 - **Closing a dialog drops the selection.** Its line numbers mean nothing in the transcript, so
   keeping one would highlight unrelated text and copy the wrong thing.
-- **D86's click target stays.** A link is the one thing in a dialog where the gesture is "follow
-  this", not "take this", so it is hit-tested before the selection begins. The two do not fight:
-  the link opens, its neighbours select.
+- **D86's click target stays, and the link is selectable too.** A link is the one thing in a dialog
+  where the gesture is "follow this" rather than "take this", so it is hit-tested — but on the
+  release, not the press, which is what lets a drag that starts on the link select it like any other
+  text (D86). The two do not fight: a click follows the link, a drag selects it.
 - **Deferred:** keyboard-only selection inside a dialog (no anchor is set without a mouse); the `/`
   menu, which is a popup over the editor rather than a dialog and is filtered rather than read.
 

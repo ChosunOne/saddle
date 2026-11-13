@@ -258,6 +258,27 @@ pub struct ModelInfo {
 /// The windows it carries are where a real context limit comes from, so `/login` and `/model`
 /// cache them (D34).
 pub fn list_models(p: &super::Provider) -> Result<Vec<ModelInfo>, ModelsError> {
+    match list_from_endpoint(p) {
+        Ok(models) if !models.is_empty() => Ok(models),
+        // A server that lists nothing, or refuses to, still has the names the provider shipped:
+        // a subscription backend serves no listing at all, and `/login` needs a picker either way
+        // (D85).
+        _ if !p.config.models.is_empty() => Ok(p
+            .config
+            .models
+            .iter()
+            .map(|id| ModelInfo {
+                id: id.clone(),
+                context_window: None,
+                price: None,
+            })
+            .collect()),
+        Ok(models) => Ok(models),
+        Err(e) => Err(e),
+    }
+}
+
+fn list_from_endpoint(p: &super::Provider) -> Result<Vec<ModelInfo>, ModelsError> {
     let config = &p.config;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
@@ -831,13 +852,36 @@ fn backoff(attempt: u32, retry_after: Option<u64>) -> Duration {
 fn error_message(text: &str) -> String {
     let parsed: Option<Value> = serde_json::from_str(text).ok();
     let message = parsed.as_ref().and_then(|v| {
-        v["error"]["message"]
+        let direct = v["error"]["message"]
             .as_str()
             .or_else(|| v["message"].as_str())
             .or_else(|| v["error"].as_str())
-            .map(str::to_owned)
+            // FastAPI's shape, which is what the subscription backend speaks: `detail` is a string,
+            // or a list of `{loc, msg}` entries that reads as a fragment of JSON if it is not
+            // unpacked (D85).
+            .or_else(|| v["detail"].as_str());
+        if let Some(m) = direct {
+            return Some(m.to_owned());
+        }
+        let first = &v["detail"][0];
+        let msg = first["msg"].as_str()?;
+        let field = first["loc"]
+            .as_array()
+            .and_then(|l| l.last())
+            .and_then(|f| f.as_str())
+            .unwrap_or_default();
+        Some(if field.is_empty() {
+            msg.to_owned()
+        } else {
+            format!("{field}: {msg}")
+        })
     });
     let mut m = message.unwrap_or_else(|| text.trim().to_owned());
+    // A body that is not JSON at all may still be several lines of it; one line reads better in a
+    // dialog that shows one.
+    if m.contains('\n') && m.lines().count() > 1 {
+        m = m.split_whitespace().collect::<Vec<_>>().join(" ");
+    }
     if m.len() > 2000 {
         let mut cut = 2000;
         while !m.is_char_boundary(cut) {
@@ -1161,6 +1205,47 @@ mod tests {
         assert_eq!(quota_from(&other), None);
     }
 
+    /// A provider pointed at a port nothing listens on, so a listing fails without a network.
+    fn provider_config(base_url: &str) -> super::super::ProviderConfig {
+        super::super::ProviderConfig {
+            api: super::super::Api::Openai,
+            base_url: base_url.into(),
+            model: "m".into(),
+            api_key_env: None,
+            max_tokens: None,
+            context_window: None,
+            effort: None,
+            price: None,
+            usage_url: None,
+            search_url: None,
+            headers: Default::default(),
+            key_header: None,
+            models: Vec::new(),
+            auth: super::super::Auth::ApiKey,
+            oauth: None,
+        }
+    }
+
+    #[test]
+    fn a_shipped_list_is_what_a_silent_server_gets() {
+        // D85: a subscription backend serves no listing, so the provider's own names are what
+        // `/login` offers. A server that does list is still believed.
+        let mut config = provider_config("http://127.0.0.1:9/v1");
+        config.models = vec!["shipped-1".into(), "shipped-2".into()];
+        let p = super::super::Provider::new("t", config, None, &super::super::Reported::default());
+        let listed = list_models(&p).expect("the shipped list answers");
+        let ids: Vec<&str> = listed.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["shipped-1", "shipped-2"]);
+        // Nothing shipped and nothing served is still an error, not an empty picker.
+        let p = super::super::Provider::new(
+            "t",
+            provider_config("http://127.0.0.1:9/v1"),
+            None,
+            &super::super::Reported::default(),
+        );
+        assert!(list_models(&p).is_err());
+    }
+
     #[test]
     fn error_messages_and_retry_rules() {
         assert_eq!(
@@ -1170,6 +1255,15 @@ mod tests {
             "Overloaded"
         );
         assert_eq!(error_message("upstream down"), "upstream down");
+        // The shape the subscription backend answers with, which used to reach the dialog as a
+        // fragment of JSON (D85).
+        assert_eq!(
+            error_message(
+                r#"{"detail":[{"loc":["body","client_version"],"msg":"Field required","input":null}]}"#
+            ),
+            "client_version: Field required"
+        );
+        assert_eq!(error_message(r#"{"detail":"Not Found"}"#), "Not Found");
         assert!(retryable(529) && retryable(429) && !retryable(400) && !retryable(401));
         assert_eq!(backoff(1, None), Duration::from_secs(1));
         assert_eq!(backoff(3, None), Duration::from_secs(4));

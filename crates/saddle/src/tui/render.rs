@@ -1706,12 +1706,9 @@ fn draw_login(
         }
         Stage::SigningIn { .. } => {
             let d = &login.device;
-            if let Some(why) = &d.error {
-                lines.push(Line::from(Span::styled(
-                    keep_tail(why, inner),
-                    Style::new().fg(theme.error),
-                )));
-            } else if let Some(code) = &d.code {
+            // The failure goes beside the code rather than instead of it: what failed is usually
+            // the browser, and the address and code are still what the person needs (D86).
+            if let Some(code) = &d.code {
                 lines.push(Line::from("A browser on any device signs this in".bold()));
                 lines.push(Line::default());
                 // The link is underlined so it reads as one, and its cells are recorded: a click
@@ -1749,12 +1746,24 @@ fn draw_login(
                     "the code is on your clipboard, ready to paste",
                     dim(theme),
                 )));
+            } else if let Some(why) = &d.error {
+                for line in wrap_text(why, inner) {
+                    lines.push(Line::from(Span::styled(line, Style::new().fg(theme.error))));
+                }
             } else {
                 let spin = SPINNER[spinner % SPINNER.len()];
                 lines.push(Line::from(vec![
                     Span::styled(format!("{spin} "), Style::new().fg(theme.warning)),
                     Span::raw("asking for a sign-in code…"),
                 ]));
+            }
+            if let Some(why) = &d.error
+                && d.code.is_some()
+            {
+                lines.push(Line::default());
+                for line in wrap_text(why, inner) {
+                    lines.push(Line::from(Span::styled(line, Style::new().fg(theme.error))));
+                }
             }
             lines.push(Line::default());
             let hint = if d.url.is_empty() {
@@ -2297,6 +2306,28 @@ fn keep_head(s: &str, max: usize) -> String {
 }
 
 /// The end of `s` in at most `max` columns, with `…` marking the cut.
+/// A message as lines that fit `width`, so a failed click says all of what went wrong rather than
+/// the tail of it (D86).
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(20);
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.width() + 1 + word.width() > width {
+            out.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out.truncate(4);
+    out
+}
+
 fn keep_tail(s: &str, max: usize) -> String {
     if s.width() <= max {
         return s.to_owned();
@@ -3405,14 +3436,43 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         };
+        let up = |column, row| MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // A click is a press and a release in the same place: that is what follows the link.
         assert_eq!(
             app.mouse(click(at.x + 3, at.y)),
+            None,
+            "pressing selects nothing yet"
+        );
+        assert_eq!(
+            app.mouse(up(at.x + 3, at.y)),
             Some(crate::tui::app::Action::OpenUrl(
                 "https://auth.openai.com/codex/device".into()
             ))
         );
         assert_eq!(app.mouse(click(at.x, at.y + 1)), None, "that is the code");
+        app.mouse(up(at.x, at.y + 1));
         assert_eq!(app.mouse(click(0, 0)), None);
+        app.mouse(up(0, 0));
+
+        // A drag that *starts* on the link selects it, which is what it could not do while the
+        // press was swallowed by the link (D87).
+        app.mouse(click(at.x, at.y));
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: at.x + 4,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        let copied = app.mouse(up(at.x + 4, at.y));
+        let Some(crate::tui::app::Action::Copy(text, _)) = copied else {
+            panic!("a drag on the link must select it, got {copied:?}");
+        };
+        assert!(text.starts_with("http"), "{text}");
     }
 
     #[test]
