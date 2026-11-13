@@ -1819,25 +1819,31 @@ ten languages by hand. None of that is worth maintaining, so it is gone.
 - **Deferred:** loading a user's own `.sublime-syntax` files, and honouring a theme's own syntax
   colours. Neither is needed while every colour is a role.
 
-**D81.** A prompt is shown as it was typed, apart from the emphasis in it.
+**D81.** A prompt is read as markdown, in the user's own colour.
 
-`*this*` in a message the user types is italic, and `**this**` is bold. Nothing else about the text
-is interpreted.
+`*this*` in a message the user types is italic and `**this**` is bold, and — because it goes through
+the same renderer a reply does — so is everything else markdown does: a fence in a prompt is a
+highlighted code block, a `-` list is a list, a heading is a heading.
 
-- **Not markdown.** A prompt is input, and it has to be readable as the thing that was sent. Parsing
-  it as markdown eats the asterisks in `src/*.rs` and `2*3*4`, which then display as `src/.rs` and
-  `23*4` — the user cannot tell whether they typed it wrong or the interface did. Fences, bullets,
-  headings and links are therefore left as literal characters.
-- **An asterisk opens emphasis only at the start of a line or after a space**, so a glob, a path, a
-  multiplication sign and an unclosed asterisk all survive. It closes only after a word and before
-  the end of the line, a space or punctuation.
-- **Only `*`.** `_` is not treated as a delimiter, because `__init__.py` and `my_var_name` are far
-  more common in a prompt than `_emphasis_`.
-- **The text keeps the prompt's colour**; the modifier is the only difference, so a marked word is
-  still visibly the user's own message, and the `›` marker still says whose it is.
-- **A reply is still full markdown.** This is the asymmetry: a model writes markdown deliberately,
-  and a person typing to an agent is usually quoting a path or an error.
+- **It is what pi does**, which is the first reason for it. pi's user-message component is its
+  markdown renderer with `color: userMessageText` and `bgColor: userMessageBg`, and its parser is
+  `marked` with a tokenizer override. The override was checked against the cases that matter and
+  changes nothing here: with pi's own modules, `2*3*4` lexes as `em("3")` and
+  `src/*.rs with tests/*.rs` as `em(".rs with tests/")`. `pulldown-cmark` answers identically, so a
+  second, stricter rule written here would be a deviation from pi and not a match for it. An earlier
+  version of this decision did exactly that — 85 lines of asterisk scanning — and it was removed.
+- **The cost, stated rather than hidden.** Markdown eats an asterisk inside a word. A prompt of
+  `2*3*4` is drawn `234` with the `3` italic, and `src/*.rs` italicises everything between it and
+  the next asterisk. That is CommonMark, it is what pi shows, and it is the one way a prompt is not
+  drawn exactly as it was typed. An unmatched `*` is a literal, so `src/*.rs` alone survives.
+- **The colour is the base, not a wrapper.** The renderer carries a `base` style that every other
+  style patches onto, so the prompt's text keeps `userMessageText`, inline code keeps `mdCode`, and a
+  modifier is the only difference emphasis makes. The text is no longer bold, because bold everywhere
+  hides `**bold**`.
+- **One renderer, not two.** The marker is applied to the rows afterwards rather than by a second
+  code path, so a prompt and a reply cannot drift apart.
 
+## 4. Scope enumeration
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
