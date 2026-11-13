@@ -1499,7 +1499,7 @@ one place at its root.
 - **Not taken here: pi's `system` theme.** It queries the terminal's own palette and derives every
   role from it; that is D73.
 
-**D73.** Two more of pi's: the `system` theme, derived from the terminal, and syntax highlighting.
+**D73.** (The highlighter this introduced was replaced by D80.) Two more of pi's: the `system` theme, derived from the terminal, and syntax highlighting.
 
 `theme = "system"` is a reserved name and not a palette. It asks the terminal what its colours are
 and derives every role from the answer.
@@ -1783,6 +1783,41 @@ sentence of D28 and D19's no-network rule; both remain as the fallback described
   sockets and no user namespaces of its own, so the tests cover the decisions, the parsers, the
   message a namespace is given, and the environment a command inherits; the rest is exercised by
   hand in a real session.
+
+**D80.** The grammars are syntect's; this project decides only what a scope means.
+
+D73's hand-written scanner was a stopgap: it was written because this build had no network and
+`Cargo.lock` could not grow. It got lifetimes wrong (`'a` read as a character literal), raw strings
+wrong (`r#"a "b" c"#` cut at the inner quote), nested generics wrong (`>>` as one token), and it knew
+ten languages by hand. None of that is worth maintaining, so it is gone.
+
+- **syntect parses, and only parses.** `two-face` supplies bat's syntax set — 213 grammars, where
+  syntect's own defaults are 75 and have neither TypeScript nor TOML, the format this project writes
+  its configuration in. The set is one embedded dump, decoded once.
+- **A scope is the fact; the colour is the theme's.** The highlighter maps a scope stack to one of
+  nine `Kind`s and nothing else: `Kind::style` reads `SyntaxColours` and is the only thing that
+  produces a style. syntect can colour text itself, and using that would put a colour somewhere
+  other than D71's theme, so its themes are never loaded.
+- **The most specific scope that names a role wins**, and the roles that are properties of a
+  character rather than of what encloses it — punctuation, operators — are used only when nothing
+  enclosing names one. Without that order the `//` of a line comment would be painted as
+  punctuation.
+- **A raw string's prefix is a string.** `r#"…"#` carries a `storage.type` scope on its `r`, which
+  would otherwise make it keyword-coloured inside a string.
+- **Adjacent runs of one kind are joined.** A grammar pushes and pops scopes inside a string for its
+  delimiters and escapes; one run per scope would draw one string as five and hand every caller a
+  string that is not one string.
+- **`storage.type` is a keyword.** The grammars scope `let`, `fn`, `struct`, `int`, `u32` and `str`
+  the same way, and a Sublime theme paints them the same; a type this project defined is an
+  `entity.name`, which is what gets the type role.
+- **A language is its tag, not an enumeration here.** `Language` holds the tag, so a grammar this
+  file has never heard of still works. A tag with no grammar is drawn in the block's own colour
+  rather than guessed at, and a fence with no tag is `Plain`, which is what pi does.
+- **A block's parse state is kept, not rebuilt.** A block comment or a triple-quoted string that
+  opens on one line closes on a later one because the grammar's own state carries between lines, and
+  a block that names a different language starts again.
+- **Deferred:** loading a user's own `.sublime-syntax` files, and honouring a theme's own syntax
+  colours. Neither is needed while every colour is a role.
 
 ## 4. Scope enumeration
 

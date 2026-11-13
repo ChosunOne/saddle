@@ -547,13 +547,17 @@ fn a_wildcard_net_grant_allows_any_host_but_not_the_local_machine() {
     );
     assert!(text.contains("policy file"), "{text}");
 
-    // Naming the address does open it, which is the escape hatch the rule is built around.
+    // Naming the address does open it, which is the escape hatch the rule is built around. The
+    // port is one nothing listens on, on purpose: a test that used 80 would be asking whether
+    // something happens to be bound there, and inside a command's network namespace something is
+    // (D79).
     env.edit_agent(|agent| {
         agent.insert(
             "net".into(),
             toml::from_str::<toml::Value>(
                 "net = [{ host = \"*\", scheme = \"http\", why = \"anything\" }, \
-                 { host = \"127.0.0.1\", scheme = \"http\", why = \"a local server\" }]",
+                 { host = \"127.0.0.1\", scheme = \"http\", port = 59999, \
+                   why = \"a local server\" }]",
             )
             .unwrap()
             .get("net")
@@ -563,9 +567,9 @@ fn a_wildcard_net_grant_allows_any_host_but_not_the_local_machine() {
     });
     let (ok, text) = env.tool(
         "fetch",
-        serde_json::json!({"url": "http://127.0.0.1:80/v1/models"}),
+        serde_json::json!({"url": "http://127.0.0.1:59999/v1/models"}),
     );
-    assert!(!ok);
+    assert!(!ok, "{text}");
     assert!(
         !text.contains("loopback"),
         "a named address is reachable: {text}"
@@ -1941,9 +1945,48 @@ fn reload_reads_instruction_files_and_skills_again() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
+    // Read as it is written, so a full pipe cannot stop the child before its session opens.
+    let stdout = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (ready, opened) = std::sync::mpsc::channel();
+    let out = stdout.clone();
+    let mut piped = child.stdout.take().unwrap();
+    let drain = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = piped.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            out.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+    });
 
-    // The session is open and waiting on stdin; now the workspace gains a rule and a skill.
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // The session is open and waiting on stdin; now the workspace gains a rule and a skill. A
+    // fixed sleep would be a race on a loaded machine, so the banner line mode prints once its
+    // session is up is waited for instead.
+    let stderr = child.stderr.take().unwrap();
+    let errors = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let seen = errors.clone();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let mut told = false;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            // The first line names the provider, the model and the audit log, and it is written
+            // once the session is open and about to read stdin.
+            if !told && line.contains(" \u{b7} audit ") {
+                told = true;
+                let _ = ready.send(());
+            }
+            seen.lock().unwrap().push_str(&format!("{line}\n"));
+        }
+    });
+    opened
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the session never started");
+
     std::fs::write(env.path("AGENTS.md"), "a rule added mid-session\n").unwrap();
     std::fs::create_dir_all(env.path(".agents/skills/second")).unwrap();
     std::fs::write(
@@ -1956,12 +1999,14 @@ fn reload_reads_instruction_files_and_skills_again() {
         let stdin = child.stdin.as_mut().unwrap();
         stdin.write_all(b"/reload\n/quit\n").unwrap();
     }
-    let out = child.wait_with_output().unwrap();
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{status:?}");
+    // A pipe still being drained is closed once the child is gone, and joining it is what makes
+    // the output complete before it is read.
+    drain.join().unwrap();
+    reader.join().unwrap();
+    let mut text = String::from_utf8_lossy(&stdout.lock().unwrap()).into_owned();
+    text.push_str(&errors.lock().unwrap());
     assert!(text.contains("skills reloaded: first, second"), "{text}");
     assert!(text.contains("instructions reloaded: AGENTS.md"), "{text}");
     assert!(

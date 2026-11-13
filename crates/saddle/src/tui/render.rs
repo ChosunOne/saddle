@@ -289,7 +289,7 @@ impl Markdown {
                     // wherever the language is known (D73).
                     self.line
                         .push(Span::styled("  ".to_owned(), self.block_style()));
-                    for (kind, text) in syntax::highlight(self.lang, l, &mut self.code_state) {
+                    for (kind, text) in syntax::highlight(&self.lang, l, &mut self.code_state) {
                         let style = self.block_style().patch(kind.style(&self.theme.syntax));
                         self.line.push(Span::styled(text.to_owned(), style));
                     }
@@ -353,7 +353,8 @@ impl Markdown {
                 self.code = true;
                 self.lang = match kind {
                     CodeBlockKind::Fenced(tag) => Language::parse(&tag),
-                    CodeBlockKind::Indented => Language::Unknown,
+                    // An indented block names no language, so there is nothing to look up.
+                    CodeBlockKind::Indented => Language::Plain,
                 };
                 self.code_state = State::default();
             }
@@ -427,7 +428,7 @@ impl Markdown {
             }
             TagEnd::CodeBlock => {
                 self.code = false;
-                self.lang = Language::Unknown;
+                self.lang = Language::Plain;
                 self.code_state = State::default();
                 self.flush();
                 self.blank_before_next_block = true;
@@ -2116,7 +2117,7 @@ mod tests {
 
     #[test]
     fn the_fence_tag_reaches_the_highlighter() {
-        assert_eq!(Language::parse("rust"), Language::Rust);
+        assert_eq!(Language::parse("rust"), Language::Tagged("rust".into()));
         let rows = markdown("```rust\nlet x = 1;\n```", &Theme::default());
         let runs = block_runs(&rows[0]);
         assert!(

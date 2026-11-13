@@ -1,14 +1,22 @@
-//! Syntax highlighting for code blocks (D73).
+//! Syntax highlighting for code blocks (D73, D80).
 //!
-//! A lexical highlighter, not a parser: it knows comments, strings, numbers, keywords, types,
-//! function calls and punctuation for the languages this harness and its projects are written in.
-//! That is what a terminal block needs — it is read, not compiled — and it needs no dependency, which
-//! matters because this build is offline and `Cargo.lock` cannot grow.
+//! The parsing is not this file's job. syntect reads the grammar for the language a fence names and
+//! hands back the scope stack of each stretch of the line — `source.rust`, `keyword.control.rust`,
+//! `string.quoted.double.rust` — and this module does one thing with it: maps a scope to one of the
+//! nine roles below.
 //!
-//! Every colour comes from the theme's `syntax*` roles, so a pi palette paints the code too.
+//! That division is what keeps the theme in charge. syntect can colour text itself, and a
+//! highlighter that took its colours would be a second place a colour comes from, which is exactly
+//! what D71 and D72 exist to prevent. The scope is a fact about the code; the colour is the theme's
+//! decision, and [`SyntaxColours`] is the only place it is made.
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use ratatui::style::{Color, Style};
+use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
 
 use super::palette::SyntaxColours;
-use ratatui::style::{Color, Style};
 
 /// What a run of characters is, for colouring. The names are pi's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,485 +51,276 @@ impl Kind {
     }
 }
 
-/// The languages with their own words. Anything else gets [`Language::Unknown`], which highlights
-/// only what is unambiguous in any language: strings, numbers and comments.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// The language a fence named.
+///
+/// It is the tag rather than an enumeration of the languages this file knows, because syntect knows
+/// about a hundred of them and a list here would be a smaller list that has to be maintained. A tag
+/// this build has no grammar for is [`Language::Plain`], drawn in the block's own colour.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Language {
-    Rust,
-    Python,
-    JavaScript,
-    Shell,
-    Json,
-    Toml,
-    Yaml,
-    C,
-    Go,
-    /// A fence that names no language: drawn in the block's own colour, with no highlighting, which
-    /// is what pi does with an untagged block.
+    /// A fence that named no language, which pi draws with no highlighting.
     #[default]
     Plain,
-    /// A fence naming a language this highlighter does not know: strings, numbers and comments
-    /// are still highlighted, since those read the same in any language.
-    Unknown,
+    /// A fence that named one: the tag, as written, so a grammar syntect has is used whatever this
+    /// file has heard of.
+    Tagged(String),
 }
 
 impl Language {
     /// The language a fence's tag names, by the spellings that appear in practice.
     pub fn parse(tag: &str) -> Self {
-        let tag = tag.trim().to_ascii_lowercase();
         // A fence may carry more than the name (`rust,ignore`, `python title="x"`).
         let first = tag
-            .split([',', ' ', '{'])
+            .trim()
+            .split([',', ' ', '{', '\t'])
             .next()
             .unwrap_or_default()
             .trim_end_matches(',');
-        match first {
-            "rust" | "rs" => Self::Rust,
-            "python" | "py" | "python3" => Self::Python,
-            "js" | "javascript" | "jsx" | "ts" | "typescript" | "tsx" | "mjs" | "cjs" => {
-                Self::JavaScript
-            }
-            "sh" | "bash" | "zsh" | "shell" | "console" | "shell-session" => Self::Shell,
-            "json" | "jsonc" | "json5" => Self::Json,
-            "toml" => Self::Toml,
-            "yaml" | "yml" => Self::Yaml,
-            "c" | "h" | "cpp" | "c++" | "cc" | "hpp" | "java" | "kt" | "kotlin" | "cs"
-            | "csharp" => Self::C,
-            "go" | "golang" => Self::Go,
-            "" => Self::Plain,
-            _ => Self::Unknown,
+        if first.is_empty() {
+            return Self::Plain;
         }
-    }
-
-    fn keywords(self) -> &'static [&'static str] {
-        match self {
-            Self::Rust => &[
-                "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else",
-                "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match",
-                "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct",
-                "super", "trait", "true", "type", "unsafe", "use", "where", "while", "yield",
-            ],
-            Self::Python => &[
-                "and", "as", "assert", "async", "await", "break", "class", "continue", "def",
-                "del", "elif", "else", "except", "False", "finally", "for", "from", "global", "if",
-                "import", "in", "is", "lambda", "None", "nonlocal", "not", "or", "pass", "raise",
-                "return", "True", "try", "while", "with", "yield",
-            ],
-            Self::JavaScript => &[
-                "async",
-                "await",
-                "break",
-                "case",
-                "catch",
-                "class",
-                "const",
-                "continue",
-                "debugger",
-                "default",
-                "delete",
-                "do",
-                "else",
-                "export",
-                "extends",
-                "false",
-                "finally",
-                "for",
-                "from",
-                "function",
-                "if",
-                "import",
-                "in",
-                "instanceof",
-                "let",
-                "new",
-                "null",
-                "of",
-                "return",
-                "static",
-                "super",
-                "switch",
-                "this",
-                "throw",
-                "true",
-                "try",
-                "typeof",
-                "undefined",
-                "var",
-                "void",
-                "while",
-                "yield",
-            ],
-            Self::Shell => &[
-                "case", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if", "in",
-                "select", "then", "time", "until", "while",
-            ],
-            Self::Json => &["true", "false", "null"],
-            Self::Toml | Self::Yaml => &["true", "false", "null", "yes", "no", "on", "off"],
-            Self::C => &[
-                "auto",
-                "break",
-                "case",
-                "char",
-                "class",
-                "const",
-                "continue",
-                "default",
-                "do",
-                "double",
-                "else",
-                "enum",
-                "extern",
-                "false",
-                "float",
-                "for",
-                "goto",
-                "if",
-                "inline",
-                "int",
-                "long",
-                "namespace",
-                "new",
-                "nullptr",
-                "private",
-                "protected",
-                "public",
-                "return",
-                "short",
-                "signed",
-                "sizeof",
-                "static",
-                "struct",
-                "switch",
-                "template",
-                "this",
-                "throw",
-                "true",
-                "try",
-                "catch",
-                "typedef",
-                "typename",
-                "union",
-                "unsigned",
-                "using",
-                "virtual",
-                "void",
-                "volatile",
-                "while",
-            ],
-            Self::Go => &[
-                "break",
-                "case",
-                "chan",
-                "const",
-                "continue",
-                "default",
-                "defer",
-                "else",
-                "fallthrough",
-                "false",
-                "for",
-                "func",
-                "go",
-                "goto",
-                "if",
-                "import",
-                "interface",
-                "iota",
-                "map",
-                "nil",
-                "package",
-                "range",
-                "return",
-                "select",
-                "struct",
-                "switch",
-                "true",
-                "type",
-                "var",
-            ],
-            Self::Plain | Self::Unknown => &[],
-        }
-    }
-
-    /// Built-in type names, which are coloured as types even in lowercase.
-    fn types(self) -> &'static [&'static str] {
-        match self {
-            Self::Rust => &[
-                "bool", "char", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "str",
-                "u8", "u16", "u32", "u64", "u128", "usize", "String", "Vec", "Option", "Result",
-                "Box", "Rc", "Arc", "HashMap", "BTreeMap", "Self",
-            ],
-            Self::Python => &[
-                "int", "float", "str", "bool", "list", "dict", "set", "tuple", "bytes",
-            ],
-            Self::JavaScript => &["bigint", "boolean", "number", "string", "symbol", "object"],
-            Self::C => &[
-                "bool", "char", "double", "float", "int", "long", "short", "size_t", "string",
-                "unsigned", "void",
-            ],
-            Self::Go => &[
-                "bool",
-                "byte",
-                "complex64",
-                "complex128",
-                "error",
-                "float32",
-                "float64",
-                "int",
-                "int8",
-                "int16",
-                "int32",
-                "int64",
-                "rune",
-                "string",
-                "uint",
-                "uint8",
-                "uint16",
-                "uint32",
-                "uint64",
-                "uintptr",
-            ],
-            _ => &[],
-        }
-    }
-
-    fn line_comment(self) -> &'static [&'static str] {
-        match self {
-            Self::Rust | Self::JavaScript | Self::C | Self::Go => &["//"],
-            Self::Python | Self::Shell | Self::Toml | Self::Yaml => &["#"],
-            // JSON has no comments; JSONC does, and highlighting them is harmless.
-            Self::Json => &["//"],
-            Self::Plain => &[],
-            Self::Unknown => &["//", "#"],
-        }
-    }
-
-    /// Whether a `#` starts a comment. In a shell a `#` mid-word is a literal, so it is only a
-    /// comment at the start of a word; that is handled where the token is read.
-    fn hash_comment(self) -> bool {
-        matches!(
-            self,
-            Self::Python | Self::Shell | Self::Toml | Self::Yaml | Self::Unknown
-        )
+        Self::Tagged(alias(first))
     }
 }
 
-/// What the highlighter carries between lines: a block comment or a multi-line string can open on one
-/// line and close on a later one.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Fence tags that are not the extension or name syntect matches on.
+///
+/// A short list of spellings, not a list of languages: every entry is another way of writing
+/// something syntect already has, so a tag missing from here is still looked up rather than refused.
+fn alias(tag: &str) -> String {
+    let lower = tag.to_ascii_lowercase();
+    let shorter = match lower.as_str() {
+        "console" | "shell-session" | "shell" | "terminal" => "sh",
+        "python3" | "py3" => "py",
+        "golang" => "go",
+        "c++" | "cc" | "cxx" => "cpp",
+        "jsonc" | "json5" => "json",
+        "yml" => "yaml",
+        "csharp" | "c#" => "cs",
+        // `sh` is the extension; the name syntect matches is the longer one.
+        "markdown" | "md" => "md",
+        _ => return lower,
+    };
+    shorter.to_owned()
+}
+
+/// The grammars, loaded once: decoding the set takes tens of milliseconds and a session draws many
+/// blocks.
+///
+/// syntect ships only Sublime's default packages, which are 75 grammars and have neither TypeScript
+/// nor TOML — the format this project writes its own configuration in. `two-face` is bat's asset
+/// set: the same grammars, plus everything else bat highlights, as one embedded dump.
+fn syntaxes() -> &'static SyntaxSet {
+    static SET: OnceLock<SyntaxSet> = OnceLock::new();
+    SET.get_or_init(two_face::syntax::extra_newlines)
+}
+
+/// The grammar a language names, if this build has one.
+fn syntax_for(language: &Language) -> Option<&'static SyntaxReference> {
+    let Language::Tagged(tag) = language else {
+        return None;
+    };
+    syntaxes().find_syntax_by_token(tag)
+}
+
+/// What the highlighter carries between lines: a block comment or a string can open on one line and
+/// close on a later one, so the grammar's own state is kept for the block.
+#[derive(Default)]
 pub struct State {
-    block_comment: bool,
-    /// The quote that opened a multi-line string, for Python's triple quotes and a trailing `\`.
-    string: Option<&'static str>,
+    inner: Inner,
+}
+
+#[derive(Default)]
+enum Inner {
+    /// No line has been read yet, so the grammar has not been chosen.
+    #[default]
+    Unset,
+    /// Nothing to highlight: no language, or one this build has no grammar for.
+    Plain,
+    Parsing {
+        language: Language,
+        parse: Box<ParseState>,
+        stack: ScopeStack,
+        /// A scope is a bit-packed pair, cheap to hash; the role it means is not, because reading
+        /// it builds a string. A block asks the same few dozen questions on every line.
+        roles: HashMap<Scope, Kind>,
+    },
 }
 
 /// One line of code, as runs of characters with the kind they are.
 ///
 /// The runs cover the whole line, in order, so a caller can render them without recomputing anything.
-pub fn highlight<'a>(language: Language, line: &'a str, state: &mut State) -> Vec<(Kind, &'a str)> {
-    if language == Language::Plain {
-        // Nothing to say about a block that named no language: one run, the block's own colour.
-        return if line.is_empty() {
-            Vec::new()
-        } else {
-            vec![(Kind::Plain, line)]
+/// `line` is a line as the caller has it, without its newline: the grammar wants the newline to end
+/// a line comment, so one is added and the runs are cut back to the line.
+pub fn highlight<'a>(
+    language: &Language,
+    line: &'a str,
+    state: &mut State,
+) -> Vec<(Kind, &'a str)> {
+    if language == &Language::Plain {
+        return plain(line);
+    }
+    // A block has one language, so a different one means a different block.
+    let unchanged =
+        matches!(&state.inner, Inner::Parsing { language: open, .. } if open == language);
+    if !unchanged {
+        state.inner = match syntax_for(language) {
+            Some(syntax) => Inner::Parsing {
+                language: language.clone(),
+                parse: Box::new(ParseState::new(syntax)),
+                stack: ScopeStack::new(),
+                roles: HashMap::new(),
+            },
+            // A tag this build has no grammar for is drawn plain rather than guessed at: a wrong
+            // colour is worse than none, and the fence said something this cannot deliver.
+            None => Inner::Plain,
         };
     }
-    let bytes = line.as_bytes();
-    let mut out: Vec<(Kind, &str)> = Vec::new();
+    let Inner::Parsing {
+        parse,
+        stack,
+        roles,
+        ..
+    } = &mut state.inner
+    else {
+        return plain(line);
+    };
+
+    // The grammars want a newline to end a line comment; the caller has no newline to give, so one
+    // is added and every offset is then read back against the line itself.
+    let mut owned = String::with_capacity(line.len() + 1);
+    owned.push_str(line);
+    owned.push('\n');
+    let Ok(ops) = parse.parse_line(&owned, syntaxes()) else {
+        return plain(line);
+    };
+
+    let mut spans: Vec<(Kind, usize, usize)> = Vec::new();
     let mut at = 0;
-
-    // A block comment or string opened on an earlier line continues.
-    if state.block_comment {
-        match line.find("*/") {
-            Some(end) => {
-                push(&mut out, line, Kind::Comment, 0, end + 2);
-                state.block_comment = false;
-                at = end + 2;
-            }
-            None => {
-                push(&mut out, line, Kind::Comment, 0, line.len());
-                return out;
-            }
+    for (offset, op) in ops {
+        let end = snapped(line, offset);
+        if end > at {
+            add(&mut spans, role_of(stack, roles), at, end);
         }
+        let _ = stack.apply(&op);
+        at = at.max(end);
     }
-    if let Some(quote) = state.string {
-        match line.find(quote) {
-            Some(end) => {
-                push(&mut out, line, Kind::String, 0, end + quote.len());
-                state.string = None;
-                at = end + quote.len();
-            }
-            None => {
-                push(&mut out, line, Kind::String, 0, line.len());
-                return out;
-            }
-        }
+    add(&mut spans, role_of(stack, roles), at, line.len());
+
+    spans
+        .into_iter()
+        .map(|(kind, from, to)| (kind, &line[from..to]))
+        .collect()
+}
+
+/// The nearest character boundary at or after `at`: a run may only be sliced where a character
+/// starts, and a grammar splitting a multi-byte character would otherwise panic.
+fn snapped(line: &str, at: usize) -> usize {
+    let mut at = at.min(line.len());
+    while at < line.len() && !line.is_char_boundary(at) {
+        at += 1;
     }
+    at
+}
 
-    while at < bytes.len() {
-        let rest = &line[at..];
-        let byte = bytes[at];
+/// Adds `[from..to)` as `kind`, joining it to the run before when that run is the same kind and
+/// touches it.
+///
+/// The joining is not cosmetic: a grammar pushes and pops a scope inside one string or comment —
+/// for its delimiters, its escapes — and one run per scope would draw the same text in pieces and
+/// make every caller deal with a string that is not one string.
+fn add(spans: &mut Vec<(Kind, usize, usize)>, kind: Kind, from: usize, to: usize) {
+    if to <= from {
+        return;
+    }
+    if let Some((last, _, end)) = spans.last_mut()
+        && *last == kind
+        && *end == from
+    {
+        *end = to;
+        return;
+    }
+    spans.push((kind, from, to));
+}
 
-        // Whitespace and anything unclassified.
-        if byte.is_ascii_whitespace() {
-            let mut end = at;
-            while end < bytes.len() && bytes[end].is_ascii_whitespace() {
-                end += 1;
-            }
-            push(&mut out, line, Kind::Plain, at, end);
-            at = end;
-            continue;
-        }
+fn plain(line: &str) -> Vec<(Kind, &str)> {
+    if line.is_empty() {
+        Vec::new()
+    } else {
+        vec![(Kind::Plain, line)]
+    }
+}
 
-        // A line comment, or the opening of a block comment.
-        if rest.starts_with("/*") {
-            match rest.find("*/") {
-                Some(end) => {
-                    push(&mut out, line, Kind::Comment, at, at + end + 2);
-                    at += end + 2;
-                    continue;
-                }
-                None => {
-                    push(&mut out, line, Kind::Comment, at, line.len());
-                    state.block_comment = true;
-                    return out;
-                }
+/// The role a scope stack means: the most specific scope that names one.
+///
+/// A scope that encloses a token wins over the punctuation inside it, so the `//` of a line comment
+/// is comment-coloured rather than punctuation-coloured. Punctuation and operators are therefore
+/// only used when nothing else on the stack names a role.
+fn role_of(stack: &ScopeStack, roles: &mut HashMap<Scope, Kind>) -> Kind {
+    let scopes = stack.as_slice();
+    let mut weak = None;
+    for scope in scopes.iter().rev() {
+        let kind = match roles.get(scope) {
+            Some(kind) => *kind,
+            None => {
+                let kind = role(scope.build_string().as_str());
+                roles.insert(*scope, kind);
+                kind
             }
-        }
-        if language
-            .line_comment()
-            .iter()
-            .any(|marker| rest.starts_with(marker))
-        {
-            push(&mut out, line, Kind::Comment, at, line.len());
-            return out;
-        }
-        if language.hash_comment()
-            && byte == b'#'
-            && (at == 0 || bytes[at - 1].is_ascii_whitespace())
-        {
-            push(&mut out, line, Kind::Comment, at, line.len());
-            return out;
-        }
-        // Python's docstring and Rust's raw string are opened by their own quotes.
-        if rest.starts_with("\"\"\"") || rest.starts_with("'''") {
-            let quote = &rest[..3];
-            let after = at + 3;
-            match line[after..].find(quote) {
-                Some(end) => {
-                    push(&mut out, line, Kind::String, at, after + end + 3);
-                    at = after + end + 3;
-                    continue;
-                }
-                None => {
-                    push(&mut out, line, Kind::String, at, line.len());
-                    state.string = Some(if quote == "\"\"\"" { "\"\"\"" } else { "'''" });
-                    return out;
-                }
-            }
-        }
-
-        // A string: single or double quoted, with backslash escapes.
-        if byte == b'"' || byte == b'\'' {
-            let quote = byte;
-            let mut end = at + 1;
-            let mut closed = false;
-            while end < bytes.len() {
-                match bytes[end] {
-                    b'\\' => end += 2,
-                    b if b == quote => {
-                        end += 1;
-                        closed = true;
-                        break;
-                    }
-                    _ => end += 1,
-                }
-            }
-            let end = end.min(bytes.len());
-            push(&mut out, line, Kind::String, at, end);
-            if !closed {
-                state.string = Some(if quote == b'"' { "\"" } else { "'" });
-            }
-            at = end;
-            continue;
-        }
-
-        // A number: digits, with `_`, `.`, an exponent and a suffix.
-        if byte.is_ascii_digit() {
-            let mut end = at;
-            while end < bytes.len()
-                && (bytes[end].is_ascii_alphanumeric()
-                    || matches!(bytes[end], b'_' | b'.')
-                    || ((bytes[end] == b'+' || bytes[end] == b'-')
-                        && end > at
-                        && matches!(bytes[end - 1], b'e' | b'E')))
-            {
-                end += 1;
-            }
-            push(&mut out, line, Kind::Number, at, end);
-            at = end;
-            continue;
-        }
-
-        // An identifier, which may be a keyword, a type, or a call.
-        if byte.is_ascii_alphabetic() || byte == b'_' {
-            let mut end = at;
-            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
-                end += 1;
-            }
-            let word = &line[at..end];
-            // A following `(` makes it a call, unless it is a keyword: `if (` is not a function.
-            let call = line[end..].trim_start().starts_with('(');
-            let kind = if language.keywords().contains(&word) {
-                Kind::Keyword
-            } else if language.types().contains(&word) || is_camel_case(word) {
-                Kind::Type
-            } else if call {
-                Kind::Function
-            } else {
-                Kind::Variable
-            };
-            push(&mut out, line, kind, at, end);
-            at = end;
-            continue;
-        }
-
-        // Operators and punctuation, one character at a time so a run does not colour a `-` in a
-        // path as an operator across the whole path.
-        let kind = if b"+-*/%=<>!&|^~?:".contains(&byte) {
-            Kind::Operator
-        } else {
-            Kind::Punctuation
         };
-        let mut end = at + 1;
-        while end < bytes.len()
-            && !bytes[end].is_ascii_whitespace()
-            && !bytes[end].is_ascii_alphanumeric()
-            && !b"+-*/%=<>!&|^~?:\"'#_".contains(&bytes[end])
-            && !(kind == Kind::Punctuation && b"+-*/%=<>!&|^~?:".contains(&bytes[end]))
-        {
-            end += 1;
+        if matches!(kind, Kind::Operator | Kind::Punctuation) {
+            weak = weak.or(Some(kind));
+        } else if kind != Kind::Plain {
+            return kind;
         }
-        push(&mut out, line, kind, at, end);
-        at = end;
     }
-    out
+    weak.unwrap_or(Kind::Plain)
 }
 
-/// Adds `line[from..to]` as `kind`, dropping an empty run.
-fn push<'a>(out: &mut Vec<(Kind, &'a str)>, line: &'a str, kind: Kind, from: usize, to: usize) {
-    if to > from {
-        out.push((kind, &line[from..to]));
+/// The role one scope names, by the conventions the grammars are written to.
+///
+/// The scopes are Sublime Text's, which syntect's grammars all follow: `comment`, `string`,
+/// `constant.numeric`, `keyword`, `storage`, `entity.name`, `support`, `variable`, `punctuation`.
+fn role(scope: &str) -> Kind {
+    // A scope is `a.b.c`, and every test here is on a prefix, so `keyword.operator` has to be
+    // asked about before `keyword`.
+    const RULES: &[(&str, Kind)] = &[
+        ("comment", Kind::Comment),
+        ("string", Kind::String),
+        ("constant.character.escape", Kind::String),
+        ("constant.numeric", Kind::Number),
+        ("constant.language", Kind::Keyword),
+        ("constant", Kind::Number),
+        ("keyword.operator", Kind::Operator),
+        ("keyword", Kind::Keyword),
+        // `r#"..."` is a string whose opening `r` carries a storage scope of its own.
+        ("storage.type.string", Kind::String),
+        // `let`, `fn`, `struct`, `int`, `u32` and `str` all carry this in the grammars, which is
+        // how a Sublime theme paints them: a keyword, not a type. A type *name* is `entity.name`.
+        ("storage", Kind::Keyword),
+        ("entity.name.function", Kind::Function),
+        ("entity.name.lifetime", Kind::Variable),
+        ("entity.name.type", Kind::Type),
+        ("entity.name.class", Kind::Type),
+        ("entity.name.struct", Kind::Type),
+        ("entity.name.enum", Kind::Type),
+        ("entity.name.trait", Kind::Type),
+        ("entity.name.tag", Kind::Type),
+        ("support.function", Kind::Function),
+        ("support.type", Kind::Type),
+        ("support.class", Kind::Type),
+        ("support.constant", Kind::Number),
+        ("variable.function", Kind::Function),
+        ("variable.annotation", Kind::Function),
+        ("variable", Kind::Variable),
+        ("punctuation", Kind::Punctuation),
+    ];
+    for (prefix, kind) in RULES {
+        if scope.starts_with(prefix) {
+            return *kind;
+        }
     }
-}
-
-/// A name that starts with a capital and has a lowercase letter: a type by convention in most of
-/// these languages. `HTTP` and `MAX` are constants, which are variables.
-fn is_camel_case(word: &str) -> bool {
-    let mut chars = word.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_uppercase())
-        && word.chars().any(|c| c.is_ascii_lowercase())
+    Kind::Plain
 }
 
 #[cfg(test)]
@@ -530,7 +329,7 @@ mod tests {
 
     fn runs(language: Language, line: &str) -> Vec<(Kind, String)> {
         let mut state = State::default();
-        highlight(language, line, &mut state)
+        highlight(&language, line, &mut state)
             .into_iter()
             .map(|(k, s)| (k, s.to_owned()))
             .collect()
@@ -540,136 +339,307 @@ mod tests {
         runs(language, line).into_iter().map(|(k, _)| k).collect()
     }
 
+    fn text_of(runs: &[(Kind, String)], kind: Kind) -> Vec<String> {
+        runs.iter()
+            .filter(|(k, _)| *k == kind)
+            .map(|(_, s)| s.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_run_of_code_is_coloured_the_way_it_reads() {
+        let r = runs(Language::parse("rust"), "let x: u32 = foo(1); // done");
+        assert!(r.contains(&(Kind::Keyword, "let".into())), "{r:?}");
+        // The grammar scopes a built-in type and a keyword the same way, and a Sublime theme
+        // paints both as keywords, so `u32` reads as one too.
+        assert!(
+            text_of(&r, Kind::Keyword).contains(&"u32".to_owned()),
+            "{r:?}"
+        );
+        assert!(
+            text_of(&r, Kind::Function).contains(&"foo".to_owned()),
+            "{r:?}"
+        );
+        assert!(text_of(&r, Kind::Number).contains(&"1".to_owned()), "{r:?}");
+        assert!(
+            text_of(&r, Kind::Comment)
+                .iter()
+                .any(|s| s.contains("done")),
+            "{r:?}"
+        );
+        // A type this project defined is the one that gets the type role.
+        let r = runs(Language::parse("rust"), "struct Point { x: f64 }");
+        assert!(
+            text_of(&r, Kind::Type).contains(&"Point".to_owned()),
+            "{r:?}"
+        );
+    }
+
     #[test]
     fn the_runs_cover_the_line_in_order() {
         // A caller renders them straight through, so nothing may be dropped or reordered.
-        for line in [
-            "let x = foo(1, \"two\"); // done",
-            "  # just a comment",
-            "",
-            "   ",
-            "a = 'unterminated",
+        for (language, line) in [
+            ("rust", "let x = foo(1, \"two\"); // done"),
+            ("python", "  # just a comment"),
+            ("rust", ""),
+            ("rust", "   "),
+            ("python", "a = 'unterminated"),
+            ("json", "{\"a\": [1, 2]}"),
+            ("toml", "key = \"value\""),
+            ("bash", "echo $HOME | grep -v x"),
         ] {
-            let runs = runs(Language::Rust, line);
+            let runs = runs(Language::parse(language), line);
             let joined: String = runs.iter().map(|(_, s)| s.as_str()).collect();
-            assert_eq!(joined, line, "for {line:?}");
+            assert_eq!(joined, line, "for {language} {line:?}");
         }
     }
 
     #[test]
-    fn rust_is_read_the_way_it_reads() {
-        let r = runs(Language::Rust, "let x: u32 = foo(1); // done");
-        assert_eq!(r[0], (Kind::Keyword, "let".into()));
-        assert!(r.contains(&(Kind::Type, "u32".into())), "{r:?}");
-        assert!(r.contains(&(Kind::Function, "foo".into())), "{r:?}");
-        assert!(r.contains(&(Kind::Number, "1".into())), "{r:?}");
+    fn a_lifetime_is_not_a_character_literal() {
+        // The bug a hand-written scanner has and a grammar does not: `'a` is a lifetime, and only
+        // a quote with a closing quote is a character literal.
+        let r = runs(Language::parse("rust"), "fn f<'a>(x: &'a str) -> &'a str {");
         assert!(
-            r.iter()
-                .any(|(k, s)| *k == Kind::Comment && s.contains("done")),
-            "{r:?}"
+            text_of(&r, Kind::String).is_empty(),
+            "a lifetime was read as a string: {r:?}"
         );
-        // A capitalised custom type.
-        let r = runs(Language::Rust, "struct Point { x: f64 }");
-        assert!(r.contains(&(Kind::Type, "Point".into())), "{r:?}");
+        let r = runs(Language::parse("rust"), "let c = 'x';");
+        assert!(
+            text_of(&r, Kind::String).iter().any(|s| s == "'x'"),
+            "a character literal is one: {r:?}"
+        );
+        let r = runs(Language::parse("rust"), "let n = '\\n';");
+        assert!(
+            text_of(&r, Kind::String).iter().any(|s| s == "'\\n'"),
+            "an escape is one too: {r:?}"
+        );
     }
 
     #[test]
-    fn a_block_comment_and_a_multiline_string_carry_over_lines() {
-        let mut state = State::default();
-        assert_eq!(
-            kind_of(highlight(Language::Rust, "/* start", &mut state)),
-            Some(Kind::Comment)
-        );
-        assert!(state.block_comment);
-        assert_eq!(
-            kind_of(highlight(Language::Rust, " still", &mut state)),
-            Some(Kind::Comment)
-        );
-        assert_eq!(
-            kind_of(highlight(Language::Rust, " end */ x", &mut state)),
-            Some(Kind::Comment)
-        );
-        assert!(!state.block_comment, "the comment closed");
-
-        let mut state = State::default();
-        let runs = highlight(Language::Python, "s = '''a", &mut state);
-        assert!(runs.iter().any(|(k, _)| *k == Kind::String), "{runs:?}");
-        assert!(state.string.is_some(), "an open triple quote");
-        // The next line closes it, and what follows the close is highlighted normally again.
-        let runs = highlight(Language::Python, "b''' + c", &mut state);
+    fn a_raw_string_is_one_string_however_many_quotes_it_holds() {
+        let r = runs(Language::parse("rust"), "let s = r#\"a \"quoted\" b\"#;");
         assert!(
-            runs.iter()
-                .any(|(k, s)| *k == Kind::String && s.starts_with("b'''")),
-            "{runs:?}"
+            text_of(&r, Kind::String)
+                .iter()
+                .any(|s| s == "r#\"a \"quoted\" b\"#"),
+            "a raw string was cut at the first quote: {r:?}"
         );
+        // Two hashes, so the string may hold one: it closes at `"##` and not before.
+        let r = runs(Language::parse("rust"), "let b = r##\"# \"quoted\" #\"##;");
         assert!(
-            runs.iter().any(|(k, s)| *k == Kind::Variable && *s == "c"),
-            "the rest of the line is not swallowed: {runs:?}"
+            text_of(&r, Kind::String)
+                .iter()
+                .any(|s| s == "r##\"# \"quoted\" #\"##"),
+            "{r:?}"
         );
-        assert!(state.string.is_none(), "the quote closed");
+        // A byte string keeps its prefix in the string.
+        let r = runs(Language::parse("rust"), "let c = b\"raw bytes\";");
+        assert!(
+            text_of(&r, Kind::String)
+                .iter()
+                .any(|s| s == "b\"raw bytes\""),
+            "{r:?}"
+        );
     }
 
     #[test]
-    fn a_hash_is_a_comment_in_shell_but_not_inside_a_word() {
-        // `#` in `a#b` is part of the word; at the start of one it is a comment.
-        let r = runs(Language::Toml, "key = \"#not a comment\"");
-        assert!(r.iter().all(|(k, _)| *k != Kind::Comment), "{r:?}");
-        let r = runs(Language::Shell, "echo hi  # a note");
+    fn nested_generics_are_not_a_shift() {
+        // `>>` closes two brackets, which a scanner that reads `>>` as one token gets wrong.
+        let r = runs(Language::parse("rust"), "let m: HashMap<K, Vec<V>> = x;");
         assert!(
-            r.iter()
-                .any(|(k, s)| *k == Kind::Comment && s.contains("a note")),
+            !text_of(&r, Kind::Operator).iter().any(|s| s == ">>"),
             "{r:?}"
         );
-        // Python's `#` is a comment even with no space before it.
-        let r = runs(Language::Python, "x = 1  # note");
-        assert!(r.iter().any(|(k, _)| *k == Kind::Comment), "{r:?}");
+        assert!(r.iter().any(|(k, _)| *k != Kind::Plain), "{r:?}");
+    }
+
+    #[test]
+    fn a_block_comment_and_a_string_carry_over_lines() {
+        let language = Language::parse("rust");
+        let mut state = State::default();
+        // A block comment opened on one line is a comment on the next.
+        let first = highlight(&language, "/* start", &mut state);
+        assert_eq!(first.first().map(|(k, _)| *k), Some(Kind::Comment));
+        let second = highlight(&language, " still", &mut state);
+        assert_eq!(second, [(Kind::Comment, " still")]);
+        let third = highlight(&language, " end */ x", &mut state);
+        assert!(
+            third
+                .iter()
+                .any(|(k, s)| *k == Kind::Comment && s.contains("end */")),
+            "the comment closed: {third:?}"
+        );
+        // What follows the close is no longer part of the comment.
+        assert!(
+            third
+                .iter()
+                .any(|(k, s)| *k == Kind::Plain && s.trim() == "x"),
+            "the rest of the line is not swallowed by the comment: {third:?}"
+        );
+        assert!(
+            highlight(&language, "let y = 1;", &mut state)
+                .iter()
+                .any(|(k, s)| *k == Kind::Keyword && *s == "let"),
+            "the comment did not reopen"
+        );
+    }
+
+    #[test]
+    fn a_python_triple_quoted_string_carries_over_lines() {
+        let language = Language::parse("python");
+        let mut state = State::default();
+        let first = highlight(&language, "s = '''a", &mut state);
+        assert!(first.iter().any(|(k, _)| *k == Kind::String), "{first:?}");
+        let second = highlight(&language, "b''' + c", &mut state);
+        assert!(
+            second
+                .iter()
+                .any(|(k, s)| *k == Kind::String && s.contains("b'''")),
+            "the string closed: {second:?}"
+        );
+        // `c` after the close is code again, not swallowed by the string.
+        assert!(
+            second.iter().any(|(k, s)| *k == Kind::Plain && *s == " c"),
+            "{second:?}"
+        );
+    }
+
+    #[test]
+    fn a_hash_is_a_comment_in_shell_but_not_inside_a_string() {
+        let r = runs(Language::parse("toml"), "key = \"#not a comment\"");
+        assert!(text_of(&r, Kind::Comment).is_empty(), "{r:?}");
+        let r = runs(Language::parse("bash"), "echo hi  # a note");
+        assert!(
+            text_of(&r, Kind::Comment)
+                .iter()
+                .any(|s| s.contains("a note")),
+            "{r:?}"
+        );
+        let r = runs(Language::parse("python"), "x = 1  # note");
+        assert!(!text_of(&r, Kind::Comment).is_empty(), "{r:?}");
     }
 
     #[test]
     fn escapes_do_not_end_a_string_early() {
-        let r = runs(Language::Rust, r#"let s = "a\"b";"#);
+        let r = runs(Language::parse("rust"), r#"let s = "a\"b";"#);
         assert!(
-            r.iter()
-                .any(|(k, s)| *k == Kind::String && s == r#""a\"b""#),
+            text_of(&r, Kind::String).iter().any(|s| s == r#""a\"b""#),
             "{r:?}"
         );
         // The semicolon after it is punctuation, not swallowed by the string.
         assert!(
-            r.iter().any(|(k, s)| *k == Kind::Punctuation && s == ";"),
+            text_of(&r, Kind::Punctuation).iter().any(|s| s == ";"),
             "{r:?}"
         );
     }
 
     #[test]
-    fn keywords_types_and_calls_are_told_apart_in_each_language() {
-        assert!(kinds(Language::Python, "def f():").contains(&Kind::Keyword));
-        assert!(kinds(Language::Go, "func main()").contains(&Kind::Keyword));
-        assert!(kinds(Language::Json, "\"a\": true").contains(&Kind::Keyword));
-        assert!(kinds(Language::C, "int main(void)").contains(&Kind::Keyword));
-        assert!(kinds(Language::C, "size_t n = 0;").contains(&Kind::Type));
-        let r = runs(Language::JavaScript, "if (x)");
-        assert!(r.contains(&(Kind::Keyword, "if".into())), "{r:?}");
-        // An unknown language still gets strings, numbers and comments.
-        let r = runs(Language::Unknown, "a = 1 # note");
-        assert!(r.contains(&(Kind::Number, "1".into())), "{r:?}");
-        assert!(r.iter().any(|(k, _)| *k == Kind::Comment), "{r:?}");
+    fn each_language_is_read_with_its_own_grammar() {
+        for (language, line) in [
+            ("python", "def f():"),
+            ("go", "func main()"),
+            ("c", "int main(void)"),
+            ("javascript", "if (x) {}"),
+            ("java", "public class A {}"),
+            ("ruby", "def f; end"),
+            ("sql", "SELECT 1 FROM t"),
+        ] {
+            assert!(
+                !kinds(Language::parse(language), line).is_empty(),
+                "{language} produced no runs"
+            );
+            assert!(
+                kinds(Language::parse(language), line).contains(&Kind::Keyword),
+                "{language} did not find a keyword in {line:?}"
+            );
+        }
+        // A type named in a Rust signature gets the type role.
+        let r = runs(Language::parse("rust"), "let m: HashMap<String, u8> = x;");
+        assert!(
+            text_of(&r, Kind::Type).iter().any(|s| s == "String"),
+            "{r:?}"
+        );
     }
 
     #[test]
-    fn a_fence_tag_is_matched_by_its_usual_spellings() {
-        assert_eq!(Language::parse("rust"), Language::Rust);
-        assert_eq!(Language::parse("rs"), Language::Rust);
-        assert_eq!(Language::parse("rust,ignore"), Language::Rust);
-        assert_eq!(Language::parse("TS"), Language::JavaScript);
-        assert_eq!(Language::parse("bash"), Language::Shell);
-        assert_eq!(Language::parse("console"), Language::Shell);
+    fn every_tag_this_project_writes_finds_a_grammar() {
+        for tag in [
+            "rust",
+            "rs",
+            "python",
+            "py",
+            "js",
+            "javascript",
+            "ts",
+            "typescript",
+            "tsx",
+            "sh",
+            "bash",
+            "zsh",
+            "console",
+            "json",
+            "toml",
+            "yaml",
+            "yml",
+            "c",
+            "h",
+            "cpp",
+            "go",
+            "java",
+            "ruby",
+            "html",
+            "css",
+            "sql",
+            "markdown",
+            "diff",
+            "dockerfile",
+        ] {
+            let language = Language::parse(tag);
+            assert!(
+                syntax_for(&language).is_some(),
+                "`{tag}` has no grammar: {language:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fence_tag_is_read_by_its_first_word() {
         assert_eq!(
             Language::parse(""),
             Language::Plain,
             "no tag, no highlighting"
         );
         assert_eq!(Language::parse("  "), Language::Plain);
-        assert_eq!(Language::parse("brainfuck"), Language::Unknown);
+        assert_eq!(
+            Language::parse("rust,ignore"),
+            Language::Tagged("rust".into())
+        );
+        assert_eq!(Language::parse("TS"), Language::Tagged("ts".into()));
+        assert_eq!(Language::parse("bash"), Language::Tagged("bash".into()));
+        assert_eq!(Language::parse("console"), Language::Tagged("sh".into()));
+        assert_eq!(Language::parse("python3"), Language::Tagged("py".into()));
+        // A tag this build has no grammar for names nothing to highlight, which is drawn plain.
+        let r = runs(Language::parse("brainfuck"), "+++[->++<]");
+        assert_eq!(r, [(Kind::Plain, "+++[->++<]".to_owned())]);
+    }
+
+    #[test]
+    fn an_untagged_block_is_drawn_plain() {
+        let r = runs(Language::Plain, "let x = 1; // looks like rust");
+        assert_eq!(
+            r,
+            [(Kind::Plain, "let x = 1; // looks like rust".to_owned())]
+        );
+        assert!(runs(Language::Plain, "").is_empty());
+    }
+
+    #[test]
+    fn a_block_that_changes_language_starts_again() {
+        let mut state = State::default();
+        highlight(&Language::parse("rust"), "/* open", &mut state);
+        // A block that names another language must not inherit the open comment.
+        let runs = highlight(&Language::parse("python"), "x = 1", &mut state);
+        assert!(!runs.iter().any(|(k, _)| *k == Kind::Comment), "{runs:?}");
     }
 
     #[test]
@@ -679,7 +649,27 @@ mod tests {
         assert_eq!(Kind::Plain.style(&syntax), Style::new());
     }
 
-    fn kind_of(runs: Vec<(Kind, &str)>) -> Option<Kind> {
-        runs.first().map(|(k, _)| *k)
+    #[test]
+    fn a_scope_says_which_role_it_means() {
+        assert_eq!(role("comment.line.double-slash.rust"), Kind::Comment);
+        assert_eq!(role("string.quoted.double.rust"), Kind::String);
+        assert_eq!(role("constant.numeric.integer.rust"), Kind::Number);
+        assert_eq!(role("constant.language.boolean.json"), Kind::Keyword);
+        assert_eq!(role("keyword.control.rust"), Kind::Keyword);
+        // The one that has to be asked first: an operator is not a keyword.
+        assert_eq!(role("keyword.operator.assignment.rust"), Kind::Operator);
+        // `let`, `fn` and a built-in type all carry a storage scope, which a theme paints as a
+        // keyword; a type this project defined is an entity name.
+        assert_eq!(role("storage.type.rust"), Kind::Keyword);
+        assert_eq!(role("storage.modifier.rust"), Kind::Keyword);
+        assert_eq!(role("entity.name.struct.rust"), Kind::Type);
+        // The prefix of a raw string is a string, not a keyword.
+        assert_eq!(role("storage.type.string.rust"), Kind::String);
+        assert_eq!(role("entity.name.function.rust"), Kind::Function);
+        assert_eq!(role("variable.other.rust"), Kind::Variable);
+        assert_eq!(role("punctuation.section.parens.rust"), Kind::Punctuation);
+        // A scope that means nothing to colour.
+        assert_eq!(role("source.rust"), Kind::Plain);
+        assert_eq!(role("meta.function-call.rust"), Kind::Plain);
     }
 }

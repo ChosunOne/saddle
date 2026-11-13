@@ -38,7 +38,7 @@ Inside `crates/saddle/src`:
 | `cache` | the cache-miss notice: one line to the user when a prompt is re-read at full price (D50) |
 | `reserved` | the D20 snapshot and restore of reserved paths around `exec` |
 | `provider/` | the neutral conversation form, the Anthropic and OpenAI-compatible renderers, the model list, the cached context windows and prices (D34, D36) |
-| `tui/` | the full-screen UI: app state, rendering, editor, login, settings, session list, `permissions` (the grants editor, D45), `tree` (the message tree, D54), `image` (drawing a picture: kitty and iTerm2, D59), `status` (the `[ui] status` template, D36), `theme` (the colour roles, D71), `palette` (pi's role vocabulary, colour forms and the palette derived from the terminal, D72, D73), `terminal` (asking the terminal for its colours, D73), `syntax` (the code-block highlighter, D73) and `themes` (the `/theme` picker, D74) |
+| `tui/` | the full-screen UI: app state, rendering, editor, login, settings, session list, `permissions` (the grants editor, D45), `tree` (the message tree, D54), `image` (drawing a picture: kitty and iTerm2, D59), `status` (the `[ui] status` template, D36), `theme` (the colour roles, D71), `palette` (pi's role vocabulary, colour forms and the palette derived from the terminal, D72, D73), `terminal` (asking the terminal for its colours, D73), `syntax` (code blocks: syntect's grammars, nine roles, the theme's colours, D80) and `themes` (the `/theme` picker, D74) |
 
 `crates/saddle/src/main.rs` dispatches subcommands (`run`, `check`, `tool`, `audit verify`)
 and intercepts `__sandbox` before clap parses anything — that is the helper process path, and it must
@@ -74,7 +74,9 @@ There is no CI config in the tree, no `rust-toolchain` pin and no `rustfmt.toml`
 in the root, not in a crate manifest.
 
 Cargo may have no network access: pass `--offline` and do not add dependencies that are not already in
-`Cargo.lock`.
+`Cargo.lock`. A command does have a network of its own now (D79), so `cargo add` works through the
+proxy when the session's `net` grants allow the registry — which is how `syntect` arrived (D80). The
+registry is still the only place a crate comes from: nothing here is fetched by hand.
 
 ### Running the binary by hand
 
@@ -118,8 +120,9 @@ WCAG contrast floor, falling back to ANSI colours if it answers nothing (D73). T
 **once, before the screen is taken over** — never from inside the interface, where reading a reply
 means owning stdin and raw mode, and turning raw mode off leaves every keystroke echoed and the
 interface deaf to all of them (D75). Code blocks are
-highlighted by a hand-written lexical highlighter whose colours are `syntax*` roles, so a theme paints
-code too (D73).
+highlighted by `syntect` — with `two-face`'s grammar set, which is bat's — and the scope it reports is
+mapped to nine roles whose colours are the theme's `syntax*` ones, so a theme paints code too and no
+colour reaches the renderer from anywhere else (D80, D71).
 The context is compacted three ways (D33): synchronously when it would overflow (`[compaction]
 auto`, `reserve-tokens`, `keep-recent-tokens`), **in the background** at `background-fraction`
 (three quarters by default) while the turn keeps generating (D78), and **when the session has been
@@ -178,7 +181,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D79 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D80 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
