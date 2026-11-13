@@ -88,6 +88,8 @@ pub enum Action {
     },
     /// Read the skills and instruction files again, and the settings with them (D70).
     Reload,
+    /// Show the theme, or switch to the named one and save it (D71).
+    Theme(Option<String>),
     Clear,
     Cancel,
     Quit,
@@ -300,6 +302,8 @@ pub struct Header {
     pub max_steps: Option<usize>,
     /// `[ui] images`: `kitty`, `iterm2`, `text`, or unset to detect it (D59).
     pub images: Option<String>,
+    /// `[ui] theme`: the name of the theme to draw with (D71).
+    pub theme: Option<String>,
 }
 
 /// Rendered lines for one entry, valid while the width and both toggles match.
@@ -383,6 +387,11 @@ pub const COMMANDS: &[SlashCommand] = &[
         about: "copy this conversation into a new one, from here",
     },
     SlashCommand {
+        name: "/theme",
+        args: "[name]",
+        about: "show the theme, or switch to another and save it",
+    },
+    SlashCommand {
         name: "/reload",
         args: "",
         about: "read the skills, AGENTS.md files and settings again, without restarting",
@@ -445,6 +454,8 @@ pub struct App {
     pub images: Vec<Placed>,
     /// What this terminal can draw, detected once at startup (D59).
     pub protocol: crate::tui::image::Protocol,
+    /// The colours to draw with (D71). Every role the renderer paints comes from here.
+    pub theme: crate::tui::theme::Theme,
     /// What the last frame drew, and where (D59).
     pub drawn: Drawn,
     pub usage: Usage,
@@ -546,6 +557,7 @@ impl App {
             total_lines: 0,
             images: Vec::new(),
             protocol: crate::tui::image::Protocol::Text,
+            theme: crate::tui::theme::Theme::default(),
             drawn: Drawn::default(),
             usage: Usage::default(),
             cost: 0.0,
@@ -1414,6 +1426,7 @@ impl App {
             }
             "/clone" => Some(Action::Clone),
             "/settings" => Some(Action::OpenSettings),
+            "/theme" => Some(Action::Theme(arg)),
             "/reload" if self.busy.is_some() => {
                 self.info("/reload waits for the turn to end; esc cancels it");
                 None
@@ -1737,6 +1750,7 @@ mod tests {
             mouse: false,
             status: crate::tui::status::Template::default(),
             images: None,
+            theme: None,
         })
     }
 
@@ -2041,6 +2055,20 @@ mod tests {
             "the conversation holds the expanded prompt"
         );
         assert!(a.busy.is_some(), "the turn starts");
+    }
+
+    #[test]
+    fn theme_is_a_command_with_an_optional_name() {
+        // D71: no argument reports, a name switches. The switch itself needs a config to write, so
+        // what the app decides is which action the command is.
+        let mut a = app();
+        type_text(&mut a, "/theme");
+        assert_eq!(a.key(key(KeyCode::Enter)), Some(Action::Theme(None)));
+        type_text(&mut a, "/theme light");
+        assert_eq!(
+            a.key(key(KeyCode::Enter)),
+            Some(Action::Theme(Some("light".into())))
+        );
     }
 
     #[test]

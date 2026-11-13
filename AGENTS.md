@@ -37,7 +37,7 @@ Inside `crates/saddle/src`:
 | `cache` | the cache-miss notice: one line to the user when a prompt is re-read at full price (D50) |
 | `reserved` | the D20 snapshot and restore of reserved paths around `exec` |
 | `provider/` | the neutral conversation form, the Anthropic and OpenAI-compatible renderers, the model list, the cached context windows and prices (D34, D36) |
-| `tui/` | the full-screen UI: app state, rendering, editor, login, settings, session list, `permissions` (the grants editor, D45), `tree` (the message tree, D54), `image` (drawing a picture: kitty and iTerm2, D59), and `status` (the `[ui] status` template, D36) |
+| `tui/` | the full-screen UI: app state, rendering, editor, login, settings, session list, `permissions` (the grants editor, D45), `tree` (the message tree, D54), `image` (drawing a picture: kitty and iTerm2, D59), and `status` (the `[ui] status` template, D36) and `theme` (the colour roles, D71) |
 
 `crates/saddle/src/main.rs` dispatches subcommands (`run`, `check`, `tool`, `audit verify`)
 and intercepts `__sandbox` before clap parses anything — that is the helper process path, and it must
@@ -101,9 +101,10 @@ its next request (D47). Editing `saddle.toml` in a repository has no effect (D42
 `/skill:<name> <request>` loads a skill's instructions into the conversation followed by the
 request, in the TUI and in line mode, and is the only way to reach a skill marked
 `disable-model-invocation` (D69). `/reload` reads the instruction files and skills again and rebuilds the
-prompt, and re-reads the settings, so a change made mid-session is picked up without restarting
-(D70). `/thinking` (or shift+tab) changes the reasoning effort for the
-session (D57), `/name` and
+prompt, and re-reads the settings and the theme, so a change made mid-session is picked up without
+restarting (D70). `/theme [name]` shows the theme or switches to one and saves it; colours are
+`[themes.<name>]` tables of roles in `config.toml`, and the renderer names no colour directly
+(D71). `/thinking` (or shift+tab) changes the reasoning effort for the session (D57), `/name` and
 `/session` name and describe it (D55), and escape twice on an empty prompt opens the message tree (D54), where a prompt can be sent again to
 make another branch; `/clone` copies the branch into a separate session instead. There is no
 trust step (D44): nothing the agent runs can write a policy file, so `saddle check` is the whole
@@ -151,7 +152,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D70 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D71 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

@@ -119,6 +119,21 @@ write = [{write}]
 # .fetchmailrc .authinfo .bash_history .zsh_history .python_history .node_repl_history
 # .psql_history .mysql_history .mozilla .thunderbird .config/google-chrome .config/chromium
 
+# Colours. `theme` names one: built in are default, light and mono. Define your own under
+# [themes.<name>], and it starts from the roles it does not list, so three lines restyle one thing:
+#
+#   [ui]
+#   theme = "mine"
+#
+#   [themes.mine]
+#   extends = "default"        # or "light", "mono", or another theme here
+#   accent = "magenta"         # an ANSI name, #rrggbb, or a palette index 0-255
+#   muted = "dark-gray"
+#
+# The roles are accent, muted, code, warn, error, success, link, text, diff-added, diff-removed,
+# tool-pending-bg, tool-ok-bg, tool-error-bg, tool-text, tool-error-text, compact-done-bg,
+# selection-bg and selection-fg. /theme switches and saves; /reload re-reads this file.
+#
 # How the TUI starts. /settings changes these; ctrl+t and ctrl+o change them for one session.
 # [ui]
 # show-reasoning = true

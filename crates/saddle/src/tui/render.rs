@@ -17,6 +17,7 @@ use super::sessions::{ROWS as SESSION_ROWS, SessionPicker, age};
 use super::settings::{ROWS, SettingsDialog};
 use super::tree::{ROWS as TREE_ROWS, Tree};
 use crate::tui::status::StatusData;
+use crate::tui::theme::Theme;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Output lines a collapsed tool block shows.
@@ -148,14 +149,17 @@ fn pieces(s: &str) -> Vec<&str> {
     out
 }
 
-fn code_style() -> Style {
-    Style::new().fg(Color::Yellow)
+fn code_style(theme: &Theme) -> Style {
+    Style::new().fg(theme.code)
 }
 
 /// Markdown to rows. Soft breaks are kept as line breaks, since a model's line breaks are usually
 /// deliberate (tables, lists written by hand).
-pub fn markdown(text: &str) -> Vec<Row> {
-    let mut md = Markdown::default();
+pub fn markdown(text: &str, theme: &Theme) -> Vec<Row> {
+    let mut md = Markdown {
+        theme: theme.clone(),
+        ..Markdown::default()
+    };
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     for event in Parser::new_ext(text, options) {
@@ -167,6 +171,8 @@ pub fn markdown(text: &str) -> Vec<Row> {
 
 #[derive(Default)]
 struct Markdown {
+    /// The colours, kept here because the parser's callbacks are methods on this struct (D71).
+    theme: Theme,
     rows: Vec<Row>,
     line: Vec<Span<'static>>,
     styles: Vec<Style>,
@@ -187,6 +193,10 @@ struct Table {
 }
 
 impl Markdown {
+    fn code_style(&self) -> Style {
+        code_style(&self.theme)
+    }
+
     fn style(&self) -> Style {
         self.styles
             .iter()
@@ -199,7 +209,7 @@ impl Markdown {
 
     fn prefixes(&mut self) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         let quote = "│ ".repeat(self.quote);
-        let quote_style = Style::new().fg(Color::DarkGray);
+        let quote_style = Style::new().fg(self.theme.muted);
         let indent = self.indent();
         let first = match self.bullet.take() {
             Some(bullet) => {
@@ -211,7 +221,7 @@ impl Markdown {
                 return (
                     vec![
                         Span::styled(quote.clone(), quote_style),
-                        Span::styled(lead, Style::new().fg(Color::Cyan)),
+                        Span::styled(lead, Style::new().fg(self.theme.accent)),
                     ],
                     vec![Span::styled(quote, quote_style), Span::raw(rest)],
                 );
@@ -262,7 +272,8 @@ impl Markdown {
                     if l.is_empty() && lines.peek().is_none() {
                         break;
                     }
-                    self.line.push(Span::styled(format!("  {l}"), code_style()));
+                    self.line
+                        .push(Span::styled(format!("  {l}"), self.code_style()));
                     self.flush();
                 }
             }
@@ -270,13 +281,13 @@ impl Markdown {
                 let style = self.style();
                 self.text(&t, style);
             }
-            Event::Code(t) => self.text(&t, code_style()),
+            Event::Code(t) => self.text(&t, self.code_style()),
             Event::SoftBreak | Event::HardBreak => self.flush(),
             Event::Rule => {
                 self.start_block();
                 self.line.push(Span::styled(
                     "─".repeat(40),
-                    Style::new().fg(Color::DarkGray),
+                    Style::new().fg(self.theme.muted),
                 ));
                 self.flush();
                 self.blank_before_next_block = true;
@@ -311,9 +322,9 @@ impl Markdown {
             Tag::Heading { level, .. } => {
                 self.start_block();
                 let style = match level {
-                    HeadingLevel::H1 | HeadingLevel::H2 => {
-                        Style::new().add_modifier(Modifier::BOLD).fg(Color::Cyan)
-                    }
+                    HeadingLevel::H1 | HeadingLevel::H2 => Style::new()
+                        .add_modifier(Modifier::BOLD)
+                        .fg(self.theme.accent),
                     _ => Style::new().add_modifier(Modifier::BOLD),
                 };
                 self.styles.push(style);
@@ -357,7 +368,7 @@ impl Markdown {
                 self.styles.push(
                     Style::new()
                         .add_modifier(Modifier::UNDERLINED)
-                        .fg(Color::Blue),
+                        .fg(self.theme.link),
                 );
                 self.link = Some(dest_url.to_string());
             }
@@ -416,7 +427,7 @@ impl Markdown {
                     if !url.is_empty() && !shown.ends_with(&url) {
                         self.line.push(Span::styled(
                             format!(" <{url}>"),
-                            Style::new().fg(Color::DarkGray),
+                            Style::new().fg(self.theme.muted),
                         ));
                     }
                 }
@@ -444,7 +455,7 @@ impl Markdown {
                 widths[i] = widths[i].max(spans_width(cell));
             }
         }
-        let sep = Style::new().fg(Color::DarkGray);
+        let sep = Style::new().fg(self.theme.muted);
         for (r, row) in t.rows.into_iter().enumerate() {
             let head = r < t.head_rows;
             for (i, cell) in row.into_iter().enumerate() {
@@ -470,8 +481,8 @@ impl Markdown {
     }
 }
 
-fn dim() -> Style {
-    Style::new().fg(Color::DarkGray)
+fn dim(theme: &Theme) -> Style {
+    Style::new().fg(theme.muted)
 }
 
 /// Toggles that change how entries render.
@@ -487,15 +498,15 @@ struct View {
     images: bool,
 }
 
-fn thinking_rows(text: &str, shown: bool) -> Vec<Row> {
+fn thinking_rows(text: &str, shown: bool, theme: &Theme) -> Vec<Row> {
     let text = text.trim();
-    let bar = Style::new().fg(Color::DarkGray);
+    let bar = Style::new().fg(theme.muted);
     if !shown {
         let n = text.lines().count();
         let plural = if n == 1 { "" } else { "s" };
         return vec![Row::plain(vec![Span::styled(
             format!("∴ thought for {n} line{plural} · ctrl+t shows it"),
-            dim().add_modifier(Modifier::ITALIC),
+            dim(theme).add_modifier(Modifier::ITALIC),
         )])];
     }
     text.lines()
@@ -506,7 +517,7 @@ fn thinking_rows(text: &str, shown: bool) -> Vec<Row> {
                 bar,
                 vec![Span::styled(
                     l.to_owned(),
-                    dim().add_modifier(Modifier::ITALIC),
+                    dim(theme).add_modifier(Modifier::ITALIC),
                 )],
             )
         })
@@ -514,16 +525,16 @@ fn thinking_rows(text: &str, shown: bool) -> Vec<Row> {
 }
 
 /// Rows for entries drawn as plain text; tool calls are drawn as blocks by [`tool_block`].
-fn entry_rows(entry: &Entry, view: View) -> Vec<Row> {
+fn entry_rows(entry: &Entry, view: View, theme: &Theme) -> Vec<Row> {
     match entry {
-        Entry::Thinking(text) => thinking_rows(text, view.thinking),
+        Entry::Thinking(text) => thinking_rows(text, view.thinking, theme),
         Entry::User(text) => text
             .lines()
             .map(|l| {
                 Row::prefixed(
                     "› ",
                     "  ",
-                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
                     vec![Span::styled(
                         l.to_owned(),
                         Style::new().add_modifier(Modifier::BOLD),
@@ -531,13 +542,13 @@ fn entry_rows(entry: &Entry, view: View) -> Vec<Row> {
                 )
             })
             .collect(),
-        Entry::Assistant(text) => markdown(text),
+        Entry::Assistant(text) => markdown(text, theme),
         Entry::Image(image) => {
             // The picture is drawn over the rows after this one, so they are left empty for it. The
             // marker line stays, and is all a terminal without a graphics protocol shows (D59).
             let mut out: Vec<Row> = vec![Row::plain(vec![Span::styled(
                 crate::tui::image::fallback(&image.name, image.width, image.height),
-                dim(),
+                dim(theme),
             )])];
             if view.images {
                 // The rows the picture will cover, from its own size scaled into the transcript
@@ -556,9 +567,9 @@ fn entry_rows(entry: &Entry, view: View) -> Vec<Row> {
         }
         Entry::Note(kind, text) => {
             let style = match kind {
-                NoteKind::Info => dim(),
-                NoteKind::Warn => Style::new().fg(Color::Yellow),
-                NoteKind::Error => Style::new().fg(Color::Red),
+                NoteKind::Info => dim(theme),
+                NoteKind::Warn => Style::new().fg(theme.warn),
+                NoteKind::Error => Style::new().fg(theme.error),
             };
             text.lines()
                 .map(|l| Row::plain(vec![Span::styled(l.to_owned(), style)]))
@@ -568,24 +579,27 @@ fn entry_rows(entry: &Entry, view: View) -> Vec<Row> {
     }
 }
 
-const COMPACT_DONE: Color = Color::Rgb(38, 42, 60);
-
 /// A compaction as a shaded block: what is being summarized, then the model's reasoning (unless
 /// hidden with ctrl+t) and the summary as they stream in, then what was kept.
-fn compaction_block(v: &CompactionView, thinking: bool, spinner: usize) -> (Vec<Row>, Color) {
-    let accent = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-    let muted = Style::new().fg(TOOL_TEXT);
+fn compaction_block(
+    v: &CompactionView,
+    thinking: bool,
+    spinner: usize,
+    theme: &Theme,
+) -> (Vec<Row>, Color) {
+    let accent = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
+    let muted = Style::new().fg(theme.tool_text);
     let italic = muted.add_modifier(Modifier::ITALIC);
     let (lead, bg) = match &v.state {
         CompactState::Running => (
             format!("{} ", SPINNER[spinner % SPINNER.len()]),
-            TOOL_PENDING,
+            theme.tool_pending_bg,
         ),
-        CompactState::Done(_) => ("✻ ".to_owned(), COMPACT_DONE),
-        CompactState::Failed(_) => ("✻ ".to_owned(), TOOL_ERROR),
+        CompactState::Done(_) => ("✻ ".to_owned(), theme.compact_done_bg),
+        CompactState::Failed(_) => ("✻ ".to_owned(), theme.tool_error_bg),
     };
     let mut rows = vec![Row::plain(vec![
-        Span::styled(lead, Style::new().fg(Color::Yellow)),
+        Span::styled(lead, Style::new().fg(theme.warn)),
         Span::styled("compaction", accent),
         Span::styled(format!("  {}", v.header), muted),
     ])];
@@ -608,7 +622,7 @@ fn compaction_block(v: &CompactionView, thinking: bool, spinner: usize) -> (Vec<
     }
     if !v.summary.trim().is_empty() {
         rows.push(Row::default());
-        rows.extend(markdown(&v.summary));
+        rows.extend(markdown(&v.summary, theme));
     }
     match &v.state {
         CompactState::Done(line) if !line.is_empty() => {
@@ -619,20 +633,13 @@ fn compaction_block(v: &CompactionView, thinking: bool, spinner: usize) -> (Vec<
             rows.push(Row::default());
             rows.push(Row::plain(vec![Span::styled(
                 format!("compaction failed: {why}"),
-                Style::new().fg(TOOL_ERROR_TEXT),
+                Style::new().fg(theme.tool_error_text),
             )]));
         }
         _ => {}
     }
     (rows, bg)
 }
-
-/// Background shades for a tool block: running, finished, failed or refused.
-const TOOL_PENDING: Color = Color::Rgb(40, 40, 52);
-const TOOL_OK: Color = Color::Rgb(36, 48, 40);
-const TOOL_ERROR: Color = Color::Rgb(62, 38, 40);
-const TOOL_TEXT: Color = Color::Rgb(170, 170, 178);
-const TOOL_ERROR_TEXT: Color = Color::Rgb(240, 165, 165);
 
 /// A tool's output as the block shows it. For bash, the exit-code line moves to the end (where
 /// it stays visible under a long output) and the stream markers are dropped.
@@ -669,16 +676,17 @@ fn tool_block(
     diff: Option<&str>,
     expand: bool,
     spinner: usize,
+    theme: &Theme,
 ) -> (Vec<Row>, Color) {
     let bold = Style::new().add_modifier(Modifier::BOLD);
-    let accent = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let accent = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
     let mut detail_lines = detail.lines();
     let first = detail_lines.next().unwrap_or_default().to_owned();
     let mut header = Vec::new();
     if result.is_none() {
         header.push(Span::styled(
             format!("{} ", SPINNER[spinner % SPINNER.len()]),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme.warn),
         ));
     }
     if name == "bash" {
@@ -697,21 +705,23 @@ fn tool_block(
                 .map(|l| Row::plain(vec![Span::styled((*l).to_owned(), bold)])),
         );
     } else if !more.is_empty() {
-        rows[0].spans.push(Span::styled(" …", dim()));
+        rows[0].spans.push(Span::styled(" …", dim(theme)));
     }
     let Some((ok, content)) = result else {
-        return (rows, TOOL_PENDING);
+        return (rows, theme.tool_pending_bg);
     };
     let (bg, text) = if *ok {
-        (TOOL_OK, Style::new().fg(TOOL_TEXT))
+        (theme.tool_ok_bg, Style::new().fg(theme.tool_text))
     } else {
-        (TOOL_ERROR, Style::new().fg(TOOL_ERROR_TEXT))
+        (theme.tool_error_bg, Style::new().fg(theme.tool_error_text))
     };
     let (lines, status) = tool_output(name, content);
-    let note = Style::new().fg(TOOL_TEXT).add_modifier(Modifier::ITALIC);
+    let note = Style::new()
+        .fg(theme.tool_text)
+        .add_modifier(Modifier::ITALIC);
     let mut body: Vec<Row> = Vec::new();
     if let (Some(diff), true) = (diff, *ok) {
-        body = diff_rows(diff, expand);
+        body = diff_rows(diff, expand, theme);
     } else if name == "read" && *ok && !expand {
         // A file's contents are noise in the transcript until asked for.
         body.push(Row::plain(vec![Span::styled(
@@ -753,7 +763,7 @@ fn tool_block(
         body.push(Row::plain(vec![Span::styled(
             status,
             Style::new()
-                .fg(TOOL_ERROR_TEXT)
+                .fg(theme.tool_error_text)
                 .add_modifier(Modifier::BOLD),
         )]));
     }
@@ -766,12 +776,10 @@ fn tool_block(
 
 /// Diff lines shown in an edit or write block, before ctrl+o.
 const DIFF_PREVIEW: usize = 16;
-const DIFF_REMOVED: Color = Color::Rgb(240, 130, 130);
-const DIFF_ADDED: Color = Color::Rgb(130, 215, 140);
 
 /// A diff from [`crate::tools`], one row per line: a gutter with the sign and line number, then
 /// the text. Wrapped text stays to the right of the gutter.
-fn diff_rows(diff: &str, expand: bool) -> Vec<Row> {
+fn diff_rows(diff: &str, expand: bool, theme: &Theme) -> Vec<Row> {
     let lines: Vec<&str> = diff.lines().collect();
     let width = lines
         .iter()
@@ -784,7 +792,7 @@ fn diff_rows(diff: &str, expand: bool) -> Vec<Row> {
     } else {
         lines.len().min(DIFF_PREVIEW)
     };
-    let gutter = Style::new().fg(Color::DarkGray);
+    let gutter = Style::new().fg(theme.muted);
     let mut rows = Vec::new();
     for line in &lines[..shown] {
         let (tag, rest) = line.split_at(line.len().min(1));
@@ -797,9 +805,9 @@ fn diff_rows(diff: &str, expand: bool) -> Vec<Row> {
         }
         let (number, text) = rest.split_once(' ').unwrap_or((rest, ""));
         let (sign, style) = match tag {
-            "-" => ("-", Style::new().fg(DIFF_REMOVED)),
-            "+" => ("+", Style::new().fg(DIFF_ADDED)),
-            _ => (" ", Style::new().fg(TOOL_TEXT)),
+            "-" => ("-", Style::new().fg(theme.diff_removed)),
+            "+" => ("+", Style::new().fg(theme.diff_added)),
+            _ => (" ", Style::new().fg(theme.tool_text)),
         };
         rows.push(Row {
             first: vec![
@@ -813,7 +821,9 @@ fn diff_rows(diff: &str, expand: bool) -> Vec<Row> {
     if shown < lines.len() {
         rows.push(Row::plain(vec![Span::styled(
             format!("… {} more lines · ctrl+o shows all", lines.len() - shown),
-            Style::new().fg(TOOL_TEXT).add_modifier(Modifier::ITALIC),
+            Style::new()
+                .fg(theme.tool_text)
+                .add_modifier(Modifier::ITALIC),
         )]));
     }
     rows
@@ -891,14 +901,15 @@ fn transcript_with_images(
                         diff.as_deref(),
                         view.expand,
                         view.spinner,
+                        &app.theme,
                     );
                     shaded(&rows, bg, width as usize)
                 }
                 Entry::Compaction(v) => {
-                    let (rows, bg) = compaction_block(v, view.thinking, view.spinner);
+                    let (rows, bg) = compaction_block(v, view.thinking, view.spinner, &app.theme);
                     shaded(&rows, bg, width as usize)
                 }
-                entry => entry_rows(entry, view)
+                entry => entry_rows(entry, view, &app.theme)
                     .iter()
                     .flat_map(|r| wrap(r, width as usize))
                     .collect(),
@@ -936,15 +947,13 @@ fn plain(line: &Line<'_>) -> String {
 
 /// The background a selected character sits on. It replaces only the colours, so dim tool output
 /// stays readable while selected, and reversed text keeps its emphasis (D35).
-fn selected_style() -> Style {
-    Style::new()
-        .bg(Color::Rgb(42, 74, 112))
-        .fg(Color::Rgb(246, 248, 251))
+fn selected_style(theme: &Theme) -> Style {
+    Style::new().bg(theme.selection_bg).fg(theme.selection_fg)
 }
 
 /// Puts the selection's background behind characters `from..to` of one rendered line, splitting
 /// spans where the selection starts and ends inside them.
-fn shade(line: &mut Line<'static>, from: usize, to: usize) {
+fn shade(line: &mut Line<'static>, from: usize, to: usize, theme: &Theme) {
     if to <= from {
         return;
     }
@@ -958,23 +967,29 @@ fn shade(line: &mut Line<'static>, from: usize, to: usize) {
             let here = index >= from && index < to;
             index += 1;
             if selected != Some(here) {
-                flush(&mut out, &mut run, selected, span.style);
+                flush(&mut out, &mut run, selected, span.style, theme);
                 selected = Some(here);
             }
             run.push(c);
         }
-        flush(&mut out, &mut run, selected, span.style);
+        flush(&mut out, &mut run, selected, span.style, theme);
     }
     line.spans = out;
 }
 
-fn flush(out: &mut Vec<Span<'static>>, run: &mut String, selected: Option<bool>, style: Style) {
+fn flush(
+    out: &mut Vec<Span<'static>>,
+    run: &mut String,
+    selected: Option<bool>,
+    style: Style,
+    theme: &Theme,
+) {
     if run.is_empty() {
         return;
     }
     let text = std::mem::take(run);
     out.push(match selected {
-        Some(true) => Span::styled(text, style.patch(selected_style())),
+        Some(true) => Span::styled(text, style.patch(selected_style(theme))),
         _ => Span::styled(text, style),
     });
 }
@@ -1019,7 +1034,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .map(|q| {
             let first = q.lines().next().unwrap_or_default();
             Line::from(vec![
-                Span::styled("queued › ", dim()),
+                Span::styled("queued › ", dim(&app.theme)),
                 Span::raw(first.to_owned()),
             ])
         })
@@ -1041,23 +1056,26 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
                 }
             };
             Line::from(vec![
-                Span::styled(format!("{spin} "), Style::new().fg(Color::Yellow)),
+                Span::styled(format!("{spin} "), Style::new().fg(app.theme.warn)),
                 Span::raw(what),
-                Span::styled("  esc to cancel", dim()),
+                Span::styled("  esc to cancel", dim(&app.theme)),
             ])
         }
         (None, Some(reason)) => Line::from(Span::styled(
             format!("session stopped: {reason}"),
-            Style::new().fg(Color::Red),
+            Style::new().fg(app.theme.error),
         )),
         (None, None) => match app.copied.filter(|at| at.elapsed() < COPY_NOTE) {
             Some(_) => Line::from(vec![
-                Span::styled("copied the selection", Style::new().fg(Color::Green)),
-                Span::styled("  (shift+drag still selects in the terminal)", dim()),
+                Span::styled("copied the selection", Style::new().fg(app.theme.success)),
+                Span::styled(
+                    "  (shift+drag still selects in the terminal)",
+                    dim(&app.theme),
+                ),
             ]),
             None => Line::from(Span::styled(
                 "enter send · shift+enter newline · /help",
-                dim(),
+                dim(&app.theme),
             )),
         },
     };
@@ -1070,10 +1088,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .iter()
         .map(|r| Line::raw(r.clone()))
         .collect();
+    // The editor's border is the one place that says whether the agent is working: muted while a
+    // turn runs, the accent colour when it is waiting for you.
     let border = if app.busy.is_some() {
-        Color::DarkGray
+        app.theme.muted
     } else {
-        Color::Cyan
+        app.theme.accent
     };
     let editor = Paragraph::new(shown).block(
         Block::bordered()
@@ -1109,29 +1129,34 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     {
         let room = (status_area.width as usize).saturating_sub(right.width() + 2);
         let left = keep_tail(&home_relative(&app.header.workspace), room);
-        frame.render_widget(Paragraph::new(left.dark_gray()), status_area);
+        frame.render_widget(
+            Paragraph::new(left).style(Style::new().fg(app.theme.muted)),
+            status_area,
+        );
     }
     frame.render_widget(
-        Paragraph::new(right.dark_gray()).alignment(Alignment::Right),
+        Paragraph::new(right)
+            .style(Style::new().fg(app.theme.muted))
+            .alignment(Alignment::Right),
         status_area,
     );
 
     draw_menu(frame, app, editor_area);
 
     if let Some(picker) = &app.resume {
-        draw_resume(frame, picker, area);
+        draw_resume(frame, picker, area, &app.theme);
     }
     if let Some(tree) = &app.tree {
-        draw_tree(frame, tree, area);
+        draw_tree(frame, tree, area, &app.theme);
     }
     if let Some(dialog) = &app.settings {
-        draw_settings(frame, dialog, area);
+        draw_settings(frame, dialog, area, &app.theme);
     }
     if let Some(dialog) = &app.permissions {
-        draw_permissions(frame, dialog, area);
+        draw_permissions(frame, dialog, area, &app.theme);
     }
     if let Some(login) = &app.login {
-        draw_login(frame, login, area, app.spinner);
+        draw_login(frame, login, area, app.spinner, &app.theme);
     }
 }
 
@@ -1149,7 +1174,7 @@ fn draw_menu(frame: &mut Frame<'_>, app: &mut App, editor_area: Rect) {
         .map(|(label, _)| label.width())
         .max()
         .unwrap_or(0);
-    let accent = Style::new().fg(Color::Cyan);
+    let accent = Style::new().fg(app.theme.accent);
     let room = (editor_area.width as usize).saturating_sub(4);
     let lines: Vec<Line> = popup
         .items
@@ -1172,7 +1197,7 @@ fn draw_menu(frame: &mut Frame<'_>, app: &mut App, editor_area: Rect) {
                 ),
             ];
             if !about.is_empty() {
-                spans.push(Span::styled(format!("  {about}"), dim()));
+                spans.push(Span::styled(format!("  {about}"), dim(&app.theme)));
             }
             Line::from(spans)
         })
@@ -1189,8 +1214,8 @@ fn draw_menu(frame: &mut Frame<'_>, app: &mut App, editor_area: Rect) {
         Paragraph::new(lines).block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(dim())
-                .title_bottom(Span::styled(popup.hint, dim())),
+                .border_style(dim(&app.theme))
+                .title_bottom(Span::styled(popup.hint, dim(&app.theme))),
         ),
         rect,
     );
@@ -1206,10 +1231,10 @@ fn login_title(login: &Login) -> String {
 }
 
 /// The /login dialog, centred over the screen. Keys are shown as dots.
-fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize) {
+fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize, theme: &Theme) {
     let width = area.width.saturating_sub(4).min(76);
     let inner = width.saturating_sub(2) as usize;
-    let accent = Style::new().fg(Color::Cyan);
+    let accent = Style::new().fg(theme.accent);
     let mut lines: Vec<Line> = Vec::new();
     let mut cursor = None;
     let title = match &login.stage {
@@ -1237,12 +1262,12 @@ fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize) 
                     ),
                 ];
                 if !c.detail.is_empty() {
-                    spans.push(Span::styled(format!("  {}", c.detail), dim()));
+                    spans.push(Span::styled(format!("  {}", c.detail), dim(theme)));
                 }
                 if !c.status.is_empty() {
                     spans.push(Span::styled(
                         format!("  {}", c.status),
-                        Style::new().fg(Color::Green),
+                        Style::new().fg(theme.success),
                     ));
                 }
                 lines.push(Line::from(spans));
@@ -1250,7 +1275,7 @@ fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize) 
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 "↑↓ choose · enter select · esc close",
-                dim(),
+                dim(theme),
             )));
             " Log in ".to_owned()
         }
@@ -1271,7 +1296,7 @@ fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize) 
                     let label = format!("{}: ", f.label);
                     let room = inner.saturating_sub(label.width());
                     lines.push(Line::from(vec![
-                        Span::styled(label, dim()),
+                        Span::styled(label, dim(theme)),
                         Span::raw(keep_tail(&shown, room)),
                     ]));
                     continue;
@@ -1290,17 +1315,20 @@ fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize) 
                     if let Some(page) = crate::provider::key_page(&login.choice().name) {
                         lines.push(Line::from(Span::styled(
                             format!("get one at {page}"),
-                            dim(),
+                            dim(theme),
                         )));
                     }
                     let note = format!("stored in {}, readable only by you", login.auth_path);
-                    lines.push(Line::from(Span::styled(keep_tail(&note, inner), dim())));
+                    lines.push(Line::from(Span::styled(
+                        keep_tail(&note, inner),
+                        dim(theme),
+                    )));
                 }
             }
             if let Some(e) = &login.error {
                 lines.push(Line::from(Span::styled(
                     keep_tail(e, inner),
-                    Style::new().fg(Color::Red),
+                    Style::new().fg(theme.error),
                 )));
             }
             lines.push(Line::default());
@@ -1311,18 +1339,18 @@ fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize) 
             };
             lines.push(Line::from(Span::styled(
                 format!("enter next · {esc}"),
-                dim(),
+                dim(theme),
             )));
             login_title(login)
         }
         Stage::Checking { .. } => {
             let spin = SPINNER[spinner % SPINNER.len()];
             lines.push(Line::from(vec![
-                Span::styled(format!("{spin} "), Style::new().fg(Color::Yellow)),
+                Span::styled(format!("{spin} "), Style::new().fg(theme.warn)),
                 Span::raw("checking the key and listing models…"),
             ]));
             lines.push(Line::default());
-            lines.push(Line::from(Span::styled("esc back", dim())));
+            lines.push(Line::from(Span::styled("esc back", dim(theme))));
             login_title(login)
         }
         Stage::Models {
@@ -1335,7 +1363,7 @@ fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize) 
             if let Some(note) = note {
                 lines.push(Line::from(Span::styled(
                     keep_tail(note, inner),
-                    Style::new().fg(Color::Yellow),
+                    Style::new().fg(theme.warn),
                 )));
             }
             let visible = keep_tail(filter, inner.saturating_sub(10));
@@ -1366,7 +1394,7 @@ fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize) 
                         &format!("enter uses \"{}\" as the model name", filter.trim()),
                         inner,
                     ),
-                    dim(),
+                    dim(theme),
                 )));
             }
             lines.push(Line::default());
@@ -1376,12 +1404,12 @@ fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize) 
                     list.len(),
                     models.len()
                 ),
-                dim(),
+                dim(theme),
             )));
             login_title(login)
         }
     };
-    modal(frame, area, width, &title, lines, cursor);
+    modal(frame, area, width, &title, lines, cursor, theme);
 }
 
 /// A bordered box centred over `area`, with an optional cursor at (row, column) inside it.
@@ -1392,6 +1420,7 @@ fn modal(
     title: &str,
     lines: Vec<Line<'_>>,
     cursor: Option<(usize, usize)>,
+    theme: &Theme,
 ) {
     let height = (lines.len() as u16 + 2).min(area.height);
     let rect = Rect::new(
@@ -1405,7 +1434,7 @@ fn modal(
         Paragraph::new(lines).block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(Style::new().fg(Color::Cyan))
+                .border_style(Style::new().fg(theme.accent))
                 .title(title.to_owned()),
         ),
         rect,
@@ -1420,10 +1449,10 @@ fn modal(
 
 /// `/tree`: every message on the branch, the one the conversation is at, and where another branch
 /// leaves from (D54).
-fn draw_tree(frame: &mut Frame<'_>, tree: &Tree, area: Rect) {
+fn draw_tree(frame: &mut Frame<'_>, tree: &Tree, area: Rect, theme: &Theme) {
     let width = area.width.saturating_sub(4).min(96);
     let inner = width.saturating_sub(2) as usize;
-    let accent = Style::new().fg(Color::Cyan);
+    let accent = Style::new().fg(theme.accent);
     let mut lines: Vec<Line> = Vec::new();
     let rows = tree.visible();
     let top = tree.offset();
@@ -1436,9 +1465,9 @@ fn draw_tree(frame: &mut Frame<'_>, tree: &Tree, area: Rect) {
         let style = if chosen {
             Style::new().add_modifier(Modifier::BOLD)
         } else if tree.is_here(row) {
-            Style::new().fg(Color::Green)
+            Style::new().fg(theme.success)
         } else if tree.is_other(row) {
-            dim()
+            dim(theme)
         } else {
             Style::new()
         };
@@ -1448,7 +1477,7 @@ fn draw_tree(frame: &mut Frame<'_>, tree: &Tree, area: Rect) {
         ]));
     }
     if rows.is_empty() {
-        lines.push(Line::from(Span::styled("no messages yet", dim())));
+        lines.push(Line::from(Span::styled("no messages yet", dim(theme))));
     }
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
@@ -1457,15 +1486,23 @@ fn draw_tree(frame: &mut Frame<'_>, tree: &Tree, area: Rect) {
             tree.prompts(),
             if tree.user_only { " (filtered)" } else { "" }
         ),
-        dim(),
+        dim(theme),
     )));
-    modal(frame, area, width, " Conversation tree ", lines, None);
+    modal(
+        frame,
+        area,
+        width,
+        " Conversation tree ",
+        lines,
+        None,
+        theme,
+    );
 }
 
-fn draw_resume(frame: &mut Frame<'_>, picker: &SessionPicker, area: Rect) {
+fn draw_resume(frame: &mut Frame<'_>, picker: &SessionPicker, area: Rect, theme: &Theme) {
     let width = area.width.saturating_sub(4).min(96);
     let inner = width.saturating_sub(2) as usize;
-    let accent = Style::new().fg(Color::Cyan);
+    let accent = Style::new().fg(theme.accent);
     let now = std::time::SystemTime::now();
     let mut lines: Vec<Line> = Vec::new();
     let visible_filter = keep_tail(&picker.filter, inner.saturating_sub(10));
@@ -1501,11 +1538,11 @@ fn draw_resume(frame: &mut Frame<'_>, picker: &SessionPicker, area: Rect) {
                 },
             ),
             Span::raw(" ".repeat(pad)),
-            Span::styled(meta, dim()),
+            Span::styled(meta, dim(theme)),
         ]));
     }
     if shown.is_empty() {
-        lines.push(Line::from(Span::styled("no session matches", dim())));
+        lines.push(Line::from(Span::styled("no session matches", dim(theme))));
     }
     lines.push(Line::default());
     // A delete needs the key twice, so the footer says so while it is waiting for the second one.
@@ -1525,18 +1562,26 @@ fn draw_resume(frame: &mut Frame<'_>, picker: &SessionPicker, area: Rect) {
     lines.push(Line::from(Span::styled(
         help,
         if confirming.is_some() {
-            Style::new().fg(Color::Red)
+            Style::new().fg(theme.error)
         } else {
-            dim()
+            dim(theme)
         },
     )));
-    modal(frame, area, width, " Resume a session ", lines, cursor);
+    modal(
+        frame,
+        area,
+        width,
+        " Resume a session ",
+        lines,
+        cursor,
+        theme,
+    );
 }
 
-fn draw_settings(frame: &mut Frame<'_>, dialog: &SettingsDialog, area: Rect) {
+fn draw_settings(frame: &mut Frame<'_>, dialog: &SettingsDialog, area: Rect, theme: &Theme) {
     let width = area.width.saturating_sub(4).min(84);
     let inner = width.saturating_sub(2) as usize;
-    let accent = Style::new().fg(Color::Cyan);
+    let accent = Style::new().fg(theme.accent);
     let label_width = ROWS.iter().map(|r| r.label().width()).max().unwrap_or(0);
     let mut lines: Vec<Line> = Vec::new();
     let mut cursor = None;
@@ -1569,8 +1614,8 @@ fn draw_settings(frame: &mut Frame<'_>, dialog: &SettingsDialog, area: Rect) {
     }
     lines.push(Line::default());
     let help = match &dialog.error {
-        Some(e) => Span::styled(keep_tail(e, inner), Style::new().fg(Color::Red)),
-        None => Span::styled(keep_tail(dialog.current().help(), inner), dim()),
+        Some(e) => Span::styled(keep_tail(e, inner), Style::new().fg(theme.error)),
+        None => Span::styled(keep_tail(dialog.current().help(), inner), dim(theme)),
     };
     lines.push(Line::from(help));
     let keys = if dialog.editing.is_some() {
@@ -1578,14 +1623,14 @@ fn draw_settings(frame: &mut Frame<'_>, dialog: &SettingsDialog, area: Rect) {
     } else {
         "↑↓ choose · enter change · esc close"
     };
-    lines.push(Line::from(Span::styled(keys, dim())));
-    modal(frame, area, width, " Settings ", lines, cursor);
+    lines.push(Line::from(Span::styled(keys, dim(theme))));
+    modal(frame, area, width, " Settings ", lines, cursor, theme);
 }
 
-fn draw_permissions(frame: &mut Frame<'_>, dialog: &Permissions, area: Rect) {
+fn draw_permissions(frame: &mut Frame<'_>, dialog: &Permissions, area: Rect, theme: &Theme) {
     let width = area.width.saturating_sub(4).min(88);
     let inner = width.saturating_sub(2) as usize;
-    let accent = Style::new().fg(Color::Cyan);
+    let accent = Style::new().fg(theme.accent);
     let rule_width = dialog
         .rows
         .iter()
@@ -1621,7 +1666,7 @@ fn draw_permissions(frame: &mut Frame<'_>, dialog: &Permissions, area: Rect) {
                 let room = inner.saturating_sub(2 + rule.width() + 1);
                 Span::styled(
                     keep_head(&what, room),
-                    if row.editable { accent } else { dim() },
+                    if row.editable { accent } else { dim(theme) },
                 )
             }
         };
@@ -1642,25 +1687,28 @@ fn draw_permissions(frame: &mut Frame<'_>, dialog: &Permissions, area: Rect) {
     if dialog.rows.is_empty() {
         lines.push(Line::from(Span::styled(
             "this project's policy grants nothing yet",
-            dim(),
+            dim(theme),
         )));
     }
     lines.push(Line::default());
     if let Some(typed) = &dialog.adding {
         // The prompt replaces the help line, so the forms are visible while typing.
         lines.push(Line::from(vec![
-            Span::styled("add  › ", Style::new().fg(Color::Cyan)),
+            Span::styled("add  › ", Style::new().fg(theme.accent)),
             Span::styled(
                 typed.clone(),
                 Style::new().add_modifier(Modifier::UNDERLINED),
             ),
         ]));
         cursor = Some((lines.len() - 1, 2 + 5 + typed.width()));
-        lines.push(Line::from(Span::styled(keep_tail(ADD_HELP, inner), dim())));
+        lines.push(Line::from(Span::styled(
+            keep_tail(ADD_HELP, inner),
+            dim(theme),
+        )));
     } else {
         let help = match &dialog.error {
-            Some(e) => Span::styled(keep_tail(e, inner), Style::new().fg(Color::Red)),
-            None => Span::styled(keep_tail(&dialog.help(), inner), dim()),
+            Some(e) => Span::styled(keep_tail(e, inner), Style::new().fg(theme.error)),
+            None => Span::styled(keep_tail(&dialog.help(), inner), dim(theme)),
         };
         lines.push(Line::from(help));
     }
@@ -1670,14 +1718,14 @@ fn draw_permissions(frame: &mut Frame<'_>, dialog: &Permissions, area: Rect) {
             keep_tail(&dialog.policy_path, inner / 2),
             keep_tail(&dialog.global_path, inner / 2)
         ),
-        dim(),
+        dim(theme),
     )));
     let keys = if dialog.editing.is_some() {
         "enter save · esc cancel"
     } else {
         "↑↓ choose · enter change · esc close"
     };
-    lines.push(Line::from(Span::styled(keys, dim())));
+    lines.push(Line::from(Span::styled(keys, dim(theme))));
     modal(
         frame,
         area,
@@ -1685,6 +1733,7 @@ fn draw_permissions(frame: &mut Frame<'_>, dialog: &Permissions, area: Rect) {
         " Permissions for this project ",
         lines,
         cursor,
+        theme,
     );
 }
 
@@ -1754,7 +1803,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             }
             let from = if i == first.line { first.ch } else { 0 };
             let to = if i == last.line { last.ch } else { usize::MAX };
-            shade(line, from, to);
+            shade(line, from, to, &app.theme);
         }
     }
     // An image is drawn in the rows below its marker line, and stays on screen while any of those
@@ -1805,7 +1854,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             1,
         );
         frame.render_widget(
-            Paragraph::new(note).style(Style::new().fg(Color::Black).bg(Color::Yellow)),
+            Paragraph::new(note).style(Style::new().fg(app.theme.selection_fg).bg(app.theme.warn)),
             r,
         );
         app.jump_badge = Some(r);
@@ -1817,6 +1866,7 @@ mod tests {
     use super::*;
     use crate::agent::End;
     use crate::tui::app::{AgentEvent, Header};
+    use crate::tui::theme::Theme;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -1937,7 +1987,10 @@ mod tests {
         assert_eq!(text(&wrap(&code, 40)), ["    fn x()"]);
         let long = Row::plain(vec![Span::raw("abcdefghij")]);
         assert_eq!(text(&wrap(&long, 4)), ["abcd", "efgh", "ij"]);
-        let styled = Row::plain(vec![Span::raw("one "), Span::styled("two", code_style())]);
+        let styled = Row::plain(vec![
+            Span::raw("one "),
+            Span::styled("two", code_style(&Theme::default())),
+        ]);
         let lines = wrap(&styled, 20);
         assert_eq!(lines[0].spans.len(), 2);
     }
@@ -1945,7 +1998,7 @@ mod tests {
     #[test]
     fn markdown_blocks() {
         let md = "# Title\n\nSome **bold** and `code`.\n\n- one\n- two\n  wrapped\n\n```rust\nfn main() {\n    x();\n}\n```\n\n| a | bb |\n|---|----|\n| ccc | d |\n";
-        let rows: Vec<String> = markdown(md)
+        let rows: Vec<String> = markdown(md, &Theme::default())
             .iter()
             .flat_map(|r| text(&wrap(r, 80)))
             .collect();
@@ -1981,7 +2034,15 @@ mod tests {
     #[test]
     fn tool_blocks_show_the_call_and_the_useful_end_of_the_output() {
         let block = |name: &str, detail: &str, ok: bool, content: &str, expand: bool| {
-            let (rows, bg) = tool_block(name, detail, Some(&(ok, content.into())), None, expand, 0);
+            let (rows, bg) = tool_block(
+                name,
+                detail,
+                Some(&(ok, content.into())),
+                None,
+                expand,
+                0,
+                &Theme::default(),
+            );
             let lines: Vec<String> = rows.iter().flat_map(|r| text(&wrap(r, 80))).collect();
             (lines, bg)
         };
@@ -1991,7 +2052,7 @@ mod tests {
             .join("\n");
         let passing = format!("exit code 0\n--- stdout ---\n{output}");
         let (lines, bg) = block("bash", "cargo test", true, &passing, false);
-        assert_eq!(bg, TOOL_OK);
+        assert_eq!(bg, Theme::default().tool_ok_bg);
         assert_eq!(
             lines,
             [
@@ -2010,7 +2071,7 @@ mod tests {
 
         let failing = "exit code 101\n--- stderr ---\nerror: boom";
         let (lines, bg) = block("bash", "cargo build", false, failing, false);
-        assert_eq!(bg, TOOL_ERROR);
+        assert_eq!(bg, Theme::default().tool_error_bg);
         assert_eq!(lines, ["$ cargo build", "", "error: boom", "exit code 101"]);
 
         let (lines, _) = block("read", "src/x.rs", true, "a\nb\nc", false);
@@ -2018,7 +2079,7 @@ mod tests {
         let (lines, _) = block("write", "a.txt", true, "wrote 2 bytes to a.txt", false);
         assert_eq!(lines, ["write a.txt", "", "wrote 2 bytes to a.txt"]);
 
-        let (rows, bg) = tool_block("bash", "sleep 9", None, None, false, 0);
+        let (rows, bg) = tool_block("bash", "sleep 9", None, None, false, 0, &Theme::default());
         let diff = "~\n-12 old line\n+12 new line, long enough to wrap around\n 13 next\n";
         let (edit_rows, _) = tool_block(
             "edit",
@@ -2027,6 +2088,7 @@ mod tests {
             Some(diff),
             false,
             0,
+            &Theme::default(),
         );
         let shown: Vec<String> = edit_rows.iter().flat_map(|r| text(&wrap(r, 30))).collect();
         assert_eq!(
@@ -2041,14 +2103,14 @@ mod tests {
                 " 13 │ next",
             ]
         );
-        assert_eq!(bg, TOOL_PENDING);
+        assert_eq!(bg, Theme::default().tool_pending_bg);
         assert_eq!(text(&wrap(&rows[0], 80)), ["⠋ $ sleep 9"]);
     }
 
     #[test]
     fn shading_spans_the_full_width_with_padding() {
         let rows = vec![Row::plain(vec![Span::raw("$ ls")])];
-        let lines = shaded(&rows, TOOL_OK, 20);
+        let lines = shaded(&rows, Theme::default().tool_ok_bg, 20);
         assert_eq!(
             text(&lines),
             [
@@ -2061,7 +2123,7 @@ mod tests {
             lines
                 .iter()
                 .flat_map(|l| l.spans.iter())
-                .all(|s| s.style.bg == Some(TOOL_OK))
+                .all(|s| s.style.bg == Some(Theme::default().tool_ok_bg))
         );
     }
 
@@ -2094,6 +2156,7 @@ mod tests {
             mouse: false,
             status: crate::tui::status::Template::default(),
             images: None,
+            theme: None,
         })
     }
 
@@ -2162,9 +2225,9 @@ mod tests {
     fn shade_splits_spans_where_the_selection_starts_and_ends() {
         let mut line = Line::from(vec![
             Span::raw("abc"),
-            Span::styled("def", Style::new().fg(Color::Red)),
+            Span::styled("def", Style::new().fg(Theme::default().error)),
         ]);
-        shade(&mut line, 2, 5);
+        shade(&mut line, 2, 5, &Theme::default());
         assert_eq!(plain(&line), "abcdef", "the text is unchanged");
         let highlighted: String = line
             .spans
@@ -2184,7 +2247,7 @@ mod tests {
         assert_eq!(line.spans.last().unwrap().style.fg, Some(Color::Red));
         // A whole-line selection needs no splitting.
         let mut whole = Line::from(vec![Span::raw("xy")]);
-        shade(&mut whole, 0, usize::MAX);
+        shade(&mut whole, 0, usize::MAX, &Theme::default());
         assert_eq!(whole.spans.len(), 1);
         assert_eq!(whole.spans[0].style.bg, Some(Color::Rgb(42, 74, 112)));
     }
@@ -2238,6 +2301,60 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let all = screen(&terminal);
         assert!(all.contains("exec is granted in the policy file"), "{all}");
+    }
+
+    #[test]
+    fn a_theme_paints_the_screen_so_a_custom_one_actually_shows() {
+        // D71: the theme is not a decoration on the settings struct — every role the renderer uses
+        // comes from it, so a theme that sets `accent` and `muted` changes what is drawn.
+        let mut app = bare_app();
+        app.entries = vec![Entry::User("hello".into())];
+        app.theme = Theme {
+            accent: Color::Rgb(255, 0, 255),
+            muted: Color::Rgb(0, 255, 0),
+            ..Theme::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let painted = |colour: Color| {
+            (0..buffer.area.height)
+                .any(|y| (0..buffer.area.width).any(|x| buffer[(x, y)].fg == colour))
+        };
+        assert!(
+            painted(Color::Rgb(255, 0, 255)),
+            "the accent is used somewhere"
+        );
+        assert!(painted(Color::Rgb(0, 255, 0)), "and the muted colour");
+
+        // The default theme still paints cyan, which is what most of this renderer's accent is.
+        let mut app = bare_app();
+        app.entries = vec![Entry::User("hello".into())];
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let cyan = (0..buffer.area.height)
+            .any(|y| (0..buffer.area.width).any(|x| buffer[(x, y)].fg == Color::Cyan));
+        assert!(cyan, "the default theme is unchanged");
+    }
+
+    #[test]
+    fn the_built_in_themes_build_and_the_light_one_differs() {
+        // The shipped themes must be usable, not just parseable: a theme with a role left out would
+        // be a colour nobody chose.
+        for name in crate::tui::theme::builtin_names() {
+            let theme = crate::tui::theme::build(name, &crate::tui::theme::ThemeTables::new())
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(theme.name, name);
+        }
+        let light =
+            crate::tui::theme::build("light", &crate::tui::theme::ThemeTables::new()).unwrap();
+        let default = Theme::default();
+        assert_ne!(light.accent, default.accent, "light is a different theme");
+        assert_ne!(
+            light.tool_pending_bg, default.tool_pending_bg,
+            "and not just the accent"
+        );
     }
 
     #[test]
@@ -2394,6 +2511,7 @@ mod tests {
             mouse: false,
             status: crate::tui::status::Template::default(),
             images: None,
+            theme: None,
         });
         app.entries.push(Entry::User("fix the build".into()));
         app.cache.push(None);
@@ -2454,8 +2572,8 @@ mod tests {
             .position(|l| l.contains("denied: agent"))
             .unwrap() as u16;
         let buf = terminal.backend().buffer();
-        assert_eq!(buf[(0, row)].bg, TOOL_ERROR);
-        assert_eq!(buf[(59, row)].bg, TOOL_ERROR);
+        assert_eq!(buf[(0, row)].bg, Theme::default().tool_error_bg);
+        assert_eq!(buf[(59, row)].bg, Theme::default().tool_error_bg);
         assert_eq!(terminal.backend().cursor_position(), Position::new(5, 17));
     }
 }

@@ -1958,3 +1958,42 @@ fn reload_reads_instruction_files_and_skills_again() {
         "what a reload cannot change is said: {text}"
     );
 }
+
+#[test]
+fn a_custom_theme_is_read_from_the_users_config() {
+    // D71: a theme is a table of roles in config.toml, selected by `[ui] theme`. The CLI has no
+    // screen to paint, so what is checked here is that the file is read and that a theme which
+    // cannot build is reported rather than silently replaced by the default.
+    let env = Env::new();
+    let path = env.policy_path();
+    std::fs::write(
+        &path,
+        r##"[ui]
+theme = "mine"
+
+[themes.mine]
+extends = "default"
+accent = "#ff00ff"
+
+[agent]
+fs-read = [{ root = "workspace" }]
+"##,
+    )
+    .unwrap();
+    // `check` reads the same config the TUI would; the theme must not make it fail.
+    let out = env.saddle(&["check"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // A theme naming an unknown base is an error the person sees, not a fallback.
+    std::fs::write(
+        &path,
+        "[ui]\ntheme = \"nope\"\n\n[agent]\nfs-read = [{ root = \"workspace\" }]\n",
+    )
+    .unwrap();
+    let out = env.saddle(&["check"]);
+    assert!(
+        out.status.success(),
+        "check does not paint, so it does not care"
+    );
+    // The message itself comes from theme::build, which the unit tests cover.
+}

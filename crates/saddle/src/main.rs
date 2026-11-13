@@ -311,6 +311,11 @@ fn run_agent(
             }
         },
     };
+    // A theme that does not build is reported here rather than only in the TUI, so a mistake in
+    // config.toml is visible wherever saddle runs. The default is drawn meanwhile (D71).
+    if let Err(e) = tui::theme_selected(&user) {
+        notes.push(format!("{e:#}"));
+    }
     let header = tui::Header {
         provider: provider
             .as_ref()
@@ -334,6 +339,7 @@ fn run_agent(
         // Unlimited unless the flag or the config sets a limit (D37).
         max_steps: args.max_steps.or(user.max_steps),
         images: user.ui.images.clone(),
+        theme: user.ui.theme.clone(),
     };
     let store = store::Store::open(&paths.session_db(), session.setup.workspace.clone())?;
     let latest = if args.resume_latest {

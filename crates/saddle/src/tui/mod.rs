@@ -12,6 +12,7 @@ mod render;
 mod sessions;
 mod settings;
 pub mod status;
+pub mod theme;
 mod tree;
 
 use std::fmt::Write as _;
@@ -134,6 +135,13 @@ pub fn run(
     app.skills = skills;
     // What this terminal can draw is decided once, from the setting and the environment (D59).
     app.protocol = image::detect(app.header.images.as_deref(), &|k| std::env::var(k).ok());
+    // The colours, from config.toml (D71). A theme that does not build is reported and the default
+    // is drawn: a bad colour must not stop a session from opening, and the person has to be told
+    // rather than quietly shown the wrong thing.
+    match theme_from_config(&paths, &app.header.theme) {
+        Ok(theme) => app.theme = theme,
+        Err(e) => app.note(NoteKind::Error, &format!("{e:#}")),
+    }
     let control = Controller {
         commands: cmd_tx,
         events: ev_tx_ui,
@@ -201,6 +209,27 @@ pub fn run(
 }
 
 /// The agent thread: runs one turn per prompt and closes the session at the end.
+/// The theme the config selects, or the default (D71). Reads the file again, so `/reload` after a
+/// hand edit picks it up without a restart.
+/// The theme `[ui] theme` selects, for a caller that only wants to know it builds (D71).
+pub fn theme_selected(user: &UserConfig) -> Result<crate::tui::theme::Theme> {
+    let name = user
+        .ui
+        .theme
+        .clone()
+        .unwrap_or_else(|| "default".to_owned());
+    crate::tui::theme::build(&name, &user.themes)
+}
+
+fn theme_from_config(paths: &Paths, selected: &Option<String>) -> Result<crate::tui::theme::Theme> {
+    let user = UserConfig::load(&paths.user_config())?;
+    let name = selected
+        .clone()
+        .or(user.ui.theme.clone())
+        .unwrap_or_else(|| "default".to_owned());
+    crate::tui::theme::build(&name, &user.themes)
+}
+
 fn work(
     mut agent: Agent,
     mut session: Session,
@@ -697,10 +726,15 @@ impl Controller {
                 self.send(app, Command::Prompt { text, skill: None });
                 Ok(())
             }
+            Action::Theme(name) => {
+                self.theme(app, name);
+                Ok(())
+            }
             Action::Reload => {
                 // The settings side first, keeping the session-only choices a person made:
                 // `/thinking` and ctrl+t/ctrl+o are not in config.toml (D70).
                 self.reload_settings(app);
+                self.reload_theme(app);
                 self.send(app, Command::Reload);
                 Ok(())
             }
@@ -1120,6 +1154,65 @@ impl Controller {
             dialog.values = values;
         }
         Ok(())
+    }
+
+    /// `/theme`: report the theme, or switch to one by name and write it to config.toml (D71).
+    ///
+    /// Writing the file is what `/model` does: a choice made once should not have to be made again.
+    /// The switch is applied here as well, so it takes effect without a reload.
+    fn theme(&self, app: &mut App, name: Option<String>) {
+        let Some(name) = name else {
+            let mut said = format!("theme: {}", app.theme.name);
+            said.push_str(&format!(
+                "\nbuilt in: {}",
+                crate::tui::theme::builtin_names().join(", ")
+            ));
+            if let Ok(user) = UserConfig::load(&self.paths.user_config())
+                && !user.themes.is_empty()
+            {
+                let defined: Vec<&str> = user.themes.keys().map(String::as_str).collect();
+                said.push_str(&format!("\ndefined here: {}", defined.join(", ")));
+            }
+            return app.note(NoteKind::Info, &said);
+        };
+        let user = match UserConfig::load(&self.paths.user_config()) {
+            Ok(user) => user,
+            Err(e) => return app.note(NoteKind::Error, &format!("{e:#}")),
+        };
+        // Built before it is written: a name that does not build must not be saved, or the next
+        // session would open on an error the person cannot see the cause of.
+        let theme = match crate::tui::theme::build(&name, &user.themes) {
+            Ok(theme) => theme,
+            Err(e) => return app.note(NoteKind::Error, &format!("{e:#}")),
+        };
+        if let Err(e) = crate::config::edit(&self.paths.user_config(), |doc| {
+            if doc.get("ui").is_none() {
+                doc.insert("ui", toml_edit::Item::Table(toml_edit::Table::new()));
+            }
+            doc["ui"]["theme"] = toml_edit::value(name.as_str());
+            Ok(())
+        }) {
+            return app.note(NoteKind::Error, &format!("{e:#}"));
+        }
+        app.header.theme = Some(name.clone());
+        app.theme = theme;
+        app.note(
+            NoteKind::Info,
+            &format!("theme: {name}; saved in config.toml"),
+        );
+    }
+
+    /// The theme named by the config, or the default (D71).
+    pub fn reload_theme(&self, app: &mut App) {
+        let selected = app.header.theme.clone();
+        match theme_from_config(&self.paths, &selected) {
+            Ok(theme) => {
+                let name = theme.name.clone();
+                app.theme = theme;
+                app.note(NoteKind::Info, &format!("theme: {name}"));
+            }
+            Err(e) => app.note(NoteKind::Error, &format!("{e:#}")),
+        }
     }
 
     /// `/reload`: the settings half, read from config.toml (D70).

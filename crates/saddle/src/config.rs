@@ -67,6 +67,9 @@ pub struct UserConfig {
     pub context: ContextConfig,
     #[serde(default)]
     pub skills: SkillsConfig,
+    /// Named colour roles, `[themes.<name>]`, and `[ui] theme` selects one (D71).
+    #[serde(default)]
+    pub themes: crate::tui::theme::ThemeTables,
     #[serde(default)]
     pub compaction: CompactionConfig,
     #[serde(default)]
@@ -77,6 +80,9 @@ pub struct UserConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct UiConfig {
+    /// The theme to draw with: a built-in name, or one this file defines under `[themes.<name>]`
+    /// (D71). Unset means `default`, which is what the interface looked like before themes.
+    pub theme: Option<String>,
     pub show_reasoning: Option<bool>,
     pub expand_tools: Option<bool>,
     /// The status line, as a template of `{field}` placeholders (D36). Empty uses the default.

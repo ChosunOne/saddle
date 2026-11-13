@@ -1446,6 +1446,30 @@ one place at its root.
   spelling. `/reload` waits for the turn to end, as `/tree` and `/compact` do: the agent thread is
   mid-request, and discovery takes the session mutably.
 
+**D71.** Colours are a theme: a table of roles in `config.toml`, and the renderer names no colour.
+
+- **Every colour the interface draws comes from a role.** The renderer used to say `Color::Cyan`
+  in fifty-eight places, which meant "change the accent" was a code change. A `Theme` holds eighteen
+  roles — accent, muted, code, warn, error, success, link, text, the four diff and tool-block
+  colours, the selection pair — and `render.rs` reaches them through the theme it is given. A role
+  nobody paints with would be a setting that does nothing, so a test asserts every role in the list
+  can be set.
+- **Nothing configured changes nothing.** The built-in `default` is *exactly* what this binary drew
+  before, so shipping the system cannot restyle anyone's screen. `light` and `mono` ship beside it:
+  the ANSI palette is chosen for a dark terminal, and a person on a light one had no way to say so.
+- **A theme is a table, and it starts from a base.** `[themes.<name>]` with `extends` naming a
+  built-in or another table; the roles it leaves out come from the base. That is what makes a
+  partial theme worth writing: three lines to restyle an accent, without owning the other fifteen
+  roles forever. A cycle is refused by name rather than recursing.
+- **Errors are errors.** An unknown theme or a misspelt role names what does exist, at session
+  start, and the default is drawn meanwhile. A colour nobody chose is worse than a session that
+  says the line is wrong.
+- **Colours are written the way a person writes them**: an ANSI name, `#rrggbb`, or a palette index
+  0–255 for a terminal without true colour.
+- **`/theme` switches and saves**, like `/model`: a choice made once should not have to be made
+  again. It builds the theme before writing it, so a name that does not work cannot be saved and
+  blamed on the next session. `/reload` re-reads the file, so a hand edit applies without a restart.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
