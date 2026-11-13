@@ -2226,9 +2226,10 @@ the menu lists both so neither is a command that has to be remembered.
 **D91.** The model a conversation is working in belongs to that conversation, and the default in
 `config.toml` is only what a new one starts with.
 
-`/model` — the name form and a chosen entry alike — wrote the model into `config.toml`. That is a
-choice about the conversation being worked in, so it silently moved every later session as well, and
-a conversation resumed after the default had been changed came back on a model it had never used.
+`/model` — the name form and a chosen entry alike — wrote the model into `config.toml`, and `/login`
+wrote both the provider and the model. That is a choice about the conversation being worked in, so it
+silently moved every later session as well, and a conversation resumed after the default had been
+changed came back on a model it had never used.
 
 - **`/model` changes this conversation.** The name form and enter in the picker both switch the
   running session and write nothing to the file. The choice is recorded with the conversation, as
@@ -2239,9 +2240,18 @@ a conversation resumed after the default had been changed came back on a model i
   the entry once, so the two keys can never disagree — and writes both the provider and the model
   to `config.toml`, which is what a new session reads. This is pi's split: `enter` says
   `Model: <id>`, ctrl+s says `Default model: <provider>/<id>`.
-- **`/login` still writes the default.** A credential just entered, and the model chosen for it, are
-  a setup decision about a provider rather than a choice about one conversation, and the provider
-  being in force is what "which provider am I set up with" means. pi persists there too.
+- **`/login` does not write the default either.** It stores the credential, which is the thing it
+  exists for, and switches this conversation to the provider and model just chosen. The only entry
+  it writes to `config.toml` is the `[providers.<name>]` table a server added there needs in order
+  to exist at all — its `api` and `base-url`, not a `model` and not `provider =`. pi persists the
+  model there, and this departs from it: two routes writing a default is how it stops being
+  obvious which one did.
+- **That leaves ctrl+s as the only writer**, which is worth stating plainly: a machine that has never
+  pressed it has no provider in force, so every session opens `/login` until someone does, or until
+  `provider =` and `model` are edited into the file by hand. One writer is the point — a second route
+  is how it stops being obvious which one set the default — and both `/login` and `/model` say in
+  their note where it is set, rather than leaving the person to find out that the choice they just
+  made was temporary.
 - **A resumed conversation comes back on its own model.** `Resumed` carries the row's
   `provider`/`model`, and the interface switches to it when it differs from what is in force —
   silently, because the resume note has already said what came back. A model that is no longer

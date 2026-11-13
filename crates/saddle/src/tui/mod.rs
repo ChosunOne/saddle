@@ -1920,23 +1920,27 @@ impl Controller {
             auth.set(&req.provider, key.clone());
             auth.save(&path)?;
         }
-        config::edit(&self.paths.user_config(), |doc| {
-            doc["provider"] = toml_edit::value(req.provider.as_str());
-            if let Some(url) = &req.base_url {
+        // What the file gets is only what makes this provider exist: a server added here has no
+        // entry until its address is written. The provider and model in force are this
+        // conversation's, and only ctrl+s in the model list writes a default (D91). Writing a
+        // provider's `model` here would be writing that default by another name, since a new
+        // session reads it.
+        if let Some(url) = &req.base_url {
+            config::edit(&self.paths.user_config(), |doc| {
                 let table = config::provider_table(doc, &req.provider)?;
                 table["api"] = toml_edit::value("openai");
                 table["base-url"] = toml_edit::value(url.as_str());
-            }
-            config::provider_table(doc, &req.provider)?["model"] =
-                toml_edit::value(req.model.as_str());
-            Ok(())
-        })?;
-        let provider = self.build(&req.provider)?;
+                Ok(())
+            })?;
+        }
+        // The model is the one just chosen, not the file's: there need not be one there (D91).
+        let provider = self.build_model(&req.provider, Some(&req.model))?;
         if let Some(why) = provider.missing_key() {
             bail!(why);
         }
         let mut msg = format!(
-            "using {} with {}; saved as the default provider",
+            "using {} with {} in this conversation; ctrl+s in the model list makes it the default \
+             for new sessions",
             provider.name, provider.config.model
         );
         if let Some(var) = provider
@@ -2421,6 +2425,75 @@ mod tests {
             "the file changed, so it is said: {:?}",
             app.entries
         );
+    }
+
+    #[test]
+    fn logging_in_does_not_change_the_default_provider_or_model() {
+        // D91: `/login` was the last thing still writing the default. A key is a credential, not a
+        // choice of what a new session starts with, and the model just chosen there is a choice
+        // about this conversation like any other.
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller(
+            dir.path(),
+            "provider = \"synthetic\"\n[providers.synthetic]\nmodel = \"the-default\"\n",
+        );
+        let mut app = an_app();
+        app.header.provider = "synthetic".into();
+        app.header.model = "the-default".into();
+        c.perform(
+            &mut app,
+            Action::Login(LoginRequest {
+                provider: "synthetic".into(),
+                key: Some("sk-entered".into()),
+                model: "chosen-at-login".into(),
+                base_url: None,
+            }),
+        );
+        // The session moved, and says how to make that the default.
+        assert_eq!(app.header.model, "chosen-at-login");
+        assert!(
+            app.entries
+                .iter()
+                .any(|e| matches!(e, Entry::Note(NoteKind::Info, t)
+                if t.contains("chosen-at-login") && t.contains("ctrl+s"))),
+            "{:?}",
+            app.entries
+        );
+        // The key was stored, and the file was not touched at all.
+        let auth = AuthStore::load(&c.paths.auth_store()).unwrap();
+        assert_eq!(auth.key("synthetic"), Some("sk-entered"));
+        let written = std::fs::read_to_string(c.paths.user_config()).unwrap();
+        assert!(
+            written.contains("the-default") && !written.contains("chosen-at-login"),
+            "the default is what it was: {written}"
+        );
+    }
+
+    #[test]
+    fn logging_in_to_a_new_server_still_writes_the_server_itself() {
+        // D91 stops `/login` writing a *default*, not a provider: a server added there has no entry
+        // until its address is in the file, and without one there is nothing to switch to.
+        let dir = tempfile::tempdir().unwrap();
+        let c = controller(dir.path(), "");
+        let mut app = an_app();
+        c.perform(
+            &mut app,
+            Action::Login(LoginRequest {
+                provider: "mine".into(),
+                key: None,
+                model: "qwen".into(),
+                base_url: Some("http://127.0.0.1:8080/v1".into()),
+            }),
+        );
+        let written = std::fs::read_to_string(c.paths.user_config()).unwrap();
+        assert!(written.contains("[providers.mine]"), "{written}");
+        assert!(written.contains("http://127.0.0.1:8080/v1"), "{written}");
+        assert!(
+            !written.contains("provider = \"mine\""),
+            "the provider in force is not a default: {written}"
+        );
+        assert_eq!(app.header.provider, "mine");
+        assert_eq!(app.header.model, "qwen");
     }
 
     #[test]

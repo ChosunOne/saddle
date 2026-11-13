@@ -64,12 +64,41 @@ Planned but not yet present: `saddle-wit`, `saddle-loader`, `saddle-sdk` (v1, D1
 
 ## Commands
 
+Use **`cargo nextest`** to run tests, not `cargo test`: one process per test, run in parallel, so a
+test cannot see another one's state and a leak is caught here rather than in CI. On a suite this
+size the wall clock comes out about the same as `cargo test` — 457 of the binary's tests take ~2.1 s
+either way, because a process per test costs what a thread saved — and the reason to use it is
+everything else: `-E` filters by name, `--no-fail-fast` summaries, per-test timeouts and retries,
+and isolation that makes a flaky test obvious.
+
 ```sh
 cargo build --offline
-cargo test --offline          # all suites
-cargo fmt --all --check       # must stay clean; no rustfmt.toml, so defaults apply
-cargo clippy --offline --all-targets   # must stay clean
+cargo nextest run --offline                  # every suite, one process per test
+cargo nextest run --offline --bin saddle     # just the unit tests in the binary
+cargo nextest run --offline -p saddle-cap    # one crate
+cargo nextest run --offline -E 'test(/^tui::/)'   # by name, with nextest's filter expressions
+cargo fmt --all --check                      # must stay clean; no rustfmt.toml, so defaults apply
+cargo clippy --offline --all-targets         # must stay clean
 ```
+
+`nextest` is installed at `~/.cargo/bin/cargo-nextest` (0.9.146); `cargo nextest run --offline`
+needs no network. Three differences from `cargo test` are worth knowing:
+
+- **Doctests are not run** — nextest runs test binaries, not rustdoc. Nothing here documents a
+  runnable example (the fenced block in `config.rs` is a sample file, in a binary crate, which has
+  no doctests at all), so nothing is missed today; `cargo test --offline --doc` is what would run
+  one if it were written.
+- **One test is one process**, so a test that relies on state another test set up will not see it,
+  and `-j`/`--test-threads` is how many run at once rather than how many share a process. It is
+  also why a test that leaks a global (an `std::env` variable, a signal handler) passes under
+  `cargo test` and fails here.
+- **A failure stops the run** unless `--no-fail-fast` is given, so use
+  `cargo nextest run --offline --no-fail-fast` to see every failure in one pass.
+
+`crates/saddle/tests/agent.rs` still fails under a sandboxed agent that blocks `socket()`/`bind()` —
+that is the environment, not the code (`cargo nextest run --offline --no-fail-fast` and look at
+whether every failure is in `saddle::agent`). One binary at a time is `--lib` or `--test <name>`,
+as in `cargo nextest run --offline --test cli`; the binary's own unit tests are `--bin saddle`.
 
 There is no CI config in the tree, no `rust-toolchain` pin and no `rustfmt.toml`. Edition 2024,
 `rust-version = 1.88`. All dependencies are declared in the root `Cargo.toml` under
@@ -108,15 +137,17 @@ its next request (D47). Editing `saddle.toml` in a repository has no effect (D42
 `/login` picks a provider and stores its credential: a key typed in, or — for a provider that
 authenticates with OAuth — the device flow, with the code on screen while a background thread polls;
 the code is put on the clipboard as it arrives, the link is underlined and opens the person's
-browser on a click or `o`, and `c` copies it (D85, D86). `saddle login <provider>` and
-`saddle logout <provider>` are the same thing without the interface, and `check` says whether the
-provider in force is signed in.
+browser on a click or `o`, and `c` copies it (D85, D86). It chooses for the session it is run in and
+stores the credential, and writes nothing else to `config.toml` except the `[providers.<name>]`
+entry a server added there needs to exist at all — the default is `ctrl+s` in the model list (or
+editing the file by hand), and nothing else the interface does (D91). `saddle login <provider>` and `saddle logout <provider>` are the same thing
+without the interface, and `check` says whether the provider in force is signed in.
 `/model` with no name is a searchable list of what **every** configured provider serves — each entry
 naming its provider, filterable by provider as well as by name — with the provider and model in force
 named above it and highlighted in the list; `/model <name>` switches straight to one (D88, D89).
 Either way the choice is this conversation's, recorded with it and **not** written to `config.toml`,
-so `ctrl+s` in the list is the only thing that changes what a new session starts with — it saves both
-the provider and the model, and `/login` still does the same for the provider it just set up (D91).
+so `ctrl+s` in the list is the only thing that changes what a new session starts with: it saves both
+the provider and the model (D91).
 A resumed conversation therefore comes back on the model it was using, whatever the default has
 become since, and two sessions in one directory keep their own models — `/reload` and a hand edit of
 the file re-read the settings but never switch provider or model (D91). `/login` ends on the same

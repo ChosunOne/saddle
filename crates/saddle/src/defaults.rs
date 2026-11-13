@@ -37,10 +37,12 @@ pub fn config_text(home: Option<&Path>) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        r##"# saddle's user configuration. saddle created it on first run; edit it freely. /login and
-# /model in the TUI update the provider settings and keep these comments.
+        r##"# saddle's user configuration. saddle created it on first run; edit it freely. ctrl+s in the model
+# list, and the provider settings in /settings, update it and keep these comments.
 
-# The provider used when -p is not given. saddle asks on first run and /login changes it.
+# The provider, and its model, that a new session starts with. saddle asks on first run until this
+# is set. /login and /model choose for the session they are run in; ctrl+s in the model list (or
+# editing this file) is what changes the default.
 # Built in: synthetic, openai.
 # provider = "synthetic"
 
