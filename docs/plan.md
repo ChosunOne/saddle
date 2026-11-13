@@ -1819,6 +1819,25 @@ ten languages by hand. None of that is worth maintaining, so it is gone.
 - **Deferred:** loading a user's own `.sublime-syntax` files, and honouring a theme's own syntax
   colours. Neither is needed while every colour is a role.
 
+**D81.** A prompt is shown as it was typed, apart from the emphasis in it.
+
+`*this*` in a message the user types is italic, and `**this**` is bold. Nothing else about the text
+is interpreted.
+
+- **Not markdown.** A prompt is input, and it has to be readable as the thing that was sent. Parsing
+  it as markdown eats the asterisks in `src/*.rs` and `2*3*4`, which then display as `src/.rs` and
+  `23*4` — the user cannot tell whether they typed it wrong or the interface did. Fences, bullets,
+  headings and links are therefore left as literal characters.
+- **An asterisk opens emphasis only at the start of a line or after a space**, so a glob, a path, a
+  multiplication sign and an unclosed asterisk all survive. It closes only after a word and before
+  the end of the line, a space or punctuation.
+- **Only `*`.** `_` is not treated as a delimiter, because `__init__.py` and `my_var_name` are far
+  more common in a prompt than `_emphasis_`.
+- **The text keeps the prompt's colour**; the modifier is the only difference, so a marked word is
+  still visibly the user's own message, and the `›` marker still says whose it is.
+- **A reply is still full markdown.** This is the asymmetry: a model writes markdown deliberately,
+  and a person typing to an agent is usually quoting a path or an error.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

@@ -551,26 +551,124 @@ fn thinking_rows(text: &str, shown: bool, theme: &Theme) -> Vec<Row> {
         .collect()
 }
 
+/// What the user typed, with the emphasis they wrote (D81).
+///
+/// A prompt is input, so it is shown as it was sent apart from `*this*` and `**this**`. It is not
+/// read as markdown: full markdown silently eats the asterisks in `src/*.rs` and `2*3*4`, and a
+/// prompt that displays something other than what was typed is worse than one with no formatting.
+/// The rules below are what make that safe — an asterisk only opens emphasis at the start of a line
+/// or after a space, so a glob, a path or a multiplication sign stays exactly as written.
+fn user_rows(text: &str, theme: &Theme) -> Vec<Row> {
+    let base = Style::new().fg(theme.user_message_text);
+    let marker = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
+    let lines: Vec<&str> = if text.is_empty() {
+        vec![""]
+    } else {
+        text.lines().collect()
+    };
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| Row {
+            first: vec![Span::styled(
+                if i == 0 { "› " } else { "  " }.to_owned(),
+                marker,
+            )],
+            rest: vec![Span::styled("  ".to_owned(), marker)],
+            spans: emphases(line, base),
+        })
+        .collect()
+}
+
+/// One line, split into what is emphasised and what is not.
+fn emphases(line: &str, base: Style) -> Vec<Span<'static>> {
+    let b = line.as_bytes();
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut plain = 0;
+    let mut at = 0;
+    while at < b.len() {
+        if b[at] != b'*' {
+            at += 1;
+            continue;
+        }
+        // A run is one or two: one is italic, two is bold, three or more is left alone.
+        let width = b[at..].iter().take_while(|c| **c == b'*').count();
+        if width > 2 || !opens(b, at, width) {
+            at += width;
+            continue;
+        }
+        let Some((from, to)) = closer(b, at + width, width) else {
+            at += width;
+            continue;
+        };
+        if at > plain {
+            out.push(Span::styled(line[plain..at].to_owned(), base));
+        }
+        let modifier = if width == 2 {
+            Modifier::BOLD
+        } else {
+            Modifier::ITALIC
+        };
+        out.push(Span::styled(
+            line[from..to].to_owned(),
+            base.add_modifier(modifier),
+        ));
+        plain = to + width;
+        at = plain;
+    }
+    if plain < line.len() || out.is_empty() {
+        out.push(Span::styled(line[plain..].to_owned(), base));
+    }
+    out
+}
+
+/// Whether the asterisk run at `at` may open emphasis: it has to start a word, so a `*` that is part
+/// of a glob, a path or an arithmetic expression cannot.
+fn opens(b: &[u8], at: usize, width: usize) -> bool {
+    let before = at.checked_sub(1).map(|i| b[i]);
+    let after = b.get(at + width).copied();
+    let starts_word = match before {
+        None => true,
+        Some(c) => c.is_ascii_whitespace() || matches!(c, b'(' | b'[' | b'"' | b'\''),
+    };
+    starts_word && after.is_some_and(|c| !c.is_ascii_whitespace() && c != b'*')
+}
+
+/// The emphasised text between `from` and its closing run, and where that run starts.
+fn closer(b: &[u8], from: usize, width: usize) -> Option<(usize, usize)> {
+    let mut at = from;
+    while at < b.len() {
+        if b[at] != b'*' {
+            at += 1;
+            continue;
+        }
+        let run = b[at..].iter().take_while(|c| **c == b'*').count();
+        // The content has to be a word: something, ending on something that is not a space, and the
+        // closing asterisk has to end it — a punctuation mark or the end of the line may follow.
+        let ends_word = at > from && !b[at - 1].is_ascii_whitespace();
+        let ends_run = match b.get(at + run) {
+            None => true,
+            Some(c) => {
+                c.is_ascii_whitespace()
+                    || matches!(
+                        c,
+                        b'.' | b',' | b';' | b':' | b'!' | b'?' | b')' | b']' | b'}' | b'"' | b'\''
+                    )
+            }
+        };
+        if run == width && ends_word && ends_run {
+            return Some((from, at));
+        }
+        at += run;
+    }
+    None
+}
+
 /// Rows for entries drawn as plain text; tool calls are drawn as blocks by [`tool_block`].
 fn entry_rows(entry: &Entry, view: View, theme: &Theme) -> Vec<Row> {
     match entry {
         Entry::Thinking(text) => thinking_rows(text, view.thinking, theme),
-        Entry::User(text) => text
-            .lines()
-            .map(|l| {
-                Row::prefixed(
-                    "› ",
-                    "  ",
-                    Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
-                    vec![Span::styled(
-                        l.to_owned(),
-                        Style::new()
-                            .fg(theme.user_message_text)
-                            .add_modifier(Modifier::BOLD),
-                    )],
-                )
-            })
-            .collect(),
+        Entry::User(text) => user_rows(text, theme),
         Entry::Assistant(text) => markdown(text, theme),
         Entry::Image(image) => {
             // The picture is drawn over the rows after this one, so they are left empty for it. The
@@ -2125,6 +2223,135 @@ mod tests {
                 .any(|(t, c)| t == "let" && *c == Some(Theme::default().syntax.keyword)),
             "{runs:?}"
         );
+    }
+
+    /// What a prompt is drawn as: its text, and the modifier on each run of it.
+    fn prompt(text: &str) -> Vec<(String, Modifier)> {
+        let theme = Theme::default();
+        let view = View {
+            expand: true,
+            thinking: false,
+            spinner: 0,
+            room: (80, 24),
+            images: false,
+        };
+        entry_rows(&Entry::User(text.into()), view, &theme)
+            .into_iter()
+            .flat_map(|row| row.spans)
+            .map(|s| (s.content.into_owned(), s.style.add_modifier))
+            .collect()
+    }
+
+    fn marked(text: &str, modifier: Modifier) -> Vec<String> {
+        prompt(text)
+            .into_iter()
+            .filter(|(_, m)| *m == modifier)
+            .map(|(s, _)| s)
+            .collect()
+    }
+
+    #[test]
+    fn a_word_in_asterisks_is_italic_in_a_prompt() {
+        // D81: what the user typed is shown with the emphasis they wrote.
+        assert_eq!(marked("make *this* italic", Modifier::ITALIC), ["this"]);
+        assert_eq!(marked("**this** is bold", Modifier::BOLD), ["this"]);
+        // The asterisks themselves are gone, and the rest of the line is untouched.
+        let drawn: String = prompt("make *this* italic")
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(drawn, "make this italic");
+        // Two on one line, and one at each end.
+        assert_eq!(marked("*one* and *two*", Modifier::ITALIC), ["one", "two"]);
+        assert_eq!(marked("*whole line*", Modifier::ITALIC), ["whole line"]);
+        // Punctuation may follow the closing asterisk.
+        assert_eq!(marked("say *this*, then stop", Modifier::ITALIC), ["this"]);
+    }
+
+    #[test]
+    fn an_asterisk_that_is_not_emphasis_is_left_exactly_as_typed() {
+        // A prompt that displays something other than what was sent is worse than one with no
+        // formatting, so a glob, a path and a multiplication sign survive.
+        for line in [
+            "look at src/*.rs please",
+            "compare src/*.rs with tests/*.rs",
+            "the answer is 2*3*4",
+            "**/*.toml means every manifest",
+            "run `*` here",
+            "a*lone asterisk",
+            "* not a word*",
+            "an *unclosed one",
+        ] {
+            let drawn: String = prompt(line).into_iter().map(|(s, _)| s).collect();
+            assert_eq!(drawn, line, "for {line:?}");
+        }
+    }
+
+    #[test]
+    fn an_asterisk_next_to_a_multibyte_character_is_safe() {
+        // The scan runs over bytes, so a word may hold any UTF-8 and the runs still land on whole
+        // characters.
+        assert_eq!(
+            marked("*café* and *日本語*", Modifier::ITALIC),
+            ["café", "日本語"]
+        );
+        // A lone asterisk beside a multi-byte word is still literal.
+        let line = "étoile*griffe";
+        let drawn: String = prompt(line).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(drawn, line);
+    }
+
+    #[test]
+    fn a_prompt_is_not_reformatted_as_markdown() {
+        // No fences, lists or headings: a pasted log stays the text that was pasted.
+        let typed = "- a bullet\n# not a heading\n```rust\nlet x = 1;\n```";
+        let rows = entry_rows(
+            &Entry::User(typed.into()),
+            View {
+                expand: true,
+                thinking: false,
+                spinner: 0,
+                room: (80, 24),
+                images: false,
+            },
+            &Theme::default(),
+        );
+        let drawn: Vec<String> = rows
+            .iter()
+            .map(|r| r.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(
+            drawn,
+            [
+                "- a bullet",
+                "# not a heading",
+                "```rust",
+                "let x = 1;",
+                "```"
+            ]
+        );
+        // The marker is on the first row only, and every row keeps its width.
+        assert_eq!(rows[0].first[0].content.as_ref(), "› ");
+        assert_eq!(rows[1].first[0].content.as_ref(), "  ");
+    }
+
+    #[test]
+    fn a_prompt_is_drawn_in_the_colour_a_prompt_has() {
+        let theme = Theme::default();
+        let rows = entry_rows(
+            &Entry::User("plain and *marked*".into()),
+            View {
+                expand: true,
+                thinking: false,
+                spinner: 0,
+                room: (80, 24),
+                images: false,
+            },
+            &theme,
+        );
+        for span in rows.iter().flat_map(|r| r.spans.iter()) {
+            assert_eq!(span.style.fg, Some(theme.user_message_text), "{span:?}");
+        }
     }
 
     #[test]
