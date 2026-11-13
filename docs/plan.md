@@ -1534,10 +1534,11 @@ and derives every role from the answer.
 - **A terminal that answers nothing gets pi's fallback**: ANSI indices, the terminal's default
   colours, faint secondary text, and no panel backgrounds at all, because a background nobody
   reported cannot be contrasted against.
-- **A light/dark switch is noticed when the theme is rebuilt** — `/theme`, or `/reload`, which asks
-  again before building. pi additionally listens for xterm's mode 2031, which reports a switch as it
-  happens; that needs a claim on stdin that crossterm holds, so this waits for the rebuild rather
-  than pretending to watch.
+- **The terminal is asked once per run, at startup, and a light/dark switch is noticed at the next
+  start.** This bullet first claimed `/theme` and `/reload` asked again before building; that was
+  wrong to do, and it is what D75 exists to undo. pi listens for xterm's mode 2031 to notice a
+  switch as it happens, which needs a claim on stdin that crossterm holds, and pi asks from inside
+  its own event loop, where it can pause the reader first.
 
 **Syntax highlighting** is a lexical highlighter, not a parser (`tui/syntax.rs`), because no
 highlighter can be added offline and a code block is read, not compiled.
@@ -1588,6 +1589,37 @@ the name before you could choose it, and choosing blind. It now opens a picker.
   names, and `/theme <name>` switches and saves as the interface does. That branch also stops
   `/theme` being sent to the model as a prompt, which it was: a command meant for the interface must
   never be billed as a question.
+
+**D75.** The terminal is asked about its colours before the interface takes it over, and never after.
+
+D73's query reads stdin and needs raw mode for the length of the wait. Doing that from inside the
+running interface is not safe, and shipping it was a mistake worth a decision.
+
+- **What it did.** `/theme` asked the terminal again before drawing the list. `ask` turned raw mode
+  on, read the reply, and turned raw mode *off* — which is the shell's state, not the interface's.
+  From then on every keystroke was echoed onto the screen and the interface received none of them:
+  the prompt filled with what was typed, the list ignored every key, and the terminal had to be
+  closed to get out. A late reply, arriving after the 100 ms deadline, was read as typing, which
+  added more of the same.
+- **The rule.** Exactly one caller asks: [`tui::theme_selected`], at startup, before `Screen::enter`.
+  There is no `requery`, and nothing in the interface asks on a rebuild — `/theme`, `/reload` and a
+  change of appearance all build from the answer taken at startup.
+- **The check, not the promise.** `may_ask` refuses when stdin or stdout is not a terminal, and
+  refuses when raw mode is already on, because that means the interface owns the terminal and the
+  terminal does not belong to the query. A caller that gets this wrong now gets the ANSI fallback
+  instead of a broken session — which is why the check is a function with its own test rather than a
+  line of care at the call site.
+- **Nothing left over is read as typing.** Whatever is still queued when the query ends is discarded
+  (`tcflush`), and again when the interface starts, since a slow terminal answers after the deadline
+  and those bytes would otherwise land in the prompt. The cost is at most a keystroke pressed in the
+  first fraction of a second of a session.
+- **Raw mode is watched, not assumed.** The event loop checks twice a second that the terminal is
+  still in raw mode and puts it back if it is not. That does not excuse asking from the wrong place;
+  it is there because losing raw mode is unrecoverable by the person in front of it — the only way
+  out is closing the terminal, which loses the session.
+- **Still true, and still the reason this cannot be verified here**: a reply has to come from a real
+  terminal, so the query is exercised by hand. What the tests pin down is the decision that keeps it
+  out of the interface, and the parsing of the replies it would get.
 
 ## 4. Scope enumeration
 

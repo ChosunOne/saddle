@@ -8,6 +8,12 @@
 //!
 //! The parsing is separated from the asking ([`parse`] takes the bytes) because a reply cannot be
 //! produced in a test: it comes from a terminal, and the sandbox that runs these tests has none.
+//!
+//! The terminal is asked **before** the full-screen interface takes it over, and never after (D75).
+//! A reply arrives on stdin, so reading one means owning stdin and the line discipline for the
+//! length of the wait — which, while the interface is running, is the key reader and raw mode
+//! itself. Asking from there turned raw mode off and left every keystroke echoed onto the screen
+//! and the interface deaf to all of them.
 
 use std::io::Write as _;
 use std::time::{Duration, Instant};
@@ -32,28 +38,18 @@ pub fn query_sequence() -> String {
 /// The answer this process has, so a theme rebuilt mid-session does not ask again (D73).
 static REPORT: std::sync::Mutex<Option<Reported>> = std::sync::Mutex::new(None);
 
-/// Asks the terminal once, in raw mode, and keeps the answer (D73).
+/// Asks the terminal once, before the interface starts, and keeps the answer (D73, D75).
 ///
-/// Called before the full-screen interface starts, because the reply comes in on stdin: with the
-/// line discipline still on, the bytes of a reply would be echoed over the screen and the read would
-/// wait for a newline. Raw mode is turned off again immediately, so the shell the interface is about
-/// to take over gets it back as it was.
+/// Called from [`super::theme_selected`], which runs before the screen is taken over; later calls
+/// return the kept answer and touch nothing. Raw mode is used for the length of the wait only —
+/// without it the reply would be echoed over the screen and the read would wait for a newline — and
+/// then put back to cooked, so the interface gets the terminal as it found it.
 pub fn prime() -> Reported {
     let mut kept = match REPORT.lock() {
         Ok(kept) => kept,
         Err(poisoned) => poisoned.into_inner(),
     };
     *kept.get_or_insert_with(ask)
-}
-
-/// Asks again, for a terminal whose colours changed under us (D73).
-pub fn requery() -> Reported {
-    let fresh = ask();
-    let mut kept = match REPORT.lock() {
-        Ok(kept) => kept,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    *kept.insert(fresh)
 }
 
 /// What the terminal reported earlier, if it has been asked (D73).
@@ -65,17 +61,54 @@ pub fn reported() -> Option<Reported> {
     *kept
 }
 
+/// Whether the terminal may be asked at all right now (D75).
+///
+/// Two refusals, both learned the hard way. A pipe has nobody to answer, so the read would sit
+/// until the deadline for nothing. Raw mode being on means the full-screen interface owns the
+/// terminal: it holds stdin for its key reader and it needs raw mode, so asking then means turning
+/// raw mode off under it — which leaves every keystroke echoed and the interface deaf to all of
+/// them. Checking is deliberate rather than trusting the caller, because trusting it broke a
+/// session.
+fn may_ask(stdin_is_tty: bool, stdout_is_tty: bool, raw_mode: bool) -> bool {
+    stdin_is_tty && stdout_is_tty && !raw_mode
+}
+
 fn ask() -> Reported {
     use std::io::IsTerminal as _;
-    if !std::io::stdin().is_terminal() {
+    let raw_mode = ratatui::crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+    if !may_ask(
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+        raw_mode,
+    ) {
         return Reported::nothing();
     }
+    // `enable_raw_mode` says whether it *was* already on; it is not, from the check above, so this
+    // always puts cooked mode back.
     let raw = ratatui::crossterm::terminal::enable_raw_mode().is_ok();
     let report = query();
     if raw {
+        // Anything still in the queue would be read as keystrokes by the interface that is about to
+        // start, and typed into the prompt (D75). Discarding it costs at most one keystroke pressed
+        // in the first 100 ms of a session.
+        discard_pending_input();
         let _ = ratatui::crossterm::terminal::disable_raw_mode();
     }
     report
+}
+
+/// Throws away whatever is still waiting on stdin: a late reply to a query nobody is listening for
+/// is indistinguishable from typing, and must not become a prompt (D75).
+pub fn discard_pending() {
+    discard_pending_input();
+}
+
+fn discard_pending_input() {
+    // SAFETY: `tcflush` takes a descriptor and an integer; stdin is open for the life of the
+    // process.
+    unsafe {
+        tcflush(0, TCIFLUSH);
+    }
 }
 
 /// Asks this process's terminal, waiting at most [`TIMEOUT`] (D73).
@@ -143,9 +176,13 @@ struct libc_pollfd {
     revents: i16,
 }
 
+/// `TCIFLUSH`: discard input that has been received but not read.
+const TCIFLUSH: i32 = 0;
+
 unsafe extern "C" {
     #[link_name = "poll"]
     fn poll_fd(fds: *mut libc_pollfd, nfds: u64, timeout: i32) -> i32;
+    fn tcflush(fd: i32, queue: i32) -> i32;
 }
 
 /// Reads the replies out of `bytes` (D73).
@@ -234,6 +271,27 @@ pub fn parse_colour(value: &str) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_terminal_is_never_asked_once_the_interface_owns_it() {
+        // The regression that cost a session: asking while the interface was running turned raw
+        // mode off, so every keystroke was echoed and none arrived (D75).
+        assert!(
+            !may_ask(true, true, true),
+            "raw mode on: the interface owns the terminal"
+        );
+        // Only a real terminal on both ends, and only while it is still the shell's.
+        assert!(may_ask(true, true, false));
+        assert!(
+            !may_ask(false, true, false),
+            "stdin is a pipe: nobody answers"
+        );
+        assert!(
+            !may_ask(true, false, false),
+            "stdout is a pipe: nothing to write to"
+        );
+        assert!(!may_ask(false, false, false));
+    }
 
     #[test]
     fn a_reply_in_the_usual_form_is_read() {

@@ -196,38 +196,6 @@ pub fn builtin_names() -> Vec<&'static str> {
     vec!["default", "dark", "light", "mono", "system"]
 }
 
-/// Whether building `selected` will ask the terminal about its colours (D73).
-///
-/// It is `system`, or a pair one half of which is, or a theme that `extends` one of those.
-pub fn needs_terminal(selected: &str, tables: &ThemeTables) -> bool {
-    // A pair needs to know which half applies, which is a question for the terminal.
-    if selected.contains('/') {
-        return true;
-    }
-    let mut name = selected;
-    let mut seen: Vec<String> = Vec::new();
-    loop {
-        if let Some((light, dark)) = name.split_once('/') {
-            return needs_terminal(light, tables) || needs_terminal(dark, tables);
-        }
-        if name == "system" {
-            return true;
-        }
-        if seen.iter().any(|s| s == name) {
-            return false;
-        }
-        seen.push(name.to_owned());
-        let Some(base) = tables
-            .get(name)
-            .and_then(|t| t.get("extends"))
-            .and_then(|v| v.as_str())
-        else {
-            return false;
-        };
-        name = base;
-    }
-}
-
 /// The themes a config defines, before the selected one is built.
 pub type ThemeTables = BTreeMap<String, toml::Value>;
 
@@ -729,25 +697,6 @@ mod tests {
                 .to_string()
                 .contains("extends itself")
         );
-    }
-
-    #[test]
-    fn only_a_theme_derived_from_the_terminal_makes_it_be_asked() {
-        // Nothing asks a terminal about its colours unless the answer changes the drawing (D73).
-        let t = tables(
-            "[mine]\nextends = \"system\"\n[plain]\nextends = \"default\"\n[loop]\nextends = \"loop\"\n",
-        );
-        assert!(needs_terminal("system", &t));
-        assert!(needs_terminal("mine", &t), "extends system, transitively");
-        assert!(
-            needs_terminal("light/dark", &t),
-            "a pair picks a half by appearance"
-        );
-        assert!(needs_terminal("light/system", &t));
-        assert!(!needs_terminal("default", &t));
-        assert!(!needs_terminal("plain", &t));
-        // A cycle in `extends` terminates instead of hanging.
-        assert!(!needs_terminal("loop", &t));
     }
 
     #[test]

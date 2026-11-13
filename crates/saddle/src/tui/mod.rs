@@ -222,30 +222,11 @@ pub fn theme_selected(user: &UserConfig) -> Result<crate::tui::theme::Theme> {
         .theme
         .clone()
         .unwrap_or_else(|| "default".to_owned());
-    // `system` is derived from the terminal's own colours, so ask it once, here, before the screen
-    // is taken over: the reply arrives on stdin and must not land in the middle of a drawn frame
-    // (D73).
-    if crate::tui::theme::needs_terminal(&name, &user.themes) {
-        crate::tui::terminal::prime();
-    }
+    // Ask the terminal about its colours once, here, before the screen is taken over (D73, D75).
+    // Not only when the chosen theme needs an answer: `/theme` can choose `system` mid-session, and
+    // there is no safe moment to ask after this one.
+    crate::tui::terminal::prime();
     crate::tui::theme::build(&name, &user.themes)
-}
-
-impl Controller {
-    /// Whether the selected theme is derived from the terminal, so a rebuild should ask it again
-    /// (D73).
-    fn theme_needs_terminal(&self, app: &App) -> bool {
-        let Ok(user) = UserConfig::load(&self.paths.user_config()) else {
-            return false;
-        };
-        let name = app
-            .header
-            .theme
-            .clone()
-            .or(user.ui.theme.clone())
-            .unwrap_or_else(|| "default".to_owned());
-        crate::tui::theme::needs_terminal(&name, &user.themes)
-    }
 }
 
 fn theme_from_config(paths: &Paths, selected: &Option<String>) -> Result<crate::tui::theme::Theme> {
@@ -656,6 +637,20 @@ fn draw_images(app: &mut App) {
     let _ = stdout.flush();
 }
 
+/// How often the event loop checks that the terminal is still in raw mode.
+const MODE_CHECK: u64 = 500;
+
+/// Puts raw mode back if it was lost, so the interface cannot end up echoing every keystroke
+/// instead of receiving it (D75).
+fn keep_raw_mode() {
+    if matches!(
+        ratatui::crossterm::terminal::is_raw_mode_enabled(),
+        Ok(false)
+    ) {
+        let _ = ratatui::crossterm::terminal::enable_raw_mode();
+    }
+}
+
 fn event_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
@@ -664,7 +659,16 @@ fn event_loop(
 ) -> Result<()> {
     let mut dirty = true;
     let mut last_tick = Instant::now();
+    let mut last_mode_check = Instant::now();
     loop {
+        // The interface is unusable without raw mode: keys are echoed instead of delivered, and the
+        // screen fills with what is typed. Whatever took it away — a child process, a terminal
+        // query that should never have run (D75) — it is put back rather than left to the person to
+        // recover by closing the terminal.
+        if last_mode_check.elapsed() >= Duration::from_millis(MODE_CHECK) {
+            last_mode_check = Instant::now();
+            keep_raw_mode();
+        }
         if dirty {
             terminal.draw(|f| render::draw(f, app))?;
             draw_images(app);
@@ -1201,10 +1205,6 @@ impl Controller {
                 .clone()
                 .or(user.ui.theme.clone())
                 .unwrap_or_else(|| "default".to_owned());
-            // A theme derived from the terminal needs its answer before the preview is drawn (D73).
-            if crate::tui::theme::needs_terminal(&current, &user.themes) {
-                crate::tui::terminal::requery();
-            }
             app.open_themes(crate::tui::themes::ThemePicker::collect(
                 &user.themes,
                 &current,
@@ -1217,9 +1217,6 @@ impl Controller {
         };
         // Built before it is written: a name that does not build must not be saved, or the next
         // session would open on an error the person cannot see the cause of.
-        if crate::tui::theme::needs_terminal(&name, &user.themes) {
-            crate::tui::terminal::requery();
-        }
         let theme = match crate::tui::theme::build(&name, &user.themes) {
             Ok(theme) => theme,
             Err(e) => return app.note(NoteKind::Error, &format!("{e:#}")),
@@ -1243,13 +1240,9 @@ impl Controller {
 
     /// The theme named by the config, or the default (D71).
     ///
-    /// The terminal is asked again first, so a session started in the dark and carried into the
-    /// light gets the colours that match (D73): the answer costs one round trip, and asking is the
-    /// only way to know.
+    /// Built from the answer the terminal gave at startup. It is not asked again: the interface owns
+    /// stdin and raw mode by now, and reading a reply from there broke a session once (D75).
     pub fn reload_theme(&self, app: &mut App) {
-        if self.theme_needs_terminal(app) {
-            crate::tui::terminal::requery();
-        }
         let selected = app.header.theme.clone();
         match theme_from_config(&self.paths, &selected) {
             Ok(theme) => {
@@ -1281,11 +1274,9 @@ impl Controller {
             Some(Ok(template)) => app.header.status = template,
             Some(Err(e)) => app.note(NoteKind::Error, &format!("[ui] status: {e}")),
         }
-        // A `/reload` after the terminal switched from light to dark is the moment to notice.
-        if self.theme_needs_terminal(app) {
-            crate::tui::terminal::requery();
-            self.reload_theme(app);
-        }
+        // The theme is rebuilt from the answer the terminal gave at startup; it is not asked again
+        // here, because the interface owns the terminal by now (D75).
+        self.reload_theme(app);
         app.max_steps = user.max_steps.filter(|n| *n > 0);
         self.send(app, Command::SetMaxSteps(app.max_steps));
         let compaction = crate::compact::Settings::from_config(&user.compaction);
@@ -1754,6 +1745,9 @@ fn leave_modes() {
 impl Screen {
     fn enter(mouse: bool) -> Result<Self> {
         let terminal = ratatui::try_init().context("starting the terminal UI")?;
+        // A reply to the startup's colour query that arrived after its deadline is a keystroke as
+        // far as this loop is concerned, and would be typed into the prompt (D75).
+        crate::tui::terminal::discard_pending();
         enter_modes(mouse)?;
         // ratatui's hook restores raw mode and the screen; this one also turns off the modes above.
         let previous = std::panic::take_hook();

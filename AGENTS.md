@@ -110,7 +110,10 @@ palette index, a `vars` entry, or `""` for the terminal default; `theme = "light
 the terminal's answer (or `COLORFGBG`), and `--use-theme` chooses for one run. A pi role for
 something this interface does not draw is refused with that reason. `theme = "system"` asks the
 terminal for its own colours at startup (OSC 10/11/4, 100 ms) and derives every role from them with a
-WCAG contrast floor, falling back to ANSI colours if it answers nothing (D73). Code blocks are
+WCAG contrast floor, falling back to ANSI colours if it answers nothing (D73). The terminal is asked
+**once, before the screen is taken over** — never from inside the interface, where reading a reply
+means owning stdin and raw mode, and turning raw mode off leaves every keystroke echoed and the
+interface deaf to all of them (D75). Code blocks are
 highlighted by a hand-written lexical highlighter whose colours are `syntax*` roles, so a theme paints
 code too (D73).
 `/thinking` (or shift+tab) changes the reasoning effort for the session (D57), `/name` and
@@ -161,7 +164,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D74 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D75 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
