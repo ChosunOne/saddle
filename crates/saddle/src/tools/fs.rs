@@ -42,11 +42,20 @@ pub fn read(session: &mut Session, input: &Value) -> Result<ToolOutput> {
         Ok(v) => v,
         Err(out) => return Ok(out),
     };
+    // One decision for one access (D10): the bytes are read once, after the gate, and the content
+    // decides whether they are a picture or text. Reading twice to find out would log the same
+    // decision twice, which is an access the model did not make.
+    let loc = match gate(session, "read", Scope::FsRead, path)? {
+        Ok(loc) => loc,
+        Err(out) => return Ok(out),
+    };
+    let bytes = match read_at(session, &loc) {
+        Ok(bytes) => bytes,
+        Err(out) => return Ok(out),
+    };
     // A picture is handed to the model as a picture rather than refused as "not UTF-8": reading
     // a screenshot is the point of asking for one (D58).
-    if let Ok(bytes) = read_bytes(session, path)?
-        && looks_like_image(&bytes)
-    {
+    if looks_like_image(&bytes) {
         return Ok(match crate::provider::Image::read(Path::new(path), bytes) {
             Ok(image) => ToolOutput {
                 images: vec![image.clone()],
@@ -58,7 +67,7 @@ pub fn read(session: &mut Session, input: &Value) -> Result<ToolOutput> {
             Err(why) => ToolOutput::err(format!("{path}: {why}")),
         });
     }
-    Ok(match read_text(session, path)? {
+    Ok(match text_of(path, bytes) {
         Ok(text) => {
             let (body, note) = page(&text, offset, limit);
             match note {
@@ -154,6 +163,11 @@ fn page(text: &str, offset: Option<u64>, limit: Option<u64>) -> (String, Option<
     (out, note)
 }
 
+/// The gate alone, for a caller that decides once and then reads the bytes itself (D10).
+pub fn gate_read(session: &mut Session, path: &str) -> Result<Result<Location, ToolOutput>> {
+    gate(session, "read", Scope::FsRead, path)
+}
+
 /// Reads a UTF-8 file as the agent, through the same gate as the read tool: each access is
 /// decided and logged, and symlinks are resolved beneath the root. Used by the read tool, by
 /// `@file` attachments and by project context files.
@@ -176,19 +190,32 @@ pub fn read_text(session: &mut Session, path: &str) -> Result<Result<String, Too
     )
 }
 
-/// The raw bytes of a file, through the same gate as [`read_text`]. Used for an attachment, which
-/// has to look at the bytes before deciding whether they are text or a picture (D58).
-pub fn read_bytes(session: &mut Session, path: &str) -> Result<Result<Vec<u8>, ToolOutput>> {
-    let loc = match gate(session, "read", Scope::FsRead, path)? {
-        Ok(loc) => loc,
-        Err(out) => return Ok(Err(out)),
-    };
-    Ok(
-        match open_root(session, &loc).and_then(|dir| dir.read(loc.rel.to_path())) {
-            Ok(bytes) => Ok(bytes),
-            Err(e) => Err(ToolOutput::err(format!("{path}: {e}"))),
-        },
-    )
+/// The bytes at a location the gate has already decided, so a caller that must look at content
+/// before knowing whether it wants the bytes or the text decides once.
+pub fn read_at(session: &Session, loc: &Location) -> Result<Vec<u8>, ToolOutput> {
+    match open_root(session, loc).and_then(|dir| dir.read(loc.rel.to_path())) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) => Err(ToolOutput::err(format!("{}: {e}", display(session, loc)))),
+    }
+}
+
+/// A path as the model wrote it, or the location when only the location is left.
+fn display(session: &Session, loc: &Location) -> String {
+    match session.base_of(&loc.root) {
+        Some(base) if loc.rel.is_root() => base.display().to_string(),
+        Some(base) => base.join(loc.rel.to_path()).display().to_string(),
+        None => loc.to_string(),
+    }
+}
+
+/// UTF-8 or a refusal, from bytes already read.
+pub fn text_of(path: &str, bytes: Vec<u8>) -> Result<String, ToolOutput> {
+    String::from_utf8(bytes).map_err(|e| {
+        ToolOutput::err(format!(
+            "{path} is not UTF-8 ({} bytes)",
+            e.as_bytes().len()
+        ))
+    })
 }
 
 /// Whether these bytes are one of the image formats the APIs accept. The magic bytes decide, so a

@@ -948,7 +948,9 @@ fn verify(log: &std::path::Path) -> Result<ExitCode> {
             );
             return Ok(ExitCode::from(1));
         }
-        None => println!("no entry in sessions.jsonl (session still open, or index missing)"),
+        // Intact but unvouched: the chain holds, yet no index entry names this log, so it cannot
+        // be checked against the close record. Said plainly rather than passed over (D10).
+        None => println!("chain intact, but no entry in sessions.jsonl names this log"),
     }
     Ok(ExitCode::SUCCESS)
 }

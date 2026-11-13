@@ -129,10 +129,11 @@ impl Env {
 
     fn audit_logs(&self) -> Vec<PathBuf> {
         let dir = self.xdg.path().join("state/saddle/audit");
-        let mut logs: Vec<PathBuf> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .collect();
+        // No run yet means no audit directory, which is not a failure.
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut logs: Vec<PathBuf> = entries.map(|e| e.unwrap().path()).collect();
         logs.sort_by_key(|p| p.metadata().unwrap().modified().unwrap());
         logs
     }
@@ -1392,5 +1393,39 @@ fn a_misspelt_tool_name_in_a_sandbox_entry_is_an_error() {
         stderr(&out).contains("lists unknown tool `raed`"),
         "{}",
         stderr(&out)
+    );
+}
+
+#[test]
+fn one_access_records_one_decision() {
+    // D10: one access is one decision. The read tool used to gate twice — once to sniff whether the
+    // file is a picture, once to read it — so every read logged the same allow twice, and "how many
+    // times was this file read" was unanswerable from the log.
+    let env = ready();
+    let decisions = |name: &str, input: &str| -> usize {
+        let before = env.audit_logs().len();
+        env.tool(name, serde_json::from_str(input).unwrap());
+        let logs = env.audit_logs();
+        assert!(logs.len() > before, "{name} wrote no log");
+        std::fs::read_to_string(logs.last().unwrap())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|r| r["kind"] == "decision")
+            .count()
+    };
+
+    assert_eq!(decisions("read", r#"{"path":"README"}"#), 1, "a text file");
+    assert_eq!(decisions("read", r#"{"path":"nope"}"#), 1, "a missing file");
+    assert_eq!(
+        decisions("read", r#"{"path":"../outside"}"#),
+        1,
+        "a refusal"
+    );
+    assert_eq!(decisions("ls", r#"{"path":"."}"#), 1);
+    // edit legitimately makes two: it reads the old text and writes the new one.
+    assert_eq!(
+        decisions("edit", r#"{"path":"README","old":"hello","new":"bye"}"#),
+        2
     );
 }

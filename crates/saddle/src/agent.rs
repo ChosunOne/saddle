@@ -458,25 +458,38 @@ impl Agent {
             if !seen.insert(path.to_owned()) {
                 continue;
             }
-            // A file that is an image is attached as one, before anything tries to read it as
-            // text (D58).
-            match tools::fs::read_bytes(session, path)? {
-                Ok(bytes) if tools::fs::looks_like_image(&bytes) => {
-                    match crate::provider::Image::read(std::path::Path::new(path), bytes) {
-                        Ok(image) => {
-                            total += image.data.len();
-                            // The UI decides how to show it: a picture where the terminal can
-                            // draw one, a line where it cannot (D58, D59).
-                            ui.attached(std::slice::from_ref(&image));
-                            images.push(image);
-                        }
-                        Err(why) => ui.note(&format!("@{path} not attached: {why}")),
-                    }
+            // One decision per attachment (D10), as in the read tool: the gate first, then the
+            // bytes, because whether they are a picture is what decides how it is attached.
+            let loc = match tools::fs::gate_read(session, path)? {
+                Ok(loc) => loc,
+                Err(out) => {
+                    ui.note(&format!("@{path} not attached: {}", out.content));
                     continue;
                 }
-                _ => {}
+            };
+            let bytes = match tools::fs::read_at(session, &loc) {
+                Ok(bytes) => bytes,
+                Err(out) => {
+                    ui.note(&format!("@{path} not attached: {}", out.content));
+                    continue;
+                }
+            };
+            // A file that is an image is attached as one, before anything tries to read it as
+            // text (D58).
+            if tools::fs::looks_like_image(&bytes) {
+                match crate::provider::Image::read(std::path::Path::new(path), bytes) {
+                    Ok(image) => {
+                        total += image.data.len();
+                        // The UI decides how to show it: a picture where the terminal can
+                        // draw one, a line where it cannot (D58, D59).
+                        ui.attached(std::slice::from_ref(&image));
+                        images.push(image);
+                    }
+                    Err(why) => ui.note(&format!("@{path} not attached: {why}")),
+                }
+                continue;
             }
-            match tools::fs::read_text(session, path)? {
+            match tools::fs::text_of(path, bytes) {
                 Ok(text) if total + text.len() > MAX_ATTACHED => {
                     ui.note(&format!(
                         "@{path} not attached: attachments are limited to {} KiB a prompt",
