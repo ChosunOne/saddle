@@ -2157,10 +2157,12 @@ mod tests {
             .collect()
     }
 
+    /// The runs carrying `modifier`, however else they are styled: `***this***` is both, and asking
+    /// for one of the two should still find it.
     fn marked(text: &str, modifier: Modifier) -> Vec<String> {
         prompt(text)
             .into_iter()
-            .filter(|(_, m)| *m == modifier)
+            .filter(|(_, m)| m.contains(modifier))
             .map(|(s, _)| s)
             .collect()
     }
@@ -2177,6 +2179,21 @@ mod tests {
         assert_eq!(drawn("make *this* italic"), "make this italic");
         assert_eq!(marked("*one* and *two*", Modifier::ITALIC), ["one", "two"]);
         assert_eq!(marked("*whole line*", Modifier::ITALIC), ["whole line"]);
+    }
+
+    #[test]
+    fn three_asterisks_are_bold_and_italic_together() {
+        // Markdown nests strong around em; the two modifiers patch onto the base rather than one
+        // replacing the other, so `***this***` gets both.
+        assert_eq!(
+            marked("***test***", Modifier::BOLD | Modifier::ITALIC),
+            ["test"]
+        );
+        // All three on one line, each with its own modifier.
+        assert_eq!(marked("*a* **b** ***c***", Modifier::ITALIC), ["a", "c"]);
+        assert_eq!(marked("*a* **b** ***c***", Modifier::BOLD), ["b", "c"]);
+        // The text around it is untouched.
+        assert_eq!(drawn("x ***y*** z"), "x y z");
     }
 
     #[test]
