@@ -42,7 +42,7 @@ use ratatui::crossterm::terminal::{
 
 pub use app::Header;
 use app::{Action, AgentEvent, App, Drawn, NoteKind, Placed};
-use login::{CUSTOM_LABEL, Choice, Draft, Login, LoginRequest};
+use login::{CUSTOM_LABEL, Choice, Draft, Listed, Login, LoginRequest, Pick};
 use permissions::{Kind, Permissions, Row};
 
 use crate::agent::{Agent, Compacted, End, Ui, call_detail};
@@ -859,6 +859,7 @@ impl Controller {
                 self.open_login(app, current, false)
             }
             Action::CheckModels(id, draft) => self.check_models(id, draft),
+            Action::ListModels(id) => self.list_all_models(app, id),
             Action::SignIn(id, provider) => {
                 self.sign_in(app, id, &provider);
                 Ok(())
@@ -1118,13 +1119,13 @@ impl Controller {
             }
         });
         let mut login = match prepared {
-            Ok(choices) => Login::for_model(choices, &provider, auth_path),
+            Ok(choices) => Login::for_all_models(choices, &provider, &app.header.model, auth_path),
             Err(e) => Login::for_model_unavailable(&provider, format!("{e:#}"), auth_path),
         };
         let pending = login.take_pending();
         app.open_login(login);
-        if let Some(login::Outcome::Check(id, draft)) = pending
-            && let Err(e) = self.check_models(id, draft)
+        if let Some(login::Outcome::ListAll(id)) = pending
+            && let Err(e) = self.list_all_models(app, id)
             && let Some(login) = &mut app.login
         {
             login.note_listing_failed(format!("{e:#}"));
@@ -1191,11 +1192,133 @@ impl Controller {
                     reported.record(&base_url, models);
                     let _ = reported.save(&cache);
                 }
-                let ids = listed.map(|models| models.into_iter().map(|m| m.id).collect());
-                let _ = events.send(AgentEvent::Models(id, ids));
+                let name = draft.provider.clone();
+                let answer = listed.map(|models| Listed {
+                    picks: models
+                        .into_iter()
+                        .map(|m| Pick {
+                            provider: name.clone(),
+                            model: m.id,
+                        })
+                        .collect(),
+                    failed: Vec::new(),
+                });
+                let _ = events.send(AgentEvent::Models(id, answer));
             })
             .context("starting the model lookup")?;
         Ok(())
+    }
+
+    /// Lists what every configured provider serves, one thread each, and answers once (D89).
+    ///
+    /// Concurrently because the list is the union: a provider that is down spends its whole timeout,
+    /// and doing that one after another would leave the dialog waiting for the sum of every failure.
+    /// A provider that cannot be asked is reported beside the list rather than left out silently —
+    /// "missing" and "serves nothing" look the same otherwise.
+    fn list_all_models(&self, app: &mut App, id: u64) -> Result<()> {
+        let (choices, _) = self.login_choices()?;
+        // A provider with no credential cannot be listed; it is not a failure, it is one the person
+        // has not set up, and `/login` is where that happens.
+        let ready: Vec<Choice> = choices
+            .into_iter()
+            .filter(|c| !c.custom && (c.has_key || !c.needs_key))
+            .collect();
+        if ready.is_empty() {
+            if let Some(login) = &mut app.login {
+                login.models(
+                    id,
+                    Ok(Listed {
+                        picks: Vec::new(),
+                        failed: vec!["no provider has a credential yet; /login first".to_owned()],
+                    }),
+                );
+            }
+            return Ok(());
+        }
+        let mut built = Vec::new();
+        let mut failed = Vec::new();
+        for choice in &ready {
+            match self.provider_for_listing(&choice.name) {
+                Ok(p) => built.push(p),
+                Err(e) => failed.push(format!("{}: {e:#}", choice.name)),
+            }
+        }
+        let events = self.events.clone();
+        let cache = self.paths.reported_windows();
+        thread::Builder::new()
+            .name("saddle-models-all".into())
+            .spawn(move || {
+                let mut picks: Vec<Pick> = Vec::new();
+                let mut failed = failed;
+                // One thread per provider, all of them joined: the answer is one list, so it can
+                // only be assembled once every provider has answered or given up. Each thread
+                // returns its models *and* its own name and base URL, so nothing has to be matched
+                // up afterwards.
+                type Answer = (String, String, Result<Vec<provider::ModelInfo>, String>);
+                let answers: Vec<Answer> = thread::scope(|scope| {
+                    let handles: Vec<_> = built
+                        .iter()
+                        .map(|p| {
+                            scope.spawn(move || {
+                                let listened = p
+                                    .refresh_tokens()
+                                    .map_err(|e| format!("{}: {e:#}", p.name))
+                                    .and_then(|()| {
+                                        provider::list_models(p)
+                                            .map_err(|e| format!("{}: {}", p.name, e.reason()))
+                                    });
+                                (p.name.clone(), p.config.base_url.clone(), listened)
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join().unwrap_or_else(|_| {
+                                (
+                                    String::new(),
+                                    String::new(),
+                                    Err("the listing thread panicked".into()),
+                                )
+                            })
+                        })
+                        .collect()
+                });
+                // Every window the servers state is kept, not just the one chosen (D34). Recorded
+                // here rather than in the threads: one file, one writer.
+                let mut reported = provider::Reported::stored(&cache);
+                let mut recorded = false;
+                for (name, base_url, answer) in answers {
+                    match answer {
+                        Ok(models) => {
+                            recorded |= !models.is_empty();
+                            reported.record(&base_url, &models);
+                            picks.extend(models.into_iter().map(|m| Pick {
+                                provider: name.clone(),
+                                model: m.id,
+                            }));
+                        }
+                        Err(why) => failed.push(why),
+                    }
+                }
+                if recorded {
+                    let _ = reported.save(&cache);
+                }
+                let _ = events.send(AgentEvent::Models(id, login::answer(picks, failed)));
+            })
+            .context("starting the model lookup")?;
+        Ok(())
+    }
+
+    /// A provider for listing only: no model is needed, and the stored credential is used as a turn
+    /// would (D85).
+    fn provider_for_listing(&self, name: &str) -> Result<Provider> {
+        let user = UserConfig::load(&self.paths.user_config())?;
+        let auth = AuthStore::load(&self.paths.auth_store())?;
+        let reported = provider::Reported::stored(&self.paths.reported_windows());
+        let config = provider::endpoint(name, &user.providers)?;
+        Ok(Provider::new(name, config, auth.key(name), &reported)
+            .with_stored_oauth(&self.paths.auth_store()))
     }
 
     fn open_resume(&self, app: &mut App) -> Result<()> {
@@ -2161,10 +2284,22 @@ mod tests {
             login::Stage::Checking { id } => id,
             _ => unreachable!(),
         };
-        app.login
-            .as_mut()
-            .unwrap()
-            .models(id, Ok(vec!["picked-a".into(), "picked-b".into()]));
+        app.login.as_mut().unwrap().models(
+            id,
+            Ok(Listed {
+                picks: vec![
+                    Pick {
+                        provider: "synthetic".into(),
+                        model: "picked-a".into(),
+                    },
+                    Pick {
+                        provider: "synthetic".into(),
+                        model: "picked-b".into(),
+                    },
+                ],
+                failed: Vec::new(),
+            }),
+        );
         let action = {
             let login = app.login.as_mut().unwrap();
             login.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));

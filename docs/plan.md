@@ -2168,6 +2168,37 @@ models, a gateway decides its own, and a listing is the only authority on what a
   a key field the provider did not need; the one picker serves both, so there is one behaviour to
   describe and to test.
 
+**D89.** `/model` lists what *every* configured provider serves, and choosing an entry switches both
+the provider and the model.
+
+D88 listed one provider's models — the one in force. That is the wrong question for a command whose
+job is "what can I switch to": on a machine with an API key and a subscription, the two serve
+different models under different names, and the identifier alone is not enough to pick one.
+
+- **An entry is a model *and* the provider that serves it.** Two of them may serve a model with the
+  same id, and a choice that named only the id would be ambiguous about which account it is spent
+  from. That is why the list is `Pick { provider, model }`, and why choosing one writes both
+  `provider` and `model` — which is exactly what `/login` already did.
+- **The requests run concurrently, one thread per provider**, and the dialog waits for the answer as
+  one list. Sequentially, a provider that is down would spend its whole timeout before the next was
+  asked, and the picker would open after the sum of every failure.
+- **A provider with no credential is not asked.** It is not a failure; it is one that has not been
+  set up, and `/login` is where that happens. Asking anyway would put a 401 in the list's note for
+  something the person already knows.
+- **A partial list says what is missing from it.** "Missing" and "serves nothing" look identical in a
+  union, so the providers that failed are named in a note above the list. Nothing at all, with
+  failures, is an error that names them; nothing at all, with no failures, is the empty list the
+  dialog already words.
+- **The filter matches the provider as well as the model**, so typing `openai` narrows the union to
+  one provider, and `provider/model` matches the pair. A name typed that nothing lists goes to the
+  provider in force — the one a person is switching when they type a name at all — and the models
+  column is padded from the whole list so it does not jump about while typing.
+- **Every listing is kept for the window cache**, not only the chosen one: each server's answer is
+  its own word on its own limits (D34). Recorded once, after every thread has answered, because one
+  file with several writers is a race.
+- **`/login` still lists one provider** — the one just logged into — because that credential was
+  just entered for it. The union is for switching, not for setting up.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

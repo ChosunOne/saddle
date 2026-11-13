@@ -111,9 +111,10 @@ the code is put on the clipboard as it arrives, the link is underlined and opens
 browser on a click or `o`, and `c` copies it (D85, D86). `saddle login <provider>` and
 `saddle logout <provider>` are the same thing without the interface, and `check` says whether the
 provider in force is signed in.
-`/model` with no name is a searchable list of what the provider serves, with the model in force
+`/model` with no name is a searchable list of what **every** configured provider serves — each entry
+naming its provider, filterable by provider as well as by name — with the provider and model in force
 named above it and highlighted in the list; `/model <name>` switches straight to one and saves it as
-that provider's default (D88). `/login` ends on the same list, so a model is chosen the same way
+that provider's default (D88, D89). `/login` ends on the same list, so a model is chosen the same way
 whether or not the credential was just entered.
 `/skill:<name> <request>` loads a skill's instructions into the conversation followed by the
 request, in the TUI and in line mode, and is the only way to reach a skill marked
@@ -194,7 +195,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D88 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D89 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

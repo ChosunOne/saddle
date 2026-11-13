@@ -226,6 +226,15 @@ pub enum ModelsError {
     Failed(String),
 }
 
+impl ModelsError {
+    /// The reason, for a message that has to carry it.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Rejected(why) | Self::Failed(why) => why,
+        }
+    }
+}
+
 /// Ids that are not chat models, in the lists OpenAI and others return.
 const NOT_CHAT: &[&str] = &[
     "embed",

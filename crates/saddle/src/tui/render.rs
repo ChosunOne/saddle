@@ -27,7 +27,7 @@ use crate::tui::theme::Theme;
 #[cfg(test)]
 use super::app::Action;
 #[cfg(test)]
-use super::login::{Choice, Outcome};
+use super::login::{Choice, Listed, Outcome, Pick};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Output lines a collapsed tool block shows.
@@ -1567,17 +1567,21 @@ fn draw_menu(frame: &mut Frame<'_>, app: &mut App, editor_area: Rect) {
 
 fn login_title(login: &Login) -> String {
     let c = login.choice();
+    // The picker names the provider and model in force, so a list that spans every provider is read
+    // against something (D88, D89).
+    if login.purpose() == Purpose::Model {
+        return match login.in_force() {
+            Some((provider, model)) if !model.is_empty() => {
+                format!(" Model · {provider} / {model} ")
+            }
+            Some((provider, _)) => format!(" Model · {provider} "),
+            None => " Model ".to_owned(),
+        };
+    }
     if c.custom {
         return " Add an OpenAI-compatible server ".to_owned();
     }
-    // The picker names the model in force, so the list is read against something (D88).
-    match (login.purpose(), c.model.as_deref()) {
-        (Purpose::Model, Some(model)) if !model.is_empty() => {
-            format!(" Model for {} · {model} ", c.name)
-        }
-        (Purpose::Model, _) => format!(" Model for {} ", c.name),
-        _ => format!(" Log in to {} ", c.name),
-    }
+    format!(" Log in to {} ", c.name)
 }
 
 /// The /login dialog, centred over the screen. Keys are shown as dots.
@@ -1810,19 +1814,33 @@ fn draw_login(
                 Span::raw(visible),
             ]));
             let list = matching(models, filter);
+            // The ids are padded to one column so the providers line up under each other, and the
+            // width comes from the whole list rather than the filtered one, so typing does not make
+            // the column jump about (D89).
+            let id_width = models
+                .iter()
+                .map(|p| p.model.width())
+                .max()
+                .unwrap_or(0)
+                .min(inner.saturating_sub(12));
             let top = (selected + 1).saturating_sub(MODEL_ROWS);
-            for (i, m) in list.iter().enumerate().skip(top).take(MODEL_ROWS) {
+            for (i, p) in list.iter().enumerate().skip(top).take(MODEL_ROWS) {
                 let chosen = i == *selected;
                 lines.push(Line::from(vec![
                     Span::styled(if chosen { "› " } else { "  " }, accent),
                     Span::styled(
-                        keep_tail(m, inner.saturating_sub(2)),
+                        format!(
+                            "{:<width$}",
+                            keep_head(&p.model, id_width),
+                            width = id_width
+                        ),
                         if chosen {
                             Style::new().add_modifier(Modifier::BOLD)
                         } else {
                             Style::new()
                         },
                     ),
+                    Span::styled(format!("  {}", p.provider), dim(theme)),
                 ]));
             }
             if list.is_empty() && !filter.trim().is_empty() {
@@ -3380,77 +3398,88 @@ mod tests {
     }
 
     #[test]
-    fn the_model_picker_shows_a_filtered_list_and_names_the_model_in_force() {
-        // D88: the point of the picker is that the name does not have to be known, so the screen has
-        // to show the served list, the filter being typed, and which model is current.
+    fn the_model_picker_shows_every_providers_list_and_names_the_model_in_force() {
+        // D89: the list spans providers, so the screen has to say which one serves each model, and
+        // name the model in force so the list is read against something.
         let mut app = bare_app();
-        let mut choice = Choice {
-            name: "synthetic".into(),
+        let choice = |name: &str, model: &str| Choice {
+            name: name.into(),
             detail: String::new(),
             status: "logged in".into(),
             needs_key: true,
             has_key: true,
-            model: Some("gpt-5.6-sol".into()),
+            model: Some(model.into()),
             custom: false,
             oauth: false,
         };
-        choice.model = Some("gpt-5.6-sol".into());
-        let mut login = Login::for_model(vec![choice], "synthetic", "auth.json".into());
-        let Some(Outcome::Check(id, _)) = login.take_pending() else {
+        let mut login = Login::for_all_models(
+            vec![
+                choice("synthetic", "gpt-5.6-sol"),
+                choice("openai", "gpt-5.4"),
+            ],
+            "synthetic",
+            "gpt-5.6-sol",
+            "auth.json".into(),
+        );
+        let Some(Outcome::ListAll(id)) = login.take_pending() else {
             panic!("a listing to ask for");
         };
         login.models(
             id,
-            Ok(vec![
-                "gpt-5.6-luna".into(),
-                "gpt-5.6-sol".into(),
-                "gpt-6.1-terra".into(),
-            ]),
+            Ok(Listed {
+                picks: vec![
+                    Pick {
+                        provider: "synthetic".into(),
+                        model: "gpt-5.6-luna".into(),
+                    },
+                    Pick {
+                        provider: "synthetic".into(),
+                        model: "gpt-5.6-sol".into(),
+                    },
+                    Pick {
+                        provider: "openai".into(),
+                        model: "gpt-5.4".into(),
+                    },
+                ],
+                failed: Vec::new(),
+            }),
         );
         app.open_login(login);
         let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let text = screen(&terminal);
-        assert!(text.contains("Model for synthetic"), "{text}");
-        assert!(
-            text.contains("gpt-5.6-sol"),
-            "the model in force is named:\n{text}"
-        );
-        for m in ["gpt-5.6-luna", "gpt-6.1-terra"] {
+        assert!(text.contains("Model · synthetic / gpt-5.6-sol"), "{text}");
+        for m in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.4"] {
             assert!(text.contains(m), "{m} is missing:\n{text}");
         }
+        // Both providers are named, which is what makes a union list readable.
+        for p in ["synthetic", "openai"] {
+            assert!(text.contains(p), "{p} is missing:\n{text}");
+        }
         assert!(text.contains("type to filter"), "{text}");
+        assert!(text.contains("esc close"), "{text}");
+        // The model in force is where the highlight starts.
         assert!(
-            text.contains("esc close"),
-            "a picker has nothing behind it:\n{text}"
+            matches!(
+                &app.login.as_ref().unwrap().stage,
+                Stage::Models { selected: 1, .. }
+            ),
+            "the highlight starts on the current model: {:?}",
+            app.login.as_ref().unwrap().stage
         );
-        // The current model is where the highlight starts, so enter keeps it by accident only if
-        // nothing was chosen.
-        assert_eq!(
-            app.login.as_ref().unwrap().stage,
-            Stage::Models {
-                models: vec![
-                    "gpt-5.6-luna".into(),
-                    "gpt-5.6-sol".into(),
-                    "gpt-6.1-terra".into()
-                ],
-                filter: String::new(),
-                selected: 1,
-                note: None,
-            }
-        );
-        // Typing narrows what is drawn.
-        for c in "terra".chars() {
+
+        // Typing a provider narrows to it; typing a model narrows to that.
+        for c in "openai".chars() {
             app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let text = screen(&terminal);
-        assert!(text.contains("filter  › terra"), "{text}");
+        assert!(text.contains("filter  › openai"), "{text}");
         assert!(
             !text.contains("gpt-5.6-luna"),
-            "the filter hides the rest:\n{text}"
+            "the filter hides the other provider:\n{text}"
         );
-        assert!(text.contains("gpt-6.1-terra"), "{text}");
+        assert!(text.contains("gpt-5.4"), "{text}");
     }
 
     #[test]

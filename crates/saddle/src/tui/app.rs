@@ -11,7 +11,7 @@ use ratatui::text::Line;
 use unicode_width::UnicodeWidthChar;
 
 use super::editor::Editor;
-use super::login::{Draft, Login, LoginRequest, Outcome};
+use super::login::{Draft, Listed, Login, LoginRequest, Outcome};
 use super::sessions::{PickOutcome, SessionPicker};
 use super::settings::{Change, SettingsDialog, SettingsOutcome};
 use crate::agent::call_detail;
@@ -57,8 +57,8 @@ pub enum AgentEvent {
     Fatal(String),
     /// The agent thread closed the session and exited.
     Closed,
-    /// The answer to a model listing started by the login dialog.
-    Models(u64, Result<Vec<String>, ModelsError>),
+    /// The answer to a model listing started by the login dialog or the picker (D89).
+    Models(u64, Result<Listed, ModelsError>),
     /// The code to type for a device sign-in: where to go, and what to enter there (D85).
     DeviceCode(u64, Result<(String, String), String>),
     /// A link could not be opened, with the reason (D86). Sent from the thread that watched the
@@ -110,6 +110,8 @@ pub enum Action {
     SignIn(u64, String),
     /// List the draft's models, answering with [`AgentEvent::Models`].
     CheckModels(u64, Draft),
+    /// List what every provider serves, answering with [`AgentEvent::Models`] (D89).
+    ListModels(u64),
     Login(LoginRequest),
     /// Remove the stored key of the named provider, or of the current one.
     Logout(Option<String>),
@@ -966,6 +968,7 @@ impl App {
                     None
                 }
                 Outcome::Check(id, draft) => Some(Action::CheckModels(id, draft)),
+                Outcome::ListAll(id) => Some(Action::ListModels(id)),
                 Outcome::SignIn(id, provider) => Some(Action::SignIn(id, provider)),
                 Outcome::OpenLink(url) => Some(Action::OpenUrl(url)),
                 Outcome::CopyLink(url) => Some(Action::Copy(url, "the sign-in link")),

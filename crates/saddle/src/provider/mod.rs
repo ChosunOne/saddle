@@ -13,7 +13,7 @@ mod reported;
 mod responses;
 mod sse;
 
-pub use http::{ModelsError, fetch_usage, list_models, page_paths, quota_from_page};
+pub use http::{ModelInfo, ModelsError, fetch_usage, list_models, page_paths, quota_from_page};
 pub use oauth::Tokens;
 pub use reported::Reported;
 

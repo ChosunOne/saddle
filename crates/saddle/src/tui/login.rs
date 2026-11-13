@@ -86,6 +86,24 @@ pub struct LoginRequest {
     pub base_url: Option<String>,
 }
 
+/// One model of one provider, as the picker lists them (D89).
+///
+/// The id alone is not enough once the list spans providers: two of them may serve a model with the
+/// same name, and choosing an entry has to say which provider it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pick {
+    pub provider: String,
+    pub model: String,
+}
+
+/// What a listing answered, and which providers it could not ask (D89).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listed {
+    pub picks: Vec<Pick>,
+    /// One line per provider that failed, so a partial list says what is missing from it.
+    pub failed: Vec<String>,
+}
+
 /// Why the dialog is open: to sign in, or to choose the model of a provider already set up (D88).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
@@ -106,7 +124,7 @@ pub enum Stage {
         id: u64,
     },
     Models {
-        models: Vec<String>,
+        models: Vec<Pick>,
         filter: String,
         selected: usize,
         note: Option<String>,
@@ -119,6 +137,8 @@ pub enum Outcome {
     Close,
     /// List the models for this draft and answer with [`Login::models`].
     Check(u64, Draft),
+    /// List what every provider serves and answer with [`Login::models`] (D89).
+    ListAll(u64),
     Submit(LoginRequest),
     /// Start a device sign-in for this provider (D85).
     SignIn(u64, String),
@@ -144,6 +164,11 @@ pub struct Login {
     pending: Option<Outcome>,
     /// Signing in, or only picking a model (D88).
     purpose: Purpose,
+    /// The provider in force when the picker opened, so a model typed rather than chosen goes to
+    /// the provider the session is already using (D89).
+    current: Option<String>,
+    /// That provider's model, which the title names and the highlight starts on (D89).
+    current_model: Option<String>,
     /// Where keys are stored, shown under the key field.
     pub auth_path: String,
     /// Opened at a provider's fields directly; esc there closes instead of going back.
@@ -177,6 +202,8 @@ impl Login {
             device: Device::default(),
             pending: None,
             purpose: Purpose::Login,
+            current: None,
+            current_model: None,
             auth_path,
             direct: false,
             builtin,
@@ -195,18 +222,27 @@ impl Login {
         login
     }
 
-    /// The model picker: the list `/login` ends on, opened at one provider's models (D88).
+    /// The picker over every provider at once (D89).
     ///
-    /// Nothing is asked for here that the provider already has — no key, no address — so the list
-    /// is the whole dialog. What it owes the host is the listing, which is taken like any other
-    /// pending outcome.
-    pub fn for_model(choices: Vec<Choice>, provider: &str, auth_path: String) -> Self {
-        let mut login = Self::new(choices, Vec::new(), Some(provider), false, auth_path);
+    /// `/model` has to answer "what can I switch to", and on a machine with more than one provider
+    /// that is not one list: the subscription serves models the API key does not, and each names
+    /// them differently. So the list is the union, every entry carrying its provider, and choosing
+    /// one switches both. `current` is the provider in force, which is what a typed name means and
+    /// whose model is preselected.
+    pub fn for_all_models(
+        choices: Vec<Choice>,
+        current: &str,
+        current_model: &str,
+        auth_path: String,
+    ) -> Self {
+        let mut login = Self::new(choices, Vec::new(), Some(current), false, auth_path);
         login.purpose = Purpose::Model;
-        let outcome = login.choose();
-        if outcome != Outcome::Stay {
-            login.pending = Some(outcome);
-        }
+        login.current = Some(current.to_owned());
+        login.current_model = Some(current_model.to_owned()).filter(|m| !m.is_empty());
+        login.next_id += 1;
+        let id = login.next_id;
+        login.stage = Stage::Checking { id };
+        login.pending = Some(Outcome::ListAll(id));
         login
     }
 
@@ -216,6 +252,15 @@ impl Login {
 
     pub fn choice(&self) -> &Choice {
         &self.choices[self.selected]
+    }
+
+    /// The provider and model in force, which a typed name is relative to and the title names
+    /// (D89).
+    pub fn in_force(&self) -> Option<(&str, &str)> {
+        Some((
+            self.current.as_deref()?,
+            self.current_model.as_deref().unwrap_or_default(),
+        ))
     }
 
     pub fn checking(&self) -> bool {
@@ -233,7 +278,11 @@ impl Login {
         // Picking a model for a provider that is already set up: there is nothing to type, so the
         // listing is the only question (D88).
         if self.purpose == Purpose::Model {
-            return self.ask_models();
+            self.next_id += 1;
+            let id = self.next_id;
+            self.stage = Stage::Checking { id };
+            self.error = None;
+            return Outcome::ListAll(id);
         }
         if self.choices[self.selected].oauth {
             // Already signed in: there is nothing to type and nothing to wait for, so the model
@@ -357,6 +406,15 @@ impl Login {
         if key.code == KeyCode::Esc && self.esc_closes() {
             return Outcome::Close;
         }
+        // Read before the stage is borrowed mutably. A typed name belongs to the provider in force
+        // in the picker, or — in the login flow, where the list is one provider's — to the provider
+        // the draft is for (D89).
+        let current = self.current.clone().or_else(|| {
+            self.draft
+                .as_ref()
+                .map(|draft| draft.provider.clone())
+                .filter(|p| !p.is_empty())
+        });
         match &mut self.stage {
             Stage::Pick => match key.code {
                 KeyCode::Up => {
@@ -451,19 +509,32 @@ impl Login {
                     }
                     KeyCode::Enter => {
                         let list = matching(models, filter);
-                        let model = match list.get(*selected) {
-                            Some(m) => (*m).clone(),
-                            None if !filter.trim().is_empty() => filter.trim().to_owned(),
+                        let pick = match list.get(*selected) {
+                            Some(p) => (**p).clone(),
+                            // A name nothing lists goes to the provider in force, which is the one
+                            // a person is switching when they type a name at all (D89).
+                            None if !filter.trim().is_empty() => match current.clone() {
+                                Some(provider) => Pick {
+                                    provider,
+                                    model: filter.trim().to_owned(),
+                                },
+                                None => return Outcome::Stay,
+                            },
                             None => return Outcome::Stay,
                         };
-                        let Some(draft) = self.draft.clone() else {
-                            return Outcome::Stay;
-                        };
+                        // The key and address entered for a login belong to the provider they were
+                        // entered for, and only to that one: the picker's own list has neither, and
+                        // taking one from a draft for another provider would save a credential to
+                        // the wrong place (D89).
+                        let draft = self
+                            .draft
+                            .clone()
+                            .filter(|draft| draft.provider == pick.provider);
                         return Outcome::Submit(LoginRequest {
-                            provider: draft.provider,
-                            key: draft.key,
-                            model,
-                            base_url: draft.base_url,
+                            provider: pick.provider,
+                            key: draft.as_ref().and_then(|draft| draft.key.clone()),
+                            model: pick.model,
+                            base_url: draft.as_ref().and_then(|draft| draft.base_url.clone()),
                         });
                     }
                     _ => {}
@@ -621,21 +692,40 @@ impl Login {
     }
 
     /// The host's answer to [`Outcome::Check`]. Answers to an abandoned check are ignored.
-    pub fn models(&mut self, id: u64, result: Result<Vec<String>, ModelsError>) {
+    pub fn models(&mut self, id: u64, result: Result<Listed, ModelsError>) {
         if self.stage != (Stage::Checking { id }) {
             return;
         }
         match result {
-            Ok(models) => {
+            Ok(Listed {
+                picks: models,
+                failed,
+            }) => {
+                // The model in force is where the highlight starts, matched on the provider too: the
+                // same id can be served by two of them (D89).
                 let selected = self
-                    .choice()
-                    .model
-                    .as_ref()
-                    .and_then(|m| models.iter().position(|x| x == m))
+                    .current
+                    .as_deref()
+                    .zip(self.current_model.as_deref())
+                    .and_then(|(provider, model)| {
+                        models
+                            .iter()
+                            .position(|p| p.provider == provider && p.model == model)
+                    })
                     .unwrap_or(0);
-                let note = models
-                    .is_empty()
-                    .then(|| "the server listed no models; type a model name".to_owned());
+                let note = if models.is_empty() {
+                    Some(if failed.is_empty() {
+                        "nothing is served right now; type a model name".to_owned()
+                    } else {
+                        format!("{}; type a model name instead", failed.join("; "))
+                    })
+                } else if !failed.is_empty() {
+                    // A partial list says what is missing from it, or a provider that is down looks
+                    // like one that serves nothing (D89).
+                    Some(failed.join("; "))
+                } else {
+                    None
+                };
                 self.stage = Stage::Models {
                     models,
                     filter: String::new(),
@@ -671,12 +761,42 @@ impl Login {
     }
 }
 
-/// Models whose id contains the filter, ignoring case.
-pub fn matching<'a>(models: &'a [String], filter: &str) -> Vec<&'a String> {
+/// What a fan-out answered, as the dialog takes it (D89).
+///
+/// Nothing at all, with failures to explain it, is a failure: a picker that says "no models" without
+/// saying that three providers are unreachable is a picker that looks broken. Some models with some
+/// failures is a list with a note, because the ones that answered are usable.
+pub fn answer(picks: Vec<Pick>, failed: Vec<String>) -> Result<Listed, ModelsError> {
+    if picks.is_empty() && !failed.is_empty() {
+        return Err(ModelsError::Failed(failed.join("; ")));
+    }
+    Ok(Listed { picks, failed })
+}
+
+/// The entries the filter keeps, ignoring case (D89).
+///
+/// A model is matched on its own id and on its provider's name, so typing `openai` narrows the union
+/// to one provider — which is how a list that spans providers is read. `provider/model` matches the
+/// pair, for the case where a name alone is ambiguous between two of them.
+pub fn matching<'a>(models: &'a [Pick], filter: &str) -> Vec<&'a Pick> {
     let needle = filter.trim().to_lowercase();
+    if needle.is_empty() {
+        return models.iter().collect();
+    }
+    if let Some((provider, model)) = needle.split_once('/') {
+        return models
+            .iter()
+            .filter(|p| {
+                p.provider.to_lowercase().contains(provider)
+                    && p.model.to_lowercase().contains(model)
+            })
+            .collect();
+    }
     models
         .iter()
-        .filter(|m| m.to_lowercase().contains(&needle))
+        .filter(|p| {
+            p.model.to_lowercase().contains(&needle) || p.provider.to_lowercase().contains(&needle)
+        })
         .collect()
 }
 
@@ -738,6 +858,20 @@ mod tests {
         Login::new(list, vec![], None, false, "auth.json".into())
     }
 
+    /// A listing answer for one provider, which is what the login flow gets.
+    fn listed(provider: &str, models: &[&str]) -> Listed {
+        Listed {
+            picks: models
+                .iter()
+                .map(|m| Pick {
+                    provider: provider.to_owned(),
+                    model: (*m).to_owned(),
+                })
+                .collect(),
+            failed: Vec::new(),
+        }
+    }
+
     fn press(l: &mut Login, code: KeyCode) -> Outcome {
         l.key(KeyEvent::new(code, KeyModifiers::NONE))
     }
@@ -773,12 +907,9 @@ mod tests {
         let Outcome::Check(id, _) = press(&mut l, KeyCode::Enter) else {
             panic!("expected a check")
         };
-        l.models(id - 1, Ok(vec!["stale".into()]));
+        l.models(id - 1, Ok(listed("openai", &["stale"])));
         assert!(l.checking(), "an old answer is ignored");
-        l.models(
-            id,
-            Ok(vec!["gpt-new".into(), "gpt-mini".into(), "o-pro".into()]),
-        );
+        l.models(id, Ok(listed("openai", &["gpt-new", "gpt-mini", "o-pro"])));
         type_text(&mut l, "gpt");
         press(&mut l, KeyCode::Down);
         press(&mut l, KeyCode::Down);
@@ -844,7 +975,7 @@ mod tests {
                 base_url: Some("http://box:8080/v1".into()),
             }
         );
-        l.models(id, Ok(vec!["qwen".into()]));
+        l.models(id, Ok(listed("box", &["qwen"])));
         let Outcome::Submit(req) = press(&mut l, KeyCode::Enter) else {
             panic!("expected a submit")
         };
@@ -898,26 +1029,89 @@ mod tests {
     }
 
     #[test]
+    fn a_fan_out_that_answered_something_lists_it_and_says_what_is_missing() {
+        // D89: the picker spans providers, so one of them being down must not look like one that
+        // serves nothing, and a total failure must not look like an empty list.
+        let pick = |provider: &str, model: &str| Pick {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+        };
+        let some = answer(
+            vec![pick("openai", "gpt-5.4"), pick("synthetic", "glm")],
+            vec!["anthropic: no route to host".to_owned()],
+        )
+        .expect("the ones that answered are usable");
+        assert_eq!(some.picks.len(), 2);
+        assert_eq!(some.failed, ["anthropic: no route to host"]);
+
+        // Nothing at all, and a reason, is a failure that names the reasons.
+        let ModelsError::Failed(why) = answer(
+            Vec::new(),
+            vec!["openai: 401".to_owned(), "synthetic: timeout".to_owned()],
+        )
+        .unwrap_err() else {
+            panic!("a total failure is a failure");
+        };
+        assert!(why.contains("openai: 401"), "{why}");
+        assert!(why.contains("synthetic: timeout"), "{why}");
+
+        // Nothing to list and nothing wrong is an empty list, which the dialog words itself.
+        let empty = answer(Vec::new(), Vec::new()).expect("not an error");
+        assert!(empty.picks.is_empty() && empty.failed.is_empty());
+    }
+
+    #[test]
+    fn the_filter_matches_a_provider_name_and_a_paired_name() {
+        // D89: a union list is narrowed by provider as often as by model, and `provider/model` is
+        // how an id two providers share is disambiguated.
+        let picks = vec![
+            Pick {
+                provider: "openai".into(),
+                model: "gpt-5.4".into(),
+            },
+            Pick {
+                provider: "synthetic".into(),
+                model: "gpt-5.4-turbo".into(),
+            },
+            Pick {
+                provider: "synthetic".into(),
+                model: "glm".into(),
+            },
+        ];
+        let ids = |f: &str| {
+            matching(&picks, f)
+                .into_iter()
+                .map(|p| p.model.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(""), ["gpt-5.4", "gpt-5.4-turbo", "glm"], "everything");
+        assert_eq!(ids("openai"), ["gpt-5.4"], "by provider");
+        assert_eq!(ids("SYNTH"), ["gpt-5.4-turbo", "glm"], "case folded");
+        assert_eq!(ids("5.4"), ["gpt-5.4", "gpt-5.4-turbo"], "by model");
+        assert_eq!(
+            ids("openai/5.4"),
+            ["gpt-5.4"],
+            "a provider and a model together"
+        );
+        assert_eq!(ids("synthetic/gpt"), ["gpt-5.4-turbo"]);
+    }
+
+    #[test]
     fn the_model_picker_goes_straight_to_the_list_and_filters_as_you_type() {
         // D88: `/model` with no name must not need the name. The list is the dialog, typing is the
         // filter, and choosing submits without a key.
         let mut list = choices();
         list[0].model = Some("synthetic-model".into());
-        let mut l = Login::for_model(list, "openai", "auth.json".into());
+        let mut l = Login::for_all_models(list, "openai", "synthetic-model", "auth.json".into());
         assert_eq!(l.purpose(), Purpose::Model);
         let pending = l.take_pending().expect("the listing to ask for");
-        let Outcome::Check(id, draft) = pending else {
-            panic!("expected a listing, got {pending:?}");
+        let Outcome::ListAll(id) = pending else {
+            panic!("expected a listing of every provider, got {pending:?}");
         };
-        assert_eq!(draft.provider, "openai");
-        assert_eq!(draft.key, None, "the key the provider has is used");
         assert_eq!(l.stage, Stage::Checking { id });
         assert!(l.fields.is_empty(), "nothing to type but the filter");
 
-        l.models(
-            id,
-            Ok(vec!["gpt-5.4".into(), "gpt-5.5".into(), "o4-mini".into()]),
-        );
+        l.models(id, Ok(listed("openai", &["gpt-5.4", "gpt-5.5", "o4-mini"])));
         // Typing narrows the list; enter takes what is highlighted.
         type_text(&mut l, "5.5");
         let Outcome::Submit(req) = press(&mut l, KeyCode::Enter) else {
@@ -933,8 +1127,8 @@ mod tests {
         // D88: a rejected listing sent a picker into the field stage, which it has no fields for —
         // an empty box with nothing to type in. The reason belongs on the list, where a name can
         // still be typed instead.
-        let mut l = Login::for_model(choices(), "openai", "auth.json".into());
-        let Some(Outcome::Check(id, _)) = l.take_pending() else {
+        let mut l = Login::for_all_models(choices(), "openai", "m", "auth.json".into());
+        let Some(Outcome::ListAll(id)) = l.take_pending() else {
             panic!("a listing to ask for");
         };
         l.models(id, Err(ModelsError::Rejected("401 nope".into())));
@@ -979,21 +1173,21 @@ mod tests {
     fn the_model_picker_closes_rather_than_backing_into_a_key_field() {
         // It was opened for a model, so there is nothing behind it: esc closes from the wait and
         // from the list, and never lands on a field asking for a key that already exists (D88).
-        let mut l = Login::for_model(choices(), "openai", "auth.json".into());
-        let Some(Outcome::Check(id, _)) = l.take_pending() else {
+        let mut l = Login::for_all_models(choices(), "openai", "m", "auth.json".into());
+        let Some(Outcome::ListAll(id)) = l.take_pending() else {
             panic!("a listing to ask for");
         };
         assert_eq!(press(&mut l, KeyCode::Esc), Outcome::Close);
-        l.models(id, Ok(vec!["m".into()]));
+        l.models(id, Ok(listed("openai", &["m"])));
         assert!(matches!(l.stage, Stage::Models { .. }));
         assert_eq!(press(&mut l, KeyCode::Esc), Outcome::Close);
         // A name typed that the server does not list is still usable, which is the way out when a
         // listing is empty.
-        let mut l = Login::for_model(choices(), "openai", "auth.json".into());
-        let Some(Outcome::Check(id, _)) = l.take_pending() else {
+        let mut l = Login::for_all_models(choices(), "openai", "m", "auth.json".into());
+        let Some(Outcome::ListAll(id)) = l.take_pending() else {
             panic!("a listing to ask for");
         };
-        l.models(id, Ok(Vec::new()));
+        l.models(id, Ok(Listed::default()));
         type_text(&mut l, "a-model-the-server-does-not-list");
         let Outcome::Submit(req) = press(&mut l, KeyCode::Enter) else {
             panic!("expected a submission");
@@ -1046,7 +1240,7 @@ mod tests {
         assert_eq!(l.stage, Stage::Checking { id: check });
         // The answer is matched by id, so a stale one does nothing.
         assert_eq!(l.signed_in(id, Ok(())), None);
-        l.models(check, Ok(vec!["gpt-5-codex".into(), "gpt-5".into()]));
+        l.models(check, Ok(listed("chatgpt", &["gpt-5-codex", "gpt-5"])));
         assert!(matches!(l.stage, Stage::Models { selected: 0, .. }));
         let Outcome::Submit(req) = press(&mut l, KeyCode::Enter) else {
             panic!("expected a submission");
