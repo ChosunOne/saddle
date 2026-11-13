@@ -1898,3 +1898,63 @@ fn the_session_offers_its_skills_and_records_a_load() {
         .expect("a discovery record");
     assert_eq!(discovered["args"]["discovered"][0]["name"], "manim");
 }
+
+#[test]
+fn reload_reads_instruction_files_and_skills_again() {
+    // D70: everything the prompt is built from, read again on request — files that appear after the
+    // session opened. Driven through line mode, which is where a reload can be run without a
+    // terminal; the session opens before it reads stdin, so writing the files first and reloading
+    // second is a real mid-session change.
+    let env = Env::new();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(env.path(".agents/skills/first")).unwrap();
+    std::fs::write(
+        env.path(".agents/skills/first/SKILL.md"),
+        "---\nname: first\ndescription: d\n---\nbody\n",
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_saddle"))
+        .arg("-C")
+        .arg(env.ws.path())
+        .arg("-p")
+        .arg("synthetic")
+        .arg("--model")
+        .arg("echo")
+        .env("HOME", home.path())
+        .env("SYNTHETIC_API_KEY", "x")
+        .env("XDG_STATE_HOME", env.xdg.path().join("state"))
+        .env("XDG_CONFIG_HOME", env.xdg.path().join("config"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // The session is open and waiting on stdin; now the workspace gains a rule and a skill.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::fs::write(env.path("AGENTS.md"), "a rule added mid-session\n").unwrap();
+    std::fs::create_dir_all(env.path(".agents/skills/second")).unwrap();
+    std::fs::write(
+        env.path(".agents/skills/second/SKILL.md"),
+        "---\nname: second\ndescription: d\n---\nbody\n",
+    )
+    .unwrap();
+    {
+        use std::io::Write as _;
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(b"/reload\n/quit\n").unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("skills reloaded: first, second"), "{text}");
+    assert!(text.contains("instructions reloaded: AGENTS.md"), "{text}");
+    assert!(
+        text.contains("already read into this conversation is unchanged"),
+        "what a reload cannot change is said: {text}"
+    );
+}

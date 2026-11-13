@@ -253,12 +253,44 @@ impl Agent {
         self.context = context;
     }
 
-    /// Builds the prompt again from the session, which is what makes a re-discovery visible: the
-    /// advertised skills are part of the base prompt, so a skill added or removed mid-session
-    /// changes the next request rather than waiting for a restart (D70).
-    pub fn rebuild_prompt(&mut self, session: &Session) {
-        self.base = base_prompt(session, &self.context);
-        self.system = system_prompt(session, &self.context);
+    /// Builds the prompt again from the session, which is what `/reload` makes visible: the
+    /// instruction files and the advertised skills are part of the base prompt, so a change to
+    /// either reaches the next request rather than waiting for a restart (D70).
+    ///
+    /// Returns the instruction files that were not in the prompt before. An added `AGENTS.md` is
+    /// handed to the conversation as well, because the prompt silently growing a rule is a rule that
+    /// arrives with no indication it arrived, and only the next reply shows its effect.
+    pub fn rebuild_prompt(
+        &mut self,
+        session: &Session,
+        fresh: Vec<ContextFile>,
+    ) -> Vec<ContextFile> {
+        let added = added_files(&self.context, &fresh);
+        self.base = base_prompt(session, &fresh);
+        self.system = system_prompt(session, &fresh);
+        self.context = fresh;
+        added
+    }
+
+    /// Hands a reloaded instruction file to the conversation, so the transcript shows that it
+    /// arrived (D70).
+    pub fn note_context(&mut self, files: &[ContextFile]) {
+        if files.is_empty() {
+            return;
+        }
+        let mut text = String::from(
+            "<instructions reloaded>The user or the project added instruction files. They are in \
+             the system prompt from now on; follow them.\n",
+        );
+        for file in files {
+            let _ = write!(
+                text,
+                "\n<instructions file=\"{}\">\n{}\n</instructions>\n",
+                file.label,
+                file.text.trim_end()
+            );
+        }
+        self.items.push(Item::User(text));
     }
 
     /// A window the endpoint stated after this session started (D34). It goes to the provider, so
@@ -1154,6 +1186,16 @@ pub fn grants_section(session: &Session) -> String {
     s
 }
 
+/// The instruction files in `fresh` that were not in `before`, by label (D70).
+pub fn added_files(before: &[ContextFile], fresh: &[ContextFile]) -> Vec<ContextFile> {
+    let before: Vec<&str> = before.iter().map(|f| f.label.as_str()).collect();
+    fresh
+        .iter()
+        .filter(|f| !before.contains(&f.label.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// The prompt sent with every request: everything about the session, then its grants. Split so a
 /// mid-session policy change replaces the grants and nothing else (D47).
 pub fn system_prompt(session: &Session, context: &[ContextFile]) -> String {
@@ -1242,6 +1284,56 @@ pub fn base_prompt(session: &Session, context: &[ContextFile]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_instruction_file_that_was_not_there_before_is_an_addition() {
+        // D70: the prompt gaining a rule silently means the next reply obeys something the history
+        // never mentions, so what is new is handed to the conversation as well.
+        let ctx = |label: &str| ContextFile {
+            label: label.into(),
+            text: "be terse".into(),
+        };
+        assert_eq!(
+            added_files(&[ctx("AGENTS.md")], &[ctx("AGENTS.md")]),
+            Vec::new(),
+            "the same file is not an addition"
+        );
+        let added = added_files(
+            &[ctx("AGENTS.md")],
+            &[ctx("AGENTS.md"), ctx("crates/AGENTS.md")],
+        );
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].label, "crates/AGENTS.md");
+        // A file that was removed and came back counts as new again, which is the honest reading.
+        let added = added_files(&[], &[ctx("AGENTS.md")]);
+        assert_eq!(added.len(), 1);
+    }
+
+    #[test]
+    fn a_reloaded_instruction_file_reaches_the_conversation() {
+        let mut agent = Agent::new(
+            None,
+            String::new(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            crate::compact::Settings::default(),
+        );
+        agent.note_context(&[]);
+        assert!(agent.items.is_empty(), "nothing to say, nothing said");
+        agent.note_context(&[ContextFile {
+            label: "crates/AGENTS.md".into(),
+            text: "be terse".into(),
+        }]);
+        assert_eq!(agent.items.len(), 1);
+        assert!(
+            matches!(&agent.items[0], Item::User(t)
+                if t.contains("crates/AGENTS.md") && t.contains("be terse") && t.contains("<instructions reloaded>")),
+            "{:?}",
+            agent.items[0]
+        );
+    }
 
     fn call(name: &str, input: serde_json::Value) -> ToolCall {
         ToolCall {

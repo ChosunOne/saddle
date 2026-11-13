@@ -91,7 +91,7 @@ pub struct UiConfig {
 }
 
 /// Instruction files (D32).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ContextConfig {
     /// The global AGENTS.md; empty turns it off. Defaults to `$XDG_CONFIG_HOME/saddle/AGENTS.md`.

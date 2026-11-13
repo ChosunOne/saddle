@@ -68,8 +68,8 @@ enum Command {
     /// Read the policy again after a grant changed, so the session acts on it and the model's next
     /// request carries the new grants (D47).
     ReloadPolicy,
-    /// Read the skills again and rebuild the prompt (D70).
-    ReloadSkills,
+    /// Read the skills and instruction files again and rebuild the prompt (D70).
+    Reload,
     SetCompaction(crate::compact::Settings),
     /// Continue a saved conversation, by its id in the session store (D53).
     Resume(String),
@@ -252,29 +252,55 @@ fn work(
                     )));
                 }
             },
-            Command::ReloadSkills => match session.reload_skills() {
-                Ok(()) => {
-                    // The advertised skills are part of the base prompt, so rebuilding it is what
-                    // makes the change visible to the model on its next request (D70).
-                    agent.rebuild_prompt(&session);
-                    let names = crate::skills::names(&session.skills);
-                    let _ = events.send(AgentEvent::Skills(session.skills.clone()));
-                    if !session.skill_notes.is_empty() {
-                        let _ = events.send(AgentEvent::SkillNotes(session.skill_notes.join("; ")));
+            // `/reload`: everything the prompt or the interface was built from, read again (D70).
+            // Skills and instruction files reach the model on its next request; a newly added
+            // instruction file is also handed to the conversation, so the transcript shows it
+            // arriving rather than the next reply simply obeying a rule that appeared from nowhere.
+            Command::Reload => {
+                let cfg = session.setup.context.clone();
+                let paths = session.setup.paths.clone();
+                let notes = match crate::context::load(&mut session, &cfg, &paths) {
+                    Ok((files, refused)) => {
+                        let added = agent.rebuild_prompt(&session, files.clone());
+                        agent.note_context(&added);
+                        let mut notes = refused;
+                        if !added.is_empty() {
+                            let labels: Vec<&str> =
+                                added.iter().map(|f| f.label.as_str()).collect();
+                            notes.push(format!("instructions reloaded: {}", labels.join(", ")));
+                        }
+                        notes
                     }
-                    // Said plainly, because a body already in the conversation is not touched: a
-                    // reload changes what is advertised, not what was read.
-                    let _ = events.send(AgentEvent::Note(format!(
-                        "skills reloaded: {names}; a skill already read into this conversation is \
-                         unchanged"
-                    )));
+                    Err(e) => vec![format!("the instruction files were not reloaded: {e:#}")],
+                };
+                match session.reload_skills() {
+                    Ok(()) => {
+                        let names = crate::skills::names(&session.skills);
+                        let _ = events.send(AgentEvent::Skills(session.skills.clone()));
+                        let mut said = vec![format!("skills reloaded: {names}")];
+                        said.extend(session.skill_notes.clone());
+                        said.extend(notes);
+                        for note in said {
+                            let _ = events.send(AgentEvent::Note(note));
+                        }
+                        // Said plainly, because it is the one thing a reload cannot change: text
+                        // already in the conversation stays there.
+                        let _ = events.send(AgentEvent::Note(
+                            "a skill or instruction file already read into this conversation is \
+                             unchanged"
+                                .into(),
+                        ));
+                    }
+                    Err(e) => {
+                        for note in notes {
+                            let _ = events.send(AgentEvent::Note(note));
+                        }
+                        let _ = events.send(AgentEvent::Note(format!(
+                            "the skills were not reloaded: {e:#}"
+                        )));
+                    }
                 }
-                Err(e) => {
-                    let _ = events.send(AgentEvent::Note(format!(
-                        "the skills were not reloaded: {e:#}"
-                    )));
-                }
-            },
+            }
             Command::SetCompaction(settings) => agent.set_compaction(settings),
             Command::Shell { command, share } => {
                 match agent.shell(&mut session, &command, share, &mut ui) {
@@ -671,8 +697,11 @@ impl Controller {
                 self.send(app, Command::Prompt { text, skill: None });
                 Ok(())
             }
-            Action::ReloadSkills => {
-                self.send(app, Command::ReloadSkills);
+            Action::Reload => {
+                // The settings side first, keeping the session-only choices a person made:
+                // `/thinking` and ctrl+t/ctrl+o are not in config.toml (D70).
+                self.reload_settings(app);
+                self.send(app, Command::Reload);
                 Ok(())
             }
             Action::Skill { name, prompt } => {
@@ -1091,6 +1120,44 @@ impl Controller {
             dialog.values = values;
         }
         Ok(())
+    }
+
+    /// `/reload`: the settings half, read from config.toml (D70).
+    ///
+    /// Not [`after_config_edit`], because that is for a dialog that just wrote the file: it resets
+    /// the session-only state a person set on purpose. `/thinking` and ctrl+t/ctrl+o change the
+    /// agent and are not written to config, so reloading over them would silently drop a choice
+    /// made minutes earlier in the same session. This keeps them; only what the file states is
+    /// taken again.
+    fn reload_settings(&self, app: &mut App) {
+        let user = match UserConfig::load(&self.paths.user_config()) {
+            Ok(user) => user,
+            Err(e) => {
+                let msg = format!("config.toml has an error and was not applied: {e:#}");
+                return app.note(NoteKind::Error, &msg);
+            }
+        };
+        match user.ui.status.as_deref().map(Template::parse) {
+            None => app.header.status = Template::default(),
+            Some(Ok(template)) => app.header.status = template,
+            Some(Err(e)) => app.note(NoteKind::Error, &format!("[ui] status: {e}")),
+        }
+        app.max_steps = user.max_steps.filter(|n| *n > 0);
+        self.send(app, Command::SetMaxSteps(app.max_steps));
+        let compaction = crate::compact::Settings::from_config(&user.compaction);
+        self.send(app, Command::SetCompaction(compaction));
+        // The provider is rebuilt only when the file names a different one; otherwise the session
+        // keeps the provider it has, with the effort and the window it has settled on.
+        let named = user.provider.clone();
+        if let Some(name) = named
+            && name != app.header.provider
+        {
+            match self.build(&name) {
+                Ok(p) => self.switch(app, p),
+                Err(e) => app.note(NoteKind::Error, &format!("{e:#}")),
+            }
+        }
+        app.note(NoteKind::Info, "settings reloaded from config.toml");
     }
 
     /// Picks up what can change mid-session after config.toml was edited by hand.

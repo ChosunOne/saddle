@@ -1414,12 +1414,16 @@ one place at its root.
   mistyped name answers with the names that do exist, because a silent no-op is the failure mode
   this project keeps having to remove.
 
-**D70.** `/reload` reads the skills again, so one written during the session is advertised.
+**D70.** `/reload` reads again everything the prompt and the interface were built from.
 
-- **Why it needs a command at all.** Discovery runs once at open (D67), so a skill added or edited
-  mid-session was invisible until restart — and skills are exactly the thing a person writes and then
-  wants to try. `/reload` runs the same discovery again, through the same gate, so the rules do not
-  change: every candidate is read as the agent, and every read is recorded.
+- **What it reads again**: the instruction files (D32) and the skills (D67), both of which are baked
+  into the base prompt at open; and the settings that live in `config.toml` — the status line, the
+  request limit, the compaction settings, and the provider when the file names a different one.
+  Those are what pi's `/reload` covers that this harness has.
+- **Why it needs a command at all.** Discovery runs once at open, so a skill written mid-session was
+  invisible until restart — and a skill is exactly the thing a person writes and then wants to try.
+  `/reload` runs the same discovery again, through the same gate, so the rules do not change: every
+  candidate is read as the agent, and every read is recorded.
 - **The prompt is rebuilt, not patched.** The advertised skills are part of the base prompt, so the
   agent keeps the instruction files it was built from and rebuilds base and system from the session.
   A patch would be a second way for the prompt to be assembled; rebuilding keeps one. Grants are
@@ -1428,6 +1432,13 @@ one place at its root.
   conversation stays there: it is a user message, and rewriting history to remove it would be a lie
   about what the model was sent. The note says so rather than leaving the person to wonder why the
   old text still seems to be in play.
+- **A newly added instruction file is also handed to the conversation.** The prompt silently growing
+  a rule means the next reply obeys something the history never mentions. An `AGENTS.md` that is new
+  since the last read goes in as a user message, wrapped in `<instructions reloaded>`, so the
+  transcript shows it arriving; one that was already there is not repeated.
+- **The settings half keeps the session-only choices.** `/thinking` and ctrl+t/ctrl+o change the
+  agent and are deliberately not written to `config.toml`, so a reload that re-applied the file
+  wholesale would drop a choice made minutes before. Only what the file states is taken again.
 - **The interface gets the list back.** The agent thread owns the session, so it sends the new skills
   to the interface, which replaces what the `/` menu and `/skill:` resolve against. Only there, and
   only on request: the queue, turns and the rest of the loop are untouched.

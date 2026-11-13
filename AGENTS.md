@@ -100,8 +100,9 @@ tool and no tool exposes it (D45, D46), and a change there applies at once, with
 its next request (D47). Editing `saddle.toml` in a repository has no effect (D42, D43).
 `/skill:<name> <request>` loads a skill's instructions into the conversation followed by the
 request, in the TUI and in line mode, and is the only way to reach a skill marked
-`disable-model-invocation` (D69). `/reload` reads the skills again and rebuilds the prompt, so one
-written mid-session is advertised (D70). `/thinking` (or shift+tab) changes the reasoning effort for the
+`disable-model-invocation` (D69). `/reload` reads the instruction files and skills again and rebuilds the
+prompt, and re-reads the settings, so a change made mid-session is picked up without restarting
+(D70). `/thinking` (or shift+tab) changes the reasoning effort for the
 session (D57), `/name` and
 `/session` name and describe it (D55), and escape twice on an empty prompt opens the message tree (D54), where a prompt can be sent again to
 make another branch; `/clone` copies the branch into a separate session instead. There is no

@@ -48,8 +48,6 @@ pub enum AgentEvent {
     Quota(crate::provider::Quota),
     /// The skills a re-discovery found, for the `/` menu (D70).
     Skills(Vec<crate::skills::Skill>),
-    /// A note about a re-discovery, such as a skill that was refused.
-    SkillNotes(String),
     TurnEnd(End),
     /// The host failed (for example, the audit log could not be written). The session is over.
     Fatal(String),
@@ -88,8 +86,8 @@ pub enum Action {
         name: String,
         prompt: String,
     },
-    /// Read the skills again, so one added or edited now is advertised (D70).
-    ReloadSkills,
+    /// Read the skills and instruction files again, and the settings with them (D70).
+    Reload,
     Clear,
     Cancel,
     Quit,
@@ -387,7 +385,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/reload",
         args: "",
-        about: "read the skills again, so one added or edited now is advertised",
+        about: "read the skills, AGENTS.md files and settings again, without restarting",
     },
     SlashCommand {
         name: "/compact",
@@ -443,8 +441,6 @@ pub struct App {
     /// When escape was last pressed on an empty editor, so two of them open the tree (D54).
     last_escape: Option<std::time::Instant>,
     pub total_lines: usize,
-    /// A note from a re-discovery, shown when its skill list arrives (D70).
-    pub skill_notes: Option<String>,
     /// Where each image sits in the transcript, and the escape that draws it (D59).
     pub images: Vec<Placed>,
     /// What this terminal can draw, detected once at startup (D59).
@@ -549,7 +545,6 @@ impl App {
             last_escape: None,
             total_lines: 0,
             images: Vec::new(),
-            skill_notes: None,
             protocol: crate::tui::image::Protocol::Text,
             drawn: Drawn::default(),
             usage: Usage::default(),
@@ -1423,7 +1418,7 @@ impl App {
                 self.info("/reload waits for the turn to end; esc cancels it");
                 None
             }
-            "/reload" => Some(Action::ReloadSkills),
+            "/reload" => Some(Action::Reload),
             "/permissions" => Some(Action::OpenPermissions),
             "/logout" => Some(Action::Logout(arg)),
             "/model" => Some(Action::Model(arg)),
@@ -1496,13 +1491,7 @@ impl App {
             }
             // The list comes back from the agent thread, which owns the session, so the `/` menu
             // and `/skill:` see what discovery just read (D70).
-            AgentEvent::Skills(skills) => {
-                self.skills = skills;
-                if let Some(note) = self.skill_notes.take() {
-                    self.push(Entry::Note(NoteKind::Info, display(&note)));
-                }
-            }
-            AgentEvent::SkillNotes(note) => self.skill_notes = Some(note),
+            AgentEvent::Skills(skills) => self.skills = skills,
             AgentEvent::Note(s) => self.push(Entry::Note(NoteKind::Warn, display(&s))),
             AgentEvent::Call { name, detail } => {
                 self.busy = Some(Activity::Tool(display(&name)));
@@ -2055,12 +2044,13 @@ mod tests {
     }
 
     #[test]
-    fn reload_asks_the_agent_thread_to_read_the_skills_again() {
-        // D70: the prompt carries the advertised skills, so a skill added during the session only
-        // reaches the model if the prompt is rebuilt. The TUI's part is the ask.
+    fn reload_asks_the_agent_thread_to_read_again_and_takes_the_new_list() {
+        // D70: the prompt carries the instruction files and the advertised skills, so a change
+        // during the session only reaches the model if the prompt is rebuilt. The TUI's part is the
+        // ask, and taking the list back.
         let mut a = app();
         type_text(&mut a, "/reload");
-        assert_eq!(a.key(key(KeyCode::Enter)), Some(Action::ReloadSkills));
+        assert_eq!(a.key(key(KeyCode::Enter)), Some(Action::Reload));
         // And the list it comes back with replaces what the menu offers.
         a.agent(AgentEvent::Skills(vec![crate::skills::Skill {
             name: "fresh".into(),

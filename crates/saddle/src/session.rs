@@ -83,6 +83,9 @@ pub struct Setup {
     pub tool_paths: Vec<crate::config::ToolPath>,
     /// Whether and how many skills to look for (D64), read with the rest of the config.
     pub skills: crate::config::SkillsConfig,
+    /// The instruction-file settings, kept so `/reload` re-reads them with the ones that were used
+    /// at open (D70).
+    pub context: crate::config::ContextConfig,
     /// The sensitive directories this workspace puts in reach, which is what the person is asked
     /// about before the session opens (D60). Empty for an ordinary project.
     pub exposed: Vec<String>,
@@ -120,6 +123,7 @@ impl Setup {
         let mut notes = Vec::new();
         let user = UserConfig::load(&config_path)?;
         let skills_cfg = user.skills.clone();
+        let context_cfg = user.context.clone();
         // This workspace's own grants are their own file (D63), so a directory's authority is
         // named after the directory and the global file does not grow a key per workspace.
         let own_path = paths.workspace_policy(&workspace);
@@ -244,6 +248,7 @@ impl Setup {
             overrides: overrides.clone(),
             tool_paths,
             skills: skills_cfg,
+            context: context_cfg,
         })
     }
 

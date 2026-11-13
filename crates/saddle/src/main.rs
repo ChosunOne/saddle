@@ -451,18 +451,31 @@ fn line_turn(
                 agent::Compacted::Failed => End::Failed,
             }
         } else if text == "/reload" {
-            // Read the skills again and rebuild the prompt, so a skill written during the session
-            // is advertised on the next request (D70). A body already read stays in the
-            // conversation, which is what the note says.
+            // Everything the prompt and the interface were built from, read again (D70). Skills and
+            // instruction files reach the model on its next request; a newly added instruction file
+            // is also handed to the conversation, so the transcript shows it arriving.
+            let cfg = session.setup.context.clone();
+            let paths = session.setup.paths.clone();
+            let (files, refused) = context::load(session, &cfg, &paths)?;
+            let added = agent.rebuild_prompt(session, files);
+            agent.note_context(&added);
+            for file in &added {
+                out.info(&format!("instructions reloaded: {}", file.label));
+            }
+            for note in refused {
+                out.info(&note);
+            }
             session.reload_skills()?;
-            agent.rebuild_prompt(session);
             out.info(&format!(
-                "skills reloaded: {}; a skill already read into this conversation is unchanged",
+                "skills reloaded: {}",
                 skills::names(&session.skills)
             ));
             for note in &session.skill_notes {
                 out.info(note);
             }
+            out.info(
+                "a skill or instruction file already read into this conversation is unchanged",
+            );
             End::Answered
         } else if let Some(rest) = text.strip_prefix("/skill:") {
             // The same expansion as the TUI's, from the skills the session discovered (D69). A
