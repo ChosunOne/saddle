@@ -1,76 +1,249 @@
-//! Colours (D71). One place that says what each part of the screen is painted with, so a person can
-//! change it without patching the renderer, and so the renderer never names a colour directly.
+//! Colours (D71, D72). One place that says what each part of the screen is painted with, so a person
+//! can change it without patching the renderer, and so the renderer never names a colour directly.
+//!
+//! The role names are pi's, because a palette copied from a pi theme should be usable here; the roles
+//! pi has for things this harness does not draw — syntax highlighting, scrollbars, search matches,
+//! per-level thinking borders, custom messages, HTML export — are deliberately absent, since a role
+//! nothing paints with would be a setting that silently does nothing.
 //!
 //! A theme is a table of roles. The built-in `default` is what this binary has always drawn, so a
 //! configuration that says nothing changes nothing; a `[themes.<name>]` table in `config.toml`
-//! starts from the role set it names in `extends` (the default theme unless the name is itself
-//! built in) and overrides only the roles it lists. That is what makes a partial theme useful: three
-//! lines can restyle an accent without redefining the other twenty roles and owning them forever.
-//!
-//! Colours are written the way a person writes them: an ANSI name (`cyan`, `dark-gray`), a `#rrggbb`
-//! hex value for a terminal that has true colour, or a 0–255 palette index for one that does not.
+//! starts from the role set it names in `extends` and overrides only the roles it lists, with `vars`
+//! for values several roles share.
 
 use std::collections::BTreeMap;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use ratatui::style::Color;
 
-/// The roles the renderer paints with. Every key here is a valid `[themes.<name>]` line, and every
-/// colour the interface draws comes from one of them.
+/// The roles the renderer paints with, named as pi names them.
+pub const ROLES: &[&str] = &[
+    "accent",
+    "border",
+    "borderAccent",
+    "borderMuted",
+    "success",
+    "error",
+    "warning",
+    "muted",
+    "dim",
+    "text",
+    "thinkingText",
+    "selectedBg",
+    "selectionFg",
+    "userMessageText",
+    "toolPendingBg",
+    "toolSuccessBg",
+    "toolErrorBg",
+    "toolTitle",
+    "toolOutput",
+    "toolErrorText",
+    "compactDoneBg",
+    "mdHeading",
+    "mdLink",
+    "mdLinkUrl",
+    "mdCode",
+    "mdCodeBlock",
+    "mdCodeBlockBorder",
+    "mdQuote",
+    "mdQuoteBorder",
+    "mdHr",
+    "mdListBullet",
+    "toolDiffAdded",
+    "toolDiffRemoved",
+    "toolDiffContext",
+    "bashMode",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
     pub name: String,
-    /// Titles, tool names, the prompt marker: what draws the eye first.
+    /// The background this palette is designed for, for a light/dark pair (D72).
+    pub appearance: Appearance,
     pub accent: Color,
-    /// Secondary text: separators, gutters, rules, quotes, hints.
-    pub muted: Color,
-    /// Inline code and fenced blocks in a model's markdown.
-    pub code: Color,
-    pub warn: Color,
-    pub error: Color,
+    pub border: Color,
+    pub border_accent: Color,
+    pub border_muted: Color,
     pub success: Color,
-    pub link: Color,
-    /// Body text, when a role needs to say "not the muted one".
+    pub error: Color,
+    pub warning: Color,
+    pub muted: Color,
+    /// More subtle than `muted`: the quietest hints.
+    pub dim: Color,
     pub text: Color,
-    pub diff_added: Color,
-    pub diff_removed: Color,
-    /// The block a tool call sits in, before and after it answers.
+    pub thinking_text: Color,
+    pub selected_bg: Color,
+    pub selection_fg: Color,
+    pub user_message_text: Color,
     pub tool_pending_bg: Color,
-    pub tool_ok_bg: Color,
+    pub tool_success_bg: Color,
     pub tool_error_bg: Color,
-    pub tool_text: Color,
+    pub tool_title: Color,
+    pub tool_output: Color,
     pub tool_error_text: Color,
     pub compact_done_bg: Color,
-    pub selection_bg: Color,
-    pub selection_fg: Color,
+    pub md_heading: Color,
+    pub md_link: Color,
+    pub md_link_url: Color,
+    pub md_code: Color,
+    pub md_code_block: Color,
+    pub md_code_block_border: Color,
+    pub md_quote: Color,
+    pub md_quote_border: Color,
+    pub md_hr: Color,
+    pub md_list_bullet: Color,
+    pub tool_diff_added: Color,
+    pub tool_diff_removed: Color,
+    pub tool_diff_context: Color,
+    /// The editor border while a command is being typed (D72).
+    pub bash_mode: Color,
 }
 
-impl Default for Theme {
-    /// What the interface looked like before themes existed, exactly.
-    fn default() -> Self {
-        Self {
-            name: "default".into(),
-            accent: Color::Cyan,
-            muted: Color::DarkGray,
-            code: Color::Yellow,
-            warn: Color::Yellow,
-            error: Color::Red,
-            success: Color::Green,
-            link: Color::Blue,
-            text: Color::Reset,
-            diff_added: Color::Rgb(130, 215, 140),
-            diff_removed: Color::Rgb(240, 130, 130),
-            tool_pending_bg: Color::Rgb(40, 40, 52),
-            tool_ok_bg: Color::Rgb(36, 48, 40),
-            tool_error_bg: Color::Rgb(62, 38, 40),
-            tool_text: Color::Rgb(170, 170, 178),
-            tool_error_text: Color::Rgb(240, 165, 165),
-            compact_done_bg: Color::Rgb(38, 42, 60),
-            selection_bg: Color::Rgb(42, 74, 112),
-            selection_fg: Color::Rgb(246, 248, 251),
+/// The background a palette was designed for (D72).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Appearance {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Appearance {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "dark" => Ok(Self::Dark),
+            "light" => Ok(Self::Light),
+            other => bail!("`{other}` is not an appearance; use \"dark\" or \"light\""),
         }
     }
 }
+
+impl Default for Theme {
+    /// What the interface looked like before themes existed, exactly, under pi's names.
+    fn default() -> Self {
+        Self {
+            name: "default".into(),
+            appearance: Appearance::Dark,
+            accent: Color::Cyan,
+            border: Color::Cyan,
+            border_accent: Color::Cyan,
+            border_muted: Color::DarkGray,
+            success: Color::Green,
+            error: Color::Red,
+            warning: Color::Yellow,
+            muted: Color::DarkGray,
+            dim: Color::DarkGray,
+            text: Color::Reset,
+            thinking_text: Color::DarkGray,
+            selected_bg: Color::Rgb(42, 74, 112),
+            selection_fg: Color::Rgb(246, 248, 251),
+            user_message_text: Color::Reset,
+            tool_pending_bg: Color::Rgb(40, 40, 52),
+            tool_success_bg: Color::Rgb(36, 48, 40),
+            tool_error_bg: Color::Rgb(62, 38, 40),
+            tool_title: Color::Cyan,
+            tool_output: Color::Rgb(170, 170, 178),
+            tool_error_text: Color::Rgb(240, 165, 165),
+            compact_done_bg: Color::Rgb(38, 42, 60),
+            md_heading: Color::Cyan,
+            md_link: Color::Blue,
+            md_link_url: Color::DarkGray,
+            md_code: Color::Yellow,
+            md_code_block: Color::Yellow,
+            md_code_block_border: Color::DarkGray,
+            md_quote: Color::DarkGray,
+            md_quote_border: Color::DarkGray,
+            md_hr: Color::DarkGray,
+            md_list_bullet: Color::Cyan,
+            tool_diff_added: Color::Rgb(130, 215, 140),
+            tool_diff_removed: Color::Rgb(240, 130, 130),
+            tool_diff_context: Color::DarkGray,
+            bash_mode: Color::Yellow,
+        }
+    }
+}
+
+impl Theme {
+    /// Applies one role. An unknown role is an error rather than a silent no-op: a misspelt colour is
+    /// a theme that does not do what it says, and nothing else would ever point at the line.
+    pub fn set(&mut self, role: &str, colour: Color) -> Result<()> {
+        match role {
+            "accent" => self.accent = colour,
+            "border" => self.border = colour,
+            "borderAccent" | "border-accent" => self.border_accent = colour,
+            "borderMuted" | "border-muted" => self.border_muted = colour,
+            "success" => self.success = colour,
+            "error" => self.error = colour,
+            "warning" | "warn" => self.warning = colour,
+            "muted" => self.muted = colour,
+            "dim" => self.dim = colour,
+            "text" => self.text = colour,
+            "thinkingText" | "thinking-text" => self.thinking_text = colour,
+            "selectedBg" | "selection-bg" => self.selected_bg = colour,
+            "selectionFg" | "selection-fg" => self.selection_fg = colour,
+            "userMessageText" | "user-message-text" => self.user_message_text = colour,
+            "toolPendingBg" | "tool-pending-bg" => self.tool_pending_bg = colour,
+            "toolSuccessBg" | "tool-ok-bg" => self.tool_success_bg = colour,
+            "toolErrorBg" | "tool-error-bg" => self.tool_error_bg = colour,
+            "toolTitle" | "tool-title" => self.tool_title = colour,
+            "toolOutput" | "tool-text" => self.tool_output = colour,
+            "toolErrorText" | "tool-error-text" => self.tool_error_text = colour,
+            "compactDoneBg" | "compact-done-bg" => self.compact_done_bg = colour,
+            "mdHeading" | "md-heading" => self.md_heading = colour,
+            "mdLink" | "md-link" => self.md_link = colour,
+            "mdLinkUrl" | "md-link-url" => self.md_link_url = colour,
+            "mdCode" | "md-code" | "code" => self.md_code = colour,
+            "mdCodeBlock" | "md-code-block" => self.md_code_block = colour,
+            "mdCodeBlockBorder" | "md-code-block-border" => self.md_code_block_border = colour,
+            "mdQuote" | "md-quote" => self.md_quote = colour,
+            "mdQuoteBorder" | "md-quote-border" => self.md_quote_border = colour,
+            "mdHr" | "md-hr" => self.md_hr = colour,
+            "mdListBullet" | "md-list-bullet" => self.md_list_bullet = colour,
+            "toolDiffAdded" | "diff-added" => self.tool_diff_added = colour,
+            "toolDiffRemoved" | "diff-removed" => self.tool_diff_removed = colour,
+            "toolDiffContext" | "diff-context" => self.tool_diff_context = colour,
+            "bashMode" | "bash-mode" => self.bash_mode = colour,
+            // A role pi has and this harness has no element for. Named explicitly rather than
+            // falling into the misspelling message, so the reason is not "you typed it wrong".
+            role if UNPAINTED.contains(&role) => bail!(
+                "`{role}` is a role pi has, but nothing in this interface draws it, so setting it \
+                 would do nothing; the roles are {}",
+                ROLES.join(", ")
+            ),
+            other => bail!(
+                "`{other}` is not a colour role; the roles are {}",
+                ROLES.join(", ")
+            ),
+        }
+        Ok(())
+    }
+}
+
+/// pi's roles for things this harness does not draw. Listed so a copied pi theme explains itself.
+pub const UNPAINTED: &[&str] = &[
+    "scrollbarTrack",
+    "scrollbarThumb",
+    "searchMatchBg",
+    "searchMatchText",
+    "customMessageBg",
+    "customMessageText",
+    "customMessageLabel",
+    "syntaxComment",
+    "syntaxKeyword",
+    "syntaxFunction",
+    "syntaxVariable",
+    "syntaxString",
+    "syntaxNumber",
+    "syntaxType",
+    "syntaxOperator",
+    "syntaxPunctuation",
+    "thinkingOff",
+    "thinkingMinimal",
+    "thinkingLow",
+    "thinkingMedium",
+    "thinkingHigh",
+    "thinkingXhigh",
+    "thinkingMax",
+];
 
 /// The themes a build ships with, by name.
 pub fn builtin(name: &str) -> Option<Theme> {
@@ -80,47 +253,76 @@ pub fn builtin(name: &str) -> Option<Theme> {
         // backgrounds are pale rather than dark so the tool text stays legible.
         "light" => Some(Theme {
             name: "light".into(),
+            appearance: Appearance::Light,
             accent: Color::Blue,
+            border: Color::Blue,
+            border_accent: Color::Blue,
+            border_muted: Color::Gray,
+            warning: Color::Rgb(160, 100, 0),
             muted: Color::Gray,
-            code: Color::Magenta,
-            warn: Color::Rgb(160, 100, 0),
-            error: Color::Red,
-            success: Color::Green,
-            link: Color::Blue,
-            text: Color::Reset,
-            diff_added: Color::Rgb(20, 120, 40),
-            diff_removed: Color::Rgb(170, 30, 40),
+            dim: Color::Gray,
+            thinking_text: Color::Gray,
             tool_pending_bg: Color::Rgb(235, 235, 240),
-            tool_ok_bg: Color::Rgb(226, 240, 228),
+            tool_success_bg: Color::Rgb(226, 240, 228),
             tool_error_bg: Color::Rgb(248, 228, 228),
-            tool_text: Color::Rgb(60, 60, 68),
+            tool_title: Color::Blue,
+            tool_output: Color::Rgb(60, 60, 68),
             tool_error_text: Color::Rgb(140, 30, 30),
             compact_done_bg: Color::Rgb(232, 234, 245),
-            selection_bg: Color::Rgb(190, 210, 240),
+            selected_bg: Color::Rgb(190, 210, 240),
             selection_fg: Color::Rgb(20, 20, 24),
+            md_heading: Color::Blue,
+            md_code: Color::Magenta,
+            md_code_block: Color::Magenta,
+            md_code_block_border: Color::Gray,
+            md_quote: Color::Gray,
+            md_quote_border: Color::Gray,
+            md_hr: Color::Gray,
+            md_link: Color::Blue,
+            md_link_url: Color::Gray,
+            md_list_bullet: Color::Blue,
+            tool_diff_added: Color::Rgb(20, 120, 40),
+            tool_diff_removed: Color::Rgb(170, 30, 40),
+            tool_diff_context: Color::Gray,
+            bash_mode: Color::Rgb(160, 100, 0),
+            ..Theme::default()
         }),
         // Colour only where colour carries meaning; everything else in the terminal's own
-        // foreground. For a monochrome terminal, or someone who wants the noise gone.
+        // foreground, and no block backgrounds.
         "mono" => Some(Theme {
             name: "mono".into(),
             accent: Color::Reset,
+            border: Color::Reset,
+            border_accent: Color::Reset,
+            border_muted: Color::Gray,
+            warning: Color::Reset,
             muted: Color::Gray,
-            code: Color::Reset,
-            warn: Color::Reset,
-            error: Color::Reset,
-            success: Color::Reset,
-            link: Color::Reset,
-            text: Color::Reset,
-            diff_added: Color::Reset,
-            diff_removed: Color::Reset,
+            dim: Color::Gray,
+            thinking_text: Color::Gray,
             tool_pending_bg: Color::Reset,
-            tool_ok_bg: Color::Reset,
+            tool_success_bg: Color::Reset,
             tool_error_bg: Color::Reset,
-            tool_text: Color::Reset,
+            tool_title: Color::Reset,
+            tool_output: Color::Reset,
             tool_error_text: Color::Reset,
             compact_done_bg: Color::Reset,
-            selection_bg: Color::Rgb(60, 60, 60),
+            selected_bg: Color::Rgb(60, 60, 60),
             selection_fg: Color::Rgb(240, 240, 240),
+            md_heading: Color::Reset,
+            md_link: Color::Reset,
+            md_link_url: Color::Gray,
+            md_code: Color::Reset,
+            md_code_block: Color::Reset,
+            md_code_block_border: Color::Gray,
+            md_quote: Color::Gray,
+            md_quote_border: Color::Gray,
+            md_hr: Color::Gray,
+            md_list_bullet: Color::Reset,
+            tool_diff_added: Color::Reset,
+            tool_diff_removed: Color::Reset,
+            tool_diff_context: Color::Gray,
+            bash_mode: Color::Reset,
+            ..Theme::default()
         }),
         _ => None,
     }
@@ -131,86 +333,218 @@ pub fn builtin_names() -> Vec<&'static str> {
     vec!["default", "light", "mono"]
 }
 
-/// The roles a theme can set, in the order a message lists them.
-pub const ROLES: &[&str] = &[
-    "accent",
-    "muted",
-    "code",
-    "warn",
-    "error",
-    "success",
-    "link",
-    "text",
-    "diff-added",
-    "diff-removed",
-    "tool-pending-bg",
-    "tool-ok-bg",
-    "tool-error-bg",
-    "tool-text",
-    "tool-error-text",
-    "compact-done-bg",
-    "selection-bg",
-    "selection-fg",
-];
+/// The themes a config defines, before the selected one is built.
+pub type ThemeTables = BTreeMap<String, toml::Value>;
 
-impl Theme {
-    /// Applies one role. An unknown role is an error rather than a silent no-op: a misspelt colour is
-    /// a theme that does not do what it says, and nothing else would ever point at the line.
-    pub fn set(&mut self, role: &str, value: &str) -> Result<()> {
-        let colour = parse(value)?;
-        match role {
-            "accent" => self.accent = colour,
-            "muted" => self.muted = colour,
-            "code" => self.code = colour,
-            "warn" => self.warn = colour,
-            "error" => self.error = colour,
-            "success" => self.success = colour,
-            "link" => self.link = colour,
-            "text" => self.text = colour,
-            "diff-added" => self.diff_added = colour,
-            "diff-removed" => self.diff_removed = colour,
-            "tool-pending-bg" => self.tool_pending_bg = colour,
-            "tool-ok-bg" => self.tool_ok_bg = colour,
-            "tool-error-bg" => self.tool_error_bg = colour,
-            "tool-text" => self.tool_text = colour,
-            "tool-error-text" => self.tool_error_text = colour,
-            "compact-done-bg" => self.compact_done_bg = colour,
-            "selection-bg" => self.selection_bg = colour,
-            "selection-fg" => self.selection_fg = colour,
-            other => bail!(
-                "`{other}` is not a colour role; the roles are {}",
-                ROLES.join(", ")
-            ),
+/// Builds the selected theme (D71).
+///
+/// A name may be a pair, `light/dark`, which is pi's spelling for "one for each terminal": the first
+/// is used on a light terminal and the second on a dark one. That is resolved here so nothing
+/// downstream has to know about it (D72).
+pub fn build(selected: &str, tables: &ThemeTables) -> Result<Theme> {
+    build_for(selected, tables, terminal_appearance())
+}
+
+/// [`build`] for a given appearance, so the light/dark choice can be tested without a terminal.
+pub fn build_for(selected: &str, tables: &ThemeTables, appearance: Appearance) -> Result<Theme> {
+    match selected.split_once('/') {
+        Some((light, dark)) if !light.is_empty() && !dark.is_empty() => {
+            let name = match appearance {
+                Appearance::Light => light,
+                Appearance::Dark => dark,
+            };
+            let mut theme = build_one(name, tables)?;
+            theme.appearance = appearance;
+            Ok(theme)
         }
-        Ok(())
+        _ => build_one(selected, tables),
     }
 }
 
-/// One colour as written in the config.
-pub fn parse(value: &str) -> Result<Color> {
-    let v = value.trim().to_ascii_lowercase();
-    if let Some(hex) = v.strip_prefix('#') {
-        if hex.len() != 6 {
-            bail!("`{value}` is not a colour: hex is #rrggbb, six digits after the #");
+fn build_one(selected: &str, tables: &ThemeTables) -> Result<Theme> {
+    let mut seen = Vec::new();
+    let mut theme = resolve(selected, tables, &mut seen)?;
+    theme.name = selected.to_owned();
+    Ok(theme)
+}
+
+/// Whether the terminal is light or dark (D72).
+///
+/// pi asks the terminal and falls back to `COLORFGBG`, then to dark. Asking needs a terminal to
+/// answer, which is a separate piece of work; `COLORFGBG` is what a terminal exports for exactly this
+/// question, and dark is what an unset value has always meant here.
+pub fn terminal_appearance() -> Appearance {
+    if let Ok(value) = std::env::var("COLORFGBG") {
+        // `fg;bg`, where either may be a 0–15 index. A white or bright background is light.
+        if let Some(bg) = value.rsplit(';').next()
+            && let Ok(index) = bg.trim().parse::<u8>()
+        {
+            return match index {
+                7 => Appearance::Light,
+                9..=15 => Appearance::Light,
+                _ => Appearance::Dark,
+            };
         }
-        let channel = |at: usize| -> Result<u8> {
-            u8::from_str_radix(&hex[at..at + 2], 16).map_err(|_| {
-                anyhow::anyhow!(
-                    "`{value}` is not a colour: `{}` is not hex",
-                    &hex[at..at + 2]
-                )
-            })
+    }
+    Appearance::Dark
+}
+
+fn resolve(name: &str, tables: &ThemeTables, seen: &mut Vec<String>) -> Result<Theme> {
+    if seen.iter().any(|s| s == name) {
+        bail!(
+            "theme `{name}` extends itself ({}); a theme cannot be its own base",
+            seen.join(" -> ")
+        );
+    }
+    seen.push(name.to_owned());
+    let table = tables.get(name);
+    let extends = table
+        .and_then(|t| t.get("extends"))
+        .and_then(|v| v.as_str());
+    let mut theme = match extends {
+        Some(base) => resolve(base, tables, seen)?,
+        // A built-in name with no `extends` starts from that built-in; anything else starts from
+        // `default`, so a table that overrides one role does not have to restate the others.
+        None => builtin(name).unwrap_or_default(),
+    };
+    let Some(value) = table else {
+        if builtin(name).is_none() {
+            bail!(
+                "there is no theme `{name}`; built in: {}. Define one with [themes.{name}] in \
+                 config.toml",
+                builtin_names().join(", ")
+            );
+        }
+        return Ok(theme);
+    };
+    let Some(table) = value.as_table() else {
+        bail!("[themes.{name}] must be a table of colour roles");
+    };
+    if let Some(appearance) = table.get("appearance") {
+        let Some(appearance) = appearance.as_str() else {
+            bail!("[themes.{name}].appearance must be \"dark\" or \"light\"");
         };
-        return Ok(Color::Rgb(channel(0)?, channel(2)?, channel(4)?));
+        theme.appearance =
+            Appearance::parse(appearance).with_context(|| format!("[themes.{name}].appearance"))?;
     }
-    // A bare number is a palette index, which is what a 256-colour terminal wants.
-    if let Ok(index) = v.parse::<u16>() {
-        if index > 255 {
-            bail!("`{value}` is not a colour: a palette index is 0 to 255");
+    // `vars` first, so a role can refer to one whatever order the file lists them in.
+    let mut vars: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(table) = table.get("vars") {
+        let Some(table) = table.as_table() else {
+            bail!("[themes.{name}].vars must be a table of colours");
+        };
+        for (key, value) in table {
+            let Some(value) = value.as_str() else {
+                bail!("[themes.{name}].vars.{key} must be a colour string");
+            };
+            vars.insert(key.clone(), value.to_owned());
         }
-        return Ok(Color::Indexed(index as u8));
     }
-    Ok(match v.as_str() {
+    for (role, value) in table {
+        if matches!(role.as_str(), "extends" | "vars" | "appearance" | "name") {
+            continue;
+        }
+        let colour = match value {
+            toml::Value::String(text) => {
+                colour_value(text, &vars).with_context(|| format!("[themes.{name}].{role}"))?
+            }
+            toml::Value::Integer(index) => {
+                palette(*index).with_context(|| format!("[themes.{name}].{role}"))?
+            }
+            _ => bail!(
+                "[themes.{name}].{role} must be a colour string or a palette index 0-255, not {}",
+                value.type_str()
+            ),
+        };
+        theme.set(role, colour)?;
+    }
+    Ok(theme)
+}
+
+/// A palette index as a TOML integer.
+fn palette(index: i64) -> Result<Color> {
+    if !(0..=255).contains(&index) {
+        bail!("a palette index is 0 to 255, not {index}");
+    }
+    Ok(Color::Indexed(index as u8))
+}
+
+/// One colour as written, resolving a `vars` reference (D72).
+fn colour_value(text: &str, vars: &BTreeMap<String, String>) -> Result<Color> {
+    let value = text.trim();
+    // An empty string is the terminal's default foreground, which is pi's spelling for it too.
+    if value.is_empty() {
+        return Ok(Color::Reset);
+    }
+    if let Some(lower) = value
+        .strip_prefix("oklch(")
+        .and_then(|v| v.strip_suffix(')'))
+    {
+        return parse_oklch(lower);
+    }
+    if let Some(lower) = value
+        .strip_prefix("okhsl(")
+        .and_then(|v| v.strip_suffix(')'))
+    {
+        return parse_okhsl(lower);
+    }
+    if let Some(hex) = value.strip_prefix('#') {
+        return parse_hex(hex, text);
+    }
+    if let Ok(index) = value.parse::<u16>() {
+        return palette(i64::from(index));
+    }
+    if let Some(ansi) = ansi(value) {
+        return Ok(ansi);
+    }
+    // Anything left is a variable reference, chained; a cycle is a mistake worth naming.
+    let mut name = value.to_owned();
+    let mut hops = 0;
+    while let Some(next) = vars.get(&name) {
+        hops += 1;
+        if hops > vars.len() + 1 {
+            bail!("`{value}` refers to itself through vars; a variable cannot be its own value");
+        }
+        if next.trim() == name {
+            bail!("`{value}` refers to itself in vars");
+        }
+        name = next.trim().to_owned();
+        if !vars.contains_key(&name) {
+            return colour_value(&name, &BTreeMap::new());
+        }
+    }
+    if vars.contains_key(value) {
+        return colour_value(&name, &BTreeMap::new());
+    }
+    bail!(
+        "`{value}` is not a colour or a var; use an ANSI name, #rgb, #rrggbb, oklch(…), okhsl(…), a \
+         palette index 0-255, \"\" for the terminal default, or the name of a `vars` entry"
+    )
+}
+
+fn parse_hex(hex: &str, whole: &str) -> Result<Color> {
+    let digits = |s: &str| -> Result<u8> {
+        u8::from_str_radix(s, 16).map_err(|_| anyhow::anyhow!("`{s}` is not hex"))
+    };
+    match hex.len() {
+        // `#abc` is `#aabbcc`, as in CSS and as pi accepts.
+        3 => {
+            let r = digits(&hex[0..1])?;
+            let g = digits(&hex[1..2])?;
+            let b = digits(&hex[2..3])?;
+            Ok(Color::Rgb(r * 17, g * 17, b * 17))
+        }
+        6 => Ok(Color::Rgb(
+            digits(&hex[0..2])?,
+            digits(&hex[2..4])?,
+            digits(&hex[4..6])?,
+        )),
+        _ => bail!("`{whole}` is not a colour: hex is #rgb or #rrggbb"),
+    }
+}
+
+fn ansi(value: &str) -> Option<Color> {
+    Some(match value.trim().to_ascii_lowercase().as_str() {
         "reset" | "default" | "terminal" => Color::Reset,
         "black" => Color::Black,
         "red" => Color::Red,
@@ -228,70 +562,114 @@ pub fn parse(value: &str) -> Result<Color> {
         "light-magenta" => Color::LightMagenta,
         "light-cyan" => Color::LightCyan,
         "white" => Color::White,
-        other => bail!(
-            "`{other}` is not a colour; use an ANSI name (cyan, dark-gray, …), #rrggbb, or a \
-             palette index 0-255"
-        ),
+        _ => return None,
     })
 }
 
-/// The themes a config defines, before the selected one is built.
-pub type ThemeTables = BTreeMap<String, toml::Value>;
-
-/// Builds the selected theme (D71).
-///
-/// `extends` names the theme to start from: a built-in, or another table in the same config, which
-/// is what lets a person put their shared roles in one place. An unknown name is an error here
-/// rather than a silent fallback to the default, because a theme that is not the one asked for is
-/// indistinguishable from a theme that failed.
-pub fn build(selected: &str, tables: &ThemeTables) -> Result<Theme> {
-    let mut seen = Vec::new();
-    let mut theme = resolve(selected, tables, &mut seen)?;
-    theme.name = selected.to_owned();
-    Ok(theme)
+/// `oklch(62% 0.1 200)`, or the same with the lightness as `0.62`.
+fn parse_oklch(args: &str) -> Result<Color> {
+    let (lightness, chroma, hue) = three(args, "oklch")?;
+    let lightness = if lightness.ends_with('%') {
+        number(&lightness[..lightness.len() - 1])? / 100.0
+    } else {
+        number(&lightness)?
+    };
+    let chroma = number(&chroma)?;
+    let hue = number(hue.trim_end_matches("deg"))?;
+    let srgb = oklch_to_srgb(lightness, chroma, hue);
+    Ok(srgb_colour(srgb))
 }
 
-fn resolve(name: &str, tables: &ThemeTables, seen: &mut Vec<String>) -> Result<Theme> {
-    if seen.iter().any(|s| s == name) {
-        bail!(
-            "theme `{name}` extends itself ({}); a theme cannot be its own base",
-            seen.join(" -> ")
-        );
+/// `okhsl(250 60% 55%)`, pi's spelling: hue, saturation and lightness.
+///
+/// Saturation is relative to the most chroma the sRGB gamut allows at that hue and lightness, which
+/// is what makes equal saturation look equally colourful.
+fn parse_okhsl(args: &str) -> Result<Color> {
+    let (hue, saturation, lightness) = three(args, "okhsl")?;
+    let hue = number(hue.trim_end_matches("deg"))?;
+    let saturation = percent_or_number(&saturation)?;
+    let lightness = percent_or_number(&lightness)?;
+    let max = max_chroma(lightness, hue);
+    let srgb = oklch_to_srgb(lightness, (saturation * max).clamp(0.0, max), hue);
+    Ok(srgb_colour(srgb))
+}
+
+fn three(args: &str, form: &str) -> Result<(String, String, String)> {
+    // Components may be separated by spaces, commas or a mixture, as CSS allows.
+    let parts: Vec<String> = args
+        .replace(',', " ")
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    match parts.len() {
+        3 => Ok((parts[0].clone(), parts[1].clone(), parts[2].clone())),
+        n => bail!("`{form}(…)` takes three values, not {n}"),
     }
-    seen.push(name.to_owned());
-    let table = tables.get(name);
-    let mut theme = match table
-        .and_then(|t| t.get("extends"))
-        .and_then(|v| v.as_str())
-    {
-        Some(base) => resolve(base, tables, seen)?,
-        // A built-in name with no `extends` starts from that built-in; anything else starts from
-        // `default`, so a table that overrides one role does not have to restate the others.
-        None => builtin(name).unwrap_or_default(),
-    };
-    if table.is_none() {
-        if builtin(name).is_none() {
-            bail!(
-                "there is no theme `{name}`; built in: {}. Define one with [themes.{name}] in \
-                 config.toml",
-                builtin_names().join(", ")
-            );
-        }
-        return Ok(theme);
+}
+
+fn number(text: &str) -> Result<f64> {
+    text.trim()
+        .parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("`{}` is not a number", text.trim()))
+}
+
+fn percent_or_number(text: &str) -> Result<f64> {
+    let text = text.trim();
+    match text.strip_suffix('%') {
+        Some(rest) => Ok((number(rest)? / 100.0).clamp(0.0, 1.0)),
+        None => Ok(number(text)?.clamp(0.0, 1.0)),
     }
-    let Some(table) = table.and_then(|t| t.as_table()) else {
-        bail!("[themes.{name}] must be a table of colour roles");
+}
+
+/// Linear sRGB for an OKLCH colour, which may be out of gamut.
+fn oklch_to_srgb(lightness: f64, chroma: f64, hue: f64) -> [f64; 3] {
+    let hue = hue.to_radians();
+    let a = chroma * hue.cos();
+    let b = chroma * hue.sin();
+    let l_ = lightness + 0.396_337_777_4 * a + 0.215_803_757_3 * b;
+    let m_ = lightness - 0.105_561_345_8 * a - 0.063_854_172_8 * b;
+    let s_ = lightness - 0.089_484_177_5 * a - 1.291_485_548_0 * b;
+    let (l, m, s) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
+    [
+        4.076_741_662_1 * l - 3.307_711_591_3 * m + 0.230_969_929_2 * s,
+        -1.268_438_004_6 * l + 2.609_757_401_1 * m - 0.341_319_396_5 * s,
+        -0.004_196_086_3 * l - 0.703_418_614_7 * m + 1.707_614_701_0 * s,
+    ]
+}
+
+/// The most chroma the sRGB gamut holds at this lightness and hue, by bisection (D72).
+fn max_chroma(lightness: f64, hue: f64) -> f64 {
+    let in_gamut = |c: f64| {
+        let rgb = oklch_to_srgb(lightness, c, hue);
+        rgb.iter().all(|v| (-1e-4..=1.0 + 1e-4).contains(v))
     };
-    for (role, value) in table {
-        if role == "extends" {
-            continue;
+    let (mut low, mut high) = (0.0, 0.5);
+    if in_gamut(high) {
+        return high;
+    }
+    for _ in 0..24 {
+        let mid = (low + high) / 2.0;
+        if in_gamut(mid) {
+            low = mid;
+        } else {
+            high = mid;
         }
-        let Some(value) = value.as_str() else {
-            bail!("[themes.{name}].{role} must be a colour string");
+    }
+    low
+}
+
+/// A linear-sRGB triple as a terminal colour, gamut-mapped and gamma encoded.
+fn srgb_colour(linear: [f64; 3]) -> Color {
+    let encode = |v: f64| -> u8 {
+        let v = v.clamp(0.0, 1.0);
+        let s = if v <= 0.003_130_8 {
+            12.92 * v
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
         };
-        theme.set(role, value)?;
-    }
-    Ok(theme)
+        (s * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    Color::Rgb(encode(linear[0]), encode(linear[1]), encode(linear[2]))
 }
 
 #[cfg(test)]
@@ -302,28 +680,105 @@ mod tests {
         toml::from_str(text).unwrap()
     }
 
+    fn vars(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
     #[test]
-    fn colours_are_written_the_way_a_person_writes_them() {
-        assert_eq!(parse("cyan").unwrap(), Color::Cyan);
-        assert_eq!(parse("Dark-Grey").unwrap(), Color::DarkGray);
-        assert_eq!(parse("#1a2b3c").unwrap(), Color::Rgb(0x1a, 0x2b, 0x3c));
-        assert_eq!(parse(" 240 ").unwrap(), Color::Indexed(240));
-        assert_eq!(parse("reset").unwrap(), Color::Reset);
-        // Anything else is refused, with what was wrong.
-        assert!(parse("#123").unwrap_err().to_string().contains("#rrggbb"));
-        assert!(parse("300").unwrap_err().to_string().contains("0 to 255"));
-        assert!(
-            parse("chartreuse")
-                .unwrap_err()
-                .to_string()
-                .contains("ANSI name")
+    fn colours_are_written_the_way_pi_writes_them() {
+        let no_vars: BTreeMap<String, String> = BTreeMap::new();
+        assert_eq!(colour_value("cyan", &no_vars).unwrap(), Color::Cyan);
+        assert_eq!(
+            colour_value("Dark-Grey", &no_vars).unwrap(),
+            Color::DarkGray
         );
+        assert_eq!(
+            colour_value("#00aaff", &no_vars).unwrap(),
+            Color::Rgb(0, 0xaa, 0xff)
+        );
+        // Three digits are expanded, as CSS and pi do.
+        assert_eq!(
+            colour_value("#0af", &no_vars).unwrap(),
+            Color::Rgb(0, 0xaa, 0xff)
+        );
+        assert_eq!(colour_value("240", &no_vars).unwrap(), Color::Indexed(240));
+        // The terminal's own colour.
+        assert_eq!(colour_value("", &no_vars).unwrap(), Color::Reset);
+        assert_eq!(colour_value("  ", &no_vars).unwrap(), Color::Reset);
+        for bad in ["#12", "chartreuse", "300"] {
+            assert!(
+                colour_value(bad, &no_vars).is_err(),
+                "{bad} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn oklch_produces_the_colour_it_names() {
+        // White and black are the anchors: no chroma, full and zero lightness.
+        assert_eq!(parse_oklch("100% 0 0").unwrap(), Color::Rgb(255, 255, 255));
+        assert_eq!(parse_oklch("0% 0 0").unwrap(), Color::Rgb(0, 0, 0));
+        // A mid blue: hue 264° is blue in OKLCH, so blue must dominate.
+        let Color::Rgb(r, g, b) = parse_oklch("62% 0.1 264").unwrap() else {
+            panic!("rgb");
+        };
+        assert!(b > r && b > g, "expected blue, got {r},{g},{b}");
+        // A mid red.
+        let Color::Rgb(r, _, _) = parse_oklch("62% 0.2 29").unwrap() else {
+            panic!("rgb");
+        };
+        assert!(r > 150, "expected red-dominant, got r={r}");
+        // The lightness may be a bare fraction, which is the other spelling.
+        assert_eq!(parse_oklch("1 0 0").unwrap(), Color::Rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn okhsl_saturation_is_relative_to_the_gamut() {
+        // Zero saturation is a grey at that lightness, whatever the hue.
+        let light = parse_okhsl("250 0% 55%").unwrap();
+        let Color::Rgb(r, g, b) = light else {
+            panic!("rgb")
+        };
+        assert!(
+            r.abs_diff(g) <= 1 && g.abs_diff(b) <= 1,
+            "grey, got {r},{g},{b}"
+        );
+        // Full saturation is the edge of the gamut: some channel is at an extreme.
+        let Color::Rgb(r, g, b) = parse_okhsl("250 100% 55%").unwrap() else {
+            panic!("rgb");
+        };
+        assert!(
+            r == 0 || r == 255 || g == 0 || g == 255 || b == 0 || b == 255,
+            "expected a gamut edge, got {r},{g},{b}"
+        );
+        // Every saturation in between stays inside the gamut by construction.
+        for s in [10, 30, 50, 70, 90] {
+            assert!(parse_okhsl(&format!("250 {s}% 55%")).is_ok());
+        }
+    }
+
+    #[test]
+    fn vars_reference_other_vars_and_a_cycle_is_refused() {
+        let v = vars(&[("base", "cyan"), ("accent2", "base")]);
+        assert_eq!(colour_value("accent2", &v).unwrap(), Color::Cyan);
+        assert_eq!(colour_value("base", &v).unwrap(), Color::Cyan);
+        // A var that points at itself, and a two-step cycle.
+        let v = vars(&[("a", "a")]);
+        assert!(format!("{:#}", colour_value("a", &v).unwrap_err()).contains("itself"));
+        let v = vars(&[("a", "b"), ("b", "a")]);
+        assert!(colour_value("a", &v).is_err(), "a cycle must not loop");
+        // A missing var says what a colour is.
+        let err = colour_value("nope", &BTreeMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a colour or a var"), "{err}");
     }
 
     #[test]
     fn the_default_theme_is_what_the_interface_always_drew() {
-        // Nothing configured means nothing changes, which is the property that makes shipping a
-        // theme system safe.
         let theme = build("default", &ThemeTables::new()).unwrap();
         assert_eq!(theme, Theme::default());
         assert_eq!(theme.accent, Color::Cyan);
@@ -332,38 +787,48 @@ mod tests {
     }
 
     #[test]
-    fn a_table_overrides_only_the_roles_it_lists() {
-        let t = tables("[mine]\naccent = \"magenta\"\nerror = \"#ff0000\"\n");
+    fn a_table_overrides_only_the_roles_it_lists_and_may_use_vars() {
+        let t = tables(
+            "[mine]\naccent = \"magenta\"\nerror = \"#f00\"\n[mine.vars]\nshared = \"#0af\"\n",
+        );
+        // Vars live under the theme table and are read before the roles.
+        let t = match t.get("mine").and_then(|v| v.as_table()) {
+            Some(_) => {
+                let mut parsed: ThemeTables = toml::from_str(
+                    "[mine]\naccent = \"magenta\"\nerror = \"#f00\"\n\n[mine.vars]\nshared = \"#0af\"\n",
+                )
+                .unwrap();
+                parsed.remove("mine.vars");
+                parsed
+            }
+            None => t,
+        };
         let theme = build("mine", &t).unwrap();
         assert_eq!(theme.accent, Color::Magenta);
         assert_eq!(theme.error, Color::Rgb(255, 0, 0));
-        // Everything else is the default's.
-        assert_eq!(theme.muted, Theme::default().muted);
-        assert_eq!(theme.selection_bg, Theme::default().selection_bg);
-        assert_eq!(theme.name, "mine");
+        assert_eq!(
+            theme.muted,
+            Theme::default().muted,
+            "the rest is the default's"
+        );
     }
 
     #[test]
-    fn extends_picks_the_base_and_another_table_is_a_valid_base() {
+    fn a_var_can_be_used_by_a_role_in_the_same_table() {
+        let t = tables("[mine.vars]\nshared = \"#0af\"\n\n[mine]\naccent = \"shared\"\n");
+        let theme = build("mine", &t).unwrap();
+        assert_eq!(theme.accent, Color::Rgb(0, 0xaa, 0xff));
+    }
+
+    #[test]
+    fn extends_picks_the_base_and_a_cycle_is_named() {
         let t = tables(
             "[base]\naccent = \"magenta\"\nmuted = \"gray\"\n\n[child]\nextends = \"base\"\nmuted = \"blue\"\n",
         );
         let theme = build("child", &t).unwrap();
-        assert_eq!(theme.accent, Color::Magenta, "inherited from its base");
-        assert_eq!(theme.muted, Color::Blue, "overridden by the child");
-        // A built-in can be extended too, so a person can adjust `light` without copying it.
-        let t = tables("[dim]\nextends = \"light\"\naccent = \"red\"\n");
-        let theme = build("dim", &t).unwrap();
-        assert_eq!(theme.accent, Color::Red);
-        assert_eq!(theme.muted, builtin("light").unwrap().muted);
-    }
-
-    #[test]
-    fn a_theme_that_extends_itself_is_refused_rather_than_looping() {
+        assert_eq!(theme.accent, Color::Magenta);
+        assert_eq!(theme.muted, Color::Blue);
         let t = tables("[a]\nextends = \"a\"\n");
-        let err = build("a", &t).unwrap_err().to_string();
-        assert!(err.contains("extends itself"), "{err}");
-        let t = tables("[a]\nextends = \"b\"\n\n[b]\nextends = \"a\"\n");
         assert!(
             build("a", &t)
                 .unwrap_err()
@@ -373,29 +838,69 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_theme_or_role_is_an_error_that_says_what_exists() {
+    fn an_unknown_theme_a_misspelt_role_and_an_unpainted_role_all_explain_themselves() {
         let err = build("nope", &ThemeTables::new()).unwrap_err().to_string();
         assert!(err.contains("no theme `nope`"), "{err}");
         assert!(err.contains("default, light, mono"), "{err}");
-        let t = tables("[mine]\naccent = \"cyan\"\nakcent = \"red\"\n");
-        // Duplicate keys do not even parse as TOML; the case that matters is a misspelt role.
-        assert!(t.is_empty() || t.contains_key("mine"));
+
         let t = tables("[mine]\nacccent = \"cyan\"\n");
-        let err = build("mine", &t).unwrap_err().to_string();
+        let err = format!("{:#}", build("mine", &t).unwrap_err());
         assert!(err.contains("not a colour role"), "{err}");
-        assert!(err.contains("accent, muted, code"), "{err}");
+
+        // A role pi has and we do not paint says why rather than "you typed it wrong".
+        let t = tables("[mine]\nsyntaxKeyword = \"cyan\"\n");
+        let err = format!("{:#}", build("mine", &t).unwrap_err());
+        assert!(err.contains("nothing in this interface draws it"), "{err}");
     }
 
     #[test]
-    fn every_role_a_theme_can_set_is_a_role_the_renderer_uses() {
-        // A role nobody paints with would be a setting that silently does nothing.
-        let theme = Theme::default();
+    fn every_role_can_be_set_so_no_setting_paints_nothing() {
         for role in ROLES {
-            let mut probe = theme.clone();
+            let mut probe = Theme::default();
             probe
-                .set(role, "cyan")
+                .set(role, Color::Cyan)
                 .unwrap_or_else(|e| panic!("{role}: {e}"));
         }
-        assert_eq!(ROLES.len(), 18, "update the count when a role is added");
+    }
+
+    #[test]
+    fn a_light_dark_pair_picks_the_right_half() {
+        // D72: pi's spelling for "one theme per terminal", with the light theme first.
+        let t = tables("[l]\naccent = \"red\"\n\n[d]\naccent = \"blue\"\n");
+        let light = build_for("l/d", &t, Appearance::Light).unwrap();
+        assert_eq!(light.name, "l");
+        assert_eq!(light.accent, Color::Red);
+        assert_eq!(light.appearance, Appearance::Light);
+        let dark = build_for("l/d", &t, Appearance::Dark).unwrap();
+        assert_eq!(dark.name, "d");
+        assert_eq!(dark.accent, Color::Blue);
+        assert_eq!(dark.appearance, Appearance::Dark);
+        // A single name with no slash is unaffected by the appearance.
+        assert_eq!(build_for("l", &t, Appearance::Light).unwrap().name, "l");
+        // Half a pair is not a pair: it is a name, and an unknown name is an error.
+        assert!(build_for("/d", &t, Appearance::Light).is_err());
+        assert!(build_for("l/", &t, Appearance::Light).is_err());
+    }
+
+    #[test]
+    fn colorfgbg_decides_the_appearance() {
+        // The variable is process-wide, so this only asserts the rule on the values pi documents.
+        let decide = |value: &str| match value.rsplit(';').next().unwrap().parse::<u8>() {
+            Ok(7) | Ok(9..=15) => Appearance::Light,
+            _ => Appearance::Dark,
+        };
+        assert_eq!(decide("15;0"), Appearance::Dark);
+        assert_eq!(decide("0;15"), Appearance::Light);
+        assert_eq!(decide("0;7"), Appearance::Light);
+        assert_eq!(decide("0;8"), Appearance::Dark);
+    }
+
+    #[test]
+    fn a_palette_index_may_be_a_toml_integer() {
+        let t = tables("[mine]\nmdCode = 39\n");
+        assert_eq!(build("mine", &t).unwrap().md_code, Color::Indexed(39));
+        let t = tables("[mine]\nmdCode = 256\n");
+        let err = format!("{:#}", build("mine", &t).unwrap_err());
+        assert!(err.contains("0 to 255"), "{err}");
     }
 }

@@ -150,7 +150,12 @@ fn pieces(s: &str) -> Vec<&str> {
 }
 
 fn code_style(theme: &Theme) -> Style {
-    Style::new().fg(theme.code)
+    Style::new().fg(theme.md_code)
+}
+
+/// A fenced block, which pi colours separately from inline code (D72).
+fn block_style(theme: &Theme) -> Style {
+    Style::new().fg(theme.md_code_block)
 }
 
 /// Markdown to rows. Soft breaks are kept as line breaks, since a model's line breaks are usually
@@ -197,6 +202,10 @@ impl Markdown {
         code_style(&self.theme)
     }
 
+    fn block_style(&self) -> Style {
+        block_style(&self.theme)
+    }
+
     fn style(&self) -> Style {
         self.styles
             .iter()
@@ -209,7 +218,7 @@ impl Markdown {
 
     fn prefixes(&mut self) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         let quote = "│ ".repeat(self.quote);
-        let quote_style = Style::new().fg(self.theme.muted);
+        let quote_style = Style::new().fg(self.theme.md_quote_border);
         let indent = self.indent();
         let first = match self.bullet.take() {
             Some(bullet) => {
@@ -221,7 +230,7 @@ impl Markdown {
                 return (
                     vec![
                         Span::styled(quote.clone(), quote_style),
-                        Span::styled(lead, Style::new().fg(self.theme.accent)),
+                        Span::styled(lead, Style::new().fg(self.theme.md_list_bullet)),
                     ],
                     vec![Span::styled(quote, quote_style), Span::raw(rest)],
                 );
@@ -273,7 +282,7 @@ impl Markdown {
                         break;
                     }
                     self.line
-                        .push(Span::styled(format!("  {l}"), self.code_style()));
+                        .push(Span::styled(format!("  {l}"), self.block_style()));
                     self.flush();
                 }
             }
@@ -287,7 +296,7 @@ impl Markdown {
                 self.start_block();
                 self.line.push(Span::styled(
                     "─".repeat(40),
-                    Style::new().fg(self.theme.muted),
+                    Style::new().fg(self.theme.md_hr),
                 ));
                 self.flush();
                 self.blank_before_next_block = true;
@@ -324,7 +333,7 @@ impl Markdown {
                 let style = match level {
                     HeadingLevel::H1 | HeadingLevel::H2 => Style::new()
                         .add_modifier(Modifier::BOLD)
-                        .fg(self.theme.accent),
+                        .fg(self.theme.md_heading),
                     _ => Style::new().add_modifier(Modifier::BOLD),
                 };
                 self.styles.push(style);
@@ -368,7 +377,7 @@ impl Markdown {
                 self.styles.push(
                     Style::new()
                         .add_modifier(Modifier::UNDERLINED)
-                        .fg(self.theme.link),
+                        .fg(self.theme.md_link),
                 );
                 self.link = Some(dest_url.to_string());
             }
@@ -500,7 +509,7 @@ struct View {
 
 fn thinking_rows(text: &str, shown: bool, theme: &Theme) -> Vec<Row> {
     let text = text.trim();
-    let bar = Style::new().fg(theme.muted);
+    let bar = Style::new().fg(theme.thinking_text);
     if !shown {
         let n = text.lines().count();
         let plural = if n == 1 { "" } else { "s" };
@@ -537,7 +546,9 @@ fn entry_rows(entry: &Entry, view: View, theme: &Theme) -> Vec<Row> {
                     Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
                     vec![Span::styled(
                         l.to_owned(),
-                        Style::new().add_modifier(Modifier::BOLD),
+                        Style::new()
+                            .fg(theme.user_message_text)
+                            .add_modifier(Modifier::BOLD),
                     )],
                 )
             })
@@ -568,7 +579,7 @@ fn entry_rows(entry: &Entry, view: View, theme: &Theme) -> Vec<Row> {
         Entry::Note(kind, text) => {
             let style = match kind {
                 NoteKind::Info => dim(theme),
-                NoteKind::Warn => Style::new().fg(theme.warn),
+                NoteKind::Warn => Style::new().fg(theme.warning),
                 NoteKind::Error => Style::new().fg(theme.error),
             };
             text.lines()
@@ -588,7 +599,7 @@ fn compaction_block(
     theme: &Theme,
 ) -> (Vec<Row>, Color) {
     let accent = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
-    let muted = Style::new().fg(theme.tool_text);
+    let muted = Style::new().fg(theme.tool_output);
     let italic = muted.add_modifier(Modifier::ITALIC);
     let (lead, bg) = match &v.state {
         CompactState::Running => (
@@ -599,7 +610,7 @@ fn compaction_block(
         CompactState::Failed(_) => ("✻ ".to_owned(), theme.tool_error_bg),
     };
     let mut rows = vec![Row::plain(vec![
-        Span::styled(lead, Style::new().fg(theme.warn)),
+        Span::styled(lead, Style::new().fg(theme.warning)),
         Span::styled("compaction", accent),
         Span::styled(format!("  {}", v.header), muted),
     ])];
@@ -679,14 +690,18 @@ fn tool_block(
     theme: &Theme,
 ) -> (Vec<Row>, Color) {
     let bold = Style::new().add_modifier(Modifier::BOLD);
-    let accent = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
+    // The tool's own name has a role of its own, so a theme can quiet the titles without touching
+    // the accent everywhere else (D72).
+    let accent = Style::new()
+        .fg(theme.tool_title)
+        .add_modifier(Modifier::BOLD);
     let mut detail_lines = detail.lines();
     let first = detail_lines.next().unwrap_or_default().to_owned();
     let mut header = Vec::new();
     if result.is_none() {
         header.push(Span::styled(
             format!("{} ", SPINNER[spinner % SPINNER.len()]),
-            Style::new().fg(theme.warn),
+            Style::new().fg(theme.warning),
         ));
     }
     if name == "bash" {
@@ -711,13 +726,13 @@ fn tool_block(
         return (rows, theme.tool_pending_bg);
     };
     let (bg, text) = if *ok {
-        (theme.tool_ok_bg, Style::new().fg(theme.tool_text))
+        (theme.tool_success_bg, Style::new().fg(theme.tool_output))
     } else {
         (theme.tool_error_bg, Style::new().fg(theme.tool_error_text))
     };
     let (lines, status) = tool_output(name, content);
     let note = Style::new()
-        .fg(theme.tool_text)
+        .fg(theme.tool_output)
         .add_modifier(Modifier::ITALIC);
     let mut body: Vec<Row> = Vec::new();
     if let (Some(diff), true) = (diff, *ok) {
@@ -792,7 +807,7 @@ fn diff_rows(diff: &str, expand: bool, theme: &Theme) -> Vec<Row> {
     } else {
         lines.len().min(DIFF_PREVIEW)
     };
-    let gutter = Style::new().fg(theme.muted);
+    let gutter = Style::new().fg(theme.tool_diff_context);
     let mut rows = Vec::new();
     for line in &lines[..shown] {
         let (tag, rest) = line.split_at(line.len().min(1));
@@ -805,9 +820,9 @@ fn diff_rows(diff: &str, expand: bool, theme: &Theme) -> Vec<Row> {
         }
         let (number, text) = rest.split_once(' ').unwrap_or((rest, ""));
         let (sign, style) = match tag {
-            "-" => ("-", Style::new().fg(theme.diff_removed)),
-            "+" => ("+", Style::new().fg(theme.diff_added)),
-            _ => (" ", Style::new().fg(theme.tool_text)),
+            "-" => ("-", Style::new().fg(theme.tool_diff_removed)),
+            "+" => ("+", Style::new().fg(theme.tool_diff_added)),
+            _ => (" ", Style::new().fg(theme.tool_output)),
         };
         rows.push(Row {
             first: vec![
@@ -822,7 +837,7 @@ fn diff_rows(diff: &str, expand: bool, theme: &Theme) -> Vec<Row> {
         rows.push(Row::plain(vec![Span::styled(
             format!("… {} more lines · ctrl+o shows all", lines.len() - shown),
             Style::new()
-                .fg(theme.tool_text)
+                .fg(theme.tool_output)
                 .add_modifier(Modifier::ITALIC),
         )]));
     }
@@ -948,7 +963,7 @@ fn plain(line: &Line<'_>) -> String {
 /// The background a selected character sits on. It replaces only the colours, so dim tool output
 /// stays readable while selected, and reversed text keeps its emphasis (D35).
 fn selected_style(theme: &Theme) -> Style {
-    Style::new().bg(theme.selection_bg).fg(theme.selection_fg)
+    Style::new().bg(theme.selected_bg).fg(theme.selection_fg)
 }
 
 /// Puts the selection's background behind characters `from..to` of one rendered line, splitting
@@ -1056,7 +1071,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
                 }
             };
             Line::from(vec![
-                Span::styled(format!("{spin} "), Style::new().fg(app.theme.warn)),
+                Span::styled(format!("{spin} "), Style::new().fg(app.theme.warning)),
                 Span::raw(what),
                 Span::styled("  esc to cancel", dim(&app.theme)),
             ])
@@ -1090,10 +1105,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .collect();
     // The editor's border is the one place that says whether the agent is working: muted while a
     // turn runs, the accent colour when it is waiting for you.
-    let border = if app.busy.is_some() {
-        app.theme.muted
+    // Three states, three roles: a command being typed, a turn running, and waiting for you (D72).
+    let border = if app.editor.text().trim_start().starts_with('!') {
+        app.theme.bash_mode
+    } else if app.busy.is_some() {
+        app.theme.border_muted
     } else {
-        app.theme.accent
+        app.theme.border_accent
     };
     let editor = Paragraph::new(shown).block(
         Block::bordered()
@@ -1346,7 +1364,7 @@ fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize, 
         Stage::Checking { .. } => {
             let spin = SPINNER[spinner % SPINNER.len()];
             lines.push(Line::from(vec![
-                Span::styled(format!("{spin} "), Style::new().fg(theme.warn)),
+                Span::styled(format!("{spin} "), Style::new().fg(theme.warning)),
                 Span::raw("checking the key and listing models…"),
             ]));
             lines.push(Line::default());
@@ -1363,7 +1381,7 @@ fn draw_login(frame: &mut Frame<'_>, login: &Login, area: Rect, spinner: usize, 
             if let Some(note) = note {
                 lines.push(Line::from(Span::styled(
                     keep_tail(note, inner),
-                    Style::new().fg(theme.warn),
+                    Style::new().fg(theme.warning),
                 )));
             }
             let visible = keep_tail(filter, inner.saturating_sub(10));
@@ -1434,7 +1452,7 @@ fn modal(
         Paragraph::new(lines).block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(Style::new().fg(theme.accent))
+                .border_style(Style::new().fg(theme.border))
                 .title(title.to_owned()),
         ),
         rect,
@@ -1854,7 +1872,11 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             1,
         );
         frame.render_widget(
-            Paragraph::new(note).style(Style::new().fg(app.theme.selection_fg).bg(app.theme.warn)),
+            Paragraph::new(note).style(
+                Style::new()
+                    .fg(app.theme.selection_fg)
+                    .bg(app.theme.warning),
+            ),
             r,
         );
         app.jump_badge = Some(r);
@@ -2052,7 +2074,7 @@ mod tests {
             .join("\n");
         let passing = format!("exit code 0\n--- stdout ---\n{output}");
         let (lines, bg) = block("bash", "cargo test", true, &passing, false);
-        assert_eq!(bg, Theme::default().tool_ok_bg);
+        assert_eq!(bg, Theme::default().tool_success_bg);
         assert_eq!(
             lines,
             [
@@ -2110,7 +2132,7 @@ mod tests {
     #[test]
     fn shading_spans_the_full_width_with_padding() {
         let rows = vec![Row::plain(vec![Span::raw("$ ls")])];
-        let lines = shaded(&rows, Theme::default().tool_ok_bg, 20);
+        let lines = shaded(&rows, Theme::default().tool_success_bg, 20);
         assert_eq!(
             text(&lines),
             [
@@ -2123,7 +2145,7 @@ mod tests {
             lines
                 .iter()
                 .flat_map(|l| l.spans.iter())
-                .all(|s| s.style.bg == Some(Theme::default().tool_ok_bg))
+                .all(|s| s.style.bg == Some(Theme::default().tool_success_bg))
         );
     }
 

@@ -103,8 +103,11 @@ request, in the TUI and in line mode, and is the only way to reach a skill marke
 `disable-model-invocation` (D69). `/reload` reads the instruction files and skills again and rebuilds the
 prompt, and re-reads the settings and the theme, so a change made mid-session is picked up without
 restarting (D70). `/theme [name]` shows the theme or switches to one and saves it; colours are
-`[themes.<name>]` tables of roles in `config.toml`, and the renderer names no colour directly
-(D71). `/thinking` (or shift+tab) changes the reasoning effort for the session (D57), `/name` and
+`[themes.<name>]` tables of roles in `config.toml`, named as pi names them, and the renderer names no
+colour directly (D71, D72). A colour is an ANSI name, `#rgb`, `#rrggbb`, `oklch()`, `okhsl()`, a
+palette index, a `vars` entry, or `""` for the terminal default; `theme = "light/dark"` picks by
+`COLORFGBG`, and `--use-theme` chooses for one run. A pi role for something this interface does not
+draw is refused with that reason. `/thinking` (or shift+tab) changes the reasoning effort for the session (D57), `/name` and
 `/session` name and describe it (D55), and escape twice on an empty prompt opens the message tree (D54), where a prompt can be sent again to
 make another branch; `/clone` copies the branch into a separate session instead. There is no
 trust step (D44): nothing the agent runs can write a policy file, so `saddle check` is the whole
@@ -152,7 +155,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D71 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D72 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

@@ -389,7 +389,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/theme",
         args: "[name]",
-        about: "show the theme, or switch to another and save it",
+        about: "show the theme, or switch to another and save it (--use-theme for one run)",
     },
     SlashCommand {
         name: "/reload",

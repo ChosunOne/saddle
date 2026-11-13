@@ -1470,6 +1470,38 @@ one place at its root.
   again. It builds the theme before writing it, so a name that does not work cannot be saved and
   blamed on the next session. `/reload` re-reads the file, so a hand edit applies without a restart.
 
+**D72.** Theme parity with pi: its role names, its colour forms, its light/dark pairs.
+
+- **The role names are pi's**, so a palette copied from a pi theme can be pasted in and understood:
+  `accent`, `borderAccent`, `toolTitle`, `mdCodeBlockBorder`, `toolDiffContext`, `bashMode` and the
+  rest. D71 shipped eighteen kebab-case roles of my own invention; those are accepted as aliases so
+  a config written in the ten minutes they existed still loads, but the documented names are pi's.
+- **Roles pi has for things this interface does not draw are refused by name.** Syntax highlighting,
+  scrollbars, search matches, per-level thinking borders, hook-injected messages, HTML export — this
+  harness has no element for any of them, and a role nothing paints with is a setting that silently
+  does nothing. Setting one says exactly that, rather than "not a colour role", so a pasted pi theme
+  explains itself instead of looking like a typo.
+- **The colour forms are pi's**: an ANSI name, `#rgb` or `#rrggbb`, `oklch(62% 0.1 200)`,
+  `okhsl(250 60% 55%)`, a palette index 0–255, a `vars` entry, or `""` for the terminal default.
+  OKLCH and OKHSL are converted to sRGB here: OKHSL's saturation is relative to the most chroma the
+  gamut holds at that hue and lightness, found by bisection, which is what makes equal saturation
+  look equally colourful. No dependency was added for this; it is a page of arithmetic and it is
+  tested against the anchors (white, black, a blue, a red, and the gamut edge).
+- **`vars` are chained and a cycle is refused.** A var may name another var; a misspelt colour that
+  is neither a colour nor a var says which.
+- **`theme = "light/dark"` picks by terminal appearance**, pi's spelling: light first, dark second.
+  The appearance comes from `COLORFGBG`, which is what a terminal exports to answer this; dark when
+  it says nothing, as before. `--use-theme <name>` chooses for one run without writing anything.
+- **Roles that describe a real element are wired, not just parsed.** `toolTitle` is the tool's name
+  and `toolOutput` its body; `thinkingText` is a reasoning block; `userMessageText` the prompt;
+  `mdHeading`/`mdListBullet`/`mdHr`/`mdQuoteBorder` the markdown pieces; `toolDiffContext` a diff's
+  gutter; `borderAccent`, `borderMuted` and `bashMode` the three states of the editor's frame.
+- **Not taken: pi's `system` theme**, which queries the terminal's own palette and derives every
+  role from it with a WCAG contrast floor, rebuilding when the terminal's appearance changes. That
+  needs the query (OSC 11/4 with a timeout, on a terminal this harness does not currently question)
+  and the contrast solver; it is a separate piece of work, and it cannot be verified in a sandbox
+  with no terminal to answer.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

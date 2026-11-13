@@ -37,7 +37,7 @@ pub fn config_text(home: Option<&Path>) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        r#"# saddle's user configuration. saddle created it on first run; edit it freely. /login and
+        r##"# saddle's user configuration. saddle created it on first run; edit it freely. /login and
 # /model in the TUI update the provider settings and keep these comments.
 
 # The provider used when -p is not given. saddle asks on first run and /login changes it.
@@ -123,17 +123,30 @@ write = [{write}]
 # [themes.<name>], and it starts from the roles it does not list, so three lines restyle one thing:
 #
 #   [ui]
-#   theme = "mine"
+#   theme = "mine"              # or "light/dark": light theme first, dark theme second
 #
 #   [themes.mine]
-#   extends = "default"        # or "light", "mono", or another theme here
-#   accent = "magenta"         # an ANSI name, #rrggbb, or a palette index 0-255
-#   muted = "dark-gray"
+#   extends = "default"         # or "light", "mono", or another theme here
+#   accent = "#ff00ff"
+#   muted = "240"
 #
-# The roles are accent, muted, code, warn, error, success, link, text, diff-added, diff-removed,
-# tool-pending-bg, tool-ok-bg, tool-error-bg, tool-text, tool-error-text, compact-done-bg,
-# selection-bg and selection-fg. /theme switches and saves; /reload re-reads this file.
+#   [themes.mine.vars]          # values several roles share; a role may name one
+#   warn = "oklch(62% 0.1 200)"
 #
+# A colour is an ANSI name (cyan, dark-gray, …), #rgb or #rrggbb, oklch(62% 0.1 200),
+# okhsl(250 60% 55%), a palette index 0-255, a `vars` name, or "" for the terminal's default.
+#
+# The roles are pi's names, so a palette from a pi theme can be copied across:
+#   accent border borderAccent borderMuted success error warning muted dim text thinkingText
+#   selectedBg selectionFg userMessageText toolPendingBg toolSuccessBg toolErrorBg toolTitle
+#   toolOutput toolErrorText compactDoneBg mdHeading mdLink mdLinkUrl mdCode mdCodeBlock
+#   mdCodeBlockBorder mdQuote mdQuoteBorder mdHr mdListBullet toolDiffAdded toolDiffRemoved
+#   toolDiffContext bashMode
+# A role pi has for something this interface does not draw (syntax highlighting, scrollbars, search
+# matches, per-level thinking borders, custom messages, HTML export) is refused with that reason
+# rather than silently ignored.
+#
+# /theme switches and saves; --use-theme changes it for one run; /reload re-reads this file.
 # How the TUI starts. /settings changes these; ctrl+t and ctrl+o change them for one session.
 # [ui]
 # show-reasoning = true
@@ -160,7 +173,7 @@ write = [{write}]
 # input = 3.00                          # add `unit = "token"` if the table is priced per token
 # output = 15.00
 # cache-read = 0.30
-"#,
+"##,
         write = write,
     )
 }

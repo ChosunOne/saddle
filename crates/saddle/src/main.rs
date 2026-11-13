@@ -49,6 +49,9 @@ struct Cli {
     /// Drop a scope's grants for this run only, as in `--revoke net` (D63).
     #[arg(long, global = true)]
     revoke: Vec<String>,
+    /// Use this theme for one run without changing what is saved, as pi's `--use-theme` (D72).
+    #[arg(long, global = true, value_name = "NAME")]
+    use_theme: Option<String>,
     /// Name the session, so an allowance made with `saddle session allow` can be used by it. One is
     /// generated and printed when the workspace needs approving (D60).
     #[arg(long, global = true)]
@@ -211,10 +214,28 @@ fn run(cli: Cli) -> Result<ExitCode> {
     };
     match cli.cmd {
         None => run_agent(
-            &cli.dir, None, cli.agent, paths, created, &session, &overrides,
+            &cli.dir,
+            None,
+            cli.agent,
+            paths,
+            created,
+            OneRun {
+                session: &session,
+                overrides: &overrides,
+                theme: cli.use_theme,
+            },
         ),
         Some(Cmd::Run { prompt, agent }) => run_agent(
-            &cli.dir, prompt, agent, paths, created, &session, &overrides,
+            &cli.dir,
+            prompt,
+            agent,
+            paths,
+            created,
+            OneRun {
+                session: &session,
+                overrides: &overrides,
+                theme: cli.use_theme,
+            },
         ),
         Some(Cmd::Check) => check(&cli.dir, &overrides),
         Some(Cmd::Tool { name, input }) => {
@@ -225,14 +246,20 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
+/// What this invocation chose that is not written to any file (D63, D72).
+struct OneRun<'a> {
+    session: &'a str,
+    overrides: &'a config::Overrides,
+    theme: Option<String>,
+}
+
 fn run_agent(
     dir: &Path,
     prompt: Option<String>,
     args: AgentArgs,
     paths: paths::Paths,
     created: Vec<String>,
-    session: &str,
-    overrides: &config::Overrides,
+    one: OneRun<'_>,
 ) -> Result<ExitCode> {
     let user = UserConfig::load(&paths.user_config())?;
     // Before a provider is chosen and before anything is opened, so a refusal costs nothing: no
@@ -242,9 +269,9 @@ fn run_agent(
             .canonicalize()
             .map(|abs| paths::find_workspace(&abs))
             .unwrap_or_else(|_| dir.to_path_buf());
-        gate_workspace(&paths, &workspace, session)?
+        gate_workspace(&paths, &workspace, one.session)?
     };
-    let session = picked.unwrap_or_else(|| session.to_owned());
+    let session = picked.unwrap_or_else(|| one.session.to_owned());
     let session = session.as_str();
     let auth = auth::AuthStore::load(&paths.auth_store())?;
     let mut reported = provider::Reported::stored(&paths.reported_windows());
@@ -285,7 +312,7 @@ fn run_agent(
         },
     };
 
-    let mut session = Session::open_with(dir, Some(session), overrides)?;
+    let mut session = Session::open_with(dir, Some(session), one.overrides)?;
     let secrets = provider::secret_env_names(&user.providers);
     session.host_env.retain(|(k, _)| !secrets.contains(k));
     let (context, refused) = context::load(&mut session, &user.context, &paths)?;
@@ -339,7 +366,8 @@ fn run_agent(
         // Unlimited unless the flag or the config sets a limit (D37).
         max_steps: args.max_steps.or(user.max_steps),
         images: user.ui.images.clone(),
-        theme: user.ui.theme.clone(),
+        // One run's choice wins over the saved setting, and is not written anywhere.
+        theme: one.theme.clone().or_else(|| user.ui.theme.clone()),
     };
     let store = store::Store::open(&paths.session_db(), session.setup.workspace.clone())?;
     let latest = if args.resume_latest {
