@@ -23,7 +23,14 @@ use std::net::IpAddr;
 /// the query arrives here instead, where [`crate::dns`] answers it. It gives nothing away: the
 /// address becomes local, so there is no route to the real host behind it, which is the point.
 pub fn enter(resolvers: &[IpAddr]) -> Result<(), String> {
-    user_namespace()?;
+    // The real ids are read before the namespace exists: inside a fresh user namespace with no map
+    // yet, `getuid` already answers with the overflow id, and mapping `0 65534 1` is what the kernel
+    // refuses.
+    let ids = Ids {
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
+    };
+    user_namespace(ids)?;
     net_namespace()?;
     raise_loopback()?;
     for ip in resolvers {
@@ -40,22 +47,35 @@ pub fn enter(resolvers: &[IpAddr]) -> Result<(), String> {
     Ok(())
 }
 
-fn user_namespace() -> Result<(), String> {
+struct Ids {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+}
+
+fn user_namespace(ids: Ids) -> Result<(), String> {
     // SAFETY: unshare(2) takes flags and returns an integer.
     if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
         return Err(format!("CLONE_NEWUSER: {}", io::Error::last_os_error()));
     }
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
     // An unprivileged user may not map a group before giving up setgroups(2).
     let _ = std::fs::write("/proc/self/setgroups", "deny");
-    // One id, mapped to the same user: files stay owned by them, so nothing on disk changes owner
-    // because of the sandbox.
+    // One id, mapped to the same user: the command is root inside the namespace, which is what lets
+    // it bind the ports a name resolves to, while every file it touches is still theirs on disk.
     for (file, line) in [
-        ("/proc/self/uid_map", format!("0 {uid} 1\n")),
-        ("/proc/self/gid_map", format!("0 {gid} 1\n")),
+        ("/proc/self/uid_map", format!("0 {} 1\n", ids.uid)),
+        ("/proc/self/gid_map", format!("0 {} 1\n", ids.gid)),
     ] {
         std::fs::write(file, line).map_err(|e| format!("{file}: {e}"))?;
+    }
+    // A namespace entered without a map cannot be left again, so it is checked rather than assumed:
+    // an unmapped id would leave every file looking as if it belonged to nobody.
+    // SAFETY: getuid(2) has no arguments and cannot fail.
+    let mapped = unsafe { libc::getuid() } == 0;
+    if !mapped {
+        return Err(
+            "the user namespace was entered but not mapped, so the command would run unmapped"
+                .to_owned(),
+        );
     }
     Ok(())
 }

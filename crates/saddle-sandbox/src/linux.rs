@@ -63,10 +63,17 @@ fn start_network(spec: &SandboxSpec) -> bool {
     let resolvers = std::fs::read_to_string("/etc/resolv.conf")
         .map(|text| crate::namespaces::resolvers(&text))
         .unwrap_or_default();
-    if crate::namespaces::enter(&resolvers).is_err() {
+    if let Err(why) = crate::namespaces::enter(&resolvers) {
+        // Said out loud rather than swallowed: the command still runs, but with no network, and a
+        // person needs to know which of the two they got and why.
+        eprintln!("saddle-sandbox: no network for this command: {why}");
         return false;
     }
-    crate::relay::spawn(net, &resolvers).is_ok()
+    if let Err(why) = crate::relay::spawn(net, &resolvers) {
+        eprintln!("saddle-sandbox: no network for this command: {why}");
+        return false;
+    }
+    true
 }
 
 fn existing(paths: &[PathBuf]) -> impl Iterator<Item = &PathBuf> {
