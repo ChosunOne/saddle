@@ -59,6 +59,8 @@ pub struct Request {
     pub model: String,
     pub usage: Usage,
     pub cost: f64,
+    /// Reasoning items the provider said it removed from what it was sent (D97).
+    pub dropped: u64,
 }
 
 /// Which request a `usage` row is.
@@ -88,6 +90,8 @@ pub struct RequestRow {
     pub model: String,
     pub usage: Usage,
     pub cost: f64,
+    /// Reasoning items the provider said it removed from the prompt (D97).
+    pub dropped: u64,
     /// When the row was written, to the second.
     pub at: String,
     /// The ordinal of the last message before this request, or 0 when it came first.
@@ -120,6 +124,7 @@ fn request_row(node: &Node, after: usize) -> RequestRow {
         model: body["model"].as_str().unwrap_or_default().to_owned(),
         usage: serde_json::from_value(body["usage"].clone()).unwrap_or_default(),
         cost: body["cost"].as_f64().unwrap_or(0.0),
+        dropped: body["dropped"].as_u64().unwrap_or(0),
         at: node.created.clone(),
         after,
     }
@@ -314,6 +319,7 @@ impl Store {
             "model": request.model,
             "usage": request.usage,
             "cost": request.cost,
+            "dropped": request.dropped,
         });
         self.push(session, kind::USAGE, &body.to_string())?;
         Ok(())
@@ -1053,6 +1059,7 @@ mod tests {
                     cache_write: 0,
                 },
                 cost: 0.25,
+                dropped: 0,
             },
         )
         .unwrap();
@@ -1096,6 +1103,7 @@ mod tests {
                     cache_write: 0,
                 },
                 cost: 0.02,
+                dropped: 3,
             },
         )
         .unwrap();
@@ -1113,6 +1121,7 @@ mod tests {
                     cache_write: 200,
                 },
                 cost: 0.01,
+                dropped: 0,
             },
         )
         .unwrap();
@@ -1125,6 +1134,8 @@ mod tests {
         assert_eq!(rows[0].kind, "reply");
         assert_eq!(rows[0].usage.cache_read, 900);
         assert!((rows[0].cost - 0.02).abs() < 1e-9);
+        // What the provider said it removed from the prompt travels with the row (D97).
+        assert_eq!(rows[0].dropped, 3);
         // The second request follows the third message, and a compaction is recorded as one.
         assert_eq!(rows[0].after, 2);
         assert_eq!(rows[1].after, 3);
@@ -1150,6 +1161,7 @@ mod tests {
                 model: "gpt".into(),
                 usage: Usage::default(),
                 cost: 0.0,
+                dropped: 0,
             },
         )
         .unwrap();

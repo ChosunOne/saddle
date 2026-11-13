@@ -281,6 +281,8 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
     Ok(Reply {
         parts,
         stop,
+        // Anthropic reports no such thing; a thinking block it did not accept is an error instead.
+        dropped_reasoning: 0,
         stop_raw,
         model,
         usage,

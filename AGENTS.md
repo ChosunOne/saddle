@@ -38,7 +38,7 @@ Inside `crates/saddle/src`:
 | `output` | line-mode output: a terminal, or one JSON object per line for a program (D52) |
 | `cache` | the cache-miss notice: one line to the user when a prompt is re-read at full price (D50) |
 | `reserved` | the D20 snapshot and restore of reserved paths around `exec` |
-| `provider/` | the neutral conversation form, the Anthropic, OpenAI-compatible and Responses renderers (every other server is a `[providers.<name>]` table naming which one it imitates, D84), OAuth login and token refresh (D85), the model list, the cached context windows and prices (D34, D36) |
+| `provider/` | the neutral conversation form, the Anthropic, OpenAI-compatible and Responses renderers (every other server is a `[providers.<name>]` table naming which one it imitates, D84), OAuth login and token refresh (D85), the model list, the cached context windows and prices (D34, D36); reasoning is kept for every model and replayed in its original position (D95, D96) |
 | `tui/` | the full-screen UI: app state, rendering (a prompt is markdown in the user's colour, D81; tables are fitted to the width, D83), editor, login (a key or an OAuth sign-in, D85; the searchable model picker `/model` opens, D88), selection (a drag copies the transcript's text or the open dialog's, D87), settings, session list, `permissions` (the grants editor, D45), `tree` (the message tree, D54), `image` (drawing a picture: kitty and iTerm2, D59), `status` (the `[ui] status` template, D36), `theme` (the colour roles, D71), `palette` (pi's role vocabulary, colour forms and the palette derived from the terminal, D72, D73), `terminal` (asking the terminal for its colours, D73), `syntax` (code blocks: syntect's grammars, nine roles, the theme's colours, D80) and `themes` (the `/theme` picker, D74), and `browser` (opening the link a sign-in shows, D86) |
 
 `crates/saddle/src/main.rs` dispatches subcommands (`run`, `check`, `tool`, `audit verify`)
@@ -74,9 +74,10 @@ existing explicit `[agent]` tables remain as written, and `--revoke transcript-r
 one run. It queries only the active conversation branch, including pre-compaction messages, through
 two in-memory views:
 `messages(ordinal, id, role, text)`, and `requests(ordinal, node, kind, provider, model, input,
-output, cache_read, cache_write, cached, cost, at, after)` — one row per model request, `kind` being
-`reply` or `summary`, `cached` 1 when the prompt came from the provider's cache, and `after` the
-ordinal of the last message before it (D92, D94). That is what a poor cache hit rate is diagnosed
+output, cache_read, cache_write, cached, cost, reasoning_dropped, at, after)` — one row per model
+request, `kind` being `reply` or `summary`, `cached` 1 when the prompt came from the provider's
+cache, `reasoning_dropped` the reasoning items the provider said it removed from the prompt (D97),
+and `after` the ordinal of the last message before it (D92, D94). That is what a poor cache hit rate is diagnosed
 with: `SELECT provider, model, sum(cache_read), sum(input + cache_read + cache_write) FROM requests
 GROUP BY provider, model` (D94). It never runs SQL on the saved database, grants filesystem
 access to state, or permits transcript mutation (D92). Results are capped at 100 rows and 50 KiB;
@@ -274,7 +275,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D94 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D97 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

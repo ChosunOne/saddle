@@ -751,7 +751,7 @@ impl App {
         // The old highlight points at lines that no longer exist.
         self.selection = None;
         self.scroll = 0;
-        let prompts = items.iter().filter(|i| i.text().is_some()).count();
+        let prompts = items.iter().filter(|i| i.prompt().is_some()).count();
         let plural = if prompts == 1 { "" } else { "s" };
         self.info(&format!("resumed a session of {prompts} prompt{plural}"));
         for entry in entries_from(items) {

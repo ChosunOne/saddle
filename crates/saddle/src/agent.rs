@@ -643,7 +643,7 @@ impl Agent {
         // here any more, and pasting it over the conversation would lose whatever replaced it.
         if with_summary(&self.items, background.cut, &background.prefix, "").is_none() {
             // The request was made and paid for even though its answer is unusable (D78).
-            self.record_spend(&summary.usage, RequestKind::Summary, ui);
+            self.record_spend(&summary.usage, RequestKind::Summary, 0, ui);
             self.log(
                 session,
                 json!({ "compaction": "BackgroundDiscarded", "usage": summary.usage }),
@@ -700,7 +700,7 @@ impl Agent {
             }),
             "conversation compacted",
         )?;
-        self.record_spend(&summary.usage, RequestKind::Summary, ui);
+        self.record_spend(&summary.usage, RequestKind::Summary, 0, ui);
         let kept_len = new_items.len() - 1;
         // A background summary is silent while it is written, so the text arrives here (D78).
         if reason == Reason::Background {
@@ -731,8 +731,17 @@ impl Agent {
     /// a total that hides it would be a total that lies (D78) — and for a cache hit rate, the
     /// request that filled a cache is as much part of the story as the one that read it.
     ///
+    /// `dropped` is how many reasoning items the provider said it removed from the prompt, which a
+    /// compaction request has no way of knowing (D97).
+    ///
     /// Returns the cost, so the caller that tells the interface does not compute it a second time.
-    fn record_spend(&mut self, usage: &Usage, kind: RequestKind, ui: &mut dyn Ui) -> f64 {
+    fn record_spend(
+        &mut self,
+        usage: &Usage,
+        kind: RequestKind,
+        dropped: u64,
+        ui: &mut dyn Ui,
+    ) -> f64 {
         let cost = self.cost_of(usage);
         self.cost += cost;
         let (provider, model) = self
@@ -746,6 +755,7 @@ impl Agent {
             model,
             usage: *usage,
             cost,
+            dropped,
         };
         if let (Some(store), Some(id)) = (&self.store, &self.saved)
             && let Err(e) = store.request(id, &request)
@@ -1458,7 +1468,12 @@ impl Agent {
             u.cache_read += reply.usage.cache_read;
             u.cache_write += reply.usage.cache_write;
             // What this reply cost, from whatever price the config or the endpoint gave (D36).
-            let cost = self.record_spend(&reply.usage, RequestKind::Reply, ui);
+            let cost = self.record_spend(
+                &reply.usage,
+                RequestKind::Reply,
+                reply.dropped_reasoning,
+                ui,
+            );
             ui.reply(&reply, cost);
             // A cache that has stopped being read costs several times what it should, and no
             // token count shows it. The user is told; the model is not (D50).
@@ -2293,6 +2308,7 @@ mod tests {
                         cache_write: 0,
                     },
                     cost: 0.0,
+                    dropped: 0,
                 },
             )
             .unwrap();
@@ -2334,10 +2350,11 @@ mod tests {
                 cache_write: 0,
             },
             RequestKind::Reply,
+            0,
             &mut ui,
         );
         // A compaction is a request the person paid for too, and it says so.
-        agent.record_spend(&Usage::default(), RequestKind::Summary, &mut ui);
+        agent.record_spend(&Usage::default(), RequestKind::Summary, 0, &mut ui);
 
         let snapshot = agent.store.as_ref().unwrap().snapshot(&id).unwrap();
         let rows = &snapshot.requests;

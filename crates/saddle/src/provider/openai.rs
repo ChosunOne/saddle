@@ -48,13 +48,18 @@ pub fn body(cfg: &ProviderConfig, conv: &Conversation<'_>) -> Value {
     body
 }
 
-/// Renders the conversation. Reasoning goes back as `reasoning_content` only for the replies since
-/// the last user message, where a thinking model continues its own tool loop; older reasoning is
-/// dropped to save context.
+/// Renders the conversation. Reasoning goes back as `reasoning_content` on every assistant message
+/// that arrived with some (D96).
+///
+/// Nothing is dropped by default: a provider that sent reasoning is telling us it wants it back, and
+/// deleting an earlier one rewrites the middle of the prompt, which costs a prompt-cache miss and,
+/// on DeepSeek, a 400 — a request that carries `tools` must pass every earlier turn's
+/// `reasoning_content` back, and a request without `tools` ignores what it is given. Always sending
+/// is therefore right for both. A server that sends no reasoning, such as OpenAI's own chat
+/// completions, has none to echo, so nothing is added for it.
 pub fn messages(system: &str, items: &[Item]) -> Vec<Value> {
     let mut out = vec![json!({ "role": "system", "content": system })];
-    let current_turn = items.iter().rposition(|i| i.text().is_some()).unwrap_or(0);
-    for (index, item) in items.iter().enumerate() {
+    for item in items {
         match item {
             Item::User(text) => out.push(json!({ "role": "user", "content": text })),
             // OpenAI carries an image as a second content part with a data URL, which is the only
@@ -138,20 +143,18 @@ pub fn messages(system: &str, items: &[Item]) -> Vec<Value> {
                 if !calls.is_empty() {
                     msg["tool_calls"] = calls.into();
                 }
-                if index > current_turn {
-                    let reasoning: String = parts
-                        .iter()
-                        .filter_map(|p| match p {
-                            Part::Native {
-                                api: Api::Openai,
-                                block,
-                            } => block["reasoning_content"].as_str(),
-                            _ => None,
-                        })
-                        .collect();
-                    if !reasoning.is_empty() {
-                        msg["reasoning_content"] = reasoning.into();
-                    }
+                let reasoning: String = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        Part::Native {
+                            api: Api::Openai,
+                            block,
+                        } => block["reasoning_content"].as_str(),
+                        _ => None,
+                    })
+                    .collect();
+                if !reasoning.is_empty() {
+                    msg["reasoning_content"] = reasoning.into();
                 }
                 out.push(msg);
             }
@@ -208,6 +211,10 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
                 .unwrap_or(0);
             usage.input = prompt.saturating_sub(cached);
             usage.cache_read = cached;
+            // D97: a cache write is billed above the ordinary input rate (D36).
+            usage.cache_write = u["prompt_tokens_details"]["cache_write_tokens"]
+                .as_u64()
+                .unwrap_or(0);
             usage.output = u["completion_tokens"].as_u64().unwrap_or(usage.output);
         }
         let Some(choice) = chunk["choices"].get(0) else {
@@ -290,6 +297,7 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
         stop_raw: finish,
         model,
         usage,
+        dropped_reasoning: 0,
     })
 }
 
@@ -438,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_is_kept_and_sent_back_only_within_the_turn() {
+    fn reasoning_is_sent_back_for_every_turn() {
         let stream = sse(&[
             json!({"choices":[{"index":0,"delta":{"reasoning_content":"think "}}]}),
             json!({"choices":[{"index":0,"delta":{"reasoning":"more"}}]}),
@@ -464,9 +472,30 @@ mod tests {
             Item::User("two".into()),
             current,
         ];
+        // D96: the earlier turn's reasoning is still on the wire. Dropping it rewrites the middle
+        // of the prompt, which costs a prompt-cache miss, and DeepSeek answers a request that
+        // carries `tools` with a 400 when an earlier turn's reasoning is missing.
         let m = messages("s", &items);
-        assert!(m[2].get("reasoning_content").is_none());
+        assert_eq!(m[2]["reasoning_content"], "think more");
         assert_eq!(m[4]["reasoning_content"], "think more");
+    }
+
+    #[test]
+    fn a_cache_write_is_counted() {
+        // D97: a write is billed above the ordinary input rate, so a cold turn priced as a plain
+        // read under-reports what it cost (D36).
+        let stream = sse(&[
+            json!({"choices":[{"index":0,"delta":{"content":"x"}}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":100,"cache_write_tokens":800}}}),
+        ]);
+        let reply = read_stream(
+            sse::Reader::new(stream.as_bytes()),
+            &mut Collect(String::new()),
+        )
+        .unwrap();
+        assert_eq!(reply.usage.cache_read, 100);
+        assert_eq!(reply.usage.cache_write, 800);
+        assert_eq!(reply.usage.input, 900, "input stays the uncached part");
     }
 
     #[test]

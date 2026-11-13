@@ -63,20 +63,28 @@ pub fn body(cfg: &super::ProviderConfig, conv: &Conversation<'_>) -> Value {
     if let Some(n) = cfg.max_tokens {
         body["max_output_tokens"] = n.into();
     }
+    // D95: a summary is only emitted when it is asked for, so without this key the TUI has nothing
+    // to show even though the model reasoned. `auto` is the most detailed summarizer a model has;
+    // the named ones differ by model and `concise` is refused outright by some of them.
+    //
+    // `reasoning.context` is deliberately left out, which means `auto`: the model's own default.
+    // Naming `all_turns` would be refused by models that do not have it, and the client does not
+    // need it — every reasoning item is replayed below, so the prefix is the same either way.
+    let mut reasoning = json!({ "summary": "auto" });
     if let Some(effort) = &cfg.effort {
-        body["reasoning"] = json!({ "effort": effort });
-        // Without this the reasoning that came back cannot be sent back, and a thinking model
-        // loses the thread between tool calls.
-        body["include"] = json!(["reasoning.encrypted_content"]);
+        reasoning["effort"] = effort.as_str().into();
     }
+    body["reasoning"] = reasoning;
+    // The encrypted reasoning comes back by itself in stateless mode, so the legacy
+    // `reasoning.encrypted_content` include is not sent: it buys nothing and a strict server may
+    // refuse a value it does not know.
     body
 }
 
 /// The conversation as Responses items.
 pub fn input(items: &[Item]) -> Vec<Value> {
-    let current_turn = items.iter().rposition(|i| i.text().is_some()).unwrap_or(0);
     let mut out = Vec::new();
-    for (index, item) in items.iter().enumerate() {
+    for item in items {
         match item {
             Item::User(text) => out.push(message("user", &[text_part(text)])),
             Item::Attached { text, images } => {
@@ -123,11 +131,11 @@ pub fn input(items: &[Item]) -> Vec<Value> {
                             // way in goes back as `{}`.
                             "arguments": c.input.as_ref().map_or_else(|_| "{}".to_owned(), Value::to_string),
                         })),
-                        // Reasoning only goes back for the replies since the last user message, so a
-                        // tool loop continues its own thinking and older turns do not pay for it.
-                        Part::Native { api, block }
-                            if *api == Api::OpenaiResponses && index >= current_turn =>
-                        {
+                        // D95: every reasoning item goes back, in the position it was produced, for
+                        // the whole conversation. Deleting an earlier one is a change to the prefix:
+                        // it stops the prompt cache matching from that point, and the API answers
+                        // by dropping the reasoning that follows it as well.
+                        Part::Native { api, block } if *api == Api::OpenaiResponses => {
                             out.push(block.clone());
                         }
                         _ => {}
@@ -170,6 +178,10 @@ struct Pending {
 pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<Reply> {
     let mut text = String::new();
     let mut reasoning = String::new();
+    // D95: the reasoning items exactly as the server sent them. They carry an opaque
+    // `encrypted_content` and an id, and only the server can read either: what comes back here must
+    // go back out unchanged, or the model starts the next step without the thinking it already did.
+    let mut reasoning_items: Vec<Value> = Vec::new();
     let mut calls: BTreeMap<u64, Pending> = BTreeMap::new();
     // The event stream identifies a call by its output index and by `item_id`; both are kept so a
     // delta lands on the right one whichever the server sends.
@@ -178,6 +190,7 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
     let mut model = String::new();
     let mut status = String::new();
     let mut incomplete = String::new();
+    let mut dropped_reasoning = 0;
     let mut finished = false;
 
     while let Some(ev) = events.next(sink)? {
@@ -233,6 +246,11 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
             }
             "response.output_item.done" => {
                 let item = &event["item"];
+                if item["type"] == "reasoning" {
+                    // Verbatim: id, summary, encrypted_content and whatever else the server put
+                    // there. This is the thing D95 exists for.
+                    reasoning_items.push(item.clone());
+                }
                 if item["type"] == "function_call" {
                     let index = event["output_index"].as_u64().unwrap_or(0);
                     let pending = calls.entry(index).or_default();
@@ -269,7 +287,13 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
                     .unwrap_or(0);
                 usage.input = input_tokens.saturating_sub(cached);
                 usage.cache_read = cached;
+                // D97: a write is billed above the ordinary input rate, so leaving it out prices a
+                // cold turn as if it were a plain read (D36).
+                usage.cache_write = u["input_tokens_details"]["cache_write_tokens"]
+                    .as_u64()
+                    .unwrap_or(0);
                 usage.output = u["output_tokens"].as_u64().unwrap_or(usage.output);
+                dropped_reasoning = dropped(&response["input_transformations"]);
                 finished = true;
             }
             "response.failed" => {
@@ -285,12 +309,18 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
     }
 
     let mut parts = Vec::new();
-    if !reasoning.is_empty() {
+    if reasoning_items.is_empty() && !reasoning.is_empty() {
+        // A server that streamed a summary without sending an item of its own: the text is still
+        // kept, so the transcript and the display have it.
         parts.push(Part::Native {
             api: Api::OpenaiResponses,
             block: json!({ "type": "reasoning", "summary": [{ "type": "summary_text", "text": reasoning }] }),
         });
     }
+    parts.extend(reasoning_items.into_iter().map(|block| Part::Native {
+        api: Api::OpenaiResponses,
+        block,
+    }));
     if !text.is_empty() {
         parts.push(Part::Text(text));
     }
@@ -339,7 +369,28 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
         },
         model,
         usage,
+        dropped_reasoning,
     })
+}
+
+/// How many input items the API said it removed before answering (D97).
+///
+/// The field is reported but not documented field by field, so an entry that does not say what it
+/// touched counts as a removal: a drop that was silently ignored because the schema moved is the
+/// one thing this number must never do.
+fn dropped(transformations: &Value) -> u64 {
+    let Some(list) = transformations.as_array() else {
+        return 0;
+    };
+    list.iter()
+        .filter(|t| {
+            let named = t["item_type"]
+                .as_str()
+                .or_else(|| t["type"].as_str())
+                .unwrap_or_default();
+            named.is_empty() || named.contains("reasoning")
+        })
+        .count() as u64
 }
 
 fn message_of(error: &Value) -> String {
@@ -577,5 +628,119 @@ mod tests {
         let reply = read_stream(events, &mut sink).unwrap();
         assert_eq!(reply.stop, Stop::MaxTokens);
         assert_eq!(reply.stop_raw, "max_output_tokens");
+    }
+
+    #[test]
+    fn a_reasoning_item_is_carried_back_exactly_as_it_arrived() {
+        // D95: the item carries an opaque `encrypted_content` that only the server can read.
+        // Rebuilding it from the summary text throws that away, and with `store: false` it is the
+        // only continuity between one step of a tool loop and the next.
+        let events = Script(vec![
+            (
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","delta":"weighing it up"}"#,
+            ),
+            (
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"weighing it up"}],"encrypted_content":"gAAAA-opaque"}}"#,
+            ),
+            (
+                "response.output_text.delta",
+                r#"{"type":"response.output_text.delta","delta":"done"}"#,
+            ),
+            (
+                "response.completed",
+                r#"{"type":"response.completed","response":{"model":"m","status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}"#,
+            ),
+        ]);
+        let mut sink = Silent;
+        let reply = read_stream(events, &mut sink).unwrap();
+        let kept: Vec<&Value> = reply
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                Part::Native {
+                    api: Api::OpenaiResponses,
+                    block,
+                } => Some(block),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kept.len(),
+            1,
+            "the item, not the item and a rebuilt one: {kept:?}"
+        );
+        assert_eq!(kept[0]["id"], "rs_1");
+        assert_eq!(kept[0]["encrypted_content"], "gAAAA-opaque");
+
+        // And it goes back out unchanged — in an earlier turn as much as this one.
+        let items = vec![
+            Item::User("first".into()),
+            Item::Assistant(reply.parts.clone()),
+            Item::User("second".into()),
+        ];
+        let sent = input(&items);
+        assert_eq!(sent[1]["type"], "reasoning");
+        assert_eq!(sent[1]["id"], "rs_1");
+        assert_eq!(sent[1]["encrypted_content"], "gAAAA-opaque");
+    }
+
+    #[test]
+    fn a_summary_is_asked_for_and_the_legacy_include_is_not_sent() {
+        // D95: without `summary` the server answers with an empty summary array, so the interface
+        // has nothing to show however much the model thought.
+        let items = vec![Item::User("hello".into())];
+        let conv = Conversation {
+            system: "s",
+            tools: &[],
+            items: &items,
+        };
+        let plain = body(&config(), &conv);
+        assert_eq!(plain["reasoning"]["summary"], "auto");
+        assert!(
+            plain["reasoning"].get("effort").is_none(),
+            "default sends no effort"
+        );
+        assert!(
+            plain.get("include").is_none(),
+            "encrypted reasoning arrives unasked for in stateless mode"
+        );
+
+        let mut cfg = config();
+        cfg.effort = Some("high".into());
+        let with_effort = body(&cfg, &conv);
+        assert_eq!(with_effort["reasoning"]["effort"], "high");
+        assert_eq!(with_effort["reasoning"]["summary"], "auto");
+        // `context` is left to the model: naming `all_turns` is refused by models without it, and
+        // every reasoning item is replayed anyway, so the prefix is the same either way.
+        assert!(with_effort["reasoning"].get("context").is_none());
+    }
+
+    #[test]
+    fn a_cache_write_and_the_reasoning_the_api_dropped_are_read() {
+        // D97: a write is billed above the ordinary input rate, and a drop is the API telling us
+        // it rewrote our prompt. Both are invisible in the token counts alone.
+        let events = Script(vec![(
+            "response.completed",
+            r#"{"type":"response.completed","response":{"model":"m","status":"completed","usage":{"input_tokens":900,"output_tokens":7,"input_tokens_details":{"cached_tokens":100,"cache_write_tokens":800}},"input_transformations":[{"item_type":"reasoning","reason":"prefix_mismatch"}]}}"#,
+        )]);
+        let mut sink = Silent;
+        let reply = read_stream(events, &mut sink).unwrap();
+        assert_eq!(reply.usage.cache_read, 100);
+        assert_eq!(reply.usage.cache_write, 800);
+        assert_eq!(reply.dropped_reasoning, 1);
+    }
+
+    #[test]
+    fn nothing_dropped_reads_as_zero() {
+        let events = Script(vec![(
+            "response.completed",
+            r#"{"type":"response.completed","response":{"model":"m","status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}"#,
+        )]);
+        let mut sink = Silent;
+        let reply = read_stream(events, &mut sink).unwrap();
+        assert_eq!(reply.dropped_reasoning, 0);
+        assert_eq!(reply.usage.cache_write, 0);
     }
 }

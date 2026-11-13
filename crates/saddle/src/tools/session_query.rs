@@ -78,9 +78,10 @@ fn query(snapshot: &Snapshot, sql: &str) -> Result<Value> {
         CREATE TABLE request_snapshot(
             ordinal INTEGER, node INTEGER, kind TEXT, provider TEXT, model TEXT,
             input INTEGER, output INTEGER, cache_read INTEGER, cache_write INTEGER,
-            cached INTEGER, cost REAL, at TEXT, after INTEGER);
+            cached INTEGER, cost REAL, dropped INTEGER, at TEXT, after INTEGER);
         CREATE VIEW requests AS SELECT ordinal, node, kind, provider, model, input, output,
-            cache_read, cache_write, cached, cost, at, after FROM request_snapshot;",
+            cache_read, cache_write, cached, cost, dropped AS reasoning_dropped, at, after
+            FROM request_snapshot;",
     )?;
     {
         let mut insert = conn.prepare("INSERT INTO message_snapshot VALUES (?1, ?2, ?3, ?4)")?;
@@ -89,7 +90,7 @@ fn query(snapshot: &Snapshot, sql: &str) -> Result<Value> {
         }
     }
     {
-        let mut insert = conn.prepare("INSERT INTO request_snapshot VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)")?;
+        let mut insert = conn.prepare("INSERT INTO request_snapshot VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)")?;
         for (ordinal, row) in snapshot.requests.iter().enumerate() {
             insert.execute(params![
                 (ordinal + 1) as i64,
@@ -105,6 +106,7 @@ fn query(snapshot: &Snapshot, sql: &str) -> Result<Value> {
                 // source of truth; this is the question a hit rate is about (D94).
                 i64::from(row.usage.cache_read > 0),
                 row.cost,
+                row.dropped as i64,
                 row.at,
                 row.after as i64,
             ])?;
@@ -187,6 +189,7 @@ mod tests {
                 cache_write: 0,
             },
             cost: 0.01,
+            dropped: 0,
             at: "2026-01-01T00:00:00Z".into(),
             after: 1,
         }
@@ -233,6 +236,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["rows"], json!([[2, "reply", "glm", 1_000, 900, 1, 1]]));
+    }
+
+    #[test]
+    fn a_request_carries_the_reasoning_the_provider_dropped() {
+        // D97: the number that answers "is the API eating my reasoning" from a query.
+        let mut dropped = request("openai", "gpt", 500, 0);
+        dropped.dropped = 2;
+        let snapshot = Snapshot {
+            messages: messages().messages,
+            requests: vec![
+                request("openai", "gpt", 500, 400),
+                dropped,
+                request("openai", "gpt", 500, 0),
+            ],
+        };
+        let out = query(
+            &snapshot,
+            "SELECT ordinal, reasoning_dropped FROM requests ORDER BY ordinal",
+        )
+        .unwrap();
+        assert_eq!(out["rows"], json!([[1, 0], [2, 2], [3, 0]]));
     }
 
     #[test]

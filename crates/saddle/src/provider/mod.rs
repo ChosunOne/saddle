@@ -223,10 +223,14 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
 }
 
 impl Item {
-    /// The prompt text, with an attachment's own text standing in for a plain prompt.
-    pub fn text(&self) -> Option<&str> {
+    /// The prompt the person wrote, with an attachment's own text standing in for it.
+    ///
+    /// A compaction summary is deliberately not one: it stands in for messages rather than being
+    /// something a person typed. This is not a question about which turn is current — D96 removed
+    /// that notion from both renderers, because dropping an earlier turn rewrites the prefix.
+    pub fn prompt(&self) -> Option<&str> {
         match self {
-            Item::User(t) | Item::Summary(t) => Some(t),
+            Item::User(text) => Some(text),
             Item::Attached { text, .. } => Some(text),
             _ => None,
         }
@@ -400,6 +404,12 @@ pub struct Reply {
     pub stop_raw: String,
     pub model: String,
     pub usage: Usage,
+    /// How many reasoning items the API said it removed from the input it was sent (D97).
+    ///
+    /// A server drops reasoning when the history before it changed, which is its own anti-distillation
+    /// rule rather than anything saddle asked for. It is counted here so the store can record it and
+    /// the question "is the API eating my reasoning" is a query rather than a guess.
+    pub dropped_reasoning: u64,
 }
 
 impl Reply {

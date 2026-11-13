@@ -284,8 +284,9 @@ provider's models. D91 supersedes saving that choice as the default: the choice 
 conversation, and only ctrl+s in the model list saves a default. The host holds the conversation in one
 neutral form and renders it for each request. A block the loop does not interpret, such as an
 Anthropic thinking block, is kept and sent back unchanged in its original position. Reasoning from
-an OpenAI-compatible thinking model goes back as `reasoning_content` within the turn that produced
-it and is dropped after.
+an OpenAI-compatible thinking model goes back as `reasoning_content` on every assistant message that
+arrived with some; D96 supersedes the earlier rule that kept it only within the turn that produced
+it.
 
 - A key comes from the provider's environment variable or, without one, from
   `$XDG_STATE_HOME/saddle/auth.json` (mode 0600), which `/login` in the TUI writes. The state
@@ -2348,6 +2349,81 @@ agent's reach by design and is not where a conversation's own numbers live.
 - **A row written before this reads as `unknown`** for its kind and empty for its provider and model,
   rather than being dropped or guessed at. What it cost is still true, and inventing a provider would
   make a hit rate lie. Rows imported from the older JSON Lines files are the same case.
+
+**D95.** A reasoning item is an opaque value to carry, not text to rebuild, and the summary it
+contains has to be asked for.
+
+A ChatGPT subscription reaches the Responses API, which keeps no conversation of its own: every
+request carries the whole history and `store` is `false`. In that mode the *only* continuity between
+one step of a tool loop and the next is the reasoning item the server sent back — an `id`, a
+`summary` array, and an `encrypted_content` blob that nothing but the server can read.
+
+Saddle asked for that blob on every request and then threw it away on every reply: the parser matched
+`function_call` items and ignored `reasoning` ones, and rebuilt a part from the streamed summary
+text, which cannot be decrypted. So the model restarted each step without its own thinking.
+
+- **The item is kept verbatim** — `id`, `type`, `summary`, `encrypted_content` and anything else the
+  server put in it — and replayed unchanged in the position it was produced. A summary-only part is
+  still built when a server streams summary text without sending an item, so nothing is lost from
+  the display.
+- **A summary is requested**: `reasoning: {"summary": "auto"}`. Without the key the server answers
+  with an empty `summary` array and the interface has nothing to show however much the model
+  thought. `auto` is the most detailed summarizer a model has; the named ones differ per model and
+  `concise` is refused by some of them.
+- **`reasoning.context` is left out**, which means `auto` — the model's own default. Naming
+  `all_turns` is refused by models that do not have it, and it buys nothing here: every item is
+  replayed whatever the model does with it, so the prompt is the same either way.
+- **The legacy `include: ["reasoning.encrypted_content"]` is no longer sent.** In stateless mode the
+  encrypted content comes back unasked for; the key is kept only for compatibility, and a server
+  that does not know it may refuse it.
+- **What is not done here is `configuration_update`** for a mid-conversation effort change (D57).
+  It is documented for GPT-6 and later only, and an unknown input item is a request a server may
+  refuse outright. Until it can be verified against the endpoint, `/thinking` still changes
+  `reasoning.effort` and still rewrites the prefix.
+
+**D96.** A provider gets its reasoning back, and by default nothing is dropped.
+
+Reasoning was echoed only for the replies since the last user message. Every new prompt therefore
+*deleted* the previous turn's reasoning from the middle of the request, which is a change to the
+prefix: prompt caching matches from the beginning, so everything after the deletion is read at full
+price and the server drops the reasoning items that follow it as its own anti-distillation rule. Two
+providers state the requirement outright:
+
+- **DeepSeek**: a request that carries `tools` *must* pass every earlier turn's `reasoning_content`
+  back, and answers a 400 if it does not; a request without `tools` ignores what it is given.
+- **OpenAI**: with `store: false`, replay every output item, keep them in their original order and
+  append new ones; and on newer models the API removes reasoning items that follow a prefix change.
+
+Sending is therefore right for both, and no provider branch is needed: the rule is **echo back what
+the provider sent**. A server that sends no reasoning, such as OpenAI's own chat completions, has
+none to echo and nothing is added for it. Reasoning is consequently kept for every model by
+default; a rule that says otherwise has to be current, specific to a provider, and written down
+here.
+
+A resumed session counts its prompts by what the person wrote (`Item::prompt`), not by the wider
+"has text" question the renderers used to ask: a compaction summary is not a prompt, and nothing
+needs to identify a turn any more.
+
+The same append-only rule applies to the Responses items (D95) and leaves one prefix change saddle
+still makes deliberately: a compaction puts its summary where the messages it replaced were (D33).
+The documented alternative is to put the compacted item at the end of the context instead; that is
+not done yet, and the cost is recorded rather than hidden (D97).
+
+**D97.** The store records two numbers that say whether the cache, and the reasoning, are working.
+
+`requests` (D94) gains `reasoning_dropped`, and `cache_write` is read for both OpenAI surfaces:
+
+- **`cache_write` is a cost, not a count.** A write is billed at 1.25× the ordinary input rate for
+  the default lifetime (2.5× for the twelve-hour one), so a cold turn priced as a plain read
+  under-reports what it cost (D36). Both the Responses and chat-completions parsers now read
+  `cache_write_tokens`.
+- **`reasoning_dropped` is the API telling us it rewrote our prompt.** A response reports the input
+  items it removed in `input_transformations`; each one is counted, and an entry that does not name
+  what it touched counts too, because a drop that vanishes because the schema moved is the one thing
+  this number must never do. It is the instrument for D95 and D96: with reasoning replayed and no
+  prefix change, it stays zero, and a non-zero row says the API — not saddle — is rewriting the
+  history.
+- **A compaction request records zero**, because it has no reply to read the count from.
 
 ## 4. Scope enumeration
 

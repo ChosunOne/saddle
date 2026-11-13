@@ -80,9 +80,11 @@ pub fn definitions() -> Vec<ToolDef> {
                 assistant, tool or summary. \
                 requests(ordinal INTEGER, node INTEGER, kind TEXT, provider TEXT, model TEXT, \
                 input INTEGER, output INTEGER, cache_read INTEGER, cache_write INTEGER, \
-                cached INTEGER, cost REAL, at TEXT, after INTEGER): one row per model request, \
-                kind reply or summary, cached 1 when the prompt was served from the provider's \
-                cache, after the ordinal of the last message before it. \
+                cached INTEGER, cost REAL, reasoning_dropped INTEGER, at TEXT, after INTEGER): \
+                one row per model request, kind reply or summary, cached 1 when the prompt was \
+                served from the provider's cache, reasoning_dropped the reasoning items the \
+                provider said it removed from the prompt, after the ordinal of the last message \
+                before it. \
                 No other conversations, images, internal tables or files are accessible. Requires \
                 transcript-read. Results are capped at 100 rows and 50 KiB; use WHERE, ORDER BY \
                 ordinal and LIMIT/OFFSET to search and page. Examples: \
