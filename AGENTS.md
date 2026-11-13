@@ -244,6 +244,10 @@ rather than loosening it.
   policy can name one; `check` lists them separately. An entry that names, contains or sits inside
   the state or config directory is refused, and a misspelt tool name is an error because the file
   tools run in saddle, with no kernel behind them. A named write still cannot reach a reserved path.
+  `~/.agents` is built in (`read`, `ls`, `find`, `grep`) unless `tools-defaults = false`, and an
+  entry for the same directory adds to it instead of replacing it. A symlink inside one of these
+  directories is followed, which no root allows, but only to another declared entry: otherwise a
+  link would reach the policy (D16).
   `saddle check` shows `tool paths`; `saddle tool read '{"path":"~/.agents/…"}'` is the by-hand test.
 - **`exec` is Linux-only**, needs landlock ABI 3 as a hard requirement, and has no network: seccomp
   blocks `socket()` for `AF_INET`/`AF_INET6`/`AF_UNIX`/`AF_NETLINK`/`AF_PACKET` and the io_uring

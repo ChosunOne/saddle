@@ -1091,12 +1091,14 @@ fn a_skill_the_policy_refuses_is_not_advertised() {
 }
 
 #[test]
-fn a_user_level_skill_loads_even_though_read_cannot_reach_it() {
-    // D64: the user's own skills are read by the host like the global instruction file, and their
-    // directory is outside every root. This is why loading is a tool rather than "read SKILL.md".
+fn a_skill_under_the_config_directory_loads_although_nothing_can_read_it() {
+    // D64: the user's own skills are read by the host like the global instruction file, so the tool
+    // works for a skill the file tools can never reach. `~/.agents` became tool-readable by default
+    // (D66), but the other user tier -- the config directory -- is protected from every root and
+    // from every sandbox entry alike (D16), so this is where the reason for a tool still lives.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
-    let dir = home.path().join(".agents/skills/pdf-tools");
+    let dir = env.xdg.path().join("config/saddle/skills/pdf-tools");
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("SKILL.md");
     std::fs::write(
@@ -1104,32 +1106,32 @@ fn a_user_level_skill_loads_even_though_read_cannot_reach_it() {
         "---\nname: pdf-tools\ndescription: Extract text from PDFs.\n---\nRead formats.md.\n",
     )
     .unwrap();
-    let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_saddle"))
-            .arg("-C")
-            .arg(env.ws.path())
-            .args(args)
-            .env("HOME", home.path())
-            .env("XDG_STATE_HOME", env.xdg.path().join("state"))
-            .env("XDG_CONFIG_HOME", env.xdg.path().join("config"))
-            .output()
-            .unwrap()
-    };
 
-    let out = run(&["tool", "skill", r#"{"name":"pdf-tools"}"#]);
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &["tool", "skill", r#"{"name":"pdf-tools"}"#],
+    );
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(out.status.success(), "{text}");
     assert!(text.contains("Read formats.md."), "{text}");
 
-    // The read tool still cannot reach it: a skill is instructions, not a new root.
-    let out = run(&[
-        "tool",
-        "read",
-        &format!(r#"{{"path":"{}"}}"#, file.display()),
-    ]);
-    let text = stderr(&out);
-    assert_ne!(out.status.code(), Some(0), "{}", text);
-    assert!(text.contains("outside every root"), "{text}");
+    // Nothing else reaches it: not a root, not a sandbox entry, not the tools.
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "read",
+            &format!(r#"{{"path":"{}"}}"#, file.display()),
+        ],
+    );
+    assert_ne!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("outside every root"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]
@@ -1440,4 +1442,272 @@ fn one_access_records_one_decision() {
         decisions("edit", r#"{"path":"README","old":"hello","new":"bye"}"#),
         2
     );
+}
+
+#[test]
+fn the_shared_skills_directory_is_readable_by_default() {
+    // D66: ~/.agents is built in and read-only, because that is where skills are installed and a
+    // skill's own references have to be readable. Nothing is written in the config for this.
+    let env = Env::new();
+    let home = tempfile::tempdir().unwrap();
+    let skill = home.path().join(".agents/skills/s");
+    std::fs::create_dir_all(skill.join("references")).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: s\ndescription: d\n---\nRead references/r.md.\n",
+    )
+    .unwrap();
+    std::fs::write(skill.join("references/r.md"), "the reference\n").unwrap();
+
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "read",
+            &format!(r#"{{"path":"{}"}}"#, skill.join("SKILL.md").display()),
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("name: s"));
+
+    // The bundled file too: that is the point of the directory being tool-readable.
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "read",
+            &format!(
+                r#"{{"path":"{}"}}"#,
+                skill.join("references/r.md").display()
+            ),
+        ],
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("the reference"));
+
+    // Read-only: the default names no tool that writes.
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "write",
+            &format!(
+                r#"{{"path":"{}","content":"x"}}"#,
+                skill.join("new").display()
+            ),
+        ],
+    );
+    assert!(
+        stderr(&out).contains("not one of the tools config.toml allows"),
+        "{}",
+        stderr(&out)
+    );
+
+    // Shown under tool paths, and named as the built-in it is.
+    let out = saddle_in(&env, home.path(), &["check"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("tool paths"), "{text}");
+    assert!(text.contains("~/.agents"), "{text}");
+
+    // `tools-defaults = false` turns it off.
+    let path = env.policy_path();
+    let mut doc: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    doc.entry("sandbox")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .unwrap()
+        .insert("tools-defaults".into(), toml::Value::Boolean(false));
+    std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "read",
+            &format!(r#"{{"path":"{}"}}"#, skill.join("SKILL.md").display()),
+        ],
+    );
+    assert!(
+        stderr(&out).contains("outside every root"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn an_entry_for_a_default_path_adds_to_it_rather_than_replacing_it() {
+    // Two entries over one directory are one claim, so writing an entry for ~/.agents widens it
+    // instead of silently dropping the default tools.
+    let env = Env::new();
+    let home = tempfile::tempdir().unwrap();
+    let agents = home.path().join(".agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(agents.join("a.txt"), "text\n").unwrap();
+    set_sandbox_read(
+        &env,
+        toml::Value::Array(vec![toml::Value::Table({
+            let mut t = toml::Table::new();
+            t.insert("path".into(), "~/.agents".into());
+            t.insert("tools".into(), toml::Value::Array(vec!["write".into()]));
+            t
+        })]),
+    );
+
+    let out = saddle_in(&env, home.path(), &["check"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    for tool in ["read", "ls", "find", "grep", "write"] {
+        assert!(
+            text.contains(tool),
+            "{tool} missing from the merged entry: {text}"
+        );
+    }
+    // One line, not two: the union is a single claim.
+    assert_eq!(text.matches("~/.agents").count(), 1, "{text}");
+
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "write",
+            &format!(
+                r#"{{"path":"{}","content":"ok"}}"#,
+                agents.join("new").display()
+            ),
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
+#[test]
+fn a_config_with_no_sandbox_table_keeps_the_built_in_defaults() {
+    // `UserConfig.sandbox` is `#[serde(default)]`, so a config with no `[sandbox]` table got
+    // `SandboxConfig`'s *derived* Default — where both flags were false. A hand-written config then
+    // silently lost the built-in include rule (D62) and, later, the built-in tool path (D66), and
+    // "absent" has to mean "on" for both.
+    let env = Env::new();
+    let home = tempfile::tempdir().unwrap();
+    let skill = home.path().join(".agents/skills/s");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: s\ndescription: d\n---\nx\n",
+    )
+    .unwrap();
+
+    // Env::new wrote a config with `[agent]` and nothing else; make sure there is no [sandbox].
+    let path = env.policy_path();
+    let mut doc: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    doc.remove("sandbox");
+    std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+
+    let out = saddle_in(&env, home.path(), &["check"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        text.contains("exec reads"),
+        "the include rule survived: {text}"
+    );
+    assert!(
+        text.contains("tool paths"),
+        "the tool path survived: {text}"
+    );
+    assert!(text.contains("~/.agents"), "{text}");
+}
+
+#[test]
+fn a_tool_path_may_follow_a_link_to_another_declared_path() {
+    // D66: skills are installed by linking them in, so a link out of the directory is normal. The
+    // target must be another directory the user declared: that is what stops a link pointing at the
+    // policy, and it means the fix for a linked skill is one more entry, not a looser rule.
+    let env = Env::new();
+    let home = tempfile::tempdir().unwrap();
+    let real = home.path().join("elsewhere/skills/prose-lint");
+    std::fs::create_dir_all(real.join("references")).unwrap();
+    std::fs::write(real.join("SKILL.md"), "---\nname: prose-lint\n---\nbody\n").unwrap();
+    std::fs::write(real.join("references/tells.md"), "# Tells\n").unwrap();
+    let agents = home.path().join(".agents/skills");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::os::unix::fs::symlink(&real, agents.join("prose-lint")).unwrap();
+
+    // Undeclared: refused, and the message says what to do about it.
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "read",
+            &format!(
+                r#"{{"path":"{}"}}"#,
+                agents.join("prose-lint/SKILL.md").display()
+            ),
+        ],
+    );
+    let text = stderr(&out);
+    assert!(
+        text.contains("not inside any directory a [sandbox] entry names"),
+        "{text}"
+    );
+
+    // Declared: the link resolves, and so does a file beneath it.
+    set_sandbox_read(
+        &env,
+        toml::Value::Array(vec![toml::Value::Table({
+            let mut t = toml::Table::new();
+            t.insert("path".into(), "~/elsewhere/skills".into());
+            t.insert(
+                "tools".into(),
+                toml::Value::Array(vec!["read".into(), "ls".into()]),
+            );
+            t
+        })]),
+    );
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "read",
+            &format!(
+                r#"{{"path":"{}"}}"#,
+                agents.join("prose-lint/SKILL.md").display()
+            ),
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("body"));
+
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "read",
+            &format!(
+                r#"{{"path":"{}"}}"#,
+                agents.join("prose-lint/references/tells.md").display()
+            ),
+        ],
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("# Tells"),
+        "{}",
+        stderr(&out)
+    );
+
+    // A link may not reach the policy: the config directory is protected for every entry (D16).
+    let policy = env.policy_path();
+    let escape = agents.join("escape.md");
+    std::os::unix::fs::symlink(&policy, &escape).unwrap();
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "read",
+            &format!(r#"{{"path":"{}"}}"#, escape.display()),
+        ],
+    );
+    assert_ne!(out.status.code(), Some(0), "{}", stderr(&out));
 }

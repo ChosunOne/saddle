@@ -79,15 +79,19 @@ exec     = {{ why = "runs builds, tests and git" }}
 # outside the sandbox.
 #
 # An entry may also name the tools that may reach that directory directly, which is how a directory
-# outside the workspace -- your own skills, say -- becomes readable by read, ls and grep without
-# becoming a root and without any grant covering it:
+# outside the workspace becomes readable by read, ls and grep without becoming a root and without
+# any grant covering it:
 #
-#   read = ["~/notes", {{ path = "~/.agents", tools = ["read", "ls", "find", "grep"] }}]
+#   read = ["~/notes", {{ path = "~/elsewhere", tools = ["read", "ls", "find", "grep"] }}]
 #
 # A bare path is indirect reach only, so "~/notes" above is still unreachable by the tools. The
 # tools are named individually: listing `write` or `edit` allows writing there, and that is enforced
 # by this list alone, because the tools run in saddle rather than in the sandbox. A typo in a name is
 # an error, not a silent no-op.
+#
+# ~/.agents is built in, read-only (read, ls, find, grep), because that is where skills are
+# installed and a skill's own references have to be readable. An entry here for the same directory
+# adds to it rather than replacing it. `tools-defaults = false` turns the built-in path off.
 [sandbox]
 write = [{write}]
 

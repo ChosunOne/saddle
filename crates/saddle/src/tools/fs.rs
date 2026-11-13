@@ -308,9 +308,17 @@ pub(crate) fn gate(
         Ok(loc) => loc,
         Err(why) => return Ok(Err(ToolOutput::denied(&why))),
     };
-    let real = match open_root(session, &loc).and_then(|dir| resolve_beneath(&dir, &loc.rel)) {
-        Ok(rel) => Location::new(loc.root.clone(), rel),
-        Err(e) => return Ok(Err(ToolOutput::err(format!("{raw}: {e}")))),
+    // A tool-visible directory is resolved by the host, and its link target may be another
+    // declared entry (D66); a root is resolved beneath itself, as before.
+    let real = match session.is_tool_root(&loc.root) {
+        true => match session.resolve_tool(&loc) {
+            Ok(real) => real,
+            Err(e) => return Ok(Err(ToolOutput::err(format!("{raw}: {e}")))),
+        },
+        false => match open_root(session, &loc).and_then(|dir| resolve_beneath(&dir, &loc.rel)) {
+            Ok(rel) => Location::new(loc.root.clone(), rel),
+            Err(e) => return Ok(Err(ToolOutput::err(format!("{raw}: {e}")))),
+        },
     };
     // D66: a `[sandbox]` directory is not covered by a grant, and `locate` has already checked
     // the tool against the list the config names and recorded the decision. The reserved paths
@@ -335,7 +343,9 @@ pub(crate) fn gate(
                 }
             }
         }
-        return Ok(Ok(loc));
+        // The resolved location, not the one that came in: a link inside a tool-visible directory
+        // would otherwise be walked again by cap-std, which refuses it.
+        return Ok(Ok(real));
     }
     for target in [&loc, &real] {
         let req = match scope {

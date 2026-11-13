@@ -1197,10 +1197,13 @@ use it.
   directory of ten skills costs a few lines of prompt instead of all of their text, and the model
   decides what to load from the description, which is why a skill without one is not loaded at all:
   the description *is* the routing signal.
-- **Loading is the `skill` tool, not "read SKILL.md".** A user-tier skill lives under `~/.agents` or
-  the config directory, which is outside every root: `read` on it is denied, while `bash` can read
-  it because D62 enumerates `~` for children. Telling the model to read a file that the gate refuses
-  would be a prompt that does not work. The tool takes a **name** and serves the text discovery
+- **Loading is the `skill` tool, not "read SKILL.md".** One user tier is the config directory, which
+  no root and no sandbox entry may reach (D16), so `read` on a skill there is denied while `bash`
+  can reach it only because D62 enumerates `~` for children. Telling the model to read a file that
+  the gate refuses would be a prompt that does not work. The other tier, `~/.agents`, became
+  readable by the tools by default in D66, which makes `read` an alternative for a *bundled* file
+  there — but the tool is still how a body is advertised and loaded by name, and it is the only way
+  to load a skill from the config directory. The tool takes a **name** and serves the text discovery
   already admitted, so it cannot become a general file reader, and the directory it returns is how
   the model finds the bundled files: with `read` and `ls` inside the workspace, with `bash` outside.
 - **`allowed-tools` is ignored, and the person is told so.** Under the specification it is an
@@ -1270,6 +1273,20 @@ tools without being a root or part of the session.
   outside every root. A root is the wrong answer, because a root is nameable by any workspace policy
   (D62, D65). So the category is a *fourth* thing, and it is declared where a root cannot be: in
   `[sandbox]`, which lives only in the user's `config.toml`.
+- **`~/.agents` is a built-in default, read-only**: `read`, `ls`, `find` and `grep`, added unless
+  `tools-defaults = false`. That directory is where skills are installed, so a skill's own
+  `references/` and scripts have to be readable by the tools that read; it was the case the property
+  exists for, and making every machine write the entry first would have been a default that is
+  really a chore. Read-only because a skill is instructions and nothing needs to write it. An entry
+  for the same directory **adds** to the default rather than replacing it: two claims over one
+  directory are one claim, and the tools are a union, so writing `tools = ["write"]` there yields
+  all five. Subtracting would need a second syntax for "none of these", which is what an absent
+  entry already means.
+- **"Absent" means on, for both defaulted flags.** `UserConfig.sandbox` is `#[serde(default)]`, so a
+  config with no `[sandbox]` table got `SandboxConfig`'s *derived* `Default` — where both
+  `include-defaults` and `tools-defaults` were `false`. A hand-written config therefore silently
+  lost the built-in include rule (D62) as well as this default. The `Default` impl now matches the
+  serde field defaults, so a missing table and an empty one mean the same thing.
 - **The shape.** An entry is a path, as before, or a table adding `tools`:
   `{ path = "~/.agents", tools = ["read", "ls", "find", "grep"] }`. A bare path keeps its old
   meaning exactly — indirect reach only — so nothing that exists today widens. The tools are named
@@ -1288,6 +1305,16 @@ tools without being a root or part of the session.
   ["~/.config/saddle"]` handed a command the policy file — and it matters more now that an entry can
   grant tool access. A default include rule over `~` prunes these instead, because a pattern is not
   a claim.
+- **A link inside a tool-visible directory is followed, and may land on another declared entry.**
+  A skill is installed by linking it in from wherever it lives, so `~/.agents/skills/x ->
+  ~/.pi/agent/skills/x` is the normal arrangement — and a link to an absolute path, which a root
+  always refuses, is exactly what that is. Resolution is done by the host for these directories, and
+  the target must lie inside *some* declared tool path: so a link may point at another directory the
+  user listed, and never at something undeclared, or `~/.agents/x -> ~/.config/saddle/config.toml`
+  would hand the tools the policy that governs them. The refusal names what to add, since the fix is
+  one more entry rather than a looser rule. A missing file is resolved through its parent, so a
+  write beneath a linked directory works, and the resolved location is what the tool then uses —
+  returning the unresolved one made cap-std walk the link again and refuse it.
 - **The reserved paths still hold** (D23). A named write bypasses the engine, so `gate` checks
   `Reserved` itself: a hook or `.git/config` under a tool-visible directory is refused whatever the
   entry lists, because it runs code as the user later.

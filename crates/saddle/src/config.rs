@@ -139,7 +139,7 @@ pub struct CompactionConfig {
     pub keep_recent_tokens: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
     #[serde(default)]
@@ -155,6 +155,11 @@ pub struct SandboxConfig {
     /// directory to exclude" means. Set false to have only the rules written here (D62).
     #[serde(default = "yes", rename = "include-defaults")]
     pub include_defaults: bool,
+    /// Whether the built-in tool path is added: `~/.agents`, readable by the tools that only read
+    /// (D66). On by default, because the shared skills directory is the case the property exists
+    /// for; set false to keep the tools to what is written in this file.
+    #[serde(default = "yes", rename = "tools-defaults")]
+    pub tools_defaults: bool,
 }
 
 /// One `[sandbox]` entry: a directory a sandboxed command may reach (D62), and, if it names tools,
@@ -191,6 +196,26 @@ impl SandboxEntry {
         }
     }
 }
+
+impl Default for SandboxConfig {
+    /// The same values serde would use for a table that omits them, because `UserConfig.sandbox`
+    /// is `#[serde(default)]`: without this a config with no `[sandbox]` table at all silently lost
+    /// the built-in include rule (D62) and the built-in tool path (D66). Both are on by default, so
+    /// "absent" must not mean "off".
+    fn default() -> Self {
+        Self {
+            read: Vec::new(),
+            write: Vec::new(),
+            include: Vec::new(),
+            include_defaults: true,
+            tools_defaults: true,
+        }
+    }
+}
+
+/// The tools the built-in `~/.agents` path allows: the ones that only read. A skill is
+/// instructions, and nothing needs to write the directory they are installed in (D66).
+pub const DEFAULT_TOOL_TOOLS: &[&str] = &["read", "ls", "find", "grep"];
 
 /// A directory the file tools may reach outside every root, with the tools allowed on it (D66).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,7 +529,22 @@ impl UserConfig {
         // error rather than a silent no-op: the list is the authority for these directories, and
         // there is no kernel check behind a host-side tool, so a typo would otherwise read as a
         // permission that silently does nothing.
-        let mut tool_paths = Vec::new();
+        let mut tool_paths: Vec<ToolPath> = Vec::new();
+        if self.sandbox.tools_defaults
+            && let Some(home) = &home
+        {
+            // The shared skills directory is the case this property exists for, so it is a default
+            // rather than something each machine writes by hand (D66). Read-only: a skill is
+            // instructions, and nothing needs to write this one.
+            let dir = home.join(".agents");
+            if dir.is_dir() {
+                tool_paths.push(ToolPath {
+                    dir,
+                    written: "~/.agents".to_owned(),
+                    tools: DEFAULT_TOOL_TOOLS.iter().map(|t| (*t).to_owned()).collect(),
+                });
+            }
+        }
         for entry in self.sandbox.read.iter().chain(self.sandbox.write.iter()) {
             let tools = entry.tools();
             if tools.is_empty() {
@@ -522,11 +562,30 @@ impl UserConfig {
             }
             let dir = resolve(entry.path())?;
             check_protected(&dir, entry.path())?;
-            tool_paths.push(ToolPath {
-                dir,
-                written: entry.path().to_owned(),
-                tools: tools.to_vec(),
-            });
+            // Two entries over one directory are one claim: the tools add up, so writing an entry
+            // for `~/.agents` adds to the default rather than replacing it. Subtracting would need
+            // a second syntax for "none of these", which is what leaving it out already means.
+            let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            match tool_paths
+                .iter_mut()
+                .find(|p| p.dir.canonicalize().unwrap_or_else(|_| p.dir.clone()) == key)
+            {
+                Some(existing) => {
+                    for tool in tools {
+                        if !existing.tools.contains(tool) {
+                            existing.tools.push(tool.clone());
+                        }
+                    }
+                    // The written spelling is what a person recognises, so it wins over the
+                    // built-in `~/.agents`.
+                    existing.written = entry.path().to_owned();
+                }
+                None => tool_paths.push(ToolPath {
+                    dir,
+                    written: entry.path().to_owned(),
+                    tools: tools.to_vec(),
+                }),
+            }
         }
         // The built-in rule first, so a machine with nothing configured still works (D62).
         let built_in = default_include();

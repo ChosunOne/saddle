@@ -522,6 +522,51 @@ impl Session {
             .max_by_key(|r| r.dir.components().count())
     }
 
+    /// A tool-visible location with its symlinks followed (D66).
+    ///
+    /// A skill is installed by linking it in from wherever it lives, so a link that leaves the
+    /// directory is the normal arrangement. The target must be inside *some* declared tool path,
+    /// which keeps the rule honest: a link may point at another directory the user listed, and
+    /// never at something undeclared — otherwise `~/.agents/x -> ~/.config/saddle/config.toml`
+    /// would hand the tools the policy that governs them (D16).
+    pub fn resolve_tool(&self, loc: &Location) -> std::io::Result<Location> {
+        use std::io::{Error, ErrorKind};
+        let base = self
+            .base_of(&loc.root)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no root `{}`", loc.root)))?;
+        let base = base.canonicalize()?;
+        let abs = base.join(loc.rel.to_path());
+        let real = match abs.canonicalize() {
+            Ok(real) => real,
+            // A file that does not exist yet is resolved through its parent, so a write beneath a
+            // linked directory works too.
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                let Some(parent) = abs.parent() else {
+                    return Err(e);
+                };
+                match (parent.canonicalize(), abs.file_name()) {
+                    (Ok(parent), Some(name)) => parent.join(name),
+                    _ => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(root) = self.tool_root_for(&real) {
+            let rel = real.strip_prefix(&root.dir).unwrap_or(Path::new(""));
+            let rel = saddle_cap::RelPath::new(rel)
+                .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+            return Ok(Location::new(root.name.clone(), rel));
+        }
+        Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "resolves to {}, which is not inside any directory a [sandbox] entry names for \
+                 the tools; add that directory as an entry to allow it",
+                real.display()
+            ),
+        ))
+    }
+
     /// The directory a `Location`'s root stands for: a root, or a `[sandbox]` directory (D66).
     pub fn base_of(&self, root: &RootName) -> Option<PathBuf> {
         if let Some(path) = self.roots().get(root) {
