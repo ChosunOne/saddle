@@ -254,11 +254,15 @@ pub(crate) fn agent(named: bool) -> ureq::Agent {
 /// A request whose body is JSON, answered as text. The same rules as [`get`]: the addresses are
 /// pinned, and a status is a result rather than an error, so the caller can report what the server
 /// said.
+/// A POST, for a host call whose body is not a page: the reply is read up to `limit` bytes rather
+/// than `fetch`'s own cap, because a search answer carries whole passages and would otherwise be
+/// refused for being a large success (D82).
 pub(crate) fn post(
     target: &Target,
     named: bool,
     headers: &[(String, String)],
     body: &str,
+    limit: u64,
 ) -> Result<(u16, String), String> {
     if !named && let Err(why) = resolve_public(&target.host, target.port) {
         return Err(why);
@@ -278,7 +282,7 @@ pub(crate) fn post(
     let text = resp
         .body_mut()
         .with_config()
-        .limit(MAX_BYTES)
+        .limit(limit)
         .read_to_string()
         .map_err(|e| format!("{url} answered {status} but the body is not UTF-8 text: {e}"))?;
     Ok((status, text))

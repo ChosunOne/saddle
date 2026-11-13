@@ -1022,6 +1022,8 @@ impl Agent {
     /// Switches provider or model between turns, and logs the change.
     pub fn set_provider(&mut self, session: &mut Session, provider: Provider) -> Result<()> {
         let model = provider.config.model.clone();
+        // A provider that searches brings its search with it, so the tool follows /login (D82).
+        session.search = provider.search_target();
         self.provider = Some(provider);
         self.log(session, json!({ "model": model }), "provider changed")
     }
@@ -1746,6 +1748,7 @@ mod tests {
                 effort: None,
                 price: None,
                 usage_url: None,
+                search_url: None,
             },
             Some("key"),
             &crate::provider::Reported::default(),

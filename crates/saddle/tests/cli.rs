@@ -66,6 +66,15 @@ impl Env {
         .unwrap();
     }
 
+    /// The provider line at the top of the same file, for a test that needs the session to know
+    /// which provider it is talking to (D82).
+    fn write_config(&self, text: &str) {
+        let path = self.policy_path();
+        let base = std::fs::read_to_string(&path).unwrap_or_default();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{text}{base}")).unwrap();
+    }
+
     /// The base grants: `[agent]` in `config.toml` (D63).
     fn write_policy(&self, text: impl AsRef<str>) {
         let agent = agent_of(text.as_ref());
@@ -578,8 +587,8 @@ fn a_wildcard_net_grant_allows_any_host_but_not_the_local_machine() {
 
 #[test]
 fn websearch_is_a_tool_and_the_gate_decides_it() {
-    // D82: the search is asked of Exa, so it needs a net grant for the host it actually reached —
-    // which a session with no net grants must be refused, naming that host rather than a vendor.
+    // D82: the search host is decided like any other request. With no provider configured, the tool
+    // falls back to Exa — and that path needs Exa's host, not a vendor's name.
     let env = Env::new();
     let (ok, text) = env.tool("websearch", serde_json::json!({ "query": "anything" }));
     assert!(!ok, "{text}");
@@ -601,6 +610,36 @@ fn websearch_is_a_tool_and_the_gate_decides_it() {
     let refused = env.saddle(&["tool", "nonesuch", "{}"]);
     let listed = String::from_utf8_lossy(&refused.stderr);
     assert!(listed.contains("websearch"), "{listed}");
+}
+
+#[test]
+fn a_provider_that_searches_is_asked_before_exa() {
+    // D82: Synthetic serves `/v2/search` beside `/v2/quotas`, so a session whose provider is
+    // Synthetic searches there, with the provider's own key, and never reaches Exa.
+    let env = Env::new();
+    env.write_config("provider = \"synthetic\"\n");
+    // A grant for Exa's hosts alone must not let the provider's search through, which is what shows
+    // the request goes to the provider and is decided on the host it actually names.
+    env.write_policy(POLICY.replace(
+        "[agent]",
+        "[agent]\nnet = [{ host = \"mcp.exa.ai\" }, { host = \"api.exa.ai\" }]",
+    ));
+    let (ok, text) = env.tool("websearch", serde_json::json!({ "query": "anything" }));
+    assert!(!ok, "{text}");
+    assert!(text.contains("api.synthetic.new"), "{text}");
+    assert!(!text.contains("exa.ai"), "{text}");
+
+    // The grant the search actually needs is the one its refusal named.
+    env.write_policy(POLICY.replace(
+        "[agent]",
+        "[agent]\nnet = [{ host = \"api.synthetic.new\", why = \"the provider's search\" }]",
+    ));
+    let (ok, text) = env.tool("websearch", serde_json::json!({ "query": "anything" }));
+    // No key is stored in a throwaway state directory, so the request is refused before it is made
+    // — and the refusal says which variable to set.
+    assert!(!ok, "{text}");
+    assert!(text.contains("SYNTHETIC_API_KEY"), "{text}");
+    assert!(text.contains("saddle login synthetic"), "{text}");
 }
 
 #[test]

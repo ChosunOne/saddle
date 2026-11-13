@@ -258,6 +258,22 @@ impl Setup {
     }
 }
 
+/// Where the provider named in the config answers a web search, if it serves one (D82).
+///
+/// A provider that cannot be resolved simply has no search, because a broken provider table is
+/// reported by `check` and by the model loop, not by a tool that was asked a different question.
+fn configured_search(setup: &Setup) -> Option<crate::provider::SearchTarget> {
+    let user = UserConfig::load(&setup.paths.user_config()).ok()?;
+    let name = user.provider?;
+    let config = crate::provider::endpoint(&name, &user.providers).ok()?;
+    let url = config.search_url?;
+    Some(crate::provider::SearchTarget {
+        provider: name,
+        url,
+        key_env: config.api_key_env,
+    })
+}
+
 /// The per-session `tmp` root: a 0700 directory under the system temp dir, removed on drop.
 pub struct PrivateTmp(PathBuf);
 
@@ -306,6 +322,9 @@ pub struct Session {
     pub skill_notes: Vec<String>,
     /// The `[sandbox]` directories the file tools may reach (D66).
     pub tool_roots: Vec<ToolRoot>,
+    /// Where the configured provider answers a web search, when it serves one (D82). Set again
+    /// whenever the provider changes, so the tool follows the model.
+    pub search: Option<crate::provider::SearchTarget>,
     _tmp: PrivateTmp,
 }
 
@@ -352,6 +371,7 @@ impl Session {
             "session opened",
         )?;
 
+        let search = configured_search(&setup);
         let mut session = Self {
             setup,
             engine: Engine::new(policy),
@@ -361,6 +381,9 @@ impl Session {
             skills: Vec::new(),
             skill_notes: Vec::new(),
             tool_roots: Vec::new(),
+            // The configured default provider, which is what `saddle tool` has. A run that resolved
+            // a provider (`-p`, or one picked with /login) replaces this with that one's (D82).
+            search,
             _tmp: tmp,
         };
         // An internal name per tool-visible directory, skipping any name a root already uses, so a

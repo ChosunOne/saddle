@@ -1843,42 +1843,59 @@ highlighted code block, a `-` list is a list, a heading is a heading.
 - **One renderer, not two.** The marker is applied to the rows afterwards rather than by a second
   code path, so a prompt and a reply cannot drift apart.
 
-**D82.** A web search is asked of Exa, because the provider cannot answer one.
+**D82.** A web search is asked of the provider, and Exa is the fallback.
 
 The `websearch` tool is the tenth built-in tool. It exists because knowing an address is not the same
 as finding one: `fetch` gets a page whose URL is already known, and nothing in the tool set could
 answer "what is the current version of X".
 
-- **The provider search does not exist, and that was checked rather than assumed.** Synthetic serves
-  an OpenAI-compatible chat-completions API. `POST /v1/responses` answers 404, as do `/v1/search`,
-  `/v1/web_search` and `/v1/tools`, and its `/v1/models` listing advertises `tools`, `json_mode`,
-  `structured_outputs` and `reasoning` — search is not among them. A server-side search tool is an
-  Anthropic or OpenAI-shaped feature, not a property of every completions endpoint.
-- **The seam is a table, not a guess.** `provider::SERVER_SIDE_SEARCH` names the providers that
-  answer a search themselves, and it is empty. `websearch` reads it first, so a provider that gains
-  the capability is one line there and no new code path. A test asserts it is empty, so filling it
-  in is a deliberate act with a decision behind it.
-- **Exa, two ways, and the choice is forced by what a key buys.** With `EXA_API_KEY` (or a key
-  stored by `/login exa`) the tool calls `POST https://api.exa.ai/search` and gets structured
-  results. Without one it calls Exa's hosted MCP server at `mcp.exa.ai`, which answers an anonymous
-  search today. The REST endpoint is *not* usable without a key: it answers `402` with an
-  `X402_PAYMENT_REQUIRED` payment challenge, which is a demand for payment rather than a rate limit,
-  so "a few free searches" is not what an unkeyed REST call gets. A key raises the rate limit and is
-  preferred when it exists; the result says which path answered.
-- **The gate is the same gate.** Each request goes through the engine as `Request::Net` before it is
-  made, so a session needs a `net` grant for `api.exa.ai` or `mcp.exa.ai` — and a session granted
-  only the first is refused on the second, which is how the fallback stays visible rather than
-  silent. The audit records the query and the backend, and header *names* only, never the key (D48).
-- **What the model gets back** is numbered results with the passages Exa quoted, and the request id
-  and cost where Exa states them, cut at 64 KiB. A failure is a sentence naming what to change — a
-  refused key, a team out of credit, a rate limit — not a status code.
-- **One request shape, not a protocol implementation.** The MCP path is `initialize` and one
-  `tools/call`, sent as JSON-RPC over HTTP and read back from either a JSON body or a server-sent
-  event stream's `data:` lines. Nothing else of MCP is implemented, and nothing is remembered
-  between calls.
-- **Deferred:** using Exa's `deep` search or its research agent; a `[search]` section in the config
-  for a default result count; and caching a query's results within a session.
+- **The provider searches, and finding that out took two wrong turns worth recording.** Synthetic's
+  search is `POST https://api.synthetic.new/v2/search`, beside the `/v2/quotas` endpoint the status
+  line already uses. It is *not* at `/v1/search` or `/v1/web_search`, which answer `404`, and the
+  neighbouring `/v1/responses` and `/v1/tools` are absent too — so probing those routes is
+  consistent with "there is no search" while being wrong. The tell is the status code on a route
+  that does exist: `/v2/search` answers `401` without a key, and a path that does not exist answers
+  `404`. A route that wants a credential is not a route that is missing. The second wrong turn was
+  generalization from a 404: the right conclusion from `/v1/search → 404` is about `/v1/search`.
+- **The provider's own key pays for its own search**, which is the point of doing it that way. A
+  session that can talk to its model can search without a second credential, and `saddle login` fixes
+  both at once. The URL is a provider setting — `search-url`, in `[providers.<name>]` or the preset —
+  rather than a constant, so a compatible server that serves one is configured and not patched.
+- **The request is the query and nothing else.** `POST {"query": "..."}` answers
+  `{"results": [{url, title, text, highlights}]}` — Exa's own shape, since this endpoint returns
+  theirs. Extra fields are ignored rather than refused (`numResults` changes nothing: five results
+  come back whatever is asked), so the tool sends the one field it knows and applies `num_results`
+  to what arrived, saying so when the count asked for is larger than the count served. A body
+  missing `query` is refused as `400 Invalid POST body: .query is missing`, and an empty query is a
+  `500`.
+- **`highlights` is not an excerpt here.** It carries the whole page. Exa's highlights are passages,
+  Synthetic's are the document, so showing them raw spends the entire answer on one result: the
+  model gets at most [`MAX_QUOTE`] characters of each, at most three passages per result, one line
+  each, with an ellipsis where it was cut. The 64 KiB ceiling stays as a backstop.
+- **A large success is still a success.** The reply for five results is about 220 KiB, so a search
+  that reused `fetch`'s 100 KiB limit would report a refusal for a working request. The POST path
+  takes its own ceiling for this reason.
+- **The gate is the same gate, and the grant is not free.** Each request goes through the engine as
+  `Request::Net` before it is made, so the search host has to be granted: `api.synthetic.new` for a
+  provider search, `api.exa.ai` or `mcp.exa.ai` for the fallback. A session granted the provider's
+  completions but not its search is refused, which is deliberate — the model loop reaches its
+  provider as part of the conversation, and this is a *tool* reaching the network, so it is decided
+  like one. The audit records the method, the URL, the header names, the query and which backend
+  answered; never a key (D48).
+- **Exa is the fallback, in two forms.** With `EXA_API_KEY` (or a key stored with `/login exa`) the
+  tool calls `POST https://api.exa.ai/search`. Without one, Exa's REST endpoint is not an option at
+  all: it answers `402 X402_PAYMENT_REQUIRED`, a payment challenge rather than a rate limit, so
+  "a few free searches" is not what an unkeyed call gets. The anonymous path is Exa's hosted MCP
+  server at `mcp.exa.ai`, which answers a `web_search_exa` call today: one `initialize`, one
+  `tools/call`, read from a JSON body or a server-sent event stream's `data:` lines. Nothing else of
+  MCP is implemented and nothing is kept between calls, because the transport here is a single POST.
+- **Nothing is searched by default without a grant**, and a provider that serves no search falls
+  through to Exa rather than failing: `search-url` absent means the fallback is the whole story.
+- **Deferred:** Exa's `deep` search or research agent; a `[search]` section for a default result
+  count and a preferred backend; caching a query's results within a session; and reading a search
+  result's own page (that is `fetch`'s job).
 
+## 4. Scope enumeration
 ## 4. Scope enumeration
 ## 4. Scope enumeration
 

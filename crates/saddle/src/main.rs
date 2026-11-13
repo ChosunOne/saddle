@@ -314,6 +314,11 @@ fn run_agent(
     };
 
     let mut session = Session::open_with(dir, Some(session), one.overrides)?;
+    // The provider resolved above is the one in use, which `-p` can make differ from the config's
+    // default; the web search follows it (D82).
+    session.search = provider
+        .as_ref()
+        .and_then(provider::Provider::search_target);
     let secrets = provider::secret_env_names(&user.providers);
     session.host_env.retain(|(k, _)| !secrets.contains(k));
     let (context, refused) = context::load(&mut session, &user.context, &paths)?;

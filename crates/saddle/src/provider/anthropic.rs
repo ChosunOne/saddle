@@ -710,6 +710,7 @@ mod tests {
             effort: Some("high".into()),
             price: None,
             usage_url: None,
+            search_url: None,
         };
         let tools = [crate::provider::ToolDef {
             name: "read",

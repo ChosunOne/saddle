@@ -1,25 +1,28 @@
 //! `websearch`: a search of the web, made by the host (D82).
 //!
-//! The search is asked of Exa, because the configured provider cannot do it: Synthetic serves chat
-//! completions only, and its `/v1/responses`, `/v1/search` and `/v1/web_search` all answer 404, so
-//! there is no provider-side search to call. The seam for one is [`Backend::Provider`], which is
-//! what a provider that gains the capability would add — the choice lives in one function, so that
-//! is an edit rather than a second code path.
+//! The search is asked of the **provider first**, because Synthetic serves one: `POST
+//! /v2/search` on `api.synthetic.new` answers with the results, and the same key that pays for the
+//! model pays for the search, so a session that can talk to its model can search without being
+//! configured twice. The endpoint sits beside `/v2/quotas`, which the status line already uses.
 //!
-//! There are two ways to reach Exa, and which one is used is not a matter of taste:
+//! The provider path had to be found the hard way: the neighbouring `/v1/search` and
+//! `/v1/web_search` answer `404`, so an unauthenticated probe of those routes suggests there is no
+//! search at all. `/v2/search` answers `401` without a key and `404` when the path does not exist,
+//! which is what distinguishes a route that wants a credential from one that is not there.
+//!
+//! Exa is the fallback, for a provider that does not search:
 //!
 //! - **with a key** (from `EXA_API_KEY`, or one stored by `/login exa`), `POST /search` on
 //!   `api.exa.ai`, which returns structured results;
-//! - **without one**, Exa's hosted MCP server, which answers an anonymous search. A key raises the
-//!   rate limit, so the keyed path is preferred when there is one.
+//! - **without one**, Exa's hosted MCP server, which answers an anonymous search.
 //!
-//! Without a key the REST endpoint is not an option at all: it answers `402 X402_PAYMENT_REQUIRED`,
+//! Without a key Exa's REST endpoint is not an option at all: it answers `402 X402_PAYMENT_REQUIRED`,
 //! which is a payment challenge rather than a rate limit. That is why the anonymous path is MCP and
 //! not REST.
 //!
 //! Everything here goes through the engine before a request is made, so the `net` grant decides —
-//! `api.exa.ai` and `mcp.exa.ai` are the hosts that have to be granted, and the same audit log
-//! records each one.
+//! `api.synthetic.new`, `api.exa.ai` and `mcp.exa.ai` are the hosts that have to be granted, and the
+//! same audit log records each one.
 
 use anyhow::Result;
 use saddle_cap::{Principal, Scope};
@@ -35,13 +38,21 @@ const DEFAULT_RESULTS: u64 = 5;
 const MAX_RESULTS: u64 = 100;
 /// A reply larger than this is cut: it is the ceiling the agent puts on a tool result anyway.
 const MAX_BYTES: usize = 64 * 1024;
+/// How much of one quoted passage the model is shown. Exa's own highlights are short excerpts, but
+/// Synthetic's search returns whole page texts under that key, so without a ceiling one result fills
+/// the entire answer and the other four are lost.
+const MAX_QUOTE: usize = 1000;
+/// Passages per result, so one page cannot take the whole answer either.
+const MAX_QUOTES: usize = 3;
+/// What one answer may be before it is refused. A search of five results carries their whole text,
+/// about 220 KiB in practice, so this is generous on purpose; anything near it is not an answer.
+const MAX_REPLY: u64 = 1024 * 1024;
 
 /// Which way the search is asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Backend {
-    /// A provider that searches on its own. No provider in this build has the capability — the
-    /// variant exists so that adding one is a variant and a match arm, not a second tool (D82).
-    Provider { provider: String, host: String },
+    /// The provider in use searches on its own, and its own key pays for it (D82).
+    Provider(crate::provider::SearchTarget),
     /// Exa's REST search, with a key.
     ExaRest,
     /// Exa's hosted MCP server, which answers without a key.
@@ -86,36 +97,131 @@ pub fn search(session: &mut Session, input: &Value) -> Result<ToolOutput> {
         format!("searched the web for `{query}`"),
     )?;
     match backend {
+        Backend::Provider(target) => provider_search(session, &target, &query, count),
         Backend::ExaRest => exa_rest(session, &query, count),
         Backend::ExaMcp => exa_mcp(session, &query, count),
-        Backend::Provider { provider, host } => Ok(ToolOutput::err(format!(
-            "{provider} reports a search capability at {host}, and this build has no request for \
-             it; unset it to use Exa instead"
-        ))),
     }
 }
 
 fn backend_name(backend: &Backend) -> &'static str {
     match backend {
-        Backend::Provider { .. } => "provider",
+        Backend::Provider(_) => "provider",
         Backend::ExaRest => "exa",
         Backend::ExaMcp => "exa-mcp",
     }
 }
 
-/// Chooses the way the search is asked: a provider that can, else Exa with a key, else Exa's MCP.
+/// Chooses the way the search is asked: the provider in use when it searches, else Exa with a key,
+/// else Exa's MCP.
 fn choose(session: &mut Session) -> Result<Backend, ToolOutput> {
-    if let Some((provider, host)) = crate::provider::searching_provider() {
-        return Ok(Backend::Provider {
-            provider: provider.to_owned(),
-            host: host.to_owned(),
-        });
+    if let Some(target) = session.search.clone() {
+        return Ok(Backend::Provider(target));
     }
     // A key makes the REST endpoint usable; without one it is a payment challenge, not a limit.
     if exa_key(session).is_some() {
         return Ok(Backend::ExaRest);
     }
     Ok(Backend::ExaMcp)
+}
+
+/// The provider's own search: one POST, the same JSON Exa answers with, paid for by the provider's
+/// key (D82).
+///
+/// The body is the query and nothing else. `numResults` is accepted and ignored — the server answers
+/// five whatever is asked — so the count is applied here, to what came back, rather than sent as a
+/// wish. A body that names a field the server does not know is not rejected either, which is why the
+/// absence of a documented schema is survivable.
+fn provider_search(
+    session: &mut Session,
+    target: &crate::provider::SearchTarget,
+    query: &str,
+    count: u64,
+) -> Result<ToolOutput> {
+    let url = match fetch::Target::parse(&target.url) {
+        Ok(url) => url,
+        Err(why) => return Ok(ToolOutput::err(why)),
+    };
+    // The gate is asked before the key is looked for: whether this session may search at all is a
+    // policy question, and a missing key must not hide the answer to it (D82).
+    if let Err(denied) = permit(session, "POST", &url, &["content-type", "authorization"])? {
+        return Ok(denied);
+    }
+    let Some(key) = provider_key(session, target) else {
+        let env = target.key_env.as_deref().unwrap_or("its API key");
+        return Ok(ToolOutput::err(format!(
+            "`{}` searches the web, but no key is set for it: set {env}, or store one with \
+             `saddle login {}`",
+            target.provider, target.provider
+        )));
+    };
+    let body = json!({ "query": query }).to_string();
+    let headers = vec![
+        ("content-type".to_owned(), "application/json".to_owned()),
+        ("authorization".to_owned(), format!("Bearer {key}")),
+    ];
+    let (status, text) = match fetch::post(&url, true, &headers, &body, MAX_REPLY) {
+        Ok(answer) => answer,
+        Err(why) => return Ok(ToolOutput::err(why)),
+    };
+    if status != 200 {
+        return Ok(ToolOutput::err(provider_explain(
+            status,
+            &text,
+            &target.provider,
+        )));
+    }
+    let mut hits = parse_exa(&text)?;
+    hits.truncate(usize::try_from(count).unwrap_or(hits.len()));
+    let asked = if count > DEFAULT_RESULTS {
+        format!(
+            " ({count} asked, {} returned: the endpoint answers {})",
+            hits.len(),
+            DEFAULT_RESULTS
+        )
+    } else {
+        String::new()
+    };
+    Ok(ToolOutput::ok(format!(
+        "{} searched for `{query}` and answered:\n\n{}{}",
+        target.provider,
+        format_hits(&hits),
+        asked
+    )))
+}
+
+/// The provider key: the variable it names, then the store `/login` writes.
+fn provider_key(session: &Session, target: &crate::provider::SearchTarget) -> Option<String> {
+    if let Some(var) = &target.key_env
+        && let Ok(key) = std::env::var(var)
+        && !key.trim().is_empty()
+    {
+        return Some(key);
+    }
+    let store = crate::auth::AuthStore::load(&session.setup.paths.auth_store()).ok()?;
+    store
+        .key(&target.provider)
+        .filter(|k| !k.trim().is_empty())
+        .map(str::to_owned)
+}
+
+/// What a failed provider search means, in a sentence the model can act on.
+fn provider_explain(status: u16, body: &str, provider: &str) -> String {
+    let detail = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| body.chars().take(200).collect());
+    match status {
+        401 | 403 => format!(
+            "`{provider}` refused the key ({status}): {detail}. The search uses the same key as the \
+             model, so `saddle login {provider}` fixes both"
+        ),
+        400 | 500 => format!(
+            "`{provider}` could not answer this search ({status}): {detail}. An empty query is \
+             refused; a query that is too long or too short is too"
+        ),
+        429 => format!("`{provider}` is rate limiting this session ({status}): {detail}"),
+        _ => format!("`{provider}` answered {status}: {detail}"),
+    }
 }
 
 /// The Exa key: the environment first, so a session can be given one for a single run, then the
@@ -160,7 +266,7 @@ fn exa_rest(session: &mut Session, query: &str, count: u64) -> Result<ToolOutput
     if let Err(denied) = allowed {
         return Ok(denied);
     }
-    let (status, text) = match fetch::post(&target, true, &headers, &body) {
+    let (status, text) = match fetch::post(&target, true, &headers, &body, MAX_REPLY) {
         Ok(answer) => answer,
         Err(why) => return Ok(ToolOutput::err(why)),
     };
@@ -204,7 +310,7 @@ fn exa_mcp(session: &mut Session, query: &str, count: u64) -> Result<ToolOutput>
         },
     })
     .to_string();
-    let (status, text) = match fetch::post(&target, true, &accept, &init) {
+    let (status, text) = match fetch::post(&target, true, &accept, &init, MAX_REPLY) {
         Ok(answer) => answer,
         Err(why) => return Ok(ToolOutput::err(why)),
     };
@@ -228,7 +334,7 @@ fn exa_mcp(session: &mut Session, query: &str, count: u64) -> Result<ToolOutput>
     if let Err(denied) = permit(session, "POST", &target, &header_names(&headers))? {
         return Ok(denied);
     }
-    let (status, text) = match fetch::post(&target, true, &headers, &call) {
+    let (status, text) = match fetch::post(&target, true, &headers, &call, MAX_REPLY) {
         Ok(answer) => answer,
         Err(why) => return Ok(ToolOutput::err(why)),
     };
@@ -339,11 +445,24 @@ pub fn format_hits(hits: &[Hit]) -> String {
         if !line.is_empty() {
             out.push_str(&format!("   {}\n", line.join(", ")));
         }
-        for quote in &h.highlights {
-            out.push_str(&format!("   > {}\n", quote.replace('\n', " ")));
+        for passage in h.highlights.iter().take(MAX_QUOTES) {
+            out.push_str(&format!("   > {}\n", passage_for_model(passage)));
         }
     }
     cut(out.trim_end())
+}
+
+/// One quoted passage as a single line, cut to [`MAX_QUOTE`] characters.
+///
+/// Cuts on a character boundary and says so, because half a word at the end of an excerpt reads as
+/// a typo rather than as an excerpt.
+fn passage_for_model(text: &str) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= MAX_QUOTE {
+        return one_line;
+    }
+    let kept: String = one_line.chars().take(MAX_QUOTE).collect();
+    format!("{kept}…")
 }
 
 fn title_of(hit: &Hit) -> &str {
@@ -560,6 +679,40 @@ mod tests {
         assert!(text.contains("rate limiting"), "{text}");
         // A body that is not JSON is reported rather than dropped.
         assert!(explain(500, "<html>oops</html>").contains("<html>oops</html>"));
+    }
+
+    #[test]
+    fn a_passage_is_one_line_of_bounded_length() {
+        // Synthetic returns whole pages under `highlights`; a model gets an excerpt (D82).
+        let page = "word ".repeat(5000);
+        let quoted = passage_for_model(&page);
+        assert_eq!(
+            quoted.chars().count(),
+            MAX_QUOTE + 1,
+            "kept or ellipsis wrong"
+        );
+        assert!(quoted.ends_with('…'), "{quoted:.20}");
+        // A short passage is untouched apart from its line breaks.
+        assert_eq!(passage_for_model("one\n two\n\nthree"), "one two three");
+        // No more than a few passages per result, whatever the server sends.
+        let hit = Hit {
+            title: "a".into(),
+            url: "https://a/".into(),
+            highlights: (0..10).map(|i| format!("passage {i}")).collect(),
+            ..Hit::default()
+        };
+        let text = format_hits(&[hit]);
+        assert_eq!(text.matches("   > ").count(), MAX_QUOTES, "{text}");
+        // Five whole pages still fit in one answer.
+        let hits: Vec<Hit> = (0..5)
+            .map(|i| Hit {
+                title: format!("t{i}"),
+                url: format!("https://a/{i}"),
+                highlights: vec![page.clone()],
+                ..Hit::default()
+            })
+            .collect();
+        assert!(format_hits(&hits).len() < MAX_BYTES, "not bounded");
     }
 
     #[test]

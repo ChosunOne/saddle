@@ -426,23 +426,6 @@ impl std::error::Error for Cancelled {}
 
 /// One `[providers.<name>]` table in `config.toml`, or a built-in preset. Fields set in the
 /// config override the preset of the same name.
-/// Providers that answer a web search themselves, as `(provider, host)` (D82).
-///
-/// It is empty, and that is a finding rather than an omission: Synthetic serves chat completions
-/// only — `/v1/responses`, `/v1/search` and `/v1/web_search` all answer 404 on `api.synthetic.new`
-/// — so there is no server-side search to call. `openai` and `anthropic` are named by
-/// [`endpoint`] and neither is asked for one here.
-///
-/// The table is the seam the `websearch` tool reads first, so a provider that gains the capability
-/// is one line here and no new code path. The test below fails the day it is filled in, which
-/// makes that a deliberate change with a decision behind it rather than a silent switch.
-pub const SERVER_SIDE_SEARCH: &[(&str, &str)] = &[];
-
-/// The first provider in [`SERVER_SIDE_SEARCH`], when one exists.
-pub fn searching_provider() -> Option<(&'static str, &'static str)> {
-    SERVER_SIDE_SEARCH.first().copied()
-}
-
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ProviderEntry {
@@ -461,6 +444,9 @@ pub struct ProviderEntry {
     /// The provider's own usage or quota endpoint, fetched for the status line (D36). A server
     /// that states nothing in its response headers can still state a balance here.
     pub usage_url: Option<String>,
+    /// The provider's web search, when it serves one (D82). The `websearch` tool asks here before
+    /// it looks for a key of its own, so a provider's own credential pays for its own search.
+    pub search_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -476,6 +462,8 @@ pub struct ProviderConfig {
     pub price: Option<Price>,
     /// Where to ask what is left, when the provider has an endpoint for it (D36).
     pub usage_url: Option<String>,
+    /// Where to ask the web a question, when the provider searches on its own (D82).
+    pub search_url: Option<String>,
 }
 
 /// Built-in providers. Anthropic's wire format stays available for providers defined in
@@ -495,6 +483,8 @@ fn presets() -> BTreeMap<&'static str, ProviderEntry> {
             "synthetic",
             ProviderEntry {
                 usage_url: Some("https://api.synthetic.new/v2/quotas".into()),
+                // Same host, same version prefix as the quotas endpoint above (D82).
+                search_url: Some("https://api.synthetic.new/v2/search".into()),
                 ..entry("https://api.synthetic.new/openai/v1", "SYNTHETIC_API_KEY")
             },
         ),
@@ -571,6 +561,7 @@ pub fn endpoint(name: &str, user: &BTreeMap<String, ProviderEntry>) -> Result<Pr
                     .and_then(PriceEntry::to_price)
             }),
         usage_url: pick(|e| &e.usage_url).filter(|u| !u.is_empty()),
+        search_url: pick(|e| &e.search_url).filter(|u| !u.is_empty()),
     })
 }
 
@@ -618,6 +609,7 @@ pub fn catalog(user: &BTreeMap<String, ProviderEntry>) -> Vec<(String, ProviderE
             effort: m.effort.clone().or(base.effort),
             pricing: m.pricing.clone().or(base.pricing),
             usage_url: m.usage_url.clone().or(base.usage_url),
+            search_url: m.search_url.clone().or(base.search_url),
         }
     };
     let mut out: Vec<(String, ProviderEntry)> = presets
@@ -756,6 +748,15 @@ pub fn available_key(config: &ProviderConfig, stored_key: Option<&str>) -> Optio
         .or_else(|| stored_key.filter(|k| !k.is_empty()).map(str::to_owned))
 }
 
+/// A provider's own web search, as the tool needs it: a URL, and the name of the variable whose key
+/// pays for it (D82). The key value lives in the environment or in the auth store, never here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchTarget {
+    pub provider: String,
+    pub url: String,
+    pub key_env: Option<String>,
+}
+
 pub struct Provider {
     pub name: String,
     pub config: ProviderConfig,
@@ -773,6 +774,18 @@ impl Provider {
     /// The context window is settled here, from [`context_window`], so that everything downstream
     /// — compaction, the TUI header, `saddle check` — reads one number rather than each deciding
     /// for itself what a model takes (D34).
+    /// Where this provider's web search is, when it serves one (D82).
+    ///
+    /// The key is not carried: it is named by `key_env` and looked up at the call, the same way the
+    /// model loop looks it up, so a key put in place mid-session is the key the search uses.
+    pub fn search_target(&self) -> Option<SearchTarget> {
+        self.config.search_url.as_ref().map(|url| SearchTarget {
+            provider: self.name.clone(),
+            url: url.clone(),
+            key_env: self.config.api_key_env.clone(),
+        })
+    }
+
     pub fn new(
         name: &str,
         config: ProviderConfig,
@@ -881,17 +894,6 @@ impl Provider {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn no_built_in_provider_searches_the_web_itself() {
-        // D82: Synthetic serves chat completions only, so `websearch` falls back to Exa. Filling
-        // this table in is a deliberate act, and the deny-list below is what makes it one.
-        assert!(
-            SERVER_SIDE_SEARCH.is_empty(),
-            "a provider now reports server-side search: wire it up and change D82"
-        );
-        assert_eq!(searching_provider(), None);
-    }
-
     use super::*;
     use crate::provider::http::ModelInfo;
 
@@ -942,7 +944,45 @@ model = "qwen"
             effort: None,
             price: None,
             usage_url: None,
+            search_url: None,
         }
+    }
+
+    #[test]
+    fn the_synthetic_preset_names_its_search() {
+        // D82: the search is a provider setting, so it is resolved like any other endpoint field.
+        // The value has to be a sibling of the quotas endpoint, not a guess at a route.
+        let user = BTreeMap::new();
+        let syn = endpoint("synthetic", &user).unwrap();
+        assert_eq!(
+            syn.search_url.as_deref(),
+            Some("https://api.synthetic.new/v2/search")
+        );
+        assert_eq!(
+            syn.usage_url.as_deref(),
+            Some("https://api.synthetic.new/v2/quotas")
+        );
+        // A provider that does not search says so by leaving it empty, which is what sends the tool
+        // to the fallback rather than to a route that is not there.
+        let config = config("m", "https://example.test/v1");
+        assert_eq!(config.search_url, None);
+        let user: BTreeMap<String, ProviderEntry> = [(
+            "mine".to_owned(),
+            ProviderEntry {
+                api: Some(Api::Openai),
+                base_url: Some("https://mine.test/v1".into()),
+                search_url: Some("https://mine.test/v2/search".into()),
+                ..ProviderEntry::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+        let config = endpoint("mine", &user).unwrap();
+        assert_eq!(
+            config.search_url.as_deref(),
+            Some("https://mine.test/v2/search"),
+            "a provider may be told where it searches"
+        );
     }
 
     #[test]
