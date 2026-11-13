@@ -1,7 +1,7 @@
 //! A branch-only, read-only SQL surface; untrusted SQL never reaches the saved store (D92).
 //!
-//! Two views: the branch's messages, and one row per model request with what it used, what
-//! answered it and whether it read the provider's cache (D94).
+//! Three views: the branch's messages, one row per model request with what it used and what
+//! answered it (D94), and the reasoning behind those messages (D98).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -48,11 +48,11 @@ fn authorize(ctx: AuthContext<'_>) -> Authorization {
     match ctx.action {
         AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
         AuthAction::Read { table_name, .. } => match (table_name, ctx.accessor) {
-            // The two views, and the backing table each of them reads (D92, D94).
-            ("messages" | "requests", _) => Authorization::Allow,
-            ("message_snapshot", Some("messages")) | ("request_snapshot", Some("requests")) => {
-                Authorization::Allow
-            }
+            // The three views, and the backing table each of them reads (D92, D94, D98).
+            ("messages" | "requests" | "reasoning", _) => Authorization::Allow,
+            ("message_snapshot", Some("messages"))
+            | ("request_snapshot", Some("requests"))
+            | ("reasoning_snapshot", Some("reasoning")) => Authorization::Allow,
             _ => Authorization::Deny,
         },
         AuthAction::Function {
@@ -81,7 +81,9 @@ fn query(snapshot: &Snapshot, sql: &str) -> Result<Value> {
             cached INTEGER, cost REAL, dropped INTEGER, at TEXT, after INTEGER);
         CREATE VIEW requests AS SELECT ordinal, node, kind, provider, model, input, output,
             cache_read, cache_write, cached, cost, dropped AS reasoning_dropped, at, after
-            FROM request_snapshot;",
+            FROM request_snapshot;
+        CREATE TABLE reasoning_snapshot(ordinal INTEGER, node INTEGER, part INTEGER, text TEXT);
+        CREATE VIEW reasoning AS SELECT ordinal, node, part, text FROM reasoning_snapshot;",
     )?;
     {
         let mut insert = conn.prepare("INSERT INTO message_snapshot VALUES (?1, ?2, ?3, ?4)")?;
@@ -109,6 +111,17 @@ fn query(snapshot: &Snapshot, sql: &str) -> Result<Value> {
                 row.dropped as i64,
                 row.at,
                 row.after as i64,
+            ])?;
+        }
+    }
+    {
+        let mut insert = conn.prepare("INSERT INTO reasoning_snapshot VALUES (?1, ?2, ?3, ?4)")?;
+        for row in &snapshot.reasoning {
+            insert.execute(params![
+                row.ordinal as i64,
+                row.node,
+                row.part as i64,
+                row.text
             ])?;
         }
     }
@@ -166,12 +179,13 @@ fn query(snapshot: &Snapshot, sql: &str) -> Result<Value> {
 mod tests {
     use super::*;
     use crate::provider::Usage;
-    use crate::store::RequestRow;
+    use crate::store::{ReasoningRow, RequestRow};
 
     fn messages() -> Snapshot {
         Snapshot {
             messages: vec![(7, "user".into(), "remember teal".into())],
             requests: Vec::new(),
+            reasoning: Vec::new(),
         }
     }
 
@@ -217,6 +231,7 @@ mod tests {
                 request("synthetic", "glm", 1_000, 900),
                 request("openai", "gpt", 2_000, 0),
             ],
+            reasoning: Vec::new(),
         };
         let out = query(
             &snapshot,
@@ -250,6 +265,7 @@ mod tests {
                 dropped,
                 request("openai", "gpt", 500, 0),
             ],
+            reasoning: Vec::new(),
         };
         let out = query(
             &snapshot,
@@ -260,14 +276,49 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_is_searchable_beside_the_text_it_produced() {
+        // D98: reasoning was replayed to the model and stored on the item (D95, D96) and no view
+        // could see it, so the transcript was searchable and the thinking behind it was not.
+        let snapshot = Snapshot {
+            messages: vec![
+                (7, "user".into(), "how many rows".into()),
+                (8, "assistant".into(), "checking".into()),
+            ],
+            requests: Vec::new(),
+            reasoning: vec![ReasoningRow {
+                ordinal: 2,
+                node: 8,
+                part: 0,
+                text: "count the rows, then subtract the ones the filter took".into(),
+            }],
+        };
+        let out = query(
+            &snapshot,
+            "SELECT m.ordinal, m.role, r.text FROM messages m JOIN reasoning r USING (ordinal)
+             WHERE r.text LIKE '%subtract%'",
+        )
+        .unwrap();
+        assert_eq!(
+            out["rows"],
+            json!([[
+                2,
+                "assistant",
+                "count the rows, then subtract the ones the filter took"
+            ]])
+        );
+    }
+
+    #[test]
     fn the_backing_tables_are_as_private_as_the_views() {
         let snapshot = Snapshot {
             messages: messages().messages,
             requests: vec![request("openai", "gpt", 10, 0)],
+            reasoning: Vec::new(),
         };
         for sql in [
             "SELECT * FROM message_snapshot",
             "SELECT * FROM request_snapshot",
+            "SELECT * FROM reasoning_snapshot",
         ] {
             assert!(query(&snapshot, sql).is_err(), "{sql}");
         }
@@ -302,6 +353,7 @@ mod tests {
         let snapshot = Snapshot {
             messages: vec![(1, "user".into(), "hi".into()); 101],
             requests: Vec::new(),
+            reasoning: Vec::new(),
         };
         let out = query(&snapshot, "SELECT * FROM messages").unwrap();
         assert_eq!(out["rows"].as_array().unwrap().len(), 100);
@@ -314,6 +366,7 @@ mod tests {
         let snapshot = Snapshot {
             messages: vec![(1, "user".into(), "\"".repeat(30_000))],
             requests: Vec::new(),
+            reasoning: Vec::new(),
         };
         let out = query(&snapshot, "SELECT text FROM messages").unwrap();
         assert_eq!(out["truncated"], true);

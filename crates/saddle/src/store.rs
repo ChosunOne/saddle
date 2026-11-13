@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{Item, Part, ToolResult, Usage};
+use crate::provider::{Item, Part, ToolResult, Usage, reasoning_text};
 
 /// What a node holds. Every node is one of these, and the kind is a column so a query can pick
 /// one out without parsing the body.
@@ -98,13 +98,27 @@ pub struct RequestRow {
     pub after: usize,
 }
 
-/// What one `session_query` may see: this branch's messages, and the requests that produced them
-/// (D92, D94).
+/// One reasoning block, as `session_query` reads it (D98).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReasoningRow {
+    /// The ordinal of the message it belongs to, in the same space as `messages`, so the two join.
+    pub ordinal: usize,
+    pub node: i64,
+    /// Its position among that message's parts, so several blocks keep the order they arrived in.
+    pub part: usize,
+    /// What the block says, not the block itself: an encrypted item has no row at all (D98).
+    pub text: String,
+}
+
+/// What one `session_query` may see: this branch's messages, the requests that produced them
+/// (D94), and what the model thought while producing them (D98).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
     /// `(node, role, text)` per message on the branch, in order.
     pub messages: Vec<(i64, String, String)>,
     pub requests: Vec<RequestRow>,
+    /// Reasoning in branch order, each row naming the message it belongs to.
+    pub reasoning: Vec<ReasoningRow>,
 }
 
 /// The schema version this build writes. A database from a newer build is refused rather than
@@ -375,31 +389,48 @@ impl Store {
     /// What `session_query` may see of one conversation: its branch's text, before compaction as
     /// well as after it (D92), and what each request on that branch used (D94).
     ///
-    /// One walk fills both, which is what lets a request name the message it answered: a request
-    /// that cost nothing for a 100k-token prompt is only diagnosable next to that prompt.
+    /// One walk fills all three, which is what lets a request name the message it answered and a
+    /// reasoning block name the reply it produced: a request that cost nothing for a 100k-token
+    /// prompt is only diagnosable next to that prompt.
     pub fn snapshot(&self, session: &str) -> Result<Snapshot> {
         let mut out = Vec::new();
         let mut requests = Vec::new();
+        let mut reasoning = Vec::new();
         for node in self.branch(session)? {
             if node.kind == kind::ITEM {
                 let item: Item = serde_json::from_str(&node.body)?;
+                let ordinal = out.len() + 1;
                 let (role, text) = match item {
                     Item::User(text) | Item::Attached { text, .. } => ("user", text),
                     Item::Summary(text) => ("summary", text),
-                    Item::Assistant(parts) => (
-                        "assistant",
-                        parts
-                            .into_iter()
-                            .filter_map(|part| match part {
-                                Part::Text(text) => Some(text),
-                                Part::Call(call) => {
-                                    Some(serde_json::to_string(&call).unwrap_or_default())
-                                }
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    ),
+                    Item::Assistant(parts) => {
+                        // D98: the thinking is kept whole to replay it, and only its prose is
+                        // readable here, so the row carries the text rather than the block.
+                        for (part, block) in parts.iter().enumerate() {
+                            if let Some(text) = reasoning_text(block) {
+                                reasoning.push(ReasoningRow {
+                                    ordinal,
+                                    node: node.id,
+                                    part,
+                                    text,
+                                });
+                            }
+                        }
+                        (
+                            "assistant",
+                            parts
+                                .into_iter()
+                                .filter_map(|part| match part {
+                                    Part::Text(text) => Some(text),
+                                    Part::Call(call) => {
+                                        Some(serde_json::to_string(&call).unwrap_or_default())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        )
+                    }
                     Item::ToolResults(results) => (
                         "tool",
                         results
@@ -424,6 +455,7 @@ impl Store {
         Ok(Snapshot {
             messages: out,
             requests,
+            reasoning,
         })
     }
 
@@ -1063,6 +1095,28 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_carries_the_reasoning_beside_the_message_it_produced() {
+        // D98: the reasoning was kept on the wire (D95, D96) and in the store, and every query
+        // dropped it on the floor, so "what did it think before it chose that tool" was an
+        // assumption about the transcript rather than something it could be asked.
+        let s = store();
+        let id = s.begin("synthetic", "glm").unwrap();
+        conversation(&s, &id);
+        let snapshot = s.snapshot(&id).unwrap();
+        assert_eq!(snapshot.messages.len(), 2);
+        assert_eq!(
+            snapshot.reasoning,
+            vec![ReasoningRow {
+                // The reply is the branch's second message, and the reasoning is its first part.
+                ordinal: 2,
+                node: snapshot.messages[1].0,
+                part: 0,
+                text: "hmm".into(),
+            }]
+        );
     }
 
     #[test]

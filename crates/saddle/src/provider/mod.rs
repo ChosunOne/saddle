@@ -237,6 +237,47 @@ impl Item {
     }
 }
 
+/// The readable text of a reasoning block, for the transcript and for search (D98).
+///
+/// A block is kept whole, because replaying it needs every field (D95); only one of those fields is
+/// prose, and which one it is depends on the surface that produced the block. A block with no prose
+/// in it — an encrypted Responses item, an Anthropic `redacted_thinking` — yields none rather than a
+/// ciphertext, because a value nothing can read is not something a search can find.
+pub fn reasoning_text(part: &Part) -> Option<String> {
+    let Part::Native { api, block } = part else {
+        return None;
+    };
+    let text = match api {
+        // Anthropic streams thinking as a block of its own, beside the signature that proves it.
+        Api::Anthropic => (block["type"] == "thinking")
+            .then(|| block["thinking"].as_str())
+            .flatten()?,
+        // Chat completions carry it as one string, under whichever of the two names a server uses.
+        Api::Openai => block["reasoning_content"]
+            .as_str()
+            .or(block["reasoning"].as_str())?,
+        // A Responses item lists summary parts, and its raw content when the server sent that.
+        Api::OpenaiResponses => return reasoning_summary(block),
+    };
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// The prose inside a Responses reasoning item: its summary parts, or its content (D98).
+///
+/// `encrypted_content` is deliberately not read. It is the item's replayable form (D95), not
+/// anything a person or a query can read.
+fn reasoning_summary(block: &Value) -> Option<String> {
+    ["summary", "content"].iter().copied().find_map(|key| {
+        let text = block[key]
+            .as_array()?
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!text.is_empty()).then_some(text)
+    })
+}
+
 /// How a summary item is introduced to the model.
 pub const SUMMARY_INTRO: &str =
     "The conversation so far was compacted. This summary replaces the earlier messages:\n\n";
@@ -1190,6 +1231,55 @@ impl Provider {
 mod tests {
     use super::*;
     use crate::provider::http::ModelInfo;
+    use serde_json::json;
+
+    #[test]
+    fn the_prose_in_a_reasoning_block_depends_on_the_surface_that_sent_it() {
+        // D98: three shapes, and two of them are not prose at all. A block that cannot be read
+        // must produce no row rather than a ciphertext in a text column.
+        let anthropic = Part::Native {
+            api: Api::Anthropic,
+            block: json!({"type":"thinking","thinking":"check the offset","signature":"sig"}),
+        };
+        let redacted = Part::Native {
+            api: Api::Anthropic,
+            block: json!({"type":"redacted_thinking","data":"AAAA"}),
+        };
+        let chat = Part::Native {
+            api: Api::Openai,
+            block: json!({"reasoning_content":"count the rows"}),
+        };
+        let other_name = Part::Native {
+            api: Api::Openai,
+            block: json!({"reasoning":"count the columns"}),
+        };
+        let responses = Part::Native {
+            api: Api::OpenaiResponses,
+            block: json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type":"summary_text","text":"one"},{"type":"summary_text","text":"two"}],
+                "encrypted_content": "gAAAA",
+            }),
+        };
+        let encrypted_only = Part::Native {
+            api: Api::OpenaiResponses,
+            block: json!({"type":"reasoning","id":"rs_2","summary":[],"encrypted_content":"gAAAA"}),
+        };
+        assert_eq!(
+            reasoning_text(&anthropic).as_deref(),
+            Some("check the offset")
+        );
+        assert_eq!(reasoning_text(&redacted), None);
+        assert_eq!(reasoning_text(&chat).as_deref(), Some("count the rows"));
+        assert_eq!(
+            reasoning_text(&other_name).as_deref(),
+            Some("count the columns")
+        );
+        assert_eq!(reasoning_text(&responses).as_deref(), Some("one\n\ntwo"));
+        assert_eq!(reasoning_text(&encrypted_only), None);
+        assert_eq!(reasoning_text(&Part::Text("not reasoning".into())), None);
+    }
 
     #[test]
     fn presets_merge_with_user_tables() {

@@ -74,7 +74,7 @@ pub fn definitions() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "session_query",
-            description: "Read-only SQL over two views of the current conversation branch, \
+            description: "Read-only SQL over three views of the current conversation branch, \
                 including pre-compaction history. \
                 messages(ordinal INTEGER, id INTEGER, role TEXT, text TEXT): role is user, \
                 assistant, tool or summary. \
@@ -85,12 +85,17 @@ pub fn definitions() -> Vec<ToolDef> {
                 served from the provider's cache, reasoning_dropped the reasoning items the \
                 provider said it removed from the prompt, after the ordinal of the last message \
                 before it. \
+                reasoning(ordinal INTEGER, node INTEGER, part INTEGER, text TEXT): one row per \
+                reasoning block, ordinal the message it belongs to, part its position among that \
+                message's parts, text what it says when the block is prose at all (an encrypted \
+                or redacted block has no row). \
                 No other conversations, images, internal tables or files are accessible. Requires \
                 transcript-read. Results are capped at 100 rows and 50 KiB; use WHERE, ORDER BY \
                 ordinal and LIMIT/OFFSET to search and page. Examples: \
                 SELECT ordinal, role, text FROM messages WHERE text LIKE '%decision%' LIMIT 10; \
                 SELECT provider, model, sum(cache_read), sum(input + cache_read) FROM requests \
-                GROUP BY provider, model",
+                GROUP BY provider, model; SELECT m.ordinal, r.text FROM messages m \
+                JOIN reasoning r USING (ordinal) WHERE r.text LIKE '%cache%'",
             schema: json!({
                 "type": "object",
                 "properties": {"sql": {"type": "string", "description": "A read-only SQLite query"}},

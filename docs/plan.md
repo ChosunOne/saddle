@@ -2425,6 +2425,36 @@ not done yet, and the cost is recorded rather than hidden (D97).
   history.
 - **A compaction request records zero**, because it has no reply to read the count from.
 
+**D98.** What the model thought is searchable, as a view of its own.
+
+D95 and D96 made reasoning travel: it is kept verbatim, replayed in position, and stored on the
+assistant item. `session_query` (D92, D94) could not see any of it — `Store::snapshot` mapped
+`Part::Text` and `Part::Call` and dropped `Part::Native` — so a conversation of nine thousand
+messages had not one reasoning block to query, and "what did the model think before it chose that
+tool" was an assumption about the transcript rather than a fact about it. The text of a reply is a
+lossy summary of the reasoning behind it, which is exactly the part left unsearchable.
+
+- **A third view, not a column.** `reasoning(ordinal INTEGER, node INTEGER, part INTEGER,
+  text TEXT)`, one row per reasoning block. Joined to `messages` on `ordinal` it puts a reply's
+  thinking beside the text it produced; `part` keeps several blocks in the order they arrived. It
+  is not folded into `messages.text`, because that column is what the model was shown and what every
+  count over the transcript measures: mixing a derivation into the record of what was said would
+  corrupt the counts it is compared against.
+- **Only the prose is extracted**, which is the one thing the surfaces disagree about (D95). The
+  function sits beside `Part` rather than in the store, because it is a fact about a wire format:
+  `thinking` for Anthropic, `reasoning_content` or `reasoning` for chat completions, the `summary`
+  parts — or the raw `content` — for a Responses item.
+- **A block with no prose produces no row.** `encrypted_content` is a ciphertext and
+  `redacted_thinking` is a placeholder; either would put unreadable bytes in a text column, and a
+  `LIKE` that can never match makes an absence of thinking indistinguishable from thinking nobody
+  can read. The block itself is still kept and still replayed (D95); only the view skips it.
+- **A row is per block, not per turn.** A reply that thought twice has two rows, so
+  `SELECT count(*) FROM reasoning` counts blocks rather than replies that had any, and a reply's
+  whole reasoning is `group_concat` over its ordinal.
+- **The gate is unchanged.** The same `transcript-read` grant, the same branch-only in-memory
+  snapshot (D92), the same authorizer, and a backing table as private as the other two: a query may
+  read `reasoning` and not `reasoning_snapshot`.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
