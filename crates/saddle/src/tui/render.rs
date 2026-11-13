@@ -159,18 +159,23 @@ fn block_style(theme: &Theme) -> Style {
     Style::new().fg(theme.md_code_block)
 }
 
-/// Markdown to rows. Soft breaks are kept as line breaks, since a model's line breaks are usually
-/// deliberate (tables, lists written by hand).
-pub fn markdown(text: &str, theme: &Theme) -> Vec<Row> {
-    markdown_over(text, theme, Style::new())
+/// Markdown to rows, fitted to `room` columns. Soft breaks are kept as line breaks, since a model's
+/// line breaks are usually deliberate (tables, lists written by hand).
+///
+/// The room is what a table needs and nothing else does: a table is the one construct whose layout
+/// cannot survive being wrapped afterwards, because a wrapped row loses the alignment that makes
+/// it a table. Every other block is wrapped by [`wrap`] as it always was.
+pub fn markdown(text: &str, theme: &Theme, room: usize) -> Vec<Row> {
+    markdown_over(text, theme, Style::new(), room)
 }
 
 /// Markdown drawn over `base`, which is what a message the user typed gets: the text is already in
 /// their colour, and the emphasis they wrote is a modifier on top of it.
-fn markdown_over(text: &str, theme: &Theme, base: Style) -> Vec<Row> {
+fn markdown_over(text: &str, theme: &Theme, base: Style, room: usize) -> Vec<Row> {
     let mut md = Markdown {
         theme: theme.clone(),
         base,
+        room,
         ..Markdown::default()
     };
     let options =
@@ -184,6 +189,8 @@ fn markdown_over(text: &str, theme: &Theme, base: Style) -> Vec<Row> {
 
 #[derive(Default)]
 struct Markdown {
+    /// The columns a table may use, so it is fitted instead of wrapped apart.
+    room: usize,
     /// The colours, kept here because the parser's callbacks are methods on this struct (D71).
     theme: Theme,
     rows: Vec<Row>,
@@ -482,31 +489,53 @@ impl Markdown {
         }
     }
 
+    /// Lays a table out inside the room it was given.
+    ///
+    /// The widths are the natural ones when they fit, and otherwise shrunk towards a minimum, which
+    /// is what pi does with the same problem: a column's share falls in proportion to how much it
+    /// wanted above its minimum, so a table of one wide prose column and three short ones keeps the
+    /// short ones readable instead of squeezing every column equally.
+    ///
+    /// A cell is then wrapped inside its column and padded to it, so a row that has to be tall
+    /// stays aligned. That is the whole point: a table whose rows are wrapped by the generic
+    /// wrapper afterwards is not a table any more.
     fn table_rows(&mut self, t: Table) {
         let cols = t.rows.iter().map(Vec::len).max().unwrap_or(0);
-        let mut widths = vec![0; cols];
+        if cols == 0 {
+            return;
+        }
+        let mut natural = vec![0; cols];
+        let mut longest_word = vec![1; cols];
         for row in &t.rows {
             for (i, cell) in row.iter().enumerate() {
-                widths[i] = widths[i].max(spans_width(cell));
+                natural[i] = natural[i].max(spans_width(cell));
+                longest_word[i] = longest_word[i].max(longest_word_width(cell));
             }
         }
+        let widths = column_widths(&natural, &longest_word, self.room);
         let sep = Style::new().fg(self.theme.muted);
         for (r, row) in t.rows.into_iter().enumerate() {
             let head = r < t.head_rows;
-            for (i, cell) in row.into_iter().enumerate() {
-                if i > 0 {
-                    self.line.push(Span::styled(" │ ", sep));
-                }
-                let pad = widths[i].saturating_sub(spans_width(&cell));
-                for mut span in cell {
-                    if head {
-                        span.style = span.style.add_modifier(Modifier::BOLD);
+            // Every cell wrapped to its column, then the row read across the tallest of them.
+            let cells: Vec<Vec<Vec<Span<'static>>>> = (0..cols)
+                .map(|i| match row.get(i) {
+                    Some(cell) => wrap_cell(cell, widths[i], head),
+                    None => vec![Vec::new()],
+                })
+                .collect();
+            let height = cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
+            for line in 0..height {
+                for (i, cell) in cells.iter().enumerate() {
+                    if i > 0 {
+                        self.line.push(Span::styled(" │ ", sep));
                     }
-                    self.line.push(span);
+                    let spans = cell.get(line).cloned().unwrap_or_default();
+                    let pad = widths[i].saturating_sub(spans_width(&spans));
+                    self.line.extend(spans);
+                    self.line.push(Span::raw(" ".repeat(pad)));
                 }
-                self.line.push(Span::raw(" ".repeat(pad)));
+                self.flush();
             }
-            self.flush();
             if head && r + 1 == t.head_rows {
                 let rule: Vec<String> = widths.iter().map(|w| "─".repeat(*w)).collect();
                 self.line.push(Span::styled(rule.join("─┼─"), sep));
@@ -514,6 +543,197 @@ impl Markdown {
             }
         }
     }
+}
+
+/// The width of the longest word one cell cannot break, which is the narrowest its column may be
+/// before a word has to be split.
+fn longest_word_width(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .flat_map(|s| s.content.split_whitespace())
+        .map(|w| w.width())
+        .max()
+        .unwrap_or(1)
+}
+
+/// Column widths for `natural` widths in `room` columns, separators included.
+///
+/// Fitting only ever shrinks: a table that already fits keeps its natural widths, so nothing moves
+/// when the terminal is wide enough.
+///
+/// The shrink is water-filling rather than an even split, which is the difference between a table
+/// that reads and one that does not. A column that would fit inside an equal share is given its
+/// natural width and takes no part in the squeeze, so a `yes` column stays `yes` while the one
+/// paragraph column beside it absorbs the whole deficit. An even split cuts the short word and
+/// starves the column that could give most, which shows up as `saddl` / `e`.
+///
+/// `min` is the longest word per column, as this does what pi does: a word is only split when the
+/// table cannot be laid out without splitting it, so `Plugin` stays whole and the column takes the
+/// room from the prose beside it.
+pub fn column_widths(natural: &[usize], min: &[usize], room: usize) -> Vec<usize> {
+    let cols = natural.len();
+    if cols == 0 {
+        return Vec::new();
+    }
+    // " │ " between columns.
+    let separators = 3 * cols.saturating_sub(1);
+    let total: usize = natural.iter().sum();
+    if total <= room.saturating_sub(separators) {
+        return natural.to_vec();
+    }
+    let mut floors: Vec<usize> = (0..cols)
+        .map(|i| min.get(i).copied().unwrap_or(1).min(natural[i]).max(1))
+        .collect();
+    // The room a column has once every other column has its floor, which is what decides whether
+    // the floors themselves can be paid for.
+    let floor_total: usize = floors.iter().sum();
+    let budget = room.saturating_sub(separators).max(cols);
+    if floor_total > budget {
+        // Even the longest words do not fit: every column takes one cell and the rest is shared by
+        // how much each still wants, so a wide table on a narrow screen still has a shape.
+        floors = vec![1; cols];
+        let mut widths = floors.clone();
+        let want: Vec<usize> = natural.iter().map(|n| n.saturating_sub(1)).collect();
+        let asked: usize = want.iter().sum();
+        let spare = budget.saturating_sub(cols);
+        for (i, w) in want.iter().enumerate() {
+            widths[i] += (w * spare).checked_div(asked).unwrap_or(0);
+        }
+        return top_up(widths, natural, budget);
+    }
+    let mut widths = floors.clone();
+    let mut order: Vec<usize> = (0..cols).collect();
+    order.sort_by_key(|i| natural[*i]);
+    let mut left = budget.saturating_sub(floor_total);
+    let mut unresolved = cols;
+    for (position, i) in order.iter().enumerate() {
+        let want = natural[*i].saturating_sub(widths[*i]);
+        let fair = left.checked_div(unresolved).unwrap_or(0);
+        if want <= fair {
+            widths[*i] += want;
+            left -= want;
+            unresolved -= 1;
+        } else {
+            // The rest share what is left: the wide columns are the ones that can give.
+            let rest = &order[position..];
+            let asked: usize = rest
+                .iter()
+                .map(|j| natural[*j].saturating_sub(widths[*j]))
+                .sum();
+            for j in rest {
+                let want = natural[*j].saturating_sub(widths[*j]);
+                let share = (want * left).checked_div(asked).unwrap_or(0);
+                widths[*j] += share;
+            }
+            break;
+        }
+    }
+    top_up(widths, natural, budget)
+}
+
+/// Hands out the columns integer division left over, to whichever column still has most to gain.
+fn top_up(mut widths: Vec<usize>, natural: &[usize], budget: usize) -> Vec<usize> {
+    let mut spare = budget.saturating_sub(widths.iter().sum::<usize>());
+    while spare > 0 {
+        let Some((i, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(i, w)| **w < natural[*i])
+            .max_by_key(|(_, w)| **w)
+        else {
+            break;
+        };
+        widths[i] += 1;
+        spare -= 1;
+    }
+    widths
+}
+
+/// One cell's spans wrapped to `width` columns, a line per row of the cell.
+///
+/// Words break at spaces and a word longer than the column is split, since a URL in a narrow column
+/// must not push the rest of the row off the screen.
+fn wrap_cell(spans: &[Span<'static>], width: usize, head: bool) -> Vec<Vec<Span<'static>>> {
+    let styled = |content: String| -> Span<'static> {
+        let style = spans
+            .first()
+            .map(|s| s.style)
+            .unwrap_or_default()
+            .patch(if head {
+                Style::new().add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            });
+        Span::styled(content, style)
+    };
+    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut used = 0usize;
+    for span in spans {
+        for word in span.content.split_inclusive(' ') {
+            let w = word.width();
+            if used > 0 && used + w > width {
+                lines.push(Vec::new());
+                used = 0;
+            }
+            if w <= width {
+                let text = if used == 0 { word.trim_start() } else { word };
+                let mut s = span.clone();
+                s.content = text.to_owned().into();
+                s.style = span.style.patch(if head {
+                    Style::new().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new()
+                });
+                if !s.content.is_empty() {
+                    used += s.content.width();
+                    lines.last_mut().expect("a cell always has a line").push(s);
+                }
+                continue;
+            }
+            // A word wider than the column: split it across the lines it needs.
+            let mut rest: String = word.to_owned();
+            while !rest.is_empty() {
+                let space = width.saturating_sub(used);
+                if space == 0 {
+                    lines.push(Vec::new());
+                    used = 0;
+                    continue;
+                }
+                let mut take = space.min(rest.len());
+                while take > 0 && !rest.is_char_boundary(take) {
+                    take -= 1;
+                }
+                if take == 0 {
+                    take = rest.len().min(1);
+                }
+                let (head_part, tail) = rest.split_at(take);
+                // At the start of a line the split's own space is dropped, or a continuation would
+                // begin with a blank and every wrapped row would look indented by one.
+                let text = if used == 0 {
+                    head_part.trim_start()
+                } else {
+                    head_part
+                };
+                if !text.is_empty() {
+                    let mut s = span.clone();
+                    s.content = text.to_owned().into();
+                    s.style = span.style.patch(if head {
+                        Style::new().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::new()
+                    });
+                    used += s.content.width();
+                    lines.last_mut().expect("a cell always has a line").push(s);
+                }
+                rest = tail.to_owned();
+            }
+        }
+    }
+    if lines.len() > 1 && lines.last().is_some_and(Vec::is_empty) {
+        lines.pop();
+    }
+    let _ = styled;
+    lines
 }
 
 fn dim(theme: &Theme) -> Style {
@@ -566,8 +786,8 @@ fn thinking_rows(text: &str, shown: bool, theme: &Theme) -> Vec<Row> {
 /// by the same code. The text is not bold, so that `**bold**` inside it is visible; the `>` marker is
 /// what says whose message it is. Every row gets the marker's width as its continuation, including
 /// a row a block construct made, so a list in a prompt still lines up under the message.
-fn user_rows(text: &str, theme: &Theme) -> Vec<Row> {
-    let mut rows = markdown_over(text, theme, Style::new().fg(theme.user_message_text));
+fn user_rows(text: &str, theme: &Theme, room: usize) -> Vec<Row> {
+    let mut rows = markdown_over(text, theme, Style::new().fg(theme.user_message_text), room);
     let marker = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
     for (i, row) in rows.iter_mut().enumerate() {
         row.first = vec![Span::styled(
@@ -583,8 +803,8 @@ fn user_rows(text: &str, theme: &Theme) -> Vec<Row> {
 fn entry_rows(entry: &Entry, view: View, theme: &Theme) -> Vec<Row> {
     match entry {
         Entry::Thinking(text) => thinking_rows(text, view.thinking, theme),
-        Entry::User(text) => user_rows(text, theme),
-        Entry::Assistant(text) => markdown(text, theme),
+        Entry::User(text) => user_rows(text, theme, view.room.0 as usize),
+        Entry::Assistant(text) => markdown(text, theme, view.room.0 as usize),
         Entry::Image(image) => {
             // The picture is drawn over the rows after this one, so they are left empty for it. The
             // marker line stays, and is all a terminal without a graphics protocol shows (D59).
@@ -628,6 +848,7 @@ fn compaction_block(
     thinking: bool,
     spinner: usize,
     theme: &Theme,
+    room: usize,
 ) -> (Vec<Row>, Color) {
     let accent = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
     let muted = Style::new().fg(theme.tool_output);
@@ -664,7 +885,7 @@ fn compaction_block(
     }
     if !v.summary.trim().is_empty() {
         rows.push(Row::default());
-        rows.extend(markdown(&v.summary, theme));
+        rows.extend(markdown(&v.summary, theme, room));
     }
     match &v.state {
         CompactState::Done(line) if !line.is_empty() => {
@@ -952,7 +1173,13 @@ fn transcript_with_images(
                     shaded(&rows, bg, width as usize)
                 }
                 Entry::Compaction(v) => {
-                    let (rows, bg) = compaction_block(v, view.thinking, view.spinner, &app.theme);
+                    let (rows, bg) = compaction_block(
+                        v,
+                        view.thinking,
+                        view.spinner,
+                        &app.theme,
+                        width as usize,
+                    );
                     shaded(&rows, bg, width as usize)
                 }
                 entry => entry_rows(entry, view, &app.theme)
@@ -2131,7 +2358,7 @@ mod tests {
     #[test]
     fn the_fence_tag_reaches_the_highlighter() {
         assert_eq!(Language::parse("rust"), Language::Tagged("rust".into()));
-        let rows = markdown("```rust\nlet x = 1;\n```", &Theme::default());
+        let rows = markdown("```rust\nlet x = 1;\n```", &Theme::default(), 80);
         let runs = block_runs(&rows[0]);
         assert!(
             runs.iter()
@@ -2293,7 +2520,7 @@ mod tests {
         // A highlighted line shows more than one colour, and the text is unchanged: highlighting
         // paints, it does not edit (D73).
         let theme = Theme::default();
-        let rows = markdown("```rust\nlet x: u32 = foo(1);\n```", &theme);
+        let rows = markdown("```rust\nlet x: u32 = foo(1);\n```", &theme, 80);
         let runs = block_runs(&rows[0]);
         let colours = distinct(&runs);
         assert!(colours > 2, "not highlighted: {runs:?}");
@@ -2301,7 +2528,7 @@ mod tests {
         assert_eq!(joined, "  let x: u32 = foo(1);");
 
         // A fence that names no language gets one colour, as it did before highlighting existed.
-        let rows = markdown("```\nlet x = 1;\n```", &theme);
+        let rows = markdown("```\nlet x = 1;\n```", &theme, 80);
         let runs = block_runs(&rows[0]);
         assert_eq!(distinct(&runs), 1, "{runs:?}");
     }
@@ -2310,7 +2537,7 @@ mod tests {
     fn a_multiline_block_comment_stays_a_comment_on_every_line() {
         // The highlighter carries state across lines, so a block's rows are walked in order (D73).
         let theme = Theme::default();
-        let rows = markdown("```rust\n/* one\ntwo */ let x = 1;\n```", &theme);
+        let rows = markdown("```rust\n/* one\ntwo */ let x = 1;\n```", &theme, 80);
         // The first run of each row is the indent, in the block's own colour; the next is the
         // comment, in the comment role, on both lines.
         for row in rows.iter().take(2) {
@@ -2353,7 +2580,7 @@ mod tests {
     #[test]
     fn markdown_blocks() {
         let md = "# Title\n\nSome **bold** and `code`.\n\n- one\n- two\n  wrapped\n\n```rust\nfn main() {\n    x();\n}\n```\n\n| a | bb |\n|---|----|\n| ccc | d |\n";
-        let rows: Vec<String> = markdown(md, &Theme::default())
+        let rows: Vec<String> = markdown(md, &Theme::default(), 80)
             .iter()
             .flat_map(|r| text(&wrap(r, 80)))
             .collect();
@@ -2384,6 +2611,94 @@ mod tests {
         assert_eq!(keep_tail("/a/b/project", 20), "/a/b/project");
         assert_eq!(keep_tail("/very/long/path/project", 10), "…h/project");
         assert_eq!(keep_tail("/x", 0), "");
+    }
+
+    /// Every row of a rendered table, as text, so a test can see the alignment.
+    fn table_text(text: &str, room: usize) -> Vec<String> {
+        markdown(text, &Theme::default(), room)
+            .iter()
+            .map(|r| {
+                r.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_table_is_fitted_to_the_room_instead_of_wrapped_apart() {
+        // The failure this fixes: a table wider than the terminal used to be handed to the generic
+        // wrapper, which broke its rows into pieces and destroyed the columns.
+        let md = "| a | b | c |\n|---|---|---|\n| alpha | beta | gamma |";
+        for room in [80usize, 40, 24, 16] {
+            let rows = table_text(md, room);
+            for row in &rows {
+                assert!(
+                    row.width() <= room.max(4),
+                    "room {room}: {row:?} is {} wide",
+                    row.width()
+                );
+            }
+            // The rule and the separators survive, which is what says it is still a table.
+            assert!(
+                rows.iter().any(|r| r.contains('┼')),
+                "room {room}: {rows:?}"
+            );
+            assert!(
+                rows.iter().any(|r| r.contains('│')),
+                "room {room}: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrow_column_wraps_its_cell_rather_than_pushing_the_row_off() {
+        // Long prose in one column of a narrow table: the cell becomes several lines and the other
+        // columns still line up beside it.
+        let md = "| gap | pi | opencode | saddle |\n|---|---|---|---|\n\
+                  | plugin system | TypeScript extensions with registerTool and lifecycle events | plugins and custom tools | none yet |";
+        let rows = table_text(md, 60);
+        assert!(rows.iter().all(|r| r.width() <= 60), "{rows:#?}");
+        // The first column appears on every physical line of that row, so it lines up.
+        let saddles = rows.iter().filter(|r| r.contains("saddle")).count();
+        assert!(saddles >= 1, "{rows:#?}");
+        // The word pair wraps at its space rather than being split, which is the difference between
+        // a narrow table and a mangled one.
+        assert!(rows.iter().any(|r| r.contains("plugin")), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("system")), "{rows:#?}");
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("plugi ") && !r.contains("plugin")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_table_that_fits_keeps_its_natural_widths() {
+        // Fitting only shrinks: on a wide terminal every cell is padded to its own content, so a
+        // short table does not get spread across the screen.
+        let widths = column_widths(&[3, 6, 4], &[3, 6, 4], 80);
+        assert_eq!(widths, vec![3, 6, 4]);
+        // A wide one shrinks, and never below the longest word while those fit at all.
+        let wide = column_widths(&[60, 60, 60], &[8, 8, 8], 40);
+        assert!(wide.iter().sum::<usize>() <= 40, "{wide:?}");
+        assert!(wide.iter().all(|w| *w >= 8), "{wide:?}");
+        // A column whose longest word fits inside its fair share keeps the word whole, while the
+        // prose column beside it gives up the room: `yes` must not become `ye`/`s`.
+        let mixed = column_widths(&[4, 40, 5], &[4, 8, 5], 30);
+        assert_eq!(mixed[0], 4, "{mixed:?}");
+        assert_eq!(mixed[2], 5, "{mixed:?}");
+        assert!(mixed[1] < 40, "{mixed:?}");
+        // When even the longest words do not fit, the columns still have a shape and each has a
+        // cell, rather than the table running off the screen.
+        let tiny = column_widths(&[20, 20], &[20, 20], 3);
+        assert_eq!(tiny.len(), 2);
+        assert!(tiny.iter().all(|w| *w >= 1), "{tiny:?}");
+        assert!(tiny.iter().sum::<usize>() <= 3, "{tiny:?}");
+        // An empty table is not a panic.
+        assert_eq!(column_widths(&[], &[], 40), Vec::<usize>::new());
     }
 
     #[test]

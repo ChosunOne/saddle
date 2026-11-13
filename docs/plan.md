@@ -1914,6 +1914,34 @@ answer "what is the current version of X".
   count and a preferred backend; and keeping a search across processes, which would need an artifact
   outside every root and buys nothing a second search does not.
 
+**D83.** A table is fitted to the width it has, because a table that is wrapped is not a table.
+
+Markdown tables were parsed into a grid and laid out at their natural widths, and the transcript
+wrapped every row afterwards like prose. A table wider than the terminal therefore came out with its
+rows broken across lines and its columns disjointed — the one construct whose meaning *is* its
+alignment. It was reported against the parity tables in a reply, which is the ordinary case: a table
+of three prose columns is wider than 80 columns by nature.
+
+- **The room is passed in.** `markdown` takes the columns it may use, which is the transcript width
+  the caller already knew; nothing else in the renderer changes, because every other block is still
+  wrapped by `wrap` exactly as before.
+- **The widths are water-filled, which is what pi does.** A column that fits inside an equal share
+  keeps its natural width and takes no part in the squeeze, so the one prose column beside three
+  short ones absorbs the deficit. An even split cuts the short word — `saddl` and `e` — and starves
+  the column that had the most to give.
+- **The floor is the longest word, not a constant.** A column is never narrowed below the widest
+  word in it, so `Plugin` stays whole while the paragraph next to it gives up the room. This is pi's
+  rule (`minWordWidths`) and the reason its tables stay legible when squeezed. Only when even the
+  words do not fit does a column fall to one cell and a word get split.
+- **A cell wraps inside its column and is padded to it**, so a tall row stays aligned. A word longer
+  than the column, a URL in a narrow column, is split rather than pushing the row off the screen; the
+  split drops the space at a line start, so a continuation is not silently indented.
+- **Nothing moves when the table fits**: natural widths are kept, so a short table is not spread
+  across the screen.
+- **Deferred:** borders around cells (`│` between and a rule under the head only, as before), column
+  alignment from the markdown (`:---:` is still ignored), and collapsing a table that cannot be made
+  readable at the width it has into a list.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
