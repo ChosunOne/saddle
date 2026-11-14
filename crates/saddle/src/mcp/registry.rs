@@ -175,7 +175,7 @@ impl Registry {
                 if let Some(bridge) = &bridge {
                     spec.net = Some(bridge.spec());
                 }
-                let mut client = Client::start(server, &helper, &spec)?;
+                let mut client = Client::start(server, &helper, &spec, entry.timeout())?;
                 let tools = {
                     let mut service = || {
                         if let Some(bridge) = bridge.as_mut() {
@@ -198,7 +198,8 @@ impl Registry {
                 // A server with no child still has a reach: its net grants, narrowed from the
                 // agent's, are what every request of its own is decided against (D105, D110).
                 let reach = crate::mcp::lower::net_reach(session, &grant)?;
-                let mut client = crate::mcp::http::Client::start(server, url, reach)?;
+                let mut client =
+                    crate::mcp::http::Client::start(server, url, reach, entry.timeout())?;
                 client.initialize(session)?;
                 let tools = client.tools(session)?;
                 self.record(server, tools);

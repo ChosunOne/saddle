@@ -1406,7 +1406,12 @@ impl OneServer<'_> {
                     spec.net = Some(bridge.spec());
                 }
                 Ok(Opened::Stdio(
-                    Box::new(Client::start(&grant.server, self.helper, &spec)?),
+                    Box::new(Client::start(
+                        &grant.server,
+                        self.helper,
+                        &spec,
+                        entry.timeout(),
+                    )?),
                     bridge,
                 ))
             }
@@ -1418,6 +1423,7 @@ impl OneServer<'_> {
                     &grant.server,
                     url,
                     reach,
+                    entry.timeout(),
                 )?)))
             }
             (Transport::Stdio { .. }, None) => {

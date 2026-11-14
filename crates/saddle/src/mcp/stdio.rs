@@ -52,12 +52,15 @@ impl Client {
         name: &str,
         helper: &Path,
         spec: &saddle_cap::sandbox::SandboxSpec,
+        timeout: Duration,
     ) -> Result<Self> {
         // The helper is this binary, re-executed: without its argument it would run the CLI
         // instead of applying the sandbox.
         let child = saddle_sandbox::spawn(helper, &[crate::tools::HELPER_ARG], spec)
             .with_context(|| format!("starting the `{name}` server"))?;
-        Self::from_child(name, child)
+        let mut client = Self::from_child(name, child)?;
+        client.timeout = timeout;
+        Ok(client)
     }
 
     /// A client over any child with piped stdio, sandboxed or not. The tests use this so the

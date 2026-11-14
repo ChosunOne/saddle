@@ -8,6 +8,8 @@
 //! a pipe). A 401 is not retried: without OAuth there is nothing to retry with, and a loop of
 //! refusals would spend the person's quota to learn the same thing twice.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
@@ -16,7 +18,7 @@ use saddle_policy::Request;
 use crate::mcp::protocol::{Reply, notification, reply, request};
 use crate::mcp::stdio::Tool;
 use crate::session::Session;
-use crate::tools::fetch::{Target, agent, authority, resolve_public};
+use crate::tools::fetch::{Target, authority, resolve_public};
 
 /// What the server said about one call, once it answered.
 pub enum Outcome {
@@ -41,6 +43,8 @@ pub struct Client {
     reach: Vec<saddle_cap::policy::NetGrant>,
     session_id: Option<String>,
     next: u64,
+    /// The entry's `timeout`: the deadline every request of this server gets (D113).
+    timeout: Duration,
 }
 
 impl Client {
@@ -48,6 +52,7 @@ impl Client {
         server: &str,
         url: &str,
         reach: Vec<saddle_cap::policy::NetGrant>,
+        timeout: Duration,
     ) -> Result<Self> {
         let target = Target::parse(url).map_err(|why| anyhow!("{url}: {why}"))?;
         Ok(Self {
@@ -56,6 +61,7 @@ impl Client {
             reach,
             session_id: None,
             next: 0,
+            timeout,
         })
     }
 
@@ -257,7 +263,7 @@ impl Client {
             ),
             self.target.request_path()
         );
-        let agent = agent(named);
+        let agent = crate::tools::fetch::agent_for(named, self.timeout);
         let mut outgoing = agent.post(&url);
         for (name, value) in &headers {
             outgoing = outgoing.header(*name, value.as_str());

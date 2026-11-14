@@ -865,6 +865,56 @@ fn mock_http_mcp() -> (
 }
 
 #[test]
+fn a_server_that_never_answers_is_cut_off_at_the_deadline_its_table_names() {
+    // D113: `[mcp.<name>] timeout` is a promise the config makes, so it is the deadline actually
+    // enforced rather than a constant. Two seconds, and the message says which deadline it was.
+    let env = Env::new();
+    let script = env.ws.path().join("mute-mcp.sh");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}\n' ;;
+    *'"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search","description":"finds things","inputSchema":{}}]}}\n' ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    env.write_config(&format!(
+        "\n[mcp.fake]\ncommand = {:?}\ntimeout = 2\n",
+        script.display().to_string()
+    ));
+    env.write_policy(
+        r#"
+version = 1
+
+[agent]
+fs-read = [{ root = "workspace" }]
+exec    = { timeout-secs = 20 }
+mcp     = [{ server = "fake", tools = ["search"] }]
+"#,
+    );
+    let began = std::time::Instant::now();
+    let out = env.saddle(&["mcp", "call", "fake", "search", "{}"]);
+    let took = began.elapsed();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("within 2s"),
+        "the refusal does not name the deadline: {text}"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(20),
+        "it waited past the deadline its table names: {took:?}"
+    );
+}
+
+#[test]
 fn mcp_call_runs_one_tool_as_the_model_would_and_refuses_an_ungranted_one() {
     // D111: one call without a conversation around it, decided by the same grant the model's call
     // is decided by. It is what a person checks a server with, and the only way to reach a remote

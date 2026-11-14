@@ -2681,6 +2681,13 @@ does not grant is a usage error before any call exists, so it is not a record; a
 not name a tool for is a refusal and is. This closes the gap where an MCP tool call left no trace
 while every other tool call wrote one, which is the whole of D10's promise.
 
+**D113.** A server's `[mcp.<name>] timeout` is the deadline every request of that server gets, on
+either transport — the same number `saddle check` prints, so what the config promises is what is
+enforced. A stdio client had a constant and an HTTP one used the fetch deadline, which made the
+setting a decoration; both now take it from the table, and a server that never answers is cut off at
+the moment its table names rather than thirty seconds later. The default stays sixty seconds, and
+the message names the deadline it hit, so a timeout is diagnosable from the transcript alone.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

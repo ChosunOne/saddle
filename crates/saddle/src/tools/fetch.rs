@@ -10,6 +10,7 @@
 //! DNS rebinding cannot swap one underneath.
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::time::Duration;
 
 use anyhow::Result;
 use saddle_cap::{Principal, Scope};
@@ -243,11 +244,17 @@ pub(crate) fn local(target: &Target) -> Option<String> {
 /// The client every host-side request is made with: a resolver that pins the addresses that were
 /// checked, so a name cannot be swapped between the decision and the connection (D28).
 pub(crate) fn agent(named: bool) -> ureq::Agent {
+    agent_for(named, Duration::from_secs(30))
+}
+
+/// The same agent with a deadline of the caller's choosing, which is what an MCP server's
+/// `[mcp.<name>] timeout` is (D113).
+pub(crate) fn agent_for(named: bool, timeout: Duration) -> ureq::Agent {
     // `with_parts` is the only way to install a resolver. The connector is the default one, so TLS
     // and pools are unchanged.
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
-        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .timeout_global(Some(timeout))
         .user_agent(concat!("saddle/", env!("CARGO_PKG_VERSION")))
         .build();
     ureq::Agent::with_parts(
