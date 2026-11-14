@@ -117,6 +117,8 @@ impl Invocation {
 /// Implementations must decide and audit using `call.principal()` and `call.grants()`, validate
 /// root-relative paths and symlinks, and bound/cancel I/O independently of Wasm's epoch deadline.
 /// `Err` is a host failure (including audit failure), not a guest-visible policy denial.
+/// read callbacks may hold either read capability; determine authority per path, never from the
+/// existence of a linked interface (D139).
 pub trait HostServices: Send + 'static {
     fn resolve_tool_path(
         &mut self,
@@ -569,7 +571,8 @@ impl Loader {
         }
         let mut linker = Linker::<State<H>>::new(engine);
         ambient::add(&mut linker).map_err(runtime("linking ambient WASI"))?;
-        if scopes.contains(&Scope::FsRead) {
+        // D139: one filesystem SDK, with actual root/external access decided per request.
+        if scopes.contains(&Scope::FsRead) || scopes.contains(&Scope::ToolRead) {
             fs_read::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
                 .map_err(runtime("linking fs-read"))?;
             fs_read_range::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
@@ -578,6 +581,9 @@ impl Loader {
                 .map_err(runtime("linking fs-paths"))?;
             fs_list::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
                 .map_err(runtime("linking fs-list"))?;
+            // Compatibility imports are service bindings too, never external-directory authority.
+            tool_paths::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+                .map_err(runtime("linking tool-paths"))?;
         }
         if scopes.contains(&Scope::Tool) {
             tool_result::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
@@ -586,10 +592,6 @@ impl Loader {
         if scopes.contains(&Scope::TranscriptRead) {
             transcript_read::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
                 .map_err(runtime("linking transcript-read"))?;
-        }
-        if scopes.contains(&Scope::ToolRead) {
-            tool_paths::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-                .map_err(runtime("linking tool-paths"))?;
         }
         check_tool_types(engine, &ty)?;
         let pre = linker
@@ -1012,8 +1014,9 @@ mod tests {
     }
 
     #[test]
-    fn managed_imports_need_their_own_scope_before_initialization() {
-        let (_dir, agent, plugin) = grants(GRANTS);
+    fn filesystem_imports_need_a_read_capability_before_initialization() {
+        let (_dir, agent, plugin) =
+            grants("[agent]\nfs-read=[{root='workspace'}]\n[plugin.reader]\ntool={}\n");
         let source = READER
             .replacen(
                 "(component",

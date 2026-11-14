@@ -1,6 +1,8 @@
 package saddle:host@0.1.0;
 
-// Independent types keep managed-only guests from importing normal-root filesystem services.
+// Independent D138 types are kept for binary compatibility.
+// Legacy D138 adapter, retained for existing components; normal filesystem services cover both
+// roots and configured external directories under per-request runtime checks (D139).
 interface tool-paths {
     record path { root: string, relative: string }
     variant failure { denied(string), invalid-path(string), io(string), too-large }

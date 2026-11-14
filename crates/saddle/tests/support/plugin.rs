@@ -46,7 +46,10 @@ pub fn reader_on_root(root: &str, path: &str) -> Vec<u8> {
 }
 
 fn reader_source(root: &str, path: &str) -> String {
-    assert!(root.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
+    assert!(
+        root.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'@' | b':'))
+    );
     assert!(path.is_ascii() && !path.contains(['"', '\\']));
     READER
         .replace(
@@ -73,6 +76,11 @@ fn reader_source(root: &str, path: &str) -> String {
 #[allow(dead_code)] // shared with the model suite, which does not need this fixture.
 pub fn range_reader(path: &str, offset: u64, limit: u32) -> Vec<u8> {
     wat::parse_str(range_source("workspace", path, offset, limit)).unwrap()
+}
+
+#[allow(dead_code)] // generic filesystem namespace fixtures are used by the CLI suite.
+pub fn range_reader_on_root(root: &str, path: &str) -> Vec<u8> {
+    wat::parse_str(range_source(root, path, 0, 128)).unwrap()
 }
 
 #[allow(dead_code)] // managed-path fixtures are only used by the CLI suite.

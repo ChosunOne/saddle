@@ -1,4 +1,4 @@
-//! bounded filesystem metadata services; names are filtered by the delegate's policy (D132).
+//! core-owned filesystem resolution and per-plugin runtime path authority (D132, D138, D139).
 
 use std::collections::BTreeMap;
 use std::env;
@@ -22,6 +22,17 @@ use crate::tools::fs::resolve_beneath;
 use crate::{cancel, fs_access};
 
 const MAX_VISITED: usize = 100_000;
+const TOOL_PATH_PREFIX: &str = "@tool:";
+
+/// opaque path routing is core-owned, not selected by guest SDK features (D139).
+pub(crate) fn decode_path(mut path: Path, legacy_managed: bool) -> (Path, bool) {
+    if let Some(root) = path.root.strip_prefix(TOOL_PATH_PREFIX) {
+        path.root = root.to_owned();
+        (path, true)
+    } else {
+        (path, legacy_managed)
+    }
+}
 
 fn expired(deadline: Instant) -> bool {
     cancel::FLAG.load(Ordering::Relaxed) || Instant::now() >= deadline
@@ -218,16 +229,14 @@ pub fn resolve_path(
         session.setup.workspace.join(&value)
     };
     let path = normalize(&path);
-    let loc = if managed && session.roots().locate(&path).is_none() {
-        session.tool_root_for(&path).and_then(|root| {
+    let loc = match (session.roots().locate(&path), managed) {
+        (Some(loc), false) => Some(loc),
+        (None, _) => session.tool_root_for(&path).and_then(|root| {
             RelPath::new(path.strip_prefix(&root.dir).ok()?)
                 .ok()
                 .map(|rel| Location::new(root.name.clone(), rel))
-        })
-    } else if !managed {
-        session.roots().locate(&path)
-    } else {
-        None
+        }),
+        (Some(_), true) => None,
     };
     let Some(loc) = loc else {
         return refuse(
@@ -238,23 +247,28 @@ pub fn resolve_path(
             if managed {
                 "plugin path is outside declared tool paths or belongs to a policy root"
             } else {
-                "plugin path is outside every root"
+                "plugin path is outside every root and configured tool path"
             },
             managed,
         );
     };
+    let tool_path = session.is_tool_root(&loc.root);
     if let Some(failure) = gate(
         session,
         who,
         call,
         &loc,
         json!({"operation":"resolve-path"}),
-        managed,
+        tool_path,
     )? {
         return Ok(Err(failure));
     }
     Ok(Ok(Path {
-        root: loc.root.to_string(),
+        root: if tool_path && !managed {
+            format!("{TOOL_PATH_PREFIX}{}", loc.root)
+        } else {
+            loc.root.to_string()
+        },
         relative: loc.rel.as_slash(),
     }))
 }
@@ -268,6 +282,7 @@ pub fn read_directory(
     page: (String, u32),
     managed: bool,
 ) -> Result<Result<Page, Failure>> {
+    let (path, managed) = decode_path(path, managed);
     let (after, limit) = page;
     let details = json!({"operation":"read-directory", "after":after, "limit":limit});
     if path.root.len() > 64

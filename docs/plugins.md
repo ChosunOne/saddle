@@ -146,7 +146,8 @@ accepted. Failed/trapped calls publish no images, and saved image data/provenanc
 The 64 KiB text result limit is not enlarged to accommodate image bytes.
 
 This is an incremental migration toward replacing built-in `read`, not a permanent implementation
-picker. Shared tool-visible directories use the optional SDK adapter below; standard-component delivery still needs work. Standard
+picker. Shared tool-visible directories use the same SDK with runtime permissions as described below;
+standard-component delivery still needs work. Standard
 plugins are not silently enabled or given the agent's authority merely because their source ships
 in the repository.
 
@@ -177,8 +178,9 @@ modified directories are not a snapshot. The guest owns suffixes, sorting and ou
 
 The additive `fs-paths` service maps paths to real roots under the same `fs-read` permission. It
 never lets a guest select a native tool identity or access D66 tool-visible directories merely
-because native `read` can. Those directories use the separately gated `tool-paths` service below,
-not an automatic exception or a new grantable root.
+because native `read` can. The core also resolves configured external directories through this same
+SDK function, but checks their distinct runtime permissions as described below; they are not new
+grantable roots or automatically accessible to every filesystem plugin.
 
 ```sh
 cargo nextest run --test plugins --run-ignored only \
@@ -237,57 +239,56 @@ cargo nextest run --test plugins --run-ignored only \
   -E 'test(standard_search_components_walk_and_match_without_bypassing_exclusions)'
 ```
 
-## Existing managed/tool-visible directories
+## Runtime access to configured external directories
 
-D66 directories such as `~/.agents` are not roots. The `tool-paths` SDK interface (D138) reuses their
-existing user-owned `[sandbox]` declarations, including the default read-only `~/.agents` entry.
-No directory is declared again, and a bare sandbox path or include rule does not become host-tool
-access. A plugin explicitly receives a subset of the existing read-only directory roles:
+The same compiled filesystem plugin and SDK functions handle workspace paths and D66 directories
+such as `~/.agents` (D139). The core resolves the path and checks the calling plugin's runtime
+permissions. There is no `tool-paths` Cargo feature, alternate guest artifact or guest-side choice
+of permission mechanism. D138's feature-based routing was superseded, not retained as an option.
+
+Directory authority remains the existing user-owned `[sandbox]` declarations and default read-only
+`~/.agents` entry. No directory is declared again. Bare sandbox paths and include rules do not become
+host-tool access. A plugin may hold root access, external-directory access, or both:
 
 ```toml
 [plugin.files]
 tool = {}
 fs-read = [{ root = "workspace" }]
+# Optional runtime permission; add/remove and reload without rebuilding or repinning:
 tool-read = { tools = ["read"] }
 ```
 
-Use `ls`, `find` or `grep` for the corresponding standard component's role. These roles select the
-configured directory reach, not the guest's name or implementation. The parent role ceiling is
-derived from current D66 declarations; no extra agent grant is needed. An optional explicit agent
-`tool-read` table can narrow that ceiling, never add directories. `--revoke tool-read` disables the
-SDK capability for one run. A sibling's grant, the registration `tool` scope, and root filesystem
-grants cannot supply it. Custom managed-only guests need no `fs-read` grant at all.
+With only `fs-read`, this reader remains loaded and reads the workspace, but is denied `~/.agents`.
+Adding the `tool-read` grant and reloading enables that existing configured reach for the exact same
+artifact. Removing it and reloading denies external reads again while workspace reads still work.
+A custom external-only reader can omit `fs-read` entirely and use the same SDK calls.
 
-The standard SDK helpers route managed paths when built with feature `tool-paths`. Default builds
-remain root-only. For example:
+The ordinary read interfaces are linked with either read capability; interface availability never
+supplies permission for a path. With neither read capability, filesystem imports are refused before
+initialization. Other SDK services keep their own capability requirements. Manifest ceilings and
+agent reach still bound every plugin grant. Standard manifests allow the optional runtime scope but
+never grant it.
 
-```sh
-cargo build -p saddle-tools --examples --features tool-paths --target wasm32-unknown-unknown --release
-mkdir -p target/tool-paths-plugin
-for name in read ls find grep; do
-  cargo run -p saddle-loader --example componentize -- \
-    target/wasm32-unknown-unknown/release/examples/$name.wasm \
-    target/tool-paths-plugin/$name.component.wasm
-done
-```
+Use `ls`, `find` or `grep` for the corresponding component's external-directory role. Roles select
+configured directory reach, not the guest's name or implementation. The parent ceiling is derived
+from current D66 declarations; no extra agent grant or new directory list is needed. An explicit
+agent `tool-read` table may narrow that ceiling, never add directories. A sibling's grant, `tool`
+registration and root grants cannot supply external-directory access.
 
-Install the desired artifact with its standard manifest, then enable/pin it and grant `tool-read`
-as above. Standard manifests allow the optional scope but do not grant it. A feature-enabled
-component requires that explicit grant for its import even on a call using only the workspace.
-Low-level SDK `managed_paths` bindings are also available independently; Cargo features are
-ergonomics, not permission. Missing import grants are rejected before initialization.
+The core retains true-root precedence: root exclusions cannot be bypassed by treating a root path
+as an external directory. Requested paths and linked targets must both be allowed. Protected
+config/state overlaps, undeclared targets and special-file reads remain refused. Metadata filtering,
+bounded ranges, deadlines, pinned handles and per-plugin audit/call identity are unchanged. Reload
+also rebuilds directory mappings and pins. Opaque path identifiers are handled by the core; plugins
+use `resolve_path`, `read_range` and `read_directory` without routing between implementations.
 
-Managed range reads and listings retain the existing size, filtering and execution limits. Both
-requested paths and linked targets must match the calling plugin's roles on the current entries.
-Undeclared targets, config/state directories and attempts to access policy roots through this
-interface are refused. Reload rebuilds mappings and pins, so removing a target declaration revokes
-it even if the plugin stays loaded. Calls are audited with the plugin identity, absolute path,
-range/page parameters and call id. Generated managed identifiers are internal; standard search
-results show managed paths relatively.
+Build standard components using the ordinary commands above, with no feature flags. The old
+D138-specific host interface is retained for binary compatibility, not used by the standard helpers.
+The acceptance test exercises one artifact and digest in one running harness across grant/revoke:
 
 ```sh
+cargo nextest run --test agent --run-ignored all -E 'test(one_compiled_reader)'
 cargo nextest run --test plugins --run-ignored all -E 'test(managed_)'
-cargo nextest run --test agent -E 'test(reloading_managed_paths)'
 ```
 
 ## Standard transcript-query component

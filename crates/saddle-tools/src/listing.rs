@@ -36,7 +36,7 @@ impl Tool for Ls {
     fn describe() -> Definition {
         Definition {
             name: "ls".into(),
-            description: "list a directory, sorted by name, with / for directories and @ for symlinks. Path defaults to workspace; accepts absolute paths inside granted roots or explicit root-relative paths. At most 500 entries and 50 KiB. Excluded names are filtered by the host.".into(),
+            description: "list a directory, sorted by name, with / for directories and @ for symlinks. Path defaults to workspace; accepts absolute or home-relative paths allowed by runtime filesystem permissions, or explicit root-relative paths. At most 500 entries and 50 KiB. Excluded names are filtered by the host.".into(),
             input_schema: json!({"type":"object","properties":{"root":{"type":"string"},"path":{"type":"string"}},"additionalProperties":false}).to_string(),
         }
     }

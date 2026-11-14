@@ -1119,6 +1119,149 @@ fn failed_plugins_are_not_advertised_and_do_not_remove_native_tools() {
 }
 
 #[test]
+#[ignore = "build the standard read component first; see docs/plugins.md"]
+fn one_compiled_reader_changes_directory_permissions_at_runtime_without_repinning() {
+    let tool = "plugin__reader__read";
+    let (base, seen) = serve(vec![
+        sse_response(&openai_sse(
+            "",
+            &[
+                ("root-1", tool, json!({"path":"file"})),
+                ("shared-1", tool, json!({"path":"~/.agents/reference"})),
+            ],
+        )),
+        sse_response(&openai_sse("first done", &[])),
+        sse_response(&openai_sse(
+            "",
+            &[
+                ("shared-2", tool, json!({"path":"~/.agents/reference"})),
+                ("excluded", tool, json!({"path":".env"})),
+            ],
+        )),
+        sse_response(&openai_sse("second done", &[])),
+        sse_response(&openai_sse(
+            "",
+            &[
+                ("root-3", tool, json!({"path":"file"})),
+                ("shared-3", tool, json!({"path":"~/.agents/reference"})),
+            ],
+        )),
+        sse_response(&openai_sse("third done", &[])),
+    ]);
+    let env = Env::new(Api::Openai, &base);
+    env.write_override("[agent]\nfs-read=[{root='workspace',exclude=['.env*']}]\n");
+    let config = env.xdg.path().join("config/saddle/config.toml");
+    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/read-plugin/read.component.wasm");
+    let bytes = fs::read(component).expect("build the standard read component first");
+    plugin_fixture::configure(&config, &bytes, plugin_fixture::GRANTS);
+    let artifact = config
+        .parent()
+        .unwrap()
+        .join("plugins/reader/component.wasm");
+    fs::write(config.parent().unwrap().join("plugins/reader/plugin.toml"), "id='reader'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes=['tool','fs-read','tool-read']\n").unwrap();
+    let initial: toml::Table = fs::read_to_string(&config).unwrap().parse().unwrap();
+    let pin = initial["plugins"]["reader"]["sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let shared = env.xdg.path().join("home/.agents");
+    fs::create_dir_all(&shared).unwrap();
+    fs::write(shared.join("reference"), "SHARED-REFERENCE-CONTENT").unwrap();
+    fs::write(env.ws.path().join("file"), "workspace content").unwrap();
+    fs::write(env.ws.path().join(".env"), "ROOT-EXCLUSION-SECRET").unwrap();
+    let mut child = env
+        .command(&["run", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let wait_for = |count| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while seen.lock().unwrap().len() < count {
+            assert!(Instant::now() < deadline, "turn did not finish");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    child.stdin.as_mut().unwrap().write_all(b"first\n").unwrap();
+    wait_for(2);
+    let role = "tool-read={tools=['read']}\n";
+    let settings = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        settings.replace("[plugin.reader]\n", &format!("[plugin.reader]\n{role}")),
+    )
+    .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"/reload\nsecond\n")
+        .unwrap();
+    wait_for(4);
+    let settings = fs::read_to_string(&config).unwrap();
+    fs::write(&config, settings.replace(role, "")).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/reload\nthird\n/quit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let seen = seen.lock().unwrap();
+    let result = |request: usize, id: &str| {
+        seen[request].body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool" && message["tool_call_id"] == id)
+            .unwrap()["content"]
+            .as_str()
+            .unwrap()
+    };
+    for index in [0, 2, 4] {
+        assert!(
+            seen[index].body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["function"]["name"] == tool)
+        );
+    }
+    assert!(result(1, "root-1").contains("workspace content"));
+    assert!(!result(1, "shared-1").contains("SHARED-REFERENCE-CONTENT"));
+    assert!(result(1, "shared-1").contains("Denied"));
+    assert!(result(3, "shared-2").contains("SHARED-REFERENCE-CONTENT"));
+    assert!(!result(3, "excluded").contains("ROOT-EXCLUSION-SECRET"));
+    assert!(result(3, "excluded").contains("excluded"));
+    assert!(result(5, "root-3").contains("workspace content"));
+    assert!(!result(5, "shared-3").contains("SHARED-REFERENCE-CONTENT"));
+    assert!(result(5, "shared-3").contains("Denied"));
+    assert_eq!(fs::read(artifact).unwrap(), bytes);
+    let final_config: toml::Table = fs::read_to_string(&config).unwrap().parse().unwrap();
+    assert_eq!(
+        final_config["plugins"]["reader"]["sha256"]
+            .as_str()
+            .unwrap(),
+        pin
+    );
+    let audit = records(&env.audit_log());
+    let loads: Vec<_> = audit
+        .iter()
+        .filter(|row| row["args"]["operation"] == "load" && row["allow"] == true)
+        .collect();
+    assert_eq!(loads.len(), 3);
+    assert!(loads.iter().all(|row| row["args"]["sha256"] == pin));
+    assert!(
+        env.saddle(&["audit", "verify", env.audit_log().to_str().unwrap()])
+            .status
+            .success()
+    );
+}
+
+#[test]
 fn reloading_managed_paths_revokes_targets_even_when_the_plugin_stays_loaded() {
     let (base, seen) = serve(vec![
         sse_response(&openai_sse(

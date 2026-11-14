@@ -3087,13 +3087,44 @@ reader/listing/search guests can be built either way. Their manifests allow the 
 never grant it. SDK-internal managed path tags are not displayed in standard search results; managed
 search paths are shown relatively. All existing byte/page/deadline limits remain in force.
 
+**D139.** SDK resource access is runtime configuration of one compiled plugin, not a Cargo
+feature or an alternate guest build. This supersedes D138's build-time `tool-paths` routing and
+D132's root-only normal filesystem interface. SDK bindings, interface availability and operational
+authority are separate concerns. A plugin calls the same filesystem functions for workspace and
+configured external paths; core resolution chooses the applicable permission check. Existing
+implementation constraints must not be promoted into product requirements that violate this rule.
+
+The ordinary `fs-read`, `fs-read-range`, `fs-paths` and `fs-list` imports, plus the legacy D138 read
+adapter for binary compatibility, can be linked with either
+bounded read capability (`fs-read` or `tool-read`). This is service eligibility only: each request
+still requires the appropriate root grant/exclusions or the explicit D138 role intersected with the
+current D66 declaration, under the calling plugin's principal. Neither read capability implies the
+other. No read capability still refuses the import before initialization; unrelated services retain
+their own requirements. Manifest ceilings and parent reach remain unchanged. Generic read-service
+availability must not authorize any path by itself.
+
+Core resolution retains true-root precedence, returns opaque routing identifiers and rechecks them
+on every byte/metadata operation. Guessed identifiers cannot bypass root exclusions, role checks,
+requested/resolved checks or protected directories. Guests do not switch SDK implementations or
+select permission mechanisms. The D138-specific interface remains supported only for existing
+compiled components; standard helpers no longer import or dispatch to it. No new directory list,
+rebuild or repin is needed to change a plugin's external-directory permissions.
+
+The acceptance test must use one reader artifact, one digest and one running harness: workspace
+access succeeds while shared access is denied; runtime grant plus reload enables shared access
+without relaxing root exclusions; runtime revocation plus reload denies shared access again while
+workspace access and plugin registration remain. Test the ordinary SDK with managed-only grants as
+well, so a root grant is not an accidental prerequisite. Tests of a build-variant design are not a
+substitute for this user-visible runtime contract. Standard plugins still replace, not coexist as
+permanent selectable alternatives to, the native tools (D137).
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
 | --- | --- | --- | --- |
 | `exec` | running commands | `saddle:host/exec` import | sandbox helper (D18, D19); the network it reaches is `net` (D79) |
 | `fs-read` | reading files under granted roots | `saddle:host/fs-read` import | policy per call |
-| `tool-read` | bounded reads of existing D66 tool paths under explicitly delegated read-only roles | `saddle:host/tool-paths` import | policy per requested/resolved location and current configuration entry (D138) |
+| `tool-read` | bounded reads of existing D66 tool paths under explicitly delegated read-only roles | ordinary filesystem-read imports (D139); legacy `saddle:host/tool-paths` | policy per requested/resolved location and current configuration entry (D138) |
 | `fs-write` | writing files under granted roots | `saddle:host/fs-write` import | policy per call, reserved paths (D23) |
 | `net` | HTTP requests to granted hosts | `wasi:http/outgoing-handler` import, `fetch` and `websearch` tools, a command's proxy | host HTTP client, policy per request (D28, D39, D79, D82) |
 | `transcript-read` | reading session messages and their request usage, and observing them as they arrive | `saddle:host/transcript-read` import, `saddle:plugin/observer` export | policy per call |

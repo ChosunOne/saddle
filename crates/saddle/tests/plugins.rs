@@ -82,6 +82,47 @@ fn no_file_reads(env: &Env) {
     );
 }
 
+#[test]
+fn generic_filesystem_imports_never_substitute_for_per_path_permissions() {
+    for (root, grants, allow) in [
+        (
+            "@tool:sandbox-1",
+            "tool={}\ntool-read={tools=['read']}",
+            true,
+        ),
+        (
+            "@tool:sandbox-1",
+            "tool={}\nfs-read=[{root='workspace'}]",
+            false,
+        ),
+        ("workspace", "tool={}\ntool-read={tools=['read']}", false),
+        (
+            "@tool:workspace",
+            "tool={}\ntool-read={tools=['read']}",
+            false,
+        ),
+    ] {
+        let env = Env::new(&fixture::range_reader_on_root(root, "file"), grants);
+        managed_manifest(&env, "['tool','fs-read','tool-read']");
+        let shared = env.0.path().join("home/.agents");
+        fs::create_dir_all(&shared).unwrap();
+        fs::write(shared.join("file"), "EXTERNAL-CONTENT").unwrap();
+        fs::write(env.ws().join("file"), "ROOT-CONTENT").unwrap();
+        let listing = env.run(&["plugin", "list"]);
+        assert!(text(&listing).contains("ready:"), "{}", text(&listing));
+        let out = call(&env);
+        assert_eq!(out.status.success(), allow, "{}", text(&out));
+        assert!(!text(&out).contains("ROOT-CONTENT"));
+        assert_eq!(text(&out).contains("EXTERNAL-CONTENT"), allow);
+        let log = env.log();
+        assert!(
+            env.run(&["audit", "verify", log.to_str().unwrap()])
+                .status
+                .success()
+        );
+    }
+}
+
 fn managed_manifest(env: &Env, scopes: &str) {
     fs::write(
         env.config()
@@ -152,7 +193,7 @@ fn managed_reads_reuse_declared_paths_without_any_root_grant_and_check_link_targ
 }
 
 #[test]
-#[ignore = "build tool-paths-enabled standard components first; see docs/plugins.md"]
+#[ignore = "build the standard filesystem components first; see docs/plugins.md"]
 fn managed_standard_components_read_list_find_and_grep_shared_files_through_the_sdk() {
     for (name, arguments, expected) in [
         ("read", r#"{"path":"~/.agents/file.txt"}"#, "needle"),
@@ -168,11 +209,9 @@ fn managed_standard_components_read_list_find_and_grep_shared_files_through_the_
             "file.txt:2: needle",
         ),
     ] {
-        let component = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
-            "../../target/tool-paths-plugin/{name}.component.wasm"
-        ));
-        let bytes =
-            fs::read(component).expect("build tool-paths-enabled standard components first");
+        let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../target/{name}-plugin/{name}.component.wasm"));
+        let bytes = fs::read(component).expect("build the standard filesystem components first");
         let env = Env::new(
             &bytes,
             &format!("tool={{}}\nfs-read=[{{root='workspace'}}]\ntool-read={{tools=['{name}']}}"),
@@ -202,6 +241,17 @@ fn managed_standard_components_read_list_find_and_grep_shared_files_through_the_
                     && r["allow"] == true)
         );
         if name == "read" {
+            env.edit("fs-read=[{root='workspace'}]", "fs-read=[]");
+            let out = env.run(&["plugin", "call", "reader", arguments]);
+            assert!(out.status.success(), "managed-only grant: {}", text(&out));
+            fs::write(
+                env.ws().join("workspace-file"),
+                "ROOT-ACCESS-MUST-STAY-DENIED",
+            )
+            .unwrap();
+            let out = env.run(&["plugin", "call", "reader", r#"{"path":"workspace-file"}"#]);
+            assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+            assert!(!text(&out).contains("ROOT-ACCESS-MUST-STAY-DENIED"));
             let external = env.0.path().join("external");
             fs::create_dir_all(&external).unwrap();
             fs::write(external.join("target"), "linked SDK reference").unwrap();
@@ -259,11 +309,12 @@ fn managed_default_paths_cannot_cover_protected_config_through_an_xdg_alias() {
 fn managed_imports_cannot_borrow_other_roles_roots_or_sibling_grants() {
     for (root, grants, expected_ready) in [
         ("sandbox-1", "tool={}", false),
+        ("sandbox-1", "tool={}\nfs-read=[{root='workspace'}]", true),
         ("workspace", "tool={}\ntool-read={tools=['read']}", true),
         ("sandbox-1", "tool={}\ntool-read={tools=['ls']}", true),
     ] {
         let env = Env::new(&fixture::tool_range_reader(root, "file", 0, 128), grants);
-        managed_manifest(&env, "['tool','tool-read']");
+        managed_manifest(&env, "['tool','fs-read','tool-read']");
         let shared = env.0.path().join("shared");
         fs::create_dir_all(&shared).unwrap();
         fs::write(shared.join("file"), "never expose this").unwrap();

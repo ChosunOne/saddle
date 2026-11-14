@@ -60,9 +60,11 @@ impl fmt::Display for Direction {
 }
 
 /// What an interface needs before a component may use it.
+/// read-service eligibility never substitutes for its per-resource decisions (D139).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Requirement {
     Scope(Scope),
+    AnyScope(&'static [Scope]),
     Ambient,
     Refused(String),
 }
@@ -90,8 +92,9 @@ pub fn classify(direction: Direction, name: &str) -> Requirement {
     match (direction, n.namespace, n.package, n.interface) {
         (Import, "saddle", "host", i) => match i {
             "exec" => scope(Scope::Exec),
-            "fs-read" | "fs-read-range" | "fs-paths" | "fs-list" => scope(Scope::FsRead),
-            "tool-paths" => scope(Scope::ToolRead),
+            "fs-read" | "fs-read-range" | "fs-paths" | "fs-list" | "tool-paths" => {
+                Requirement::AnyScope(&[Scope::FsRead, Scope::ToolRead])
+            }
             "tool-result" => scope(Scope::Tool),
             "fs-write" => scope(Scope::FsWrite),
             "transcript-read" => scope(Scope::TranscriptRead),
@@ -156,6 +159,17 @@ pub fn check_component<'a>(
                 Requirement::Ambient => return None,
                 Requirement::Scope(s) if granted.contains(&s) => return None,
                 Requirement::Scope(s) => format!("needs scope `{s}`, which is not granted"),
+                Requirement::AnyScope(scopes) if scopes.iter().any(|s| granted.contains(s)) => {
+                    return None;
+                }
+                Requirement::AnyScope(scopes) => format!(
+                    "needs scope {}, which are not granted",
+                    scopes
+                        .iter()
+                        .map(|s| format!("`{s}`"))
+                        .collect::<Vec<_>>()
+                        .join(" or ")
+                ),
                 Requirement::Refused(reason) => reason,
             };
             Some(Refusal {
@@ -177,10 +191,20 @@ pub fn check_component<'a>(
 pub fn host_interfaces(granted: &BTreeSet<Scope>) -> Vec<&'static str> {
     let mut out = Vec::new();
     for scope in granted {
-        out.push(match scope {
+        let interface = match scope {
             Scope::Exec => "saddle:host/exec",
-            Scope::FsRead => "saddle:host/fs-read",
-            Scope::ToolRead => "saddle:host/tool-paths",
+            Scope::FsRead | Scope::ToolRead => {
+                if !out.contains(&"saddle:host/fs-read") {
+                    out.extend([
+                        "saddle:host/fs-read",
+                        "saddle:host/fs-read-range",
+                        "saddle:host/fs-paths",
+                        "saddle:host/fs-list",
+                        "saddle:host/tool-paths",
+                    ]);
+                }
+                continue;
+            }
             Scope::FsWrite => "saddle:host/fs-write",
             Scope::TranscriptRead => "saddle:host/transcript-read",
             Scope::ContextContribute => "saddle:host/context-contribute",
@@ -190,7 +214,8 @@ pub fn host_interfaces(granted: &BTreeSet<Scope>) -> Vec<&'static str> {
             // An MCP grant declares no component import: the client is host-side and reached
             // through built-in tools (D103). A plugin calling one needs `saddle:host/mcp`.
             Scope::Tool | Scope::Veto | Scope::Ui | Scope::Mcp => continue,
-        });
+        };
+        out.push(interface);
     }
     out
 }
@@ -275,7 +300,37 @@ mod tests {
         let granted = BTreeSet::from([Scope::FsRead, Scope::Net, Scope::Tool]);
         assert_eq!(
             host_interfaces(&granted),
-            ["saddle:host/fs-read", "wasi:http/outgoing-handler"]
+            [
+                "saddle:host/fs-read",
+                "saddle:host/fs-read-range",
+                "saddle:host/fs-paths",
+                "saddle:host/fs-list",
+                "saddle:host/tool-paths",
+                "wasi:http/outgoing-handler"
+            ]
+        );
+    }
+
+    #[test]
+    fn one_read_service_family_accepts_either_read_capability_not_registration_alone() {
+        let imports = [
+            "saddle:host/fs-read@0.1.0",
+            "saddle:host/fs-read-range@0.1.0",
+            "saddle:host/fs-paths@0.1.0",
+            "saddle:host/fs-list@0.1.0",
+            "saddle:host/tool-paths@0.1.0",
+        ];
+        for scope in [Scope::FsRead, Scope::ToolRead] {
+            check_component(&BTreeSet::from([scope]), imports, []).unwrap();
+        }
+        assert!(check_component(&BTreeSet::from([Scope::Tool]), imports, []).is_err());
+        assert_eq!(
+            host_interfaces(&BTreeSet::from([Scope::FsRead])),
+            host_interfaces(&BTreeSet::from([Scope::ToolRead]))
+        );
+        assert_eq!(
+            host_interfaces(&BTreeSet::from([Scope::FsRead, Scope::ToolRead])),
+            host_interfaces(&BTreeSet::from([Scope::FsRead]))
         );
     }
 }

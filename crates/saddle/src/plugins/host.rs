@@ -523,6 +523,7 @@ fn read_file(
     range: Option<(u64, u32)>,
     managed: bool,
 ) -> Result<Result<Chunk, Failure>> {
+    let (path, managed) = filesystem::decode_path(path, managed);
     if range.is_some_and(|(_, limit)| limit == 0 || u64::from(limit) > MAX_FILE_BYTES as u64) {
         return denied(
             session,

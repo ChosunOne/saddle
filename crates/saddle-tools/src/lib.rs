@@ -60,7 +60,7 @@ impl Tool for Read {
     fn describe() -> Definition {
         Definition {
             name: "read".into(),
-            description: "read a file beneath a granted root in the explicitly selected format. Format defaults to text (UTF-8); use image for PNG/JPEG/GIF/WebP attachments. No automatic detection or fallback between modes. Path is workspace-relative or absolute unless root is provided. Offset is a 1-based text line; text pages have at most 2000 lines and 50 KiB with total/continuation notes. Text scans are limited to 64 MiB; images to 5 MiB.".into(),
+            description: "read a file allowed by this plugin's runtime filesystem permissions in the explicitly selected format. Format defaults to text (UTF-8); use image for PNG/JPEG/GIF/WebP attachments. No automatic detection or fallback between modes. Path is workspace-relative, absolute or home-relative unless root is provided. Offset is a 1-based text line; text pages have at most 2000 lines and 50 KiB with total/continuation notes. Text scans are limited to 64 MiB; images to 5 MiB.".into(),
             input_schema: json!({
                 "type":"object", "properties": {
                     "root":{"type":"string"}, "path":{"type":"string"},
