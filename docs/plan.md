@@ -2688,6 +2688,17 @@ setting a decoration; both now take it from the table, and a server that never a
 the moment its table names rather than thirty seconds later. The default stays sixty seconds, and
 the message names the deadline it hit, so a timeout is diagnosable from the transcript alone.
 
+**D114.** A server may send requests and notifications of its own, and both are handled rather than
+dropped. Every message off a server's pipe is classified — a reply to us, a request of its own, a
+notification — and a request is answered by whoever holds the pipe, at the next moment it is waiting,
+because that is the only place the answer can go back down. `roots/list` is answered with the roots
+the session would lower into a sandbox spec: what a command may reach, not a wish list.
+`sampling/createMessage` and `elicitation/*` are refused with `-32601` and a sentence saying this
+client declares no such capability — the handshake offers none, so a conforming server will not ask,
+and a server that asks anyway learns why instead of waiting forever. `notifications/tools/list_changed`
+marks that server's catalogue stale, and the next search re-reads it before scoring, so a tool a
+server has withdrawn is not offered and one it has added is not invisible.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

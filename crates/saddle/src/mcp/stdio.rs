@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use crate::mcp::protocol::{self, Reply};
+use crate::mcp::protocol::{self, Message, Reply};
 
 /// How long one reply may take before the server is treated as broken. A handshake that silently
 /// never arrives is a stall rather than an error (D106), so this is not optional.
@@ -40,10 +40,14 @@ pub struct Client {
     name: String,
     child: Child,
     stdin: ChildStdin,
-    replies: Receiver<Reply>,
+    messages: Receiver<Message>,
     stderr: Arc<Mutex<Vec<u8>>>,
     next: u64,
     timeout: Duration,
+    /// What `roots/list` is answered with, handed in because this client has no session (D114).
+    roots: Vec<Value>,
+    /// The server said its tool list changed, so the catalogue it gave earlier is not the truth.
+    stale: bool,
 }
 
 impl Client {
@@ -53,6 +57,7 @@ impl Client {
         helper: &Path,
         spec: &saddle_cap::sandbox::SandboxSpec,
         timeout: Duration,
+        roots: Vec<Value>,
     ) -> Result<Self> {
         // The helper is this binary, re-executed: without its argument it would run the CLI
         // instead of applying the sandbox.
@@ -60,6 +65,7 @@ impl Client {
             .with_context(|| format!("starting the `{name}` server"))?;
         let mut client = Self::from_child(name, child)?;
         client.timeout = timeout;
+        client.roots = roots;
         Ok(client)
     }
 
@@ -69,13 +75,16 @@ impl Client {
         let stdin = child.stdin.take().context("the server has no stdin")?;
         let stdout = child.stdout.take().context("the server has no stdout")?;
         let stderr = child.stderr.take().context("the server has no stderr")?;
-        let (tx, replies) = channel();
+        let (tx, messages) = channel();
         // The pipes are read on their own thread so the caller can service the relay while it
         // waits, and so a server that writes a lot of stderr cannot fill a pipe and deadlock.
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
-                if let Some(parsed) = protocol::reply(&line)
+                // Everything the server says goes to the waiter, including the requests it makes
+                // of us: a request answered only by someone who happened to be reading would be
+                // answered by nobody (D114).
+                if let Some(parsed) = protocol::message(&line)
                     && tx.send(parsed).is_err()
                 {
                     break;
@@ -106,11 +115,23 @@ impl Client {
             name: name.to_owned(),
             child,
             stdin,
-            replies,
+            messages,
             stderr: tail,
             next: 0,
             timeout: REPLY_TIMEOUT,
+            roots: Vec::new(),
+            stale: false,
         })
+    }
+
+    /// Whether the server has said its catalogue changed since it was read (D114).
+    pub fn stale(&self) -> bool {
+        self.stale
+    }
+
+    /// Forgets a stale catalogue once it has been read again.
+    pub fn refreshed(&mut self) {
+        self.stale = false;
     }
 
     /// The handshake, and the notification that says this client is ready. `service` runs whenever
@@ -189,14 +210,30 @@ impl Client {
         self.send(&protocol::request(id, method, params.clone()))?;
         let deadline = Instant::now() + self.timeout;
         loop {
-            match self.replies.recv_timeout(POLL) {
-                Ok(Reply {
+            match self.messages.recv_timeout(POLL) {
+                Ok(Message::Reply(Reply {
                     id: answered,
                     result,
-                }) if answered == id => {
+                })) if answered == id => {
                     return result.map_err(|why| anyhow!("`{}`: {why}", self.name));
                 }
-                // A reply to something else, or a notification: keep waiting for ours.
+                // A request of the server's own: answered here, because this is the only place
+                // holding the pipe it must go back down (D114). The session is out of reach in a
+                // `service` closure, so the answer comes from what the client was given.
+                Ok(Message::Request { id, method, .. }) => {
+                    let reply = crate::mcp::host::answer(&self.roots, &method);
+                    self.send(&protocol::response(id, reply))?;
+                    continue;
+                }
+                Ok(Message::Notification { method }) => {
+                    // A server that changed its tool list mid-session: noticed, and re-read when
+                    // the next search runs rather than trusting a stale catalogue (D114).
+                    if method == "notifications/tools/list_changed" {
+                        self.stale = true;
+                    }
+                    continue;
+                }
+                // A reply to something else: keep waiting for ours.
                 Ok(_) => continue,
                 Err(RecvTimeoutError::Timeout) => {
                     service();

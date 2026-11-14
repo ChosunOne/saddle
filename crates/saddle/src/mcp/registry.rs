@@ -142,7 +142,42 @@ impl Registry {
                 self.failures.insert(name, why);
             }
         }
+        // A server that said its catalogue changed is read again before this search scores
+        // anything, so the model is never offered a tool the server has since withdrawn (D114).
+        let running: Vec<String> = self.servers.keys().cloned().collect();
+        for name in running {
+            if let Err(e) = self.refresh(&name, session) {
+                notes.push(format!("{name}: {e:#}"));
+            }
+        }
         notes
+    }
+
+    /// Re-reads one server's catalogue if it said it changed. A failure here is not a failure of
+    /// the session: the old catalogue is still what the grant decides over.
+    fn refresh(&mut self, server: &str, session: &mut Session) -> Result<()> {
+        let Some(Running { conn, bridge }) = self.servers.get_mut(server) else {
+            return Ok(());
+        };
+        let tools = match conn {
+            Connection::Stdio(client) => {
+                if !client.stale() {
+                    return Ok(());
+                }
+                let mut service = || {
+                    if let Some(bridge) = bridge.as_mut() {
+                        bridge.service(session);
+                    }
+                };
+                let tools = client.tools(&mut service)?;
+                client.refreshed();
+                tools
+            }
+            Connection::Http(_) => return Ok(()),
+        };
+        self.catalogue.retain(|_, (owner, _)| owner != server);
+        self.record(server, tools);
+        Ok(())
     }
 
     /// Starts one server and records the tools it offers. The grant is consulted when a tool is
@@ -175,7 +210,8 @@ impl Registry {
                 if let Some(bridge) = &bridge {
                     spec.net = Some(bridge.spec());
                 }
-                let mut client = Client::start(server, &helper, &spec, entry.timeout())?;
+                let roots = crate::mcp::host::roots(session);
+                let mut client = Client::start(server, &helper, &spec, entry.timeout(), roots)?;
                 let tools = {
                     let mut service = || {
                         if let Some(bridge) = bridge.as_mut() {

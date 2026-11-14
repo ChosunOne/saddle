@@ -3,6 +3,7 @@
 //! tools may be called; this module only reads what was declared and refuses a table that does not
 //! describe exactly one server.
 
+pub mod host;
 pub mod http;
 pub mod lower;
 pub mod protocol;

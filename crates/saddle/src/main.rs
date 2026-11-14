@@ -1411,6 +1411,7 @@ impl OneServer<'_> {
                         self.helper,
                         &spec,
                         entry.timeout(),
+                        mcp::host::roots(session),
                     )?),
                     bridge,
                 ))

@@ -82,3 +82,47 @@ mod tests {
         assert_eq!(reply("not json at all"), None);
     }
 }
+
+/// Everything a server may send: a reply to us, a request of its own (D114), or a notification,
+/// which by definition wants no answer.
+#[derive(Debug, PartialEq)]
+pub enum Message {
+    Reply(Reply),
+    Request {
+        id: u64,
+        method: String,
+        params: Value,
+    },
+    Notification {
+        method: String,
+    },
+}
+
+/// Classifies one framed message. `None` for a line that is not JSON-RPC at all, which a server
+/// writing to its own stdout may well produce.
+pub fn message(text: &str) -> Option<Message> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    let method = value.get("method").and_then(Value::as_str);
+    let id = value.get("id").and_then(Value::as_u64);
+    Some(match (method, id) {
+        (Some(method), Some(id)) => Message::Request {
+            id,
+            method: method.to_owned(),
+            params: value.get("params").cloned().unwrap_or(Value::Null),
+        },
+        (Some(method), None) => Message::Notification {
+            method: method.to_owned(),
+        },
+        (None, _) => Message::Reply(reply(text)?),
+    })
+}
+
+/// One answer to a request of the server's, framed for the wire.
+pub fn response(id: u64, result: Result<Value, String>) -> String {
+    match result {
+        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
+        Err(message) => json!({"jsonrpc": "2.0", "id": id,
+            "error": {"code": -32601, "message": message}})
+        .to_string(),
+    }
+}

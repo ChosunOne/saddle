@@ -33,7 +33,7 @@ Inside `crates/saddle/src`:
 | `context` | instruction files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md` fallback), read through the policy |
 | `skills` | `SKILL.md` skills: discovery through the `read` gate, the prompt listing, `/skill:name` (D64, D67, D68, D69) |
 | `ignore` | ignore-file matching (`.gitignore`, `.ignore`, `.fdignore`), shared by `tools/search` and `skills` (D68) |
-| `mcp` | the MCP servers a person declared in `config.toml` (`[mcp.<name>]`): the transport fields and their validation (D104), the `check` lines that compare them with the grants, `saddle mcp call` as the model's own path with no conversation around it (D111), a `decision` record for every call allowed or refused with the arguments hashed (D112), the stdio client — JSON-RPC over a sandboxed child's pipes, with a reply deadline and a bounded stderr tail (D107) — the streamable-HTTP transport, whose every request is decided against that server's own narrowed net reach and recorded with the server named (D110), and the per-server deadline both transports enforce from the table's own `timeout` (D113), and the registry that `tool_search` declares tools from, so nothing a server offers is in the prompt until the model asks (D108), with a declaration saved as a branch node so a resume, a fork or a `/tree` jump brings it back and a rewind forgets it — and restoring one re-checks the grant (D109) |
+| `mcp` | the MCP servers a person declared in `config.toml` (`[mcp.<name>]`): the transport fields and their validation (D104), the `check` lines that compare them with the grants, `saddle mcp call` as the model's own path with no conversation around it (D111), a `decision` record for every call allowed or refused with the arguments hashed (D112), and the answers to what a server asks — `roots/list`, `-32601` for sampling and elicitation, a re-read when a catalogue changes (D114), the stdio client — JSON-RPC over a sandboxed child's pipes, with a reply deadline and a bounded stderr tail (D107) — the streamable-HTTP transport, whose every request is decided against that server's own narrowed net reach and recorded with the server named (D110), and the per-server deadline both transports enforce from the table's own `timeout` (D113), and the registry that `tool_search` declares tools from, so nothing a server offers is in the prompt until the model asks (D108), with a declaration saved as a branch node so a resume, a fork or a `/tree` jump brings it back and a rewind forgets it — and restoring one re-checks the grant (D109) |
 | `compact` | replacing the older part of a long conversation with a model-written summary (D33), of a session left alone (D77) or written while the turn carries on (D78) |
 | `store` | the saved conversations: a SQLite tree of messages per workspace (D53), imported from the older JSON Lines files once, with one row per model request recording what it used and which model answered (D94), and a `declared` node for what an MCP search declared on a branch (D109) |
 | `output` | line-mode output: a terminal, or one JSON object per line for a program (D52) |
@@ -281,7 +281,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D113 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D114 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

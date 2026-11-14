@@ -865,6 +865,61 @@ fn mock_http_mcp() -> (
 }
 
 #[test]
+fn a_request_from_the_server_is_answered_so_the_listing_can_finish() {
+    // D114: a server may ask the client something of its own. This one asks for the roots before
+    // it will hand over its catalogue, so a listing that completes at all proves the answer went
+    // back down the pipe — and that it carried the workspace root rather than an empty list.
+    let env = Env::new();
+    let script = env.ws.path().join("asking-mcp.sh");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+asked=0
+while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}\n' ;;
+    *'"tools/list"'*)
+      if [ "$asked" = 1 ]; then
+        printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search","description":"finds things","inputSchema":{}}]}}\n'
+      else
+        asked=1
+        printf '{"jsonrpc":"2.0","id":99,"method":"roots/list","params":{}}\n'
+      fi ;;
+    *'"id":99'*)
+      case "$line" in
+        *file://*) printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search","description":"finds things","inputSchema":{}}]}}\n' ;;
+        *) printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n' ;;
+      esac ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    env.write_config(&format!(
+        "\n[mcp.fake]\ncommand = {:?}\n",
+        script.display().to_string()
+    ));
+    env.write_policy(
+        r#"
+version = 1
+
+[agent]
+fs-read = [{ root = "workspace" }]
+exec    = { timeout-secs = 20 }
+mcp     = [{ server = "fake", tools = ["search"] }]
+"#,
+    );
+    let out = env.saddle(&["mcp", "list"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("fake  1 tool(s)"),
+        "the server's own request was not answered with the roots: {text}"
+    );
+}
+
+#[test]
 fn a_server_that_never_answers_is_cut_off_at_the_deadline_its_table_names() {
     // D113: `[mcp.<name>] timeout` is a promise the config makes, so it is the deadline actually
     // enforced rather than a constant. Two seconds, and the message says which deadline it was.
