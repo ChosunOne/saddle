@@ -1,4 +1,4 @@
 id = "finder"
 version = "0.1.0"
 component = "find.component.wasm"
-scopes = ["tool", "fs-read"]
+scopes = ["tool", "fs-read", "tool-read"]

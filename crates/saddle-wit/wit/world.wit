@@ -8,5 +8,6 @@ world read-tool {
     import fs-list;
     import tool-result;
     import transcript-read;
+    import tool-paths;
     export saddle:plugin/tool@0.1.0;
 }

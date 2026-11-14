@@ -82,6 +82,209 @@ fn no_file_reads(env: &Env) {
     );
 }
 
+fn managed_manifest(env: &Env, scopes: &str) {
+    fs::write(
+        env.config()
+            .parent()
+            .unwrap()
+            .join("plugins/reader/plugin.toml"),
+        format!("id='reader'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes={scopes}\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn managed_reads_reuse_declared_paths_without_any_root_grant_and_check_link_targets() {
+    let env = Env::new(
+        &fixture::tool_range_reader("sandbox-1", "file", 0, 128),
+        "tool={}\ntool-read={tools=['read']}",
+    );
+    managed_manifest(&env, "['tool','tool-read']");
+    env.edit(
+        "fs-read=[{root='workspace',exclude=['.env*']}]",
+        "fs-read=[]",
+    );
+    let shared = env.0.path().join("home/.agents");
+    fs::create_dir_all(&shared).unwrap();
+    fs::write(shared.join("file"), "shared reference").unwrap();
+    let out = call(&env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("shared reference"));
+    no_file_reads(&env);
+    assert!(env.records().iter().any(|r| r["scope"] == "tool-read"
+        && r["principal"] == "plugin.reader"
+        && r["allow"] == true
+        && r["args"]["offset"] == 0
+        && r["args"]["call_id"].is_string()));
+    fs::remove_file(shared.join("file")).unwrap();
+    let external = env.0.path().join("external");
+    fs::create_dir_all(&external).unwrap();
+    fs::write(external.join("reference"), "linked reference").unwrap();
+    symlink(external.join("reference"), shared.join("file")).unwrap();
+    let out = call(&env);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(!text(&out).contains("linked reference"));
+    let config = fs::read_to_string(env.config()).unwrap();
+    fs::write(
+        env.config(),
+        format!(
+            "{config}\n[sandbox]\nread=[{{path={:?},tools=['ls']}}]\n",
+            external.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let out = call(&env);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(!text(&out).contains("linked reference"));
+    env.edit("tools=['ls']", "tools=['read']");
+    let out = call(&env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("linked reference"));
+    let log = env.log();
+    assert!(
+        env.run(&["audit", "verify", log.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let out = env.run(&["--revoke", "tool-read", "plugin", "call", "reader", "{}"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(!text(&out).contains("linked reference"));
+}
+
+#[test]
+#[ignore = "build tool-paths-enabled standard components first; see docs/plugins.md"]
+fn managed_standard_components_read_list_find_and_grep_shared_files_through_the_sdk() {
+    for (name, arguments, expected) in [
+        ("read", r#"{"path":"~/.agents/file.txt"}"#, "needle"),
+        ("ls", r#"{"path":"~/.agents"}"#, "file.txt"),
+        (
+            "find",
+            r#"{"path":"~/.agents","pattern":"*.txt"}"#,
+            "sub/other.txt",
+        ),
+        (
+            "grep",
+            r#"{"path":"~/.agents","pattern":"needle"}"#,
+            "file.txt:2: needle",
+        ),
+    ] {
+        let component = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/tool-paths-plugin/{name}.component.wasm"
+        ));
+        let bytes =
+            fs::read(component).expect("build tool-paths-enabled standard components first");
+        let env = Env::new(
+            &bytes,
+            &format!("tool={{}}\nfs-read=[{{root='workspace'}}]\ntool-read={{tools=['{name}']}}"),
+        );
+        managed_manifest(&env, "['tool','fs-read','tool-read']");
+        let shared = env.0.path().join("home/.agents");
+        fs::create_dir_all(shared.join("sub")).unwrap();
+        fs::create_dir_all(shared.join("ignored")).unwrap();
+        fs::write(shared.join("file.txt"), "first\nneedle\n").unwrap();
+        fs::write(shared.join("sub/other.txt"), "needle in subdirectory\n").unwrap();
+        fs::write(shared.join(".ignore"), "ignored/\n").unwrap();
+        fs::write(
+            shared.join("ignored/hidden.txt"),
+            "needle must remain ignored\n",
+        )
+        .unwrap();
+        let out = env.run(&["plugin", "call", "reader", arguments]);
+        assert!(out.status.success(), "{name}: {}", text(&out));
+        assert!(text(&out).contains(expected), "{name}: {}", text(&out));
+        assert!(!text(&out).contains("@tool:"), "{}", text(&out));
+        assert!(!text(&out).contains("hidden.txt"), "{}", text(&out));
+        assert!(
+            env.records()
+                .iter()
+                .any(|r| r["principal"] == "plugin.reader"
+                    && r["scope"] == "tool-read"
+                    && r["allow"] == true)
+        );
+        if name == "read" {
+            let external = env.0.path().join("external");
+            fs::create_dir_all(&external).unwrap();
+            fs::write(external.join("target"), "linked SDK reference").unwrap();
+            symlink(external.join("target"), shared.join("linked")).unwrap();
+            let arguments = r#"{"path":"~/.agents/linked"}"#;
+            let out = env.run(&["plugin", "call", "reader", arguments]);
+            assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+            let config = fs::read_to_string(env.config()).unwrap();
+            fs::write(
+                env.config(),
+                format!(
+                    "{config}\n[sandbox]\nread=[{{path={:?},tools=['read']}}]\n",
+                    external.to_str().unwrap()
+                ),
+            )
+            .unwrap();
+            let out = env.run(&["plugin", "call", "reader", arguments]);
+            assert!(out.status.success(), "{}", text(&out));
+            assert!(text(&out).contains("linked SDK reference"));
+        }
+        let log = env.log();
+        assert!(
+            env.run(&["audit", "verify", log.to_str().unwrap()])
+                .status
+                .success()
+        );
+    }
+}
+
+#[test]
+fn managed_default_paths_cannot_cover_protected_config_through_an_xdg_alias() {
+    let env = Env::new(
+        &fixture::tool_range_reader("sandbox-1", "public", 0, 128),
+        "tool={}\ntool-read={tools=['read']}",
+    );
+    managed_manifest(&env, "['tool','tool-read']");
+    let shared = env.0.path().join("home/.agents");
+    fs::create_dir_all(&shared).unwrap();
+    fs::write(shared.join("public"), "PROTECTED-OVERLAP-CONTENT").unwrap();
+    let config_base = env.0.path().join("config");
+    let actual = shared.join("config");
+    fs::rename(&config_base, &actual).unwrap();
+    symlink(&actual, &config_base).unwrap();
+    let out = call(&env);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(!text(&out).contains("PROTECTED-OVERLAP-CONTENT"));
+    assert!(
+        env.records()
+            .iter()
+            .any(|r| r["scope"] == "tool-read" && r["allow"] == false)
+    );
+}
+
+#[test]
+fn managed_imports_cannot_borrow_other_roles_roots_or_sibling_grants() {
+    for (root, grants, expected_ready) in [
+        ("sandbox-1", "tool={}", false),
+        ("workspace", "tool={}\ntool-read={tools=['read']}", true),
+        ("sandbox-1", "tool={}\ntool-read={tools=['ls']}", true),
+    ] {
+        let env = Env::new(&fixture::tool_range_reader(root, "file", 0, 128), grants);
+        managed_manifest(&env, "['tool','tool-read']");
+        let shared = env.0.path().join("shared");
+        fs::create_dir_all(&shared).unwrap();
+        fs::write(shared.join("file"), "never expose this").unwrap();
+        fs::write(env.ws().join("file"), "never expose this").unwrap();
+        let config = fs::read_to_string(env.config()).unwrap();
+        fs::write(env.config(), format!("{config}\n[sandbox]\nread=[{{path={:?},tools=['read']}}]\n[plugin.sibling]\ntool-read={{tools=['read']}}\n", shared.to_str().unwrap())).unwrap();
+        let listing = env.run(&["plugin", "list"]);
+        // A role absent from the parent's configured reach is refused at load time.
+        let ready = expected_ready && !grants.contains("tools=['ls']");
+        assert_eq!(
+            text(&listing).contains("ready:"),
+            ready,
+            "{}",
+            text(&listing)
+        );
+        let out = call(&env);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert!(!text(&out).contains("never expose this"));
+    }
+}
+
 #[test]
 fn transcript_plugins_need_both_grants_and_never_open_the_saved_database() {
     for (agent, plugin, expected) in [

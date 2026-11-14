@@ -72,14 +72,25 @@ fn reader_source(root: &str, path: &str) -> String {
 
 #[allow(dead_code)] // shared with the model suite, which does not need this fixture.
 pub fn range_reader(path: &str, offset: u64, limit: u32) -> Vec<u8> {
-    let source = reader_source("workspace", path)
+    wat::parse_str(range_source("workspace", path, offset, limit)).unwrap()
+}
+
+#[allow(dead_code)] // managed-path fixtures are only used by the CLI suite.
+pub fn tool_range_reader(root: &str, path: &str, offset: u64, limit: u32) -> Vec<u8> {
+    wat::parse_str(
+        range_source(root, path, offset, limit).replace("fs-read-range@0.1.0", "tool-paths@0.1.0"),
+    )
+    .unwrap()
+}
+
+fn range_source(root: &str, path: &str, offset: u64, limit: u32) -> String {
+    reader_source(root, path)
         .replace("fs-read@0.1.0", "fs-read-range@0.1.0")
         .replace("\"read-file\"", "\"read-range\"")
         .replace("(type $result (result (list u8) (error $failure)))", "(type $chunk-record (record (field \"bytes\" (list u8)) (field \"eof\" bool))) (export \"chunk\" (type $chunk (eq $chunk-record))) (type $result (result $chunk (error $failure)))")
         .replace("(func (param \"path\" $path) (result $result))", "(func (param \"path\" $path) (param \"offset\" u64) (param \"limit\" u32) (result $result))")
         .replace("(param i32 i32 i32 i32 i32)", "(param i32 i32 i32 i32 i64 i32 i32)")
-        .replace("i32.const 32 call $read", &format!("i64.const {offset} i32.const {limit} i32.const 32 call $read"));
-    wat::parse_str(source).unwrap()
+        .replace("i32.const 32 call $read", &format!("i64.const {offset} i32.const {limit} i32.const 32 call $read"))
 }
 
 #[allow(dead_code)] // shared with model tests that do not need metadata fixtures.

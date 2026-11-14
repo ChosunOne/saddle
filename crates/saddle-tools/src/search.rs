@@ -187,7 +187,7 @@ fn matches(glob: &(GlobMatcher, bool), path: &str, start: &str) -> bool {
     glob.0.is_match(path)
 }
 fn shown(root: &str, path: &str) -> String {
-    if root == "workspace" {
+    if root == "workspace" || root.starts_with("@tool:") {
         path.into()
     } else {
         format!("{root}:{path}")

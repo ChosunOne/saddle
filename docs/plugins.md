@@ -146,7 +146,7 @@ accepted. Failed/trapped calls publish no images, and saved image data/provenanc
 The 64 KiB text result limit is not enlarged to accommodate image bytes.
 
 This is an incremental migration toward replacing built-in `read`, not a permanent implementation
-picker. Shared tool-visible directories and standard-component delivery still need work. Standard
+picker. Shared tool-visible directories use the optional SDK adapter below; standard-component delivery still needs work. Standard
 plugins are not silently enabled or given the agent's authority merely because their source ships
 in the repository.
 
@@ -177,8 +177,8 @@ modified directories are not a snapshot. The guest owns suffixes, sorting and ou
 
 The additive `fs-paths` service maps paths to real roots under the same `fs-read` permission. It
 never lets a guest select a native tool identity or access D66 tool-visible directories merely
-because native `read` can. Those directories need a separate bounded delegation design, not an
-automatic exception or a new grantable root.
+because native `read` can. Those directories use the separately gated `tool-paths` service below,
+not an automatic exception or a new grantable root.
 
 ```sh
 cargo nextest run --test plugins --run-ignored only \
@@ -237,6 +237,59 @@ cargo nextest run --test plugins --run-ignored only \
   -E 'test(standard_search_components_walk_and_match_without_bypassing_exclusions)'
 ```
 
+## Existing managed/tool-visible directories
+
+D66 directories such as `~/.agents` are not roots. The `tool-paths` SDK interface (D138) reuses their
+existing user-owned `[sandbox]` declarations, including the default read-only `~/.agents` entry.
+No directory is declared again, and a bare sandbox path or include rule does not become host-tool
+access. A plugin explicitly receives a subset of the existing read-only directory roles:
+
+```toml
+[plugin.files]
+tool = {}
+fs-read = [{ root = "workspace" }]
+tool-read = { tools = ["read"] }
+```
+
+Use `ls`, `find` or `grep` for the corresponding standard component's role. These roles select the
+configured directory reach, not the guest's name or implementation. The parent role ceiling is
+derived from current D66 declarations; no extra agent grant is needed. An optional explicit agent
+`tool-read` table can narrow that ceiling, never add directories. `--revoke tool-read` disables the
+SDK capability for one run. A sibling's grant, the registration `tool` scope, and root filesystem
+grants cannot supply it. Custom managed-only guests need no `fs-read` grant at all.
+
+The standard SDK helpers route managed paths when built with feature `tool-paths`. Default builds
+remain root-only. For example:
+
+```sh
+cargo build -p saddle-tools --examples --features tool-paths --target wasm32-unknown-unknown --release
+mkdir -p target/tool-paths-plugin
+for name in read ls find grep; do
+  cargo run -p saddle-loader --example componentize -- \
+    target/wasm32-unknown-unknown/release/examples/$name.wasm \
+    target/tool-paths-plugin/$name.component.wasm
+done
+```
+
+Install the desired artifact with its standard manifest, then enable/pin it and grant `tool-read`
+as above. Standard manifests allow the optional scope but do not grant it. A feature-enabled
+component requires that explicit grant for its import even on a call using only the workspace.
+Low-level SDK `managed_paths` bindings are also available independently; Cargo features are
+ergonomics, not permission. Missing import grants are rejected before initialization.
+
+Managed range reads and listings retain the existing size, filtering and execution limits. Both
+requested paths and linked targets must match the calling plugin's roles on the current entries.
+Undeclared targets, config/state directories and attempts to access policy roots through this
+interface are refused. Reload rebuilds mappings and pins, so removing a target declaration revokes
+it even if the plugin stays loaded. Calls are audited with the plugin identity, absolute path,
+range/page parameters and call id. Generated managed identifiers are internal; standard search
+results show managed paths relatively.
+
+```sh
+cargo nextest run --test plugins --run-ignored all -E 'test(managed_)'
+cargo nextest run --test agent -E 'test(reloading_managed_paths)'
+```
+
 ## Standard transcript-query component
 
 The `session_query` guest owns the schema and presentation; core `transcript` services own the
@@ -278,8 +331,8 @@ No standard component is silently aliased over a built-in or given implicit gran
 
 | Tool | Guest implementation | Remaining parity/adapters |
 | --- | --- | --- |
-| `read` | native-style text pagination/totals, deep offsets, bounded range reads and explicit image mode | managed tool paths, scans beyond resource bounds, standard-component delivery |
-| `ls` | filtered directory pages, suffixes, sorted output | managed tool paths; bounded/non-UTF-8 listing differences |
+| `read` | native-style text pagination/totals, deep offsets, bounded range reads, explicit image mode and optional managed paths | scans beyond resource bounds, standard-component delivery |
+| `ls` | filtered directory pages, suffixes, sorted output, optional managed paths | bounded/non-UTF-8 listing differences |
 | `find`, `grep` | guest traversal, shared ignore syntax, glob/regex matching | large-tree/performance edges, host-path display and unreadable-file metadata |
 | `write`, `edit`, `patch` | not migrated | scoped mutation/atomic transaction services, reserved paths, preflight all patch paths |
 | `bash` | not migrated | delegated exec sandbox, bounded streaming, cancellation, environment filtering and reservation restore |
@@ -289,8 +342,8 @@ No standard component is silently aliased over a built-in or given implicit gran
 The target is replacement, not parallel selectable implementations: native entry points go away as
 parity and standard-component delivery land. Remaining adapters must act as the plugin principal,
 not reuse a built-in's hard-coded agent identity. D65/D66 tool-visible paths remain distinct from
-roots; their SDK adapter must reuse the existing configuration rather than require another directory
-declaration. That adapter is not implemented yet.
+roots; their SDK adapter reuses the existing configuration rather than requiring another directory
+declaration.
 
 ## Authority and provenance
 
@@ -302,8 +355,9 @@ Native tools do not require an explicit `agent.tool` grant to use their host-man
 The session assigns the plugin principal and a unique call id; guest JSON cannot select them.
 Filesystem imports decide and audit both requested and resolved names with that principal. Directory
 descriptors are pinned with no-follow opens; final reads require a regular file, use nonblocking and
-no-follow flags, and cap bytes during I/O. Absolute symlinks, root escapes and excluded targets are
-refused. A FIFO, socket, device or oversized file is not a way around the boundary.
+no-follow flags, and cap bytes during I/O. Normal roots refuse absolute symlinks, root escapes and
+excluded targets. Managed tool paths permit links only into other declared, independently allowed
+tool paths. A FIFO, socket, device or oversized file is not a way around the boundary.
 
 Plugin descriptions and results are untrusted data. Results are wrapped with a random session
 delimiter, embedded delimiter prefixes are neutralized and terminal controls removed. Host metadata
@@ -324,7 +378,7 @@ These labels are provenance, not permission to follow instructions found in a pl
   filesystem adapter. Its worker asks the session thread over a bounded channel; the loader does
   not own a second policy engine or depend on `Session`.
 
-Only `fs-read`, `transcript-read` and `tool` grants are supported by this runtime. Other scopes fail closed. The
+Only `fs-read`, `tool-read`, `transcript-read` and `tool` grants are supported by this runtime. Other scopes fail closed. The
 component classifier describes a wider planned ABI; that does not make its adapters available.
 Descriptions are capped at 1,000 characters, schemas at 16 KiB and configured plugins at 16.
 Schemas must parse as JSON objects with an object input type; the provider may enforce further

@@ -11,7 +11,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Error as HostError, Result, anyhow};
+use anyhow::{Error as HostError, Result, anyhow};
 use saddle_cap::{Location, Principal, RelPath, RootName, Scope};
 use saddle_loader::{HostServices, Invocation, MAX_FILE_BYTES, Prepared};
 use saddle_policy::audit::sha256_hex;
@@ -26,7 +26,6 @@ use serde_json::json;
 use super::filesystem;
 use crate::provider::Image;
 use crate::session::Session;
-use crate::tools::fs::resolve_beneath;
 use crate::{cancel, fs_access, transcript};
 
 pub enum Job {
@@ -62,6 +61,7 @@ enum Event {
         answer: SyncSender<HostReply<String, String>>,
     },
     Read {
+        managed: bool,
         who: Principal,
         deadline: Instant,
         path: Path,
@@ -69,12 +69,14 @@ enum Event {
         answer: SyncSender<FileReply>,
     },
     Resolve {
+        managed: bool,
         who: Principal,
         deadline: Instant,
         value: String,
         answer: SyncSender<HostReply<Path>>,
     },
     List {
+        managed: bool,
         who: Principal,
         deadline: Instant,
         path: Path,
@@ -96,6 +98,59 @@ pub struct Host {
     events: SyncSender<Event>,
 }
 impl HostServices for Host {
+    fn resolve_tool_path(
+        &mut self,
+        call: &Invocation,
+        value: String,
+    ) -> Result<Result<Path, Failure>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        self.events
+            .send(Event::Resolve {
+                managed: true,
+                who: call.principal().clone(),
+                deadline: call.deadline(),
+                value,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        result
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(|_| anyhow!("plugin path request timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
+    fn read_tool_range(
+        &mut self,
+        call: &Invocation,
+        path: Path,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Result<Chunk, Failure>> {
+        self.request(call, path, Some((offset, limit)), true)
+    }
+    fn read_tool_directory(
+        &mut self,
+        call: &Invocation,
+        path: Path,
+        after: String,
+        limit: u32,
+    ) -> Result<Result<DirectoryPage, Failure>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        self.events
+            .send(Event::List {
+                managed: true,
+                who: call.principal().clone(),
+                deadline: call.deadline(),
+                path,
+                after,
+                limit,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        result
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(|_| anyhow!("plugin directory request timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
     fn query_transcript(
         &mut self,
         call: &Invocation,
@@ -140,6 +195,7 @@ impl HostServices for Host {
         let (answer, result) = mpsc::sync_channel(1);
         self.events
             .send(Event::Resolve {
+                managed: false,
                 who: call.principal().clone(),
                 deadline: call.deadline(),
                 value,
@@ -162,6 +218,7 @@ impl HostServices for Host {
         let (answer, result) = mpsc::sync_channel(1);
         self.events
             .send(Event::List {
+                managed: false,
                 who: call.principal().clone(),
                 deadline: call.deadline(),
                 path,
@@ -177,7 +234,9 @@ impl HostServices for Host {
     }
 
     fn read_file(&mut self, call: &Invocation, path: Path) -> Result<Result<Vec<u8>, Failure>> {
-        Ok(self.request(call, path, None)?.map(|chunk| chunk.bytes))
+        Ok(self
+            .request(call, path, None, false)?
+            .map(|chunk| chunk.bytes))
     }
 
     fn read_range(
@@ -187,7 +246,7 @@ impl HostServices for Host {
         offset: u64,
         limit: u32,
     ) -> Result<Result<Chunk, Failure>> {
-        self.request(call, path, Some((offset, limit)))
+        self.request(call, path, Some((offset, limit)), false)
     }
 }
 impl Host {
@@ -196,10 +255,12 @@ impl Host {
         call: &Invocation,
         path: Path,
         range: Option<(u64, u32)>,
+        managed: bool,
     ) -> Result<Result<Chunk, Failure>> {
         let (answer, result) = mpsc::sync_channel(1);
         self.events
             .send(Event::Read {
+                managed,
                 who: call.principal().clone(),
                 deadline: call.deadline(),
                 path,
@@ -268,6 +329,7 @@ pub fn execute(
                 );
             }
             Ok(Event::Read {
+                managed,
                 who,
                 deadline,
                 path,
@@ -275,26 +337,28 @@ pub fn execute(
                 answer,
             }) => {
                 respond(
-                    read_file(session, &who, call, deadline, path, range),
+                    read_file(session, &who, call, deadline, path, range, managed),
                     answer,
                     &mut fatal,
                     &cancelled,
                 );
             }
             Ok(Event::Resolve {
+                managed,
                 who,
                 deadline,
                 value,
                 answer,
             }) => {
                 respond(
-                    filesystem::resolve_path(session, &who, call, deadline, value),
+                    filesystem::resolve_path(session, &who, call, deadline, value, managed),
                     answer,
                     &mut fatal,
                     &cancelled,
                 );
             }
             Ok(Event::List {
+                managed,
                 who,
                 deadline,
                 path,
@@ -303,7 +367,15 @@ pub fn execute(
                 answer,
             }) => {
                 respond(
-                    filesystem::read_directory(session, &who, call, deadline, path, after, limit),
+                    filesystem::read_directory(
+                        session,
+                        &who,
+                        call,
+                        deadline,
+                        path,
+                        (after, limit),
+                        managed,
+                    ),
                     answer,
                     &mut fatal,
                     &cancelled,
@@ -420,6 +492,7 @@ fn denied(
     path: &Path,
     range: Option<(u64, u32)>,
     why: String,
+    managed: bool,
 ) -> Result<Result<Chunk, Failure>> {
     let mut args = json!({"call_id":call, "root_sha256":sha256_hex(path.root.as_bytes()), "relative_sha256":sha256_hex(path.relative.as_bytes())});
     if let Some((offset, limit)) = range {
@@ -429,33 +502,16 @@ fn denied(
     session.audit.event(
         Kind::Decision,
         Some(who),
-        Some(Scope::FsRead),
+        Some(if managed {
+            Scope::ToolRead
+        } else {
+            Scope::FsRead
+        }),
         Some(false),
         args,
         &why,
     )?;
     Ok(Err(Failure::Denied(why)))
-}
-
-fn gate(
-    session: &mut Session,
-    who: &Principal,
-    call: &str,
-    loc: &Location,
-    range: Option<(u64, u32)>,
-) -> Result<Option<Failure>> {
-    let request = Request::FsRead { loc };
-    let decision = session.engine.decide(who, &request);
-    if let Some(range) = range {
-        session
-            .audit
-            .decision_for_read_range(who, &request, &decision, call, range)?;
-    } else {
-        session
-            .audit
-            .decision_for_call(who, &request, &decision, call)?;
-    }
-    Ok((!decision.allow).then_some(Failure::Denied(decision.explanation)))
 }
 
 fn read_file(
@@ -465,6 +521,7 @@ fn read_file(
     deadline: Instant,
     path: Path,
     range: Option<(u64, u32)>,
+    managed: bool,
 ) -> Result<Result<Chunk, Failure>> {
     if range.is_some_and(|(_, limit)| limit == 0 || u64::from(limit) > MAX_FILE_BYTES as u64) {
         return denied(
@@ -474,6 +531,7 @@ fn read_file(
             &path,
             range,
             "read range limit must be between 1 and 65536 bytes".into(),
+            managed,
         );
     }
     if path.root.len() > 64 || path.relative.len() > 4096 {
@@ -484,6 +542,7 @@ fn read_file(
             &path,
             range,
             "plugin path is too long".into(),
+            managed,
         );
     }
     let (root, rel) = match (RootName::new(&path.root), RelPath::new(&path.relative)) {
@@ -496,6 +555,7 @@ fn read_file(
                 &path,
                 range,
                 "invalid root-relative plugin path".into(),
+                managed,
             );
         }
     };
@@ -507,26 +567,19 @@ fn read_file(
             &path,
             range,
             "plugin read cancelled or timed out".into(),
+            managed,
         );
     }
     let loc = Location::new(root, rel);
-    if let Some(failure) = gate(session, who, call, &loc, range)? {
-        return Ok(Err(failure));
-    }
-    let dir = session
-        .file_roots
-        .get(&loc.root)
-        .context("plugin has no filesystem root")?
-        .try_clone()?;
-    let real = match resolve_beneath(&dir, &loc.rel) {
-        Ok(rel) => Location::new(loc.root.clone(), rel),
-        Err(error) => return denied(session, who, call, &path, range, error.to_string()),
-    };
-    if real != loc
-        && let Some(failure) = gate(session, who, call, &real, range)?
+    let details = range.map_or_else(
+        || json!({}),
+        |(offset, limit)| json!({"offset":offset,"limit":limit}),
+    );
+    let (dir, real) = match filesystem::open_read_path(session, who, call, &loc, details, managed)?
     {
-        return Ok(Err(failure));
-    }
+        Ok(opened) => opened,
+        Err(failure) => return Ok(Err(failure)),
+    };
     let bytes = (|| -> Result<Result<Chunk, Failure>> {
         let mut file = fs_access::file(&dir, &real.rel)?;
         if let Some((offset, _)) = range {

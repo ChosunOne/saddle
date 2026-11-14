@@ -7,10 +7,12 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use cap_std::fs::Dir;
+use saddle_cap::roots::normalize;
 use saddle_cap::{Location, Principal, RelPath, RootName, Scope};
 use saddle_loader::MAX_DIRECTORY_ENTRIES;
 use saddle_policy::audit::sha256_hex;
-use saddle_policy::{Kind, Request};
+use saddle_policy::{Decision, Kind, Request};
 use saddle_wit::saddle::host::fs_list::{Entry, EntryKind, Page};
 use saddle_wit::saddle::host::fs_read::{Failure, Path};
 use serde_json::{Value, json};
@@ -31,11 +33,16 @@ fn refuse<T>(
     call: &str,
     details: Value,
     why: &str,
+    managed: bool,
 ) -> Result<Result<T, Failure>> {
     session.audit.event(
         Kind::Decision,
         Some(who),
-        Some(Scope::FsRead),
+        Some(if managed {
+            Scope::ToolRead
+        } else {
+            Scope::FsRead
+        }),
         Some(false),
         json!({"call_id":call,"details":details}),
         why,
@@ -43,19 +50,135 @@ fn refuse<T>(
     Ok(Err(Failure::Denied(why.into())))
 }
 
-fn gate(
+fn tool_read_info<'a>(session: &'a Session, loc: &Location) -> (String, &'a [String]) {
+    let path = session
+        .base_of(&loc.root)
+        .map(|base| base.join(loc.rel.to_path()));
+    let roles = path
+        .as_ref()
+        .filter(|path| session.roots().locate(path).is_none())
+        .filter(|_| session.is_tool_root(&loc.root))
+        .and_then(|path| session.tool_root_for(path))
+        .filter(|root| !root.protected)
+        .map(|root| root.tools.as_slice())
+        .unwrap_or(&[]);
+    (
+        path.map(|path| path.display().to_string())
+            .unwrap_or_else(|| loc.to_string()),
+        roles,
+    )
+}
+
+pub(crate) fn read_decision(
+    session: &Session,
+    who: &Principal,
+    loc: &Location,
+    managed: bool,
+) -> Decision {
+    if managed {
+        let (path, roles) = tool_read_info(session, loc);
+        session.engine.decide(
+            who,
+            &Request::ToolRead {
+                path: &path,
+                available_tools: roles,
+            },
+        )
+    } else {
+        session.engine.decide(who, &Request::FsRead { loc })
+    }
+}
+
+pub(crate) fn gate(
     session: &mut Session,
     who: &Principal,
     call: &str,
     loc: &Location,
     details: Value,
+    managed: bool,
 ) -> Result<Option<Failure>> {
-    let request = Request::FsRead { loc };
-    let decision = session.engine.decide(who, &request);
-    session
-        .audit
-        .decision_for_call_details(who, &request, &decision, call, details)?;
+    let decision = read_decision(session, who, loc, managed);
+    if managed {
+        let (path, roles) = tool_read_info(session, loc);
+        let roles = roles.to_vec();
+        let request = Request::ToolRead {
+            path: &path,
+            available_tools: &roles,
+        };
+        session
+            .audit
+            .decision_for_call_details(who, &request, &decision, call, details)?;
+    } else {
+        session.audit.decision_for_call_details(
+            who,
+            &Request::FsRead { loc },
+            &decision,
+            call,
+            details,
+        )?;
+    }
     Ok((!decision.allow).then_some(Failure::Denied(decision.explanation)))
+}
+
+pub(crate) fn open_read_path(
+    session: &mut Session,
+    who: &Principal,
+    call: &str,
+    loc: &Location,
+    details: Value,
+    managed: bool,
+) -> Result<Result<(Dir, Location), Failure>> {
+    if let Some(failure) = gate(session, who, call, loc, details.clone(), managed)? {
+        return Ok(Err(failure));
+    }
+    let opened = (|| -> Result<(Dir, Location)> {
+        let real = if managed {
+            session.resolve_tool(loc)?
+        } else {
+            let dir = session
+                .file_roots
+                .get(&loc.root)
+                .context("plugin has no filesystem root")?;
+            Location::new(loc.root.clone(), resolve_beneath(dir, &loc.rel)?)
+        };
+        let dir = if managed {
+            session
+                .tool_root(&real.root)
+                .and_then(|root| root.handle.as_ref())
+                .context("configured tool path cannot be opened as a pinned directory")?
+        } else {
+            session
+                .file_roots
+                .get(&real.root)
+                .context("plugin has no filesystem root")?
+        }
+        .try_clone()?;
+        Ok((dir, real))
+    })();
+    let (dir, real) = match opened {
+        Ok(opened) => opened,
+        Err(error) => {
+            session.audit.event(
+                Kind::Decision,
+                Some(who),
+                Some(if managed {
+                    Scope::ToolRead
+                } else {
+                    Scope::FsRead
+                }),
+                Some(false),
+                json!({"call_id":call,"details":details}),
+                error.to_string(),
+            )?;
+            return Ok(Err(Failure::Denied(error.to_string())));
+        }
+    };
+    if real != *loc
+        && let Some(failure) = gate(session, who, call, &real, details, managed)?
+    {
+        return Ok(Err(failure));
+    }
+    Ok(Ok((dir, real)))
 }
 
 pub fn resolve_path(
@@ -64,6 +187,7 @@ pub fn resolve_path(
     call: &str,
     deadline: Instant,
     value: String,
+    managed: bool,
 ) -> Result<Result<Path, Failure>> {
     let details = json!({"operation":"resolve-path", "path_sha256":sha256_hex(value.as_bytes())});
     if value.len() > 4096 || expired(deadline) {
@@ -73,11 +197,19 @@ pub fn resolve_path(
             call,
             details,
             "plugin path is too long, cancelled or timed out",
+            managed,
         );
     }
     let path = if value == "~" || value.starts_with("~/") {
         let Some(home) = env::var_os("HOME") else {
-            return refuse(session, who, call, details, "home directory is unavailable");
+            return refuse(
+                session,
+                who,
+                call,
+                details,
+                "home directory is unavailable",
+                managed,
+            );
         };
         NativePath::new(&home).join(value.strip_prefix("~/").unwrap_or(""))
     } else if NativePath::new(&value).is_absolute() {
@@ -85,14 +217,30 @@ pub fn resolve_path(
     } else {
         session.setup.workspace.join(&value)
     };
-    // Only true roots are addressable here. D66 tool-visible directories are NOT delegatable roots.
-    let Some(loc) = session.roots().locate(&path) else {
+    let path = normalize(&path);
+    let loc = if managed && session.roots().locate(&path).is_none() {
+        session.tool_root_for(&path).and_then(|root| {
+            RelPath::new(path.strip_prefix(&root.dir).ok()?)
+                .ok()
+                .map(|rel| Location::new(root.name.clone(), rel))
+        })
+    } else if !managed {
+        session.roots().locate(&path)
+    } else {
+        None
+    };
+    let Some(loc) = loc else {
         return refuse(
             session,
             who,
             call,
             details,
-            "plugin path is outside every root",
+            if managed {
+                "plugin path is outside declared tool paths or belongs to a policy root"
+            } else {
+                "plugin path is outside every root"
+            },
+            managed,
         );
     };
     if let Some(failure) = gate(
@@ -101,6 +249,7 @@ pub fn resolve_path(
         call,
         &loc,
         json!({"operation":"resolve-path"}),
+        managed,
     )? {
         return Ok(Err(failure));
     }
@@ -116,9 +265,10 @@ pub fn read_directory(
     call: &str,
     deadline: Instant,
     path: Path,
-    after: String,
-    limit: u32,
+    page: (String, u32),
+    managed: bool,
 ) -> Result<Result<Page, Failure>> {
+    let (after, limit) = page;
     let details = json!({"operation":"read-directory", "after":after, "limit":limit});
     if path.root.len() > 64
         || path.relative.len() > 4096
@@ -133,6 +283,7 @@ pub fn read_directory(
             call,
             json!({"operation":"read-directory","root_sha256":sha256_hex(path.root.as_bytes()),"relative_sha256":sha256_hex(path.relative.as_bytes()),"after_sha256":sha256_hex(after.as_bytes()),"limit":limit}),
             "invalid, cancelled or timed-out directory request",
+            managed,
         );
     }
     let (root, relative) = match (RootName::new(&path.root), RelPath::new(&path.relative)) {
@@ -144,28 +295,15 @@ pub fn read_directory(
                 call,
                 details,
                 "invalid root-relative plugin path",
+                managed,
             );
         }
     };
     let loc = Location::new(root, relative);
-    if let Some(failure) = gate(session, who, call, &loc, details.clone())? {
-        return Ok(Err(failure));
-    }
-    let root = session
-        .file_roots
-        .get(&loc.root)
-        .context("plugin has no filesystem root")?
-        .try_clone()?;
-    let relative = match resolve_beneath(&root, &loc.rel) {
-        Ok(relative) => relative,
-        Err(error) => return refuse(session, who, call, details, &error.to_string()),
+    let (root, real) = match open_read_path(session, who, call, &loc, details, managed)? {
+        Ok(opened) => opened,
+        Err(failure) => return Ok(Err(failure)),
     };
-    let real = Location::new(loc.root.clone(), relative);
-    if real != loc
-        && let Some(failure) = gate(session, who, call, &real, details)?
-    {
-        return Ok(Err(failure));
-    }
     let result = (|| -> Result<Result<Page, Failure>> {
         let directory = fs_access::directory(&root, &real.rel)?;
         let mut candidates = BTreeMap::new();
@@ -195,15 +333,13 @@ pub fn read_directory(
                 let Ok(relative) = RelPath::new(base.rel.to_path().join(&name)) else {
                     return false;
                 };
-                session
-                    .engine
-                    .decide(
-                        who,
-                        &Request::FsRead {
-                            loc: &Location::new(base.root.clone(), relative),
-                        },
-                    )
-                    .allow
+                read_decision(
+                    session,
+                    who,
+                    &Location::new(base.root.clone(), relative),
+                    managed,
+                )
+                .allow
             });
             if !allowed {
                 skipped += 1;

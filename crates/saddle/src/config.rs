@@ -836,7 +836,7 @@ impl Overrides {
             match rest {
                 "" => {
                     // A scope with no parameters: `exec`, `net` is not one of these.
-                    if matches!(scope, "fs-read" | "fs-write" | "net" | "tool") {
+                    if matches!(scope, "fs-read" | "fs-write" | "net" | "tool" | "tool-read") {
                         bail!(
                             "--grant {scope} needs what it grants, as in `--grant {scope}:scratch`"
                         );
@@ -849,6 +849,19 @@ impl Overrides {
                     *table = toml::Value::Table(a);
                 }
                 rest => {
+                    if scope == "tool-read" {
+                        let mut grant = toml::Table::new();
+                        grant.insert(
+                            "tools".into(),
+                            toml::Value::Array(
+                                rest.split(',')
+                                    .map(|role| toml::Value::String(role.trim().into()))
+                                    .collect(),
+                            ),
+                        );
+                        *table = toml::Value::Table(grant);
+                        continue;
+                    }
                     let mut grant = toml::Table::new();
                     let (root, exclude) = match rest.split_once(':') {
                         Some((root, pats)) => (

@@ -91,6 +91,7 @@ pub fn classify(direction: Direction, name: &str) -> Requirement {
         (Import, "saddle", "host", i) => match i {
             "exec" => scope(Scope::Exec),
             "fs-read" | "fs-read-range" | "fs-paths" | "fs-list" => scope(Scope::FsRead),
+            "tool-paths" => scope(Scope::ToolRead),
             "tool-result" => scope(Scope::Tool),
             "fs-write" => scope(Scope::FsWrite),
             "transcript-read" => scope(Scope::TranscriptRead),
@@ -179,6 +180,7 @@ pub fn host_interfaces(granted: &BTreeSet<Scope>) -> Vec<&'static str> {
         out.push(match scope {
             Scope::Exec => "saddle:host/exec",
             Scope::FsRead => "saddle:host/fs-read",
+            Scope::ToolRead => "saddle:host/tool-paths",
             Scope::FsWrite => "saddle:host/fs-write",
             Scope::TranscriptRead => "saddle:host/transcript-read",
             Scope::ContextContribute => "saddle:host/context-contribute",

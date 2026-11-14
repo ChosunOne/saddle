@@ -12,6 +12,11 @@ use serde_json::{Value, json};
 /// A request with its arguments already resolved.
 #[derive(Debug, Clone)]
 pub enum Request<'a> {
+    /// the host supplies the current D66 entry's roles, never the guest.
+    ToolRead {
+        path: &'a str,
+        available_tools: &'a [String],
+    },
     FsRead {
         loc: &'a Location,
     },
@@ -46,6 +51,7 @@ pub enum Request<'a> {
 impl Request<'_> {
     pub fn scope(&self) -> Scope {
         match self {
+            Request::ToolRead { .. } => Scope::ToolRead,
             Request::FsRead { .. } => Scope::FsRead,
             Request::FsWrite { .. } => Scope::FsWrite,
             Request::Exec { .. } => Scope::Exec,
@@ -59,6 +65,10 @@ impl Request<'_> {
     /// Arguments as they go into the audit log. Query values are redacted (D24).
     pub fn args(&self) -> Value {
         match self {
+            Request::ToolRead {
+                path,
+                available_tools,
+            } => json!({"path":path,"available_tools":available_tools}),
             Request::FsRead { loc } | Request::FsWrite { loc } => {
                 json!({ "path": loc.to_string() })
             }
@@ -239,6 +249,17 @@ impl Engine {
             return Decision::deny(scope, format!("{who} has no grants in the policy"));
         };
         match req {
+            Request::ToolRead {
+                available_tools, ..
+            } => match &grants.tool_read {
+                Some(g) if g.tools.iter().any(|tool| available_tools.contains(tool)) => {
+                    Decision::allow(scope, &g.rule, &g.why)
+                }
+                _ => Decision::deny(
+                    scope,
+                    format!("{who} has no tool-read role covering this configured directory"),
+                ),
+            },
             Request::FsRead { loc } => fs_decision(who, scope, &grants.fs_read, loc),
             Request::FsWrite { loc } => {
                 if self.reserved.contains(loc) {
@@ -310,6 +331,49 @@ fn fs_decision(who: &Principal, scope: Scope, grants: &[FsGrant], loc: &Location
 mod tests {
     use super::*;
     use saddle_cap::{PluginId, Roots};
+
+    #[test]
+    fn tool_paths_intersect_host_supplied_entry_roles_and_the_calling_principal() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = Roots::resolve([(RootName::workspace(), dir.path().into())], &[]).unwrap();
+        let policy = Policy::parse("version=1\n[plugin.reader]\ntool-read={tools=['read']}\n[plugin.sibling]\ntool-read={tools=['ls']}\n", &roots).unwrap();
+        let engine = Engine::new(policy);
+        let who = Principal::Plugin(PluginId::new("reader").unwrap());
+        for (roles, allow) in [
+            (vec!["read".into()], true),
+            (vec!["ls".into()], false),
+            (Vec::new(), false),
+        ] {
+            let request = Request::ToolRead {
+                path: "/shared/file",
+                available_tools: &roles,
+            };
+            assert_eq!(engine.decide(&who, &request).allow, allow);
+            assert_eq!(request.args()["path"], "/shared/file");
+        }
+        let missing = Principal::Plugin(PluginId::new("missing").unwrap());
+        assert!(
+            !engine
+                .decide(
+                    &missing,
+                    &Request::ToolRead {
+                        path: "/shared/file",
+                        available_tools: &["read".into()]
+                    }
+                )
+                .allow
+        );
+        assert!(
+            !engine
+                .decide(
+                    &who,
+                    &Request::FsRead {
+                        loc: &Location::new(RootName::workspace(), RelPath::new("file").unwrap())
+                    }
+                )
+                .allow
+        );
+    }
 
     fn engine() -> (tempfile::TempDir, Engine) {
         let ws = tempfile::tempdir().unwrap();

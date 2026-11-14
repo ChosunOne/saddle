@@ -1,5 +1,18 @@
 package saddle:host@0.1.0;
 
+// Independent types keep managed-only guests from importing normal-root filesystem services.
+interface tool-paths {
+    record path { root: string, relative: string }
+    variant failure { denied(string), invalid-path(string), io(string), too-large }
+    record chunk { bytes: list<u8>, eof: bool }
+    enum entry-kind { file, directory, symlink, other }
+    record entry { name: string, kind: entry-kind }
+    record page { entries: list<entry>, total: u32, skipped: u32, more: bool }
+    resolve-path: func(value: string) -> result<path, failure>;
+    read-range: func(path: path, offset: u64, limit: u32) -> result<chunk, failure>;
+    read-directory: func(path: path, after: string, limit: u32) -> result<page, failure>;
+}
+
 // A query over the active branch, never a handle to the saved database.
 interface transcript-read {
     query: func(sql: string) -> result<string, string>;

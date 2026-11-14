@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs as unix_fs;
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -1115,6 +1116,103 @@ fn failed_plugins_are_not_advertised_and_do_not_remove_native_tools() {
             .starts_with("plugin__")
     }));
     assert!(tools.iter().any(|t| t["function"]["name"] == "read"));
+}
+
+#[test]
+fn reloading_managed_paths_revokes_targets_even_when_the_plugin_stays_loaded() {
+    let (base, seen) = serve(vec![
+        sse_response(&openai_sse(
+            "",
+            &[("first", "plugin__reader__reader", json!({}))],
+        )),
+        sse_response(&openai_sse("first done", &[])),
+        sse_response(&openai_sse(
+            "",
+            &[("second", "plugin__reader__reader", json!({}))],
+        )),
+        sse_response(&openai_sse("second done", &[])),
+    ]);
+    let env = Env::new(Api::Openai, &base);
+    let config = env.xdg.path().join("config/saddle/config.toml");
+    plugin_fixture::configure(
+        &config,
+        &plugin_fixture::tool_range_reader("sandbox-1", "linked", 0, 128),
+        "tool={}\ntool-read={tools=['read']}",
+    );
+    fs::write(
+        config.parent().unwrap().join("plugins/reader/plugin.toml"),
+        "id='reader'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes=['tool','tool-read']\n",
+    )
+    .unwrap();
+    let shared = env.xdg.path().join("home/.agents");
+    let external = env.xdg.path().join("external");
+    fs::create_dir_all(&shared).unwrap();
+    fs::create_dir_all(&external).unwrap();
+    fs::write(external.join("reference"), "before reload").unwrap();
+    symlink(external.join("reference"), shared.join("linked")).unwrap();
+    let declaration = format!(
+        "read=[{{path={:?},tools=['read']}}]",
+        external.to_str().unwrap()
+    );
+    let settings = fs::read_to_string(&config).unwrap();
+    fs::write(&config, format!("{settings}\n[sandbox]\n{declaration}\n")).unwrap();
+    let mut child = env
+        .command(&["run", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"first\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while seen.lock().unwrap().len() < 2 {
+        assert!(Instant::now() < deadline, "first turn did not finish");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let settings = fs::read_to_string(&config).unwrap();
+    fs::write(&config, settings.replace(&declaration, "read=[]")).unwrap();
+    fs::write(external.join("reference"), "AFTER-REVOCATION-SECRET").unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/reload\nsecond\n/quit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!text(&out.stdout).contains("AFTER-REVOCATION-SECRET"));
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen[2].body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "plugin__reader__reader")
+    );
+    let messages = seen[3].body["messages"].as_array().unwrap();
+    let results: Vec<_> = messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    assert!(
+        results[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("before reload")
+    );
+    assert!(
+        !results.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("AFTER-REVOCATION-SECRET")
+    );
+    assert!(
+        records(&env.audit_log())
+            .iter()
+            .any(|row| row["principal"] == "plugin.reader"
+                && row["scope"] == "tool-read"
+                && row["allow"] == false)
+    );
 }
 
 #[test]

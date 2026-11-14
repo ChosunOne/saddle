@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub enum Scope {
     Exec,
     FsRead,
+    ToolRead,
     FsWrite,
     Net,
     TranscriptRead,
@@ -23,9 +24,10 @@ pub enum Scope {
 }
 
 impl Scope {
-    pub const ALL: [Scope; 12] = [
+    pub const ALL: [Scope; 13] = [
         Scope::Exec,
         Scope::FsRead,
+        Scope::ToolRead,
         Scope::FsWrite,
         Scope::Net,
         Scope::TranscriptRead,
@@ -42,6 +44,7 @@ impl Scope {
         match self {
             Scope::Exec => "exec",
             Scope::FsRead => "fs-read",
+            Scope::ToolRead => "tool-read",
             Scope::FsWrite => "fs-write",
             Scope::Net => "net",
             Scope::TranscriptRead => "transcript-read",

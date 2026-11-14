@@ -3052,12 +3052,48 @@ decided and audited by the session's engine under the host-assigned principal an
 audit failures remain fatal; standalone calls report no active conversation. The guest owns the
 tool schema and result presentation, not SQL authorization or branch selection.
 
+**D138.** D66's tool-visible directories are available through the additive
+`saddle:host/tool-paths@0.1.0` SDK interface: bounded path resolution, byte ranges and filtered
+metadata pages. Directory authority remains the existing user-owned `[sandbox]` declarations and
+`~/.agents` default. No second directory list or new policy root is introduced. Bare sandbox paths,
+include rules and Landlock reach alone do not become host-service authority.
+
+`tool-read = { tools = ["read"] }` explicitly delegates a subset of the existing read-only path
+roles (`read`, `ls`, `find`, `grep`) to a plugin. These roles select directory reach, not an assertion
+about a guest's implementation or exported tool name. No role comes from guest arguments, a sibling
+or `tool`. The core derives the parent's role ceiling from current tool-path declarations; an explicit
+agent `tool-read` table can narrow that ceiling but never add directories. `--revoke tool-read`
+removes this SDK service for the run. Manifest ceilings and bounded delegation apply independently
+of `fs-read`: a managed-only component needs no root grant. Mutating roles are refused.
+
+The session's engine intersects the calling principal's bounded roles with the innermost current
+configuration entry at every requested and resolved location. Both ends of a linked path must be
+allowed. True roots retain precedence and cannot be reached through this interface to evade root
+exclusions. Protected config/state overlaps remain forbidden, including default entries. Managed
+directory handles are pinned with no-follow opens separately from true roots; the final path is
+opened beneath its checked target handle with no-follow and regular-file requirements. A symlink
+may cross declared directories as D66 permits, never into an undeclared target. Metadata filters
+both aliases and targets without an audit record per entry. Calls are attributed and audited under
+`tool-read` with absolute paths, range/page parameters and host call ids, not generated root names.
+Policy reload rebuilds managed-directory mappings and pins as well as plugin grants/catalogues;
+removing a target declaration revokes access even if the plugin retains its source role.
+
+SDK feature `tool-paths` enables optional managed-path routing in the standard filesystem helpers;
+the default build remains root-only. A feature-enabled component must explicitly hold `tool-read`
+for its import, even when a particular invocation uses a true root. Low-level managed bindings are
+also usable independently. Compile-time features provide ergonomics, never authority: the linker
+still checks imports before initialization and links only the explicitly granted services. Standard
+reader/listing/search guests can be built either way. Their manifests allow the optional scope but
+never grant it. SDK-internal managed path tags are not displayed in standard search results; managed
+search paths are shown relatively. All existing byte/page/deadline limits remain in force.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
 | --- | --- | --- | --- |
 | `exec` | running commands | `saddle:host/exec` import | sandbox helper (D18, D19); the network it reaches is `net` (D79) |
 | `fs-read` | reading files under granted roots | `saddle:host/fs-read` import | policy per call |
+| `tool-read` | bounded reads of existing D66 tool paths under explicitly delegated read-only roles | `saddle:host/tool-paths` import | policy per requested/resolved location and current configuration entry (D138) |
 | `fs-write` | writing files under granted roots | `saddle:host/fs-write` import | policy per call, reserved paths (D23) |
 | `net` | HTTP requests to granted hosts | `wasi:http/outgoing-handler` import, `fetch` and `websearch` tools, a command's proxy | host HTTP client, policy per request (D28, D39, D79, D82) |
 | `transcript-read` | reading session messages and their request usage, and observing them as they arrive | `saddle:host/transcript-read` import, `saddle:plugin/observer` export | policy per call |

@@ -14,10 +14,15 @@ use saddle_cap::manifest::{Manifest, above_ceiling};
 use saddle_cap::{Grants, Principal, Scope};
 use saddle_wit::ReadToolPre;
 use saddle_wit::exports::saddle::plugin::tool::{Definition, Output};
+use saddle_wit::saddle::host::fs_list::EntryKind;
 use saddle_wit::saddle::host::fs_list::{self, Host as ListHost, Page as DirectoryPage};
 use saddle_wit::saddle::host::fs_paths::{self, Host as PathsHost};
 use saddle_wit::saddle::host::fs_read::{self, Failure, Host, Path};
 use saddle_wit::saddle::host::fs_read_range::{self, Chunk, Host as RangeHost};
+use saddle_wit::saddle::host::tool_paths::{
+    self, Chunk as ToolChunk, Entry as ToolEntry, EntryKind as ToolEntryKind,
+    Failure as ToolFailure, Host as ToolPathsHost, Page as ToolPage, Path as ToolPath,
+};
 use saddle_wit::saddle::host::tool_result::{self, Host as ResultHost, ImageInfo};
 use saddle_wit::saddle::host::transcript_read::{self, Host as TranscriptHost};
 use sha2::{Digest, Sha256};
@@ -113,6 +118,37 @@ impl Invocation {
 /// root-relative paths and symlinks, and bound/cancel I/O independently of Wasm's epoch deadline.
 /// `Err` is a host failure (including audit failure), not a guest-visible policy denial.
 pub trait HostServices: Send + 'static {
+    fn resolve_tool_path(
+        &mut self,
+        _call: &Invocation,
+        _value: String,
+    ) -> anyhow::Result<Result<Path, Failure>> {
+        Ok(Err(Failure::Denied(
+            "host does not implement tool paths".into(),
+        )))
+    }
+    fn read_tool_range(
+        &mut self,
+        _call: &Invocation,
+        _path: Path,
+        _offset: u64,
+        _limit: u32,
+    ) -> anyhow::Result<Result<Chunk, Failure>> {
+        Ok(Err(Failure::Denied(
+            "host does not implement tool paths".into(),
+        )))
+    }
+    fn read_tool_directory(
+        &mut self,
+        _call: &Invocation,
+        _path: Path,
+        _after: String,
+        _limit: u32,
+    ) -> anyhow::Result<Result<DirectoryPage, Failure>> {
+        Ok(Err(Failure::Denied(
+            "host does not implement tool paths".into(),
+        )))
+    }
     fn query_transcript(
         &mut self,
         _call: &Invocation,
@@ -268,6 +304,134 @@ impl<H: HostServices> ListHost for State<H> {
     }
 }
 
+fn tool_failure(failure: Failure) -> ToolFailure {
+    match failure {
+        Failure::Denied(why) => ToolFailure::Denied(why),
+        Failure::InvalidPath(why) => ToolFailure::InvalidPath(why),
+        Failure::Io(why) => ToolFailure::Io(why),
+        Failure::TooLarge => ToolFailure::TooLarge,
+    }
+}
+
+impl<H: HostServices> ToolPathsHost for State<H> {
+    fn resolve_path(&mut self, value: String) -> anyhow::Result<Result<ToolPath, ToolFailure>> {
+        if self.call.cancelled() || Instant::now() >= self.call.deadline {
+            return Err(anyhow!("plugin call cancelled or timed out"));
+        }
+        if value.len() > 4096 {
+            return Ok(Err(ToolFailure::TooLarge));
+        }
+        let result = self.host.resolve_tool_path(&self.call, value)?;
+        Ok(result
+            .and_then(|path| {
+                if path.root.len() > 64 || path.relative.len() > 4096 {
+                    return Err(Failure::TooLarge);
+                }
+                Ok(ToolPath {
+                    root: path.root,
+                    relative: path.relative,
+                })
+            })
+            .map_err(tool_failure))
+    }
+    fn read_range(
+        &mut self,
+        path: ToolPath,
+        offset: u64,
+        limit: u32,
+    ) -> anyhow::Result<Result<ToolChunk, ToolFailure>> {
+        if self.call.cancelled() || Instant::now() >= self.call.deadline {
+            return Err(anyhow!("plugin call cancelled or timed out"));
+        }
+        if limit == 0
+            || limit as usize > MAX_FILE_BYTES
+            || path.root.len() > 64
+            || path.relative.len() > 4096
+        {
+            return Ok(Err(ToolFailure::TooLarge));
+        }
+        let result = self.host.read_tool_range(
+            &self.call,
+            Path {
+                root: path.root,
+                relative: path.relative,
+            },
+            offset,
+            limit,
+        )?;
+        Ok(result
+            .and_then(|chunk| {
+                if chunk.bytes.len() > limit as usize {
+                    return Err(Failure::TooLarge);
+                }
+                Ok(ToolChunk {
+                    bytes: chunk.bytes,
+                    eof: chunk.eof,
+                })
+            })
+            .map_err(tool_failure))
+    }
+    fn read_directory(
+        &mut self,
+        path: ToolPath,
+        after: String,
+        limit: u32,
+    ) -> anyhow::Result<Result<ToolPage, ToolFailure>> {
+        if self.call.cancelled() || Instant::now() >= self.call.deadline {
+            return Err(anyhow!("plugin call cancelled or timed out"));
+        }
+        if limit == 0
+            || limit as usize > MAX_DIRECTORY_ENTRIES
+            || after.len() > 1024
+            || path.root.len() > 64
+            || path.relative.len() > 4096
+        {
+            return Ok(Err(ToolFailure::TooLarge));
+        }
+        let result = self.host.read_tool_directory(
+            &self.call,
+            Path {
+                root: path.root,
+                relative: path.relative,
+            },
+            after,
+            limit,
+        )?;
+        Ok(result
+            .and_then(|page| {
+                if page.entries.len() > limit as usize
+                    || page
+                        .entries
+                        .iter()
+                        .map(|entry| entry.name.len())
+                        .sum::<usize>()
+                        > MAX_FILE_BYTES
+                {
+                    return Err(Failure::TooLarge);
+                }
+                Ok(ToolPage {
+                    entries: page
+                        .entries
+                        .into_iter()
+                        .map(|entry| ToolEntry {
+                            name: entry.name,
+                            kind: match entry.kind {
+                                EntryKind::File => ToolEntryKind::File,
+                                EntryKind::Directory => ToolEntryKind::Directory,
+                                EntryKind::Symlink => ToolEntryKind::Symlink,
+                                EntryKind::Other => ToolEntryKind::Other,
+                            },
+                        })
+                        .collect(),
+                    total: page.total,
+                    skipped: page.skipped,
+                    more: page.more,
+                })
+            })
+            .map_err(tool_failure))
+    }
+}
+
 impl<H: HostServices> ResultHost for State<H> {
     fn emit_image(
         &mut self,
@@ -394,6 +558,7 @@ impl Loader {
                     | "saddle:host/fs-paths@0.1.0"
                     | "saddle:host/fs-list@0.1.0"
                     | "saddle:host/tool-result@0.1.0"
+                    | "saddle:host/tool-paths@0.1.0"
                     | "saddle:host/transcript-read@0.1.0"
             ) && !ambient::supports(name)
             {
@@ -421,6 +586,10 @@ impl Loader {
         if scopes.contains(&Scope::TranscriptRead) {
             transcript_read::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
                 .map_err(runtime("linking transcript-read"))?;
+        }
+        if scopes.contains(&Scope::ToolRead) {
+            tool_paths::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+                .map_err(runtime("linking tool-paths"))?;
         }
         check_tool_types(engine, &ty)?;
         let pre = linker
@@ -840,6 +1009,33 @@ mod tests {
             Ok(_) => panic!("component was accepted"),
             Err(e) => e.to_string(),
         }
+    }
+
+    #[test]
+    fn managed_imports_need_their_own_scope_before_initialization() {
+        let (_dir, agent, plugin) = grants(GRANTS);
+        let source = READER
+            .replacen(
+                "(component",
+                "(component (import \"saddle:host/tool-paths@0.1.0\" (instance))",
+                1,
+            )
+            .replace(
+                ";; initialization-probe",
+                "(func $start unreachable) (start $start)",
+            );
+        let why = refusal(Loader::new().unwrap().prepare::<NoHost>(
+            &manifest(),
+            &agent,
+            &plugin,
+            &wat::parse_str(source).unwrap(),
+            Limits::default(),
+        ));
+        assert!(
+            why.contains("tool-read") && why.contains("not granted"),
+            "{why}"
+        );
+        assert!(!why.contains("unreachable"), "{why}");
     }
 
     #[test]

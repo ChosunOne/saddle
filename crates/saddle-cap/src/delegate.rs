@@ -8,6 +8,8 @@ pub enum DelegationError {
     Unsupported(Scope),
     #[error("plugin asks for scope `{0}`, which the agent does not hold")]
     Scope(Scope),
+    #[error("plugin asks for tool-path role `{0}`, which the agent does not hold")]
+    ToolRole(String),
     #[error("plugin asks to read root `{0}`, which the agent does not hold")]
     Root(RootName),
     #[error("could not combine grant exclusions: {0}")]
@@ -20,7 +22,10 @@ pub enum DelegationError {
 /// check before their scopes can be linked; unsupported grants are never silently ignored.
 pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationError> {
     for scope in plugin.scopes() {
-        if !matches!(scope, Scope::FsRead | Scope::Tool | Scope::TranscriptRead) {
+        if !matches!(
+            scope,
+            Scope::FsRead | Scope::ToolRead | Scope::Tool | Scope::TranscriptRead
+        ) {
             return Err(DelegationError::Unsupported(scope));
         }
         if scope == Scope::TranscriptRead && !agent.scopes().contains(&scope) {
@@ -29,8 +34,20 @@ pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationEr
     }
     let mut out = Grants {
         plain: plugin.plain.clone(),
+        tool_read: plugin.tool_read.clone(),
         ..Grants::default()
     };
+    if let Some(want) = &plugin.tool_read {
+        for role in &want.tools {
+            if !agent
+                .tool_read
+                .as_ref()
+                .is_some_and(|g| g.tools.contains(role))
+            {
+                return Err(DelegationError::ToolRole(role.clone()));
+            }
+        }
+    }
     for want in &plugin.fs_read {
         let held: Vec<_> = agent
             .fs_read
@@ -163,5 +180,36 @@ mod tests {
             read_tool(&agent, &plugin),
             Err(DelegationError::Scope(Scope::TranscriptRead))
         ));
+    }
+
+    #[test]
+    fn tool_path_roles_are_explicit_and_bounded_without_inheriting_roots() {
+        let (agent, plugin) = grants(
+            "[agent]\ntool-read={tools=['read','ls']}\n[plugin.reader]\ntool={}\ntool-read={tools=['read']}\n",
+        );
+        let bounded = read_tool(&agent, &plugin).unwrap();
+        assert!(bounded.fs_read.is_empty());
+        assert_eq!(bounded.tool_read.unwrap().tools, ["read"]);
+        let (agent, plugin) = grants(
+            "[agent]\ntool-read={tools=['ls']}\n[plugin.reader]\ntool={}\ntool-read={tools=['read']}\n",
+        );
+        assert!(matches!(
+            read_tool(&agent, &plugin),
+            Err(DelegationError::ToolRole(_))
+        ));
+        let (agent, plugin) =
+            grants("[agent]\ntool-read={tools=['read']}\n[plugin.reader]\ntool={}\n");
+        assert!(read_tool(&agent, &plugin).unwrap().tool_read.is_none());
+        for role in ["write", "*", "Read", "plugin__sibling__read"] {
+            let dir = tempfile::tempdir().unwrap();
+            let roots = Roots::resolve([(RootName::workspace(), dir.path().into())], &[]).unwrap();
+            assert!(
+                Policy::parse(
+                    &format!("version=1\n[plugin.reader]\ntool-read={{tools=['{role}']}}"),
+                    &roots
+                )
+                .is_err()
+            );
+        }
     }
 }

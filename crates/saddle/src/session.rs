@@ -30,7 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use cap_std::fs::Dir;
-use saddle_cap::policy::{NetGrant, POLICY_FILE};
+use saddle_cap::policy::{NetGrant, POLICY_FILE, TOOL_READ_ROLES, ToolReadGrant};
 use saddle_cap::sandbox::SandboxExtras;
 use saddle_cap::{Location, PluginId, Policy, Principal, RootName, Roots, Scope, names_host};
 use saddle_policy::audit::sha256_hex;
@@ -335,8 +335,31 @@ impl Setup {
     }
 
     pub fn parse_policy(&self) -> Result<Policy> {
-        Policy::layer(&self.global_text, &self.policy_text, &self.roots)
-            .with_context(|| format!("{}", self.policy_path.display()))
+        let mut policy = Policy::layer(&self.global_text, &self.policy_text, &self.roots)
+            .with_context(|| format!("{}", self.policy_path.display()))?;
+        let agent = policy.principals.entry(Principal::Agent).or_default();
+        let mut roles: Vec<String> = self
+            .tool_paths
+            .iter()
+            .flat_map(|p| p.tools.iter())
+            .filter(|role| TOOL_READ_ROLES.contains(&role.as_str()))
+            .cloned()
+            .collect();
+        roles.sort();
+        roles.dedup();
+        if self
+            .overrides
+            .revoke
+            .iter()
+            .any(|scope| scope == "tool-read")
+        {
+            roles.clear();
+        }
+        if let Some(ceiling) = &agent.tool_read {
+            roles.retain(|role| ceiling.tools.contains(role));
+        }
+        agent.tool_read = (!roles.is_empty()).then(|| ToolReadGrant::for_agent(roles));
+        Ok(policy)
     }
 }
 
@@ -387,6 +410,54 @@ pub struct ToolRoot {
     pub dir: PathBuf,
     pub tools: Vec<String>,
     pub written: String,
+    pub handle: Option<Dir>,
+    pub protected: bool,
+}
+
+fn configured_tool_roots(setup: &Setup) -> Vec<ToolRoot> {
+    let mut used: Vec<RootName> = setup.roots.iter().map(|(name, _)| name.clone()).collect();
+    let protected: Vec<PathBuf> = setup
+        .paths
+        .protected()
+        .iter()
+        .flat_map(|path| {
+            let lexical = roots::normalize(path);
+            [lexical.clone(), lexical.canonicalize().unwrap_or(lexical)]
+        })
+        .collect();
+    let mut roots = Vec::new();
+    for path in &setup.tool_paths {
+        let mut n = 1;
+        let name = loop {
+            let candidate = match RootName::new(&format!("sandbox-{n}")) {
+                Ok(name) => name,
+                Err(_) => break None,
+            };
+            if !used.contains(&candidate) {
+                break Some(candidate);
+            }
+            n += 1;
+        };
+        let Some(name) = name else {
+            continue;
+        };
+        used.push(name.clone());
+        let base = roots::normalize(&path.dir);
+        let actual = base.canonicalize().unwrap_or_else(|_| base.clone());
+        roots.push(ToolRoot {
+            name,
+            dir: path.dir.clone(),
+            tools: path.tools.clone(),
+            written: path.written.clone(),
+            handle: fs_access::root(&path.dir).ok(),
+            protected: protected.iter().any(|secret| {
+                [&base, &actual]
+                    .iter()
+                    .any(|base| base.starts_with(secret) || secret.starts_with(base))
+            }),
+        });
+    }
+    roots
 }
 
 pub struct Session {
@@ -499,32 +570,8 @@ impl Session {
             query_conversation: None,
             _tmp: tmp,
         };
-        // An internal name per tool-visible directory, skipping any name a root already uses, so a
-        // `Location` addresses it without the name meaning anything to a policy (D66).
-        let mut used: Vec<RootName> = session.setup.roots.iter().map(|(n, _)| n.clone()).collect();
-        for path in session.setup.tool_paths.clone() {
-            let mut n = 1;
-            let name = loop {
-                let candidate = match RootName::new(&format!("sandbox-{n}")) {
-                    Ok(name) => name,
-                    Err(_) => break None,
-                };
-                if !used.contains(&candidate) {
-                    break Some(candidate);
-                }
-                n += 1;
-            };
-            let Some(name) = name else {
-                continue;
-            };
-            used.push(name.clone());
-            session.tool_roots.push(ToolRoot {
-                name,
-                dir: path.dir,
-                tools: path.tools,
-                written: path.written,
-            });
-        }
+        // Managed directories are pinned separately from policy-addressable roots (D138).
+        session.tool_roots = configured_tool_roots(&session.setup);
         // Discovered before the first request so the prompt can advertise them, and once only: a
         // skill is read at startup as an instruction file is, so a grants reload does not change
         // what the conversation was built from.
@@ -571,6 +618,7 @@ impl Session {
             .collect::<Result<_>>()?;
         let before = self.setup.policy_sha256.clone();
         self.setup = fresh;
+        self.tool_roots = configured_tool_roots(&self.setup);
         self.file_roots = file_roots;
         self.engine.replace_policy(policy);
         self.audit
@@ -713,7 +761,7 @@ impl Session {
     }
 
     /// The tool-visible directory containing `abs`, innermost first (D66).
-    fn tool_root_for(&self, abs: &Path) -> Option<&ToolRoot> {
+    pub(crate) fn tool_root_for(&self, abs: &Path) -> Option<&ToolRoot> {
         let abs = roots::normalize(abs);
         self.tool_roots
             .iter()
@@ -779,6 +827,10 @@ impl Session {
     /// Whether a location is a `[sandbox]` directory rather than a root, for the gate (D66).
     pub fn is_tool_root(&self, root: &RootName) -> bool {
         self.tool_roots.iter().any(|r| &r.name == root)
+    }
+
+    pub(crate) fn tool_root(&self, name: &RootName) -> Option<&ToolRoot> {
+        self.tool_roots.iter().find(|root| &root.name == name)
     }
 
     /// Runs discovery again, so a skill added or edited during the session is advertised (D70).

@@ -296,9 +296,32 @@ pub struct PlainGrant {
     pub why: String,
 }
 
-/// Everything one principal holds.
+/// read-only roles D66 can delegate through its SDK service (D138).
+pub const TOOL_READ_ROLES: &[&str] = &["read", "ls", "find", "grep"];
+
+/// delegates existing D66 tool-path reach, not new directories or policy roots (D138).
+#[derive(Debug, Clone)]
+pub struct ToolReadGrant {
+    pub rule: RuleId,
+    pub why: String,
+    pub tools: Vec<String>,
+}
+
+impl ToolReadGrant {
+    /// constructs the parent's ceiling from host-validated D66 configuration (D138).
+    pub fn for_agent(tools: Vec<String>) -> Self {
+        Self {
+            rule: RuleId::new(&Principal::Agent, Scope::ToolRead, None),
+            why: "bounded by config.toml tool-path declarations".into(),
+            tools,
+        }
+    }
+}
+
+/// everything one principal holds.
 #[derive(Debug, Clone, Default)]
 pub struct Grants {
+    pub tool_read: Option<ToolReadGrant>,
     pub fs_read: Vec<FsGrant>,
     pub fs_write: Vec<FsGrant>,
     pub exec: Option<ExecGrant>,
@@ -319,6 +342,9 @@ impl Grants {
 
     pub fn scopes(&self) -> BTreeSet<Scope> {
         let mut out: BTreeSet<Scope> = self.plain.keys().copied().collect();
+        if self.tool_read.as_ref().is_some_and(|g| !g.tools.is_empty()) {
+            out.insert(Scope::ToolRead);
+        }
         if !self.fs_read.is_empty() {
             out.insert(Scope::FsRead);
         }
@@ -419,6 +445,7 @@ struct RawPolicy {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct RawGrants {
+    tool_read: Option<RawToolRead>,
     #[serde(default)]
     fs_read: Vec<RawFs>,
     #[serde(default)]
@@ -499,6 +526,13 @@ struct RawPlain {
     why: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawToolRead {
+    tools: Vec<String>,
+    why: Option<String>,
+}
+
 impl Policy {
     /// Parses and validates a policy against the session's roots. Every root a grant names must
     /// exist in `roots`.
@@ -542,6 +576,12 @@ impl Policy {
     pub fn describe(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for g in self.principals.values() {
+            if let Some(g) = &g.tool_read {
+                lines.push(with_why(
+                    format!("{} = tools [{}]", g.rule, g.tools.join(", ")),
+                    &g.why,
+                ));
+            }
             for f in g.fs_read.iter().chain(&g.fs_write) {
                 let exclude = if f.exclude.is_empty() {
                     String::new()
@@ -677,6 +717,25 @@ fn lower(who: &Principal, raw: RawGrants, roots: &Roots) -> Result<Grants, Polic
         fs_write: fs(Scope::FsWrite, raw.fs_write)?,
         ..Grants::default()
     };
+
+    if let Some(g) = raw.tool_read {
+        let rule = RuleId::new(who, Scope::ToolRead, None);
+        if let Some(tool) = g
+            .tools
+            .iter()
+            .find(|tool| !TOOL_READ_ROLES.contains(&tool.as_str()))
+        {
+            return Err(invalid(
+                &rule,
+                format!("unknown read-only tool-path role `{tool}`"),
+            ));
+        }
+        grants.tool_read = Some(ToolReadGrant {
+            rule,
+            why: why(g.why),
+            tools: g.tools,
+        });
+    }
 
     if let Some(e) = raw.exec {
         let rule = RuleId::new(who, Scope::Exec, None);
