@@ -123,6 +123,13 @@ impl Invocation {
 /// filesystem callbacks may hold any filesystem capability; determine authority per operation/path,
 /// never from the existence of a linked interface (D139, D140).
 pub trait HostServices: Send + 'static {
+    fn emit_diff(
+        &mut self,
+        _call: &Invocation,
+        _text: String,
+    ) -> anyhow::Result<Result<(), String>> {
+        Ok(Err("host does not implement diff presentation".into()))
+    }
     fn apply_changes(
         &mut self,
         _call: &Invocation,
@@ -463,6 +470,15 @@ impl<H: HostServices> ToolPathsHost for State<H> {
 }
 
 impl<H: HostServices> ResultHost for State<H> {
+    fn emit_diff(&mut self, text: String) -> anyhow::Result<Result<(), String>> {
+        if self.call.cancelled() || Instant::now() >= self.call.deadline {
+            return Err(anyhow!("plugin call cancelled or timed out"));
+        }
+        if text.len() > MAX_FILE_BYTES {
+            return Ok(Err("diff exceeds 64 KiB".into()));
+        }
+        self.host.emit_diff(&self.call, text)
+    }
     fn emit_image(
         &mut self,
         name: String,
@@ -604,6 +620,7 @@ impl Loader {
         if scopes.contains(&Scope::FsRead)
             || scopes.contains(&Scope::ToolRead)
             || scopes.contains(&Scope::FsWrite)
+            || scopes.contains(&Scope::ToolWrite)
         {
             fs_write::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
                 .map_err(runtime("linking fs-write"))?;

@@ -19,6 +19,7 @@ use saddle_wit::saddle::host::fs_write::{Change, Expectation};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use super::filesystem;
 use crate::session::{Session, session_id};
 use crate::tools::fs::resolve_beneath;
 use crate::{cancel, fs_access};
@@ -64,7 +65,17 @@ fn gate(
     loc: &Location,
     change: &Change,
 ) -> Result<Option<String>> {
-    let request = Request::FsWrite { loc };
+    let managed = session.is_tool_root(&loc.root);
+    let (path, roles) = filesystem::tool_read_info(session, loc);
+    let roles = roles.to_vec();
+    let request = if managed {
+        Request::ToolWrite {
+            path: &path,
+            available_tools: &roles,
+        }
+    } else {
+        Request::FsWrite { loc }
+    };
     let decision = session.engine.decide(who, &request);
     session
         .audit
@@ -81,10 +92,18 @@ fn path(session: &Session, value: &str) -> Result<Location> {
     } else {
         session.setup.workspace.join(value)
     };
+    let absolute = normalize(&absolute);
     session
         .roots()
-        .locate(&normalize(&absolute))
-        .ok_or_else(|| anyhow!("mutation path is outside every writable policy root"))
+        .locate(&absolute)
+        .or_else(|| {
+            let root = session.tool_root_for(&absolute)?;
+            let relative = RelPath::new(absolute.strip_prefix(&root.dir).ok()?).ok()?;
+            Some(Location::new(root.name.clone(), relative))
+        })
+        .ok_or_else(|| {
+            anyhow!("mutation path is outside every policy root or configured tool directory")
+        })
 }
 
 fn precondition_gate(
@@ -97,16 +116,15 @@ fn precondition_gate(
     if !matches!(change.expected, Expectation::Sha256(_)) {
         return Ok(None);
     }
-    let request = Request::FsRead { loc };
-    let decision = session.engine.decide(who, &request);
-    session.audit.decision_for_call_details(
+    let failure = filesystem::gate(
+        session,
         who,
-        &request,
-        &decision,
         call,
+        loc,
         json!({"operation":"mutation-precondition"}),
+        session.is_tool_root(&loc.root),
     )?;
-    Ok((!decision.allow).then_some(format!("denied: {}", decision.explanation)))
+    Ok(failure.map(|failure| format!("denied: {failure:?}")))
 }
 
 fn expected(plan: &Planned, deadline: Instant) -> Result<()> {
@@ -244,13 +262,18 @@ pub fn apply(
         if let Some(why) = precondition_gate(session, who, call, &loc, &change)? {
             return Ok(Err(format!("{why}; nothing was written")));
         }
-        let root = session
-            .file_roots
-            .get(&loc.root)
-            .ok_or_else(|| anyhow!("mutation has no pinned root"))?
-            .try_clone()?;
-        let real = match resolve_beneath(&root, &loc.rel) {
-            Ok(relative) => Location::new(loc.root.clone(), relative),
+        let resolved = if session.is_tool_root(&loc.root) {
+            session.resolve_tool(&loc)
+        } else {
+            let root = session
+                .file_roots
+                .get(&loc.root)
+                .ok_or_else(|| anyhow!("mutation has no pinned root"))?;
+            resolve_beneath(root, &loc.rel)
+                .map(|relative| Location::new(loc.root.clone(), relative))
+        };
+        let real = match resolved {
+            Ok(real) => real,
             Err(error) => return reject(session, who, call, &loc, &change, error.to_string()),
         };
         if real != loc
@@ -273,6 +296,15 @@ pub fn apply(
                 "mutation requires a file path".into(),
             );
         }
+        let root = if session.is_tool_root(&real.root) {
+            session
+                .tool_root(&real.root)
+                .and_then(|root| root.handle.as_ref())
+        } else {
+            session.file_roots.get(&real.root)
+        }
+        .ok_or_else(|| anyhow!("mutation has no pinned directory"))?
+        .try_clone()?;
         if plans.iter().any(|plan| {
             plan.loc.root == real.root
                 && (plan.loc.rel.to_path().starts_with(real.rel.to_path())

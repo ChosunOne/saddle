@@ -24,7 +24,12 @@ pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationEr
     for scope in plugin.scopes() {
         if !matches!(
             scope,
-            Scope::FsRead | Scope::FsWrite | Scope::ToolRead | Scope::Tool | Scope::TranscriptRead
+            Scope::FsRead
+                | Scope::FsWrite
+                | Scope::ToolRead
+                | Scope::ToolWrite
+                | Scope::Tool
+                | Scope::TranscriptRead
         ) {
             return Err(DelegationError::Unsupported(scope));
         }
@@ -35,15 +40,16 @@ pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationEr
     let mut out = Grants {
         plain: plugin.plain.clone(),
         tool_read: plugin.tool_read.clone(),
+        tool_write: plugin.tool_write.clone(),
         ..Grants::default()
     };
-    if let Some(want) = &plugin.tool_read {
+    for (want, parent) in [
+        (&plugin.tool_read, &agent.tool_read),
+        (&plugin.tool_write, &agent.tool_write),
+    ] {
+        let Some(want) = want else { continue };
         for role in &want.tools {
-            if !agent
-                .tool_read
-                .as_ref()
-                .is_some_and(|g| g.tools.contains(role))
-            {
+            if !parent.as_ref().is_some_and(|g| g.tools.contains(role)) {
                 return Err(DelegationError::ToolRole(role.clone()));
             }
         }

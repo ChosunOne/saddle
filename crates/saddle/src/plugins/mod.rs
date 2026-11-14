@@ -378,12 +378,17 @@ impl Registry {
             &call,
         )?;
         let mut output = match result {
-            Ok(Reply::Output { output, images }) => {
+            Ok(Reply::Output {
+                output,
+                images,
+                diff,
+            }) => {
                 if output.is_error {
                     ToolOutput::err(output.text)
                 } else {
                     ToolOutput {
                         images,
+                        diff,
                         ..ToolOutput::ok(output.text)
                     }
                 }

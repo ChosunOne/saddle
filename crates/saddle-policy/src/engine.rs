@@ -17,6 +17,10 @@ pub enum Request<'a> {
         path: &'a str,
         available_tools: &'a [String],
     },
+    ToolWrite {
+        path: &'a str,
+        available_tools: &'a [String],
+    },
     FsRead {
         loc: &'a Location,
     },
@@ -52,6 +56,7 @@ impl Request<'_> {
     pub fn scope(&self) -> Scope {
         match self {
             Request::ToolRead { .. } => Scope::ToolRead,
+            Request::ToolWrite { .. } => Scope::ToolWrite,
             Request::FsRead { .. } => Scope::FsRead,
             Request::FsWrite { .. } => Scope::FsWrite,
             Request::Exec { .. } => Scope::Exec,
@@ -66,6 +71,10 @@ impl Request<'_> {
     pub fn args(&self) -> Value {
         match self {
             Request::ToolRead {
+                path,
+                available_tools,
+            }
+            | Request::ToolWrite {
                 path,
                 available_tools,
             } => json!({"path":path,"available_tools":available_tools}),
@@ -249,6 +258,30 @@ impl Engine {
             return Decision::deny(scope, format!("{who} has no grants in the policy"));
         };
         match req {
+            Request::ToolWrite {
+                path,
+                available_tools,
+            } => {
+                let relative = RelPath::new(path.trim_start_matches('/'));
+                if relative.as_ref().is_ok_and(|rel| {
+                    self.reserved
+                        .contains(&Location::new(RootName::workspace(), rel.clone()))
+                }) {
+                    return Decision::deny(
+                        scope,
+                        "path is reserved by the host and no grant can write it".into(),
+                    );
+                }
+                match &grants.tool_write {
+                    Some(g) if g.tools.iter().any(|tool| available_tools.contains(tool)) => {
+                        Decision::allow(scope, &g.rule, &g.why)
+                    }
+                    _ => Decision::deny(
+                        scope,
+                        format!("{who} has no tool-write role covering this configured directory"),
+                    ),
+                }
+            }
             Request::ToolRead {
                 available_tools, ..
             } => match &grants.tool_read {

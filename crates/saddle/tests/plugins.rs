@@ -491,6 +491,76 @@ fn managed_manifest(env: &Env, scopes: &str) {
 }
 
 #[test]
+fn managed_mutations_check_both_directories_reserved_absolute_paths_and_read_preconditions() {
+    let outside = tempfile::tempdir().unwrap();
+    let source = outside.path().join("source");
+    let target = outside.path().join("target");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    symlink(target.join("file"), source.join("alias")).unwrap();
+    let first = source.join("first").display().to_string();
+    let alias = source.join("alias").display().to_string();
+    let env = Env::new(
+        &fixture::mutator(
+            &[
+                (&first, Some("first"), "any"),
+                (&alias, Some("changed"), "any"),
+            ],
+            false,
+            false,
+        ),
+        "tool={}\ntool-write={tools=['write']}",
+    );
+    managed_manifest(&env, "['tool','tool-write','tool-read']");
+    let settings = fs::read_to_string(env.config()).unwrap();
+    fs::write(env.config(), format!("{settings}\n[sandbox]\ntools-defaults=false\nwrite=[{{path={source:?},tools=['write']}},{{path={target:?},tools=['read']}}]\n")).unwrap();
+    assert_eq!(call(&env).status.code(), Some(1));
+    assert!(!source.join("first").exists());
+    assert!(!target.join("file").exists());
+    env.edit("tools=['read']", "tools=['read','write']");
+    let out = call(&env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(target.join("file")).unwrap(), "changed");
+    assert!(env.records().iter().any(|row| row["scope"] == "tool-write"
+        && row["principal"] == "plugin.reader"
+        && row["allow"] == true));
+
+    let hash = sha256_hex(b"changed");
+    let file = target.join("file").display().to_string();
+    let conditional = Env::new(
+        &fixture::mutator(&[(&file, Some("conditional"), &hash)], false, false),
+        "tool={}\ntool-write={tools=['write']}",
+    );
+    managed_manifest(&conditional, "['tool','tool-write','tool-read']");
+    let settings = fs::read_to_string(conditional.config()).unwrap();
+    fs::write(conditional.config(), format!("{settings}\n[sandbox]\ntools-defaults=false\nwrite=[{{path={target:?},tools=['read','write']}}]\n")).unwrap();
+    assert_eq!(call(&conditional).status.code(), Some(1));
+    assert_eq!(fs::read_to_string(&file).unwrap(), "changed");
+    conditional.edit(
+        "[plugin.reader]\n",
+        "[plugin.reader]\ntool-read={tools=['read']}\n",
+    );
+    let out = call(&conditional);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(&file).unwrap(), "conditional");
+
+    let git = outside.path().join("repo/.git");
+    fs::create_dir_all(&git).unwrap();
+    let config = git.join("config").display().to_string();
+    let env = Env::new(
+        &fixture::mutator(&[(&config, Some("unsafe"), "any")], false, false),
+        "tool={}\ntool-write={tools=['write']}",
+    );
+    managed_manifest(&env, "['tool','tool-write']");
+    let settings = fs::read_to_string(env.config()).unwrap();
+    fs::write(env.config(), format!("{settings}\n[sandbox]\ntools-defaults=false\nwrite=[{{path={git:?},tools=['write']}}]\n")).unwrap();
+    let out = call(&env);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("reserved"), "{}", text(&out));
+    assert!(!git.join("config").exists());
+}
+
+#[test]
 fn managed_reads_reuse_declared_paths_without_any_root_grant_and_check_link_targets() {
     let env = Env::new(
         &fixture::tool_range_reader("sandbox-1", "file", 0, 128),

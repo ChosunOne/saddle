@@ -35,7 +35,11 @@ pub enum Job {
 }
 pub enum Reply {
     Description(Definition),
-    Output { output: Output, images: Vec<Image> },
+    Output {
+        output: Output,
+        images: Vec<Image>,
+        diff: Option<String>,
+    },
 }
 
 /// audit and host failures stop the session; they are never downgraded to a broken extension.
@@ -55,6 +59,11 @@ impl StdError for Fatal {
 type HostReply<T, E = Failure> = Result<Result<T, E>, String>;
 type FileReply = HostReply<Chunk>;
 enum Event {
+    Diff {
+        who: Principal,
+        text: String,
+        answer: SyncSender<HostReply<(), String>>,
+    },
     Mutate {
         who: Principal,
         deadline: Instant,
@@ -105,6 +114,20 @@ pub struct Host {
     events: SyncSender<Event>,
 }
 impl HostServices for Host {
+    fn emit_diff(&mut self, call: &Invocation, text: String) -> Result<Result<(), String>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        self.events
+            .send(Event::Diff {
+                who: call.principal().clone(),
+                text,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        result
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(|_| anyhow!("plugin diff request timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
     fn apply_changes(
         &mut self,
         call: &Invocation,
@@ -310,6 +333,7 @@ pub fn execute(
 ) -> Result<Result<Reply, String>> {
     let invoking = matches!(job, Job::Invoke(_));
     let mut filesystem_effects = false;
+    let mut diff = None;
     let mut images = Vec::new();
     let (events, pending) = mpsc::sync_channel(1);
     let host = Host {
@@ -327,6 +351,7 @@ pub fn execute(
                         .invoke(host, &arguments, flag)
                         .map(|output| Reply::Output {
                             output,
+                            diff: None,
                             images: Vec::new(),
                         })
                 }
@@ -341,6 +366,19 @@ pub fn execute(
             cancelled.store(true, Ordering::Relaxed);
         }
         match pending.recv_timeout(Duration::from_millis(10)) {
+            Ok(Event::Diff { who, text, answer }) => {
+                let request = Request::Plain(Scope::Tool);
+                let decision = session.engine.decide(&who, &request);
+                let result = session.audit.decision_for_call_details(&who, &request, &decision, call, json!({"operation":"emit-diff", "bytes":text.len(), "sha256":sha256_hex(text.as_bytes())})).map(|_| {
+                    if !invoking || !decision.allow || text.len() > 65536 || diff.is_some() {
+                        Err("diff presentation refused outside invocation or exceeds count/size/permission limit".into())
+                    } else {
+                        diff = Some(text.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect());
+                        Ok(())
+                    }
+                }).map_err(Into::into);
+                respond(result, answer, &mut fatal, &cancelled);
+            }
             Ok(Event::Mutate {
                 who,
                 deadline,
@@ -468,6 +506,7 @@ pub fn execute(
                 break result.map(|reply| match reply {
                     Reply::Output { output, .. } if !output.is_error => Reply::Output {
                         output,
+                        diff: diff.take(),
                         images: mem::take(&mut images),
                     },
                     reply => reply,

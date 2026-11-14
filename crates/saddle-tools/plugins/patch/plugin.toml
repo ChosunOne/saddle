@@ -1,4 +1,4 @@
 id = "patcher"
 version = "0.1.0"
 component = "patch.component.wasm"
-scopes = ["tool", "fs-read", "fs-write"]
+scopes = ["tool", "fs-read", "fs-write", "tool-read", "tool-write"]

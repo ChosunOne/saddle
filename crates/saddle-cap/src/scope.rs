@@ -11,6 +11,7 @@ pub enum Scope {
     Exec,
     FsRead,
     ToolRead,
+    ToolWrite,
     FsWrite,
     Net,
     TranscriptRead,
@@ -24,10 +25,11 @@ pub enum Scope {
 }
 
 impl Scope {
-    pub const ALL: [Scope; 13] = [
+    pub const ALL: [Scope; 14] = [
         Scope::Exec,
         Scope::FsRead,
         Scope::ToolRead,
+        Scope::ToolWrite,
         Scope::FsWrite,
         Scope::Net,
         Scope::TranscriptRead,
@@ -45,6 +47,7 @@ impl Scope {
             Scope::Exec => "exec",
             Scope::FsRead => "fs-read",
             Scope::ToolRead => "tool-read",
+            Scope::ToolWrite => "tool-write",
             Scope::FsWrite => "fs-write",
             Scope::Net => "net",
             Scope::TranscriptRead => "transcript-read",

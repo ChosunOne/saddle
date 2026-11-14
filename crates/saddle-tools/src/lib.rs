@@ -1,5 +1,6 @@
 //! standard tool implementations; the core owns effects, guests own presentation (D131).
 
+mod diff;
 pub mod listing;
 pub mod mutation;
 mod pagination;

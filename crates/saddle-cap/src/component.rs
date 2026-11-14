@@ -93,7 +93,12 @@ pub fn classify(direction: Direction, name: &str) -> Requirement {
         (Import, "saddle", "host", i) => match i {
             "exec" => scope(Scope::Exec),
             "fs-read" | "fs-read-range" | "fs-paths" | "fs-list" | "tool-paths" | "fs-write" => {
-                Requirement::AnyScope(&[Scope::FsRead, Scope::ToolRead, Scope::FsWrite])
+                Requirement::AnyScope(&[
+                    Scope::FsRead,
+                    Scope::ToolRead,
+                    Scope::FsWrite,
+                    Scope::ToolWrite,
+                ])
             }
             "tool-result" => scope(Scope::Tool),
             "transcript-read" => scope(Scope::TranscriptRead),
@@ -192,7 +197,7 @@ pub fn host_interfaces(granted: &BTreeSet<Scope>) -> Vec<&'static str> {
     for scope in granted {
         let interface = match scope {
             Scope::Exec => "saddle:host/exec",
-            Scope::FsRead | Scope::ToolRead | Scope::FsWrite => {
+            Scope::FsRead | Scope::ToolRead | Scope::FsWrite | Scope::ToolWrite => {
                 if !out.contains(&"saddle:host/fs-read") {
                     out.extend([
                         "saddle:host/fs-read",

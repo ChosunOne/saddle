@@ -21,6 +21,7 @@ use std::time::Instant;
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use tempfile::TempDir;
 
 const POLICY: &str = r#"
 version = 1
@@ -1264,6 +1265,17 @@ fn one_compiled_reader_changes_directory_permissions_at_runtime_without_repinnin
 #[test]
 #[ignore = "build the standard write component first; see docs/plugins.md"]
 fn one_compiled_writer_changes_write_permissions_at_runtime_without_repinning() {
+    writer_runtime_case(false);
+    writer_runtime_case(true);
+}
+
+fn writer_runtime_case(external: bool) {
+    let outside = TempDir::new().unwrap();
+    let path = if external {
+        outside.path().join("file").display().to_string()
+    } else {
+        "file".into()
+    };
     let tool = "plugin__reader__write";
     let mut responses = Vec::new();
     for turn in 0..3 {
@@ -1273,7 +1285,7 @@ fn one_compiled_writer_changes_write_permissions_at_runtime_without_repinning() 
             &[(
                 &id,
                 tool,
-                json!({"path":"file","content":format!("turn {turn}")}),
+                json!({"path":path,"content":format!("turn {turn}")}),
             )],
         )));
         responses.push(sse_response(&openai_sse("done", &[])));
@@ -1285,13 +1297,22 @@ fn one_compiled_writer_changes_write_permissions_at_runtime_without_repinning() 
         .join("../../target/write-plugin/write.component.wasm");
     let bytes = fs::read(component).expect("build the standard write component first");
     plugin_fixture::configure(&config, &bytes, "tool={}\nfs-read=[{root='workspace'}]");
-    fs::write(config.parent().unwrap().join("plugins/reader/plugin.toml"), "id='reader'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes=['tool','fs-read','fs-write']\n").unwrap();
+    fs::write(config.parent().unwrap().join("plugins/reader/plugin.toml"), "id='reader'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes=['tool','fs-read','fs-write','tool-read','tool-write']\n").unwrap();
+    if external {
+        let settings = fs::read_to_string(&config).unwrap();
+        fs::write(&config, format!("{settings}\n[sandbox]\ntools-defaults=false\nwrite=[{{path={:?}, tools=['write']}}]\n", outside.path().display().to_string())).unwrap();
+    }
+    let target = if external {
+        outside.path().join("file")
+    } else {
+        env.ws.path().join("file")
+    };
     let initial: toml::Table = fs::read_to_string(&config).unwrap().parse().unwrap();
     let pin = initial["plugins"]["reader"]["sha256"]
         .as_str()
         .unwrap()
         .to_owned();
-    fs::write(env.ws.path().join("file"), "original").unwrap();
+    fs::write(target.clone(), "original").unwrap();
     let mut child = env
         .command(&["run", "--json"])
         .stdin(Stdio::piped())
@@ -1308,11 +1329,12 @@ fn one_compiled_writer_changes_write_permissions_at_runtime_without_repinning() 
     };
     child.stdin.as_mut().unwrap().write_all(b"first\n").unwrap();
     wait_for(2);
-    assert_eq!(
-        fs::read_to_string(env.ws.path().join("file")).unwrap(),
-        "original"
-    );
-    let grant = "fs-write=[{root='workspace'}]\n";
+    assert_eq!(fs::read_to_string(target.clone()).unwrap(), "original");
+    let grant = if external {
+        "tool-write={tools=['write']}\n"
+    } else {
+        "fs-write=[{root='workspace'}]\n"
+    };
     let settings = fs::read_to_string(&config).unwrap();
     fs::write(
         &config,
@@ -1326,10 +1348,7 @@ fn one_compiled_writer_changes_write_permissions_at_runtime_without_repinning() 
         .write_all(b"/reload\nsecond\n")
         .unwrap();
     wait_for(4);
-    assert_eq!(
-        fs::read_to_string(env.ws.path().join("file")).unwrap(),
-        "turn 1"
-    );
+    assert_eq!(fs::read_to_string(target.clone()).unwrap(), "turn 1");
     let settings = fs::read_to_string(&config).unwrap();
     fs::write(
         &config,
@@ -1344,10 +1363,17 @@ fn one_compiled_writer_changes_write_permissions_at_runtime_without_repinning() 
         .unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert_eq!(
-        fs::read_to_string(env.ws.path().join("file")).unwrap(),
-        "turn 1"
-    );
+    let results: Vec<Value> = text(&out.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|row| row["type"] == "result")
+        .collect();
+    assert!(results.iter().any(|row| {
+        row["diff"]
+            .as_str()
+            .is_some_and(|diff| diff.contains("preimage not read"))
+    }));
+    assert_eq!(fs::read_to_string(target.clone()).unwrap(), "turn 1");
     assert_eq!(
         fs::read(
             config
@@ -1384,7 +1410,11 @@ fn one_compiled_writer_changes_write_permissions_at_runtime_without_repinning() 
             .unwrap()["content"]
             .as_str()
             .unwrap();
-        assert_eq!(result.contains("wrote file"), turn == 1, "{result}");
+        assert_eq!(
+            result.contains(&format!("wrote {path}")),
+            turn == 1,
+            "{result}"
+        );
         if turn != 1 {
             assert!(result.contains("denied:"), "{result}");
         }

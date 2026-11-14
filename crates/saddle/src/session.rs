@@ -30,7 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use cap_std::fs::Dir;
-use saddle_cap::policy::{NetGrant, POLICY_FILE, TOOL_READ_ROLES, ToolReadGrant};
+use saddle_cap::policy::{NetGrant, POLICY_FILE, TOOL_READ_ROLES, TOOL_WRITE_ROLES, ToolReadGrant};
 use saddle_cap::sandbox::SandboxExtras;
 use saddle_cap::{Location, PluginId, Policy, Principal, RootName, Roots, Scope, names_host};
 use saddle_policy::audit::sha256_hex;
@@ -338,28 +338,68 @@ impl Setup {
         let mut policy = Policy::layer(&self.global_text, &self.policy_text, &self.roots)
             .with_context(|| format!("{}", self.policy_path.display()))?;
         let agent = policy.principals.entry(Principal::Agent).or_default();
-        let mut roles: Vec<String> = self
-            .tool_paths
-            .iter()
-            .flat_map(|p| p.tools.iter())
-            .filter(|role| TOOL_READ_ROLES.contains(&role.as_str()))
-            .cloned()
-            .collect();
-        roles.sort();
-        roles.dedup();
-        if self
-            .overrides
-            .revoke
-            .iter()
-            .any(|scope| scope == "tool-read")
-        {
-            roles.clear();
+        for (scope, allowed, output) in [
+            (Scope::ToolRead, TOOL_READ_ROLES, &mut agent.tool_read),
+            (Scope::ToolWrite, TOOL_WRITE_ROLES, &mut agent.tool_write),
+        ] {
+            let mut roles: Vec<String> = self
+                .tool_paths
+                .iter()
+                .flat_map(|p| p.tools.iter())
+                .filter(|role| allowed.contains(&role.as_str()))
+                .cloned()
+                .collect();
+            roles.sort();
+            roles.dedup();
+            if self.overrides.revoke.iter().any(|s| s == scope.as_str()) {
+                roles.clear();
+            }
+            if let Some(ceiling) = output {
+                roles.retain(|role| ceiling.tools.contains(role));
+            }
+            *output = (!roles.is_empty()).then(|| {
+                if scope == Scope::ToolRead {
+                    ToolReadGrant::for_agent(roles)
+                } else {
+                    ToolReadGrant::for_agent_write(roles)
+                }
+            });
         }
-        if let Some(ceiling) = &agent.tool_read {
-            roles.retain(|role| ceiling.tools.contains(role));
-        }
-        agent.tool_read = (!roles.is_empty()).then(|| ToolReadGrant::for_agent(roles));
         Ok(policy)
+    }
+}
+
+/// resolves declared-path links even when their final target or intermediate parents are missing.
+fn resolve_missing_tool_path(path: &Path, depth: usize) -> IoResult<PathBuf> {
+    if depth > 128 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "tool path resolution exceeds depth limit",
+        ));
+    }
+    match path.canonicalize() {
+        Ok(real) => Ok(real),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "tool path has no parent"))?;
+            if let Ok(target) = fs::read_link(path) {
+                return resolve_missing_tool_path(
+                    &if target.is_absolute() {
+                        target
+                    } else {
+                        parent.join(target)
+                    },
+                    depth + 1,
+                );
+            }
+            let real_parent = resolve_missing_tool_path(parent, depth + 1)?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "tool path has no file name"))?;
+            Ok(real_parent.join(name))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -782,21 +822,7 @@ impl Session {
             .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no root `{}`", loc.root)))?;
         let base = base.canonicalize()?;
         let abs = base.join(loc.rel.to_path());
-        let real = match abs.canonicalize() {
-            Ok(real) => real,
-            // A file that does not exist yet is resolved through its parent, so a write beneath a
-            // linked directory works too.
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                let Some(parent) = abs.parent() else {
-                    return Err(e);
-                };
-                match (parent.canonicalize(), abs.file_name()) {
-                    (Ok(parent), Some(name)) => parent.join(name),
-                    _ => return Err(e),
-                }
-            }
-            Err(e) => return Err(e),
-        };
+        let real = resolve_missing_tool_path(&abs, 0)?;
         if let Some(root) = self.tool_root_for(&real) {
             let rel = real.strip_prefix(&root.dir).unwrap_or(Path::new(""));
             let rel = saddle_cap::RelPath::new(rel)

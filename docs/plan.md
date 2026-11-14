@@ -3162,6 +3162,23 @@ resulting batches are bounded to 1 MiB in addition to normal argument/fuel/deadl
 entry points stay temporary until delivery and documented parity gaps, including human diff
 presentation and external-directory writes, are closed.
 
+**D141.** Filesystem parity uses the existing D66 declarations for external mutations. Runtime
+`tool-write = { tools = ["write", "edit", "patch"] }` selects a subset of the configured entry's
+roles, bounded by the host-derived parent ceiling, never a new directory list or root. It grants no
+read authority; SHA-256 preconditions independently require `tool-read` on external paths. Ordinary
+mutation SDK calls route by path, with true-root precedence, protected-overlap refusal and checks on
+both requested and resolved directories. Reserved Git paths are checked against absolute external
+paths too, including declarations nested beneath `.git`. Runtime grant/revoke uses one artifact.
+
+The additive `tool-result.emit-diff` accepts one bounded 64 KiB human-only presentation per invocation,
+never filesystem authority. Guests compute line presentations before mutation, publish after success,
+and label blind writes/deletes rather than reading old data implicitly. The host decides/audits the
+presentation under `tool`, strips controls, stages it until successful completion, and retains it in
+the ordinary saved/replayed tool result with plugin provenance. Errors/traps discard the presentation,
+not committed filesystem effects. Core does not compute plugin diffs or parse guest patch workflows.
+Large-text, non-UTF-8 filename and traversal limits remain explicit standard-tool bounds, not native
+fallbacks; further performance improvements must keep filtering under the same policy decisions.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

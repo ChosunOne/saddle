@@ -77,6 +77,7 @@ interface fs-list {
 
 // Result presentation carries data, not filesystem or network authority.
 interface tool-result {
+    emit-diff: func(text: string) -> result<_, string>;
     record image-info {
         media-type: string,
         width: u32,

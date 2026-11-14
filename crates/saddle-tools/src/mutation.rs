@@ -5,10 +5,13 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 #[cfg(target_arch = "wasm32")]
-use saddle_sdk::{Definition, FilePath, Output, Tool, apply_changes, read_range, resolve_path};
+use saddle_sdk::{
+    Definition, FilePath, Output, Tool, apply_changes, emit_diff, read_range, resolve_path,
+};
 #[cfg(target_arch = "wasm32")]
 use serde_json::json;
 
+use crate::diff;
 use crate::patch::{self, Op};
 
 const MAX_BYTES: usize = 1024 * 1024;
@@ -21,12 +24,20 @@ pub struct Patch;
 pub trait Filesystem {
     fn read(&mut self, path: &str) -> Result<Vec<u8>, String>;
     fn apply(&mut self, changes: &[Change]) -> Result<(), String>;
+    fn present_diff(&mut self, _text: &str) {}
 }
 
 #[cfg(target_arch = "wasm32")]
 struct HostFilesystem;
 #[cfg(target_arch = "wasm32")]
 impl Filesystem for HostFilesystem {
+    fn present_diff(&mut self, text: &str) {
+        let mut end = text.len().min(60 * 1024);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let _ = emit_diff(&text[..end]);
+    }
     fn read(&mut self, path: &str) -> Result<Vec<u8>, String> {
         let path = resolve_path(path).map_err(|error| format!("resolve failed: {error:?}"))?;
         let path = FilePath {
@@ -100,6 +111,7 @@ pub fn write_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, S
         serde_json::from_str(arguments).map_err(|error| format!("invalid arguments: {error}"))?;
     let lines = args.content.lines().count();
     let bytes = args.content.len();
+    let presentation = diff::lines(&args.path, None, &args.content);
     submit(
         fs,
         &[Change {
@@ -108,6 +120,7 @@ pub fn write_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, S
             expected: Expectation::Any,
         }],
     )?;
+    fs.present_diff(&presentation);
     Ok(format!(
         "wrote {} ({bytes} bytes, {lines} lines)",
         args.path
@@ -138,6 +151,7 @@ pub fn edit_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, St
     let at = text.find(&args.old).ok_or("old does not occur")?;
     let line = text[..at].bytes().filter(|byte| *byte == b'\n').count() + 1;
     let updated = text.replacen(&args.old, &args.new, 1);
+    let presentation = diff::lines(&args.path, Some(&text), &updated);
     submit(
         fs,
         &[Change {
@@ -146,6 +160,7 @@ pub fn edit_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, St
             expected: Expectation::Sha256(hash(text.as_bytes())),
         }],
     )?;
+    fs.present_diff(&presentation);
     Ok(format!("edited {} at line {line}", args.path))
 }
 
@@ -155,9 +170,13 @@ pub fn patch_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, S
     let ops = patch::parse(&args.patch)?;
     let mut changes = Vec::new();
     let mut report = Vec::new();
+    let mut presentation = String::new();
     for op in ops {
         match op {
             Op::Add { path, text } => {
+                if presentation.len() < 60 * 1024 {
+                    presentation.push_str(&diff::lines(&path, Some(""), &text));
+                }
                 report.push(format!("added {path}"));
                 changes.push(Change {
                     path,
@@ -166,6 +185,9 @@ pub fn patch_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, S
                 });
             }
             Op::Delete { path } => {
+                if presentation.len() < 60 * 1024 {
+                    presentation.push_str(&format!(" 0 {path} (deleted; preimage not read)\n"));
+                }
                 report.push(format!("deleted {path}"));
                 changes.push(Change {
                     path,
@@ -186,6 +208,9 @@ pub fn patch_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, S
                 let updated = patch::apply(&text, &hunks)
                     .map_err(|error| format!("{path}: {error}; nothing was written"))?;
                 let expected = Expectation::Sha256(hash(text.as_bytes()));
+                if presentation.len() < 60 * 1024 {
+                    presentation.push_str(&diff::lines(&path, Some(&text), &updated));
+                }
                 if let Some(destination) = destination {
                     report.push(format!("moved {path} to {destination}"));
                     changes.push(Change {
@@ -210,6 +235,7 @@ pub fn patch_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, S
         }
     }
     submit(fs, &changes)?;
+    fs.present_diff(&presentation);
     Ok(report.join(", "))
 }
 

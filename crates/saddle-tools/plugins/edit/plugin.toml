@@ -1,4 +1,4 @@
 id = "editor"
 version = "0.1.0"
 component = "edit.component.wasm"
-scopes = ["tool", "fs-read", "fs-write"]
+scopes = ["tool", "fs-read", "fs-write", "tool-read", "tool-write"]

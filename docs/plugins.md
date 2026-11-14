@@ -1,7 +1,7 @@
 # WASI tool plugins
 
 Saddle loads explicitly installed, digest-pinned WASI components as model-callable tools
-(D126–D140). The runtime supports bounded filesystem and transcript services, not arbitrary extensions. A manifest
+(D126–D141). The runtime supports bounded filesystem and transcript services, not arbitrary extensions. A manifest
 in a repository never executes automatically. Installation, enablement and grants are separate steps
 performed by a person; an agent cannot write its own protected configuration.
 
@@ -388,9 +388,17 @@ preimages before publication, but are not an OS-level atomic compare-and-swap ag
 writers. Publication is atomic per entry, **not** a multi-file transaction or crash-durability
 promise: I/O errors during publication may partially apply and are explicitly reported.
 
-This first mutation adapter covers true policy roots only. D66 external-directory writes and
-native human-facing diff presentation remain parity work; no build variant is needed or planned
-for them. Native tools have not been removed yet.
+The same artifacts support D66 configured external directories (D141): add
+`tool-write = { tools = ["write"] }` to the writer's runtime grants (use `edit`/`patch` for those
+components). The protected `[sandbox]` entry must independently name that role. Updates also need
+`tool-read = { tools = ["read"] }` and a configured read role. True roots retain precedence;
+external links must land in independently permitted declared directories, and protected/reserved
+paths remain refused. No new allowlist, root, build variant or repinning is involved.
+
+Guests emit bounded human-only line diffs through `tool-result.emit-diff`. They are retained in
+saved/replayed tool results, not model text. Blind writes/deletes label unavailable preimages rather
+than acquiring read access implicitly. Diffs are bounded, may summarize a changed span rather than
+produce minimal hunks, and are discarded on guest error/trap. Native tools have not been removed yet.
 
 ```sh
 cargo nextest run --test plugins --run-ignored all -E 'test(mutation)'
@@ -406,7 +414,7 @@ No standard component is silently aliased over a built-in or given implicit gran
 | `read` | native-style text pagination/totals, deep offsets, bounded range reads, explicit image mode and optional managed paths | scans beyond resource bounds, standard-component delivery |
 | `ls` | filtered directory pages, suffixes, sorted output, optional managed paths | bounded/non-UTF-8 listing differences |
 | `find`, `grep` | guest traversal, shared ignore syntax, glob/regex matching | large-tree/performance edges, host-path display and unreadable-file metadata |
-| `write`, `edit`, `patch` | guest workflows over bounded, preflight-all mutation batches and optimistic preconditions | external-directory writes, human diff presentation, standard delivery; documented size/atomicity limits |
+| `write`, `edit`, `patch` | guest workflows over bounded, preflight-all mutation batches and optimistic preconditions | standard delivery; documented size/atomicity and bounded diff presentation differences |
 | `bash` | not migrated | delegated exec sandbox, bounded streaming, cancellation, environment filtering and reservation restore |
 | `fetch`, `websearch` | not migrated | bounded attributed network/search adapters, redirects, protected credentials and grant narrowing |
 | `session_query` | guest schema/presentation over branch-only, bounded transcript SQL under delegated `transcript-read` | standard-component delivery and native-entry-point removal |
@@ -450,7 +458,7 @@ These labels are provenance, not permission to follow instructions found in a pl
   filesystem adapter. Its worker asks the session thread over a bounded channel; the loader does
   not own a second policy engine or depend on `Session`.
 
-Only `fs-read`, `fs-write`, `tool-read`, `transcript-read` and `tool` grants are supported by this runtime. Other scopes fail closed. The
+Only `fs-read`, `fs-write`, `tool-read`, `tool-write`, `transcript-read` and `tool` grants are supported by this runtime. Other scopes fail closed. The
 component classifier describes a wider planned ABI; that does not make its adapters available.
 Descriptions are capped at 1,000 characters, schemas at 16 KiB and configured plugins at 16.
 Schemas must parse as JSON objects with an object input type; the provider may enforce further

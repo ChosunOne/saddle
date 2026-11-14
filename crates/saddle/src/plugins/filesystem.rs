@@ -61,7 +61,7 @@ fn refuse<T>(
     Ok(Err(Failure::Denied(why.into())))
 }
 
-fn tool_read_info<'a>(session: &'a Session, loc: &Location) -> (String, &'a [String]) {
+pub(crate) fn tool_read_info<'a>(session: &'a Session, loc: &Location) -> (String, &'a [String]) {
     let path = session
         .base_of(&loc.root)
         .map(|base| base.join(loc.rel.to_path()));
