@@ -1,6 +1,7 @@
 //! standard tool implementations; the core owns effects, guests own presentation (D131).
 
 pub mod listing;
+pub mod search;
 
 use serde::Deserialize;
 

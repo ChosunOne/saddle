@@ -1,0 +1,4 @@
+id = "search"
+version = "0.1.0"
+component = "grep.component.wasm"
+scopes = ["tool", "fs-read"]

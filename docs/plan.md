@@ -2974,6 +2974,23 @@ own design without weakening D65/D66. Search tools build on metadata/range servi
 exec/network tools and transcript SQL require their own bounded adapters and delegation tests before
 migration; they must not call a built-in as the agent to bypass their plugin principal.
 
+**D133.** Standard `find` and `grep` run traversal, glob matching, ignore parsing, regex matching
+and presentation in guest components over D131/D132 services, never by dispatching native tools
+as the agent. The D68 parser is factored into authority-free `saddle-ignore` and shared with native
+search and skill discovery, so the semantics do not drift. `.git`, symlinks and special files are
+not walked. File operations are independently rechecked and audited under the plugin principal;
+guest ignore rules never override the host's exclusion filter.
+
+Guest search bounds are 100,000 visited entries, 2,048 pending directories/1 MiB of queued path
+text, 128 KiB of aggregate ignore text (64 KiB per ignore file), 4 MiB per searched file and 50 KiB
+of result text. Regex compilation has a 1 MiB size limit. Find returns at most 1,000 names; grep
+returns at most 200 matches with 300-byte UTF-8-safe line previews. Invocation fuel, memory and
+deadlines remain independent tighter bounds. Large trees/results produce narrowing notes; oversized
+ignore data fails explicitly rather than silently changing matching rules. Unreadable, binary and
+oversized searched files are skipped. The guest identifies direct readable file targets for grep;
+unreadable explicit file targets may still report a directory error, a documented parity gap.
+Workspace paths are shown relatively and other roots as `root:relative`, not guessed host base paths.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

@@ -170,6 +170,76 @@ cargo nextest run --test plugins --run-ignored only \
   -E 'test(standard_ls_component_lists_filtered_pages_and_never_follows_entry_links)'
 ```
 
+## Standard find and grep plugins
+
+`finder` exports `plugin__finder__find`; `search` exports `plugin__search__grep`. Both implement
+traversal and matching in the guest. The core supplies only policy-filtered directory pages and
+bounded reads; it does not run native `find` or `grep` on their behalf. Ignore parsing is shared
+with native tools and skill discovery through the authority-free `saddle-ignore` crate.
+
+Build each component, then install, enable and grant it independently:
+
+```sh
+cargo build -p saddle-tools --examples --target wasm32-unknown-unknown --release
+mkdir -p target/find-plugin target/grep-plugin
+cargo run -p saddle-loader --example componentize -- \
+  target/wasm32-unknown-unknown/release/examples/find.wasm target/find-plugin/find.component.wasm
+cargo run -p saddle-loader --example componentize -- \
+  target/wasm32-unknown-unknown/release/examples/grep.wasm target/grep-plugin/grep.component.wasm
+cp crates/saddle-tools/plugins/find/plugin.toml target/find-plugin/plugin.toml
+cp crates/saddle-tools/plugins/grep/plugin.toml target/grep-plugin/plugin.toml
+saddle plugin install target/find-plugin/plugin.toml
+saddle plugin install target/grep-plugin/plugin.toml
+```
+
+Use the printed `[plugins.finder]`/`[plugins.search]` entries, with corresponding explicit
+`[plugin.finder]`/`[plugin.search]` `tool` and `fs-read` grants. Example calls:
+
+```sh
+saddle plugin call finder '{"path":"src","pattern":"*.rs"}'
+saddle plugin call search '{"path":"src","pattern":"TODO|FIXME","glob":"*.rs","ignore_case":true}'
+```
+
+Globs without `/` match filenames at any depth; those with `/` match paths from the search
+directory. Both honor `.gitignore`, `.ignore` and `.fdignore`, skip `.git`, and do not follow
+symlinks or read special files. Parent ignore files apply when starting in a subdirectory. Regex
+search returns `path:line: text`, supports explicit readable file targets and case-insensitive
+matching, and skips binary, invalid UTF-8, oversized and unreadable content. All permission checks
+remain independent of ignore rules. Files larger than 64 KiB are searched through bounded ranges.
+
+Limits: 1,000 find results, 200 grep matches, 50 KiB result text, 300-byte UTF-8-safe line previews,
+4 MiB per searched file, 100,000 visited entries, 2,048 pending directories/1 MiB of queued paths,
+128 KiB aggregate ignore text (64 KiB per file), plus normal fuel/memory/deadline bounds. Large
+ignore data fails explicitly. Other limits produce narrowing notes; the runtime can interrupt
+earlier. These are incremental replacements: other roots display `root:relative` rather than
+absolute host paths, and an explicitly requested unreadable file may report a directory error.
+Cold compilation of regex-bearing components is substantial; it happens once per loaded component
+in a running session, but standalone CLI calls each start a new process. Compilation caching and
+independent compilation resource limits remain work, not execution-fuel guarantees.
+
+```sh
+cargo nextest run --test plugins --run-ignored only \
+  -E 'test(standard_search_components_walk_and_match_without_bypassing_exclusions)'
+```
+
+## Built-in migration tracking
+
+No standard component is silently aliased over a built-in or given implicit grants.
+
+| Tool | Guest implementation | Remaining parity/adapters |
+| --- | --- | --- |
+| `read` | text pagination and bounded range reads | images, deep-offset cursors, managed tool paths |
+| `ls` | filtered directory pages, suffixes, sorted output | managed tool paths; bounded/non-UTF-8 listing differences |
+| `find`, `grep` | guest traversal, shared ignore syntax, glob/regex matching | large-tree/performance edges, host-path display and unreadable-file metadata |
+| `write`, `edit`, `patch` | not migrated | scoped mutation/atomic transaction services, reserved paths, preflight all patch paths |
+| `bash` | not migrated | delegated exec sandbox, bounded streaming, cancellation, environment filtering and reservation restore |
+| `fetch`, `websearch` | not migrated | bounded attributed network/search adapters, redirects, protected credentials and grant narrowing |
+| `session_query` | not migrated | branch-only, bounded transcript SQL service under explicit delegated `transcript-read` |
+
+All replacements also need a person-controlled standard-tool selection/default configuration story
+before native fallbacks can be removed. Remaining adapters must act as the plugin principal, not
+reuse a built-in's hard-coded agent identity. D65/D66 tool-visible paths remain distinct from roots.
+
 ## Authority and provenance
 
 Operational authority is bounded by the agent, then the manifest's scope ceiling, then the plugin's

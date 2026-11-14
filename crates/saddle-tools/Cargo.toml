@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+saddle-ignore.workspace = true
+globset.workspace = true
+regex.workspace = true
 saddle-sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -16,6 +19,14 @@ crate-type = ["cdylib"]
 
 [[example]]
 name = "ls"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "find"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "grep"
 crate-type = ["cdylib"]
 
 [lints]

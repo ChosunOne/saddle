@@ -493,6 +493,63 @@ fn standard_ls_component_lists_filtered_pages_and_never_follows_entry_links() {
 }
 
 #[test]
+#[ignore = "build standard find/grep components first; see docs/plugins.md"]
+fn standard_search_components_walk_and_match_without_bypassing_exclusions() {
+    for (tool, filename) in [
+        ("find", "find-plugin/find.component.wasm"),
+        ("grep", "grep-plugin/grep.component.wasm"),
+    ] {
+        let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(filename);
+        let bytes = fs::read(component)
+            .expect("build standard find/grep components first; see docs/plugins.md");
+        let env = Env::new(&bytes, fixture::GRANTS);
+        fs::create_dir_all(env.ws().join("src")).unwrap();
+        fs::create_dir_all(env.ws().join(".git")).unwrap();
+        fs::write(env.ws().join(".gitignore"), "ignored.rs\n").unwrap();
+        fs::write(env.ws().join(".git/hidden.rs"), "HELLO secret").unwrap();
+        fs::write(env.ws().join("ignored.rs"), "HELLO secret").unwrap();
+        fs::write(env.ws().join("private"), "HELLO secret").unwrap();
+        fs::write(env.ws().join(".env"), "HELLO secret").unwrap();
+        fs::write(
+            env.ws().join("src/file.rs"),
+            format!("{}\nHELLO Rust\n", "x".repeat(70_000)),
+        )
+        .unwrap();
+        symlink("src/file.rs", env.ws().join("link.rs")).unwrap();
+        let arguments = if tool == "find" {
+            r#"{"pattern":"*.rs"}"#
+        } else {
+            r#"{"pattern":"hello","ignore_case":true,"glob":"*.rs"}"#
+        };
+        let out = env.run(&["plugin", "call", "reader", arguments]);
+        assert!(out.status.success(), "{tool}: {}", text(&out));
+        let output = text(&out);
+        assert!(output.contains("src/file.rs"), "{output}");
+        if tool == "grep" {
+            assert!(output.contains("src/file.rs:2: HELLO Rust"), "{output}");
+        }
+        assert!(!output.contains("ignored.rs"));
+        assert!(!output.contains("hidden.rs"));
+        assert!(!output.contains("link.rs"));
+        assert!(!output.contains("secret"));
+        let rows = env.records();
+        assert!(
+            rows.iter()
+                .filter(|r| r["scope"] == "fs-read")
+                .all(|r| r["principal"] == "plugin.reader")
+        );
+        let log = env.log();
+        assert!(
+            env.run(&["audit", "verify", log.to_str().unwrap()])
+                .status
+                .success()
+        );
+    }
+}
+
+#[test]
 fn workspace_plugin_grants_are_layered_and_one_run_revocation_keeps_them_bounded() {
     let env = Env::new(&fixture::reader("file"), "");
     fs::write(env.ws().join("file"), "workspace-scoped plugin").unwrap();

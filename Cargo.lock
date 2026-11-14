@@ -2463,6 +2463,7 @@ dependencies = [
  "regex",
  "rusqlite",
  "saddle-cap",
+ "saddle-ignore",
  "saddle-loader",
  "saddle-policy",
  "saddle-sandbox",
@@ -2492,6 +2493,13 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml",
+]
+
+[[package]]
+name = "saddle-ignore"
+version = "0.0.1"
+dependencies = [
+ "globset",
 ]
 
 [[package]]
@@ -2552,6 +2560,9 @@ dependencies = [
 name = "saddle-tools"
 version = "0.0.1"
 dependencies = [
+ "globset",
+ "regex",
+ "saddle-ignore",
  "saddle-sdk",
  "serde",
  "serde_json",
