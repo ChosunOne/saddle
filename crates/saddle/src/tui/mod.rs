@@ -492,16 +492,23 @@ fn work(
                 // The registry lives on the session, and starting a server needs it, so it is
                 // taken out for the call and put back (D108, D118).
                 let mut registry = std::mem::take(&mut session.mcp);
-                let outcome = match arg.strip_prefix("restart") {
-                    Some(name) if !name.trim().is_empty() => {
-                        registry.restart(name.trim(), &mut session)
-                    }
-                    Some(_) => Err(anyhow::anyhow!(
-                        "`/mcp restart` needs a server: /mcp lists them"
+                let outcome = match arg.split_once(' ') {
+                    Some(("restart", name)) => registry.restart(name.trim(), &mut session),
+                    Some(("disable", name)) => registry.suspend(name.trim()),
+                    Some(("enable", name)) => registry.resume(name.trim()),
+                    Some((other, _)) => Err(anyhow::anyhow!(
+                        "`/mcp {other}` is not a command: /mcp, /mcp restart <server>, \
+                         /mcp disable <server>, /mcp enable <server>"
+                    )),
+                    None if !arg.is_empty() => Err(anyhow::anyhow!(
+                        "`/mcp {arg}` needs a server: /mcp lists them"
                     )),
                     None => {
                         let mut lines = registry.report();
-                        lines.push("\n/mcp restart <server> starts one again".to_owned());
+                        lines.push(
+                            "\n/mcp restart <server> · /mcp disable <server> · /mcp enable <server>"
+                                .to_owned(),
+                        );
                         Ok(lines.join("\n"))
                     }
                 };

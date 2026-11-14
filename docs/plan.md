@@ -2792,6 +2792,16 @@ a search may declare, and whether a call is refused. A hidden tool is refused wi
 so a model that guessed the name learns why rather than getting a transport error. The grant is
 still the only authority: exposure changes where a schema appears, never whether a call is allowed.
 
+**D123.** `/mcp disable <server>` turns a server off for the rest of the session and
+`/mcp enable <server>` makes it available again; neither writes anything, because the config is a
+person's file and a session's convenience is not an edit to it. Off means off in the three places it
+matters — a search does not declare its tools, the declaration list leaves them out, and a call is
+refused with the command that turns it back on — and dropping the client kills its child, so nothing
+of the old one runs while it is off. The report distinguishes `off (this session)` from `hidden` in
+the table, because one is a runtime convenience and the other is a decision the person wrote down.
+Enabling does not start the server: it starts on demand or on `/mcp restart`, so turning one back on
+costs nothing until it is used.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

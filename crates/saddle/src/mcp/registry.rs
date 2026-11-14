@@ -95,6 +95,9 @@ pub struct Registry {
     catalogue: BTreeMap<String, (String, Tool)>,
     loaded: BTreeSet<String>,
     servers: BTreeMap<String, Running>,
+    /// Servers a person turned off for this session only: not a config change, and forgotten when
+    /// the session ends (D123).
+    suspended: BTreeSet<String>,
     /// Servers that could not be started, and why: remembered, so a search does not retry one that
     /// is broken or repeat the same failure.
     failures: BTreeMap<String, String>,
@@ -134,7 +137,7 @@ impl Registry {
             .iter()
             .map(|g| g.server.clone())
             .filter(|name| !self.servers.contains_key(name) && !self.failures.contains_key(name))
-            .filter(|name| !self.is_hidden(name))
+            .filter(|name| !self.is_off(name))
             .collect();
         for name in pending.into_iter() {
             if let Err(e) = self.connect(&name, session) {
@@ -270,6 +273,34 @@ impl Registry {
             })
     }
 
+    /// Whether a server is off: `hidden` in its table, or turned off for this session (D117, D123).
+    fn is_off(&self, server: &str) -> bool {
+        self.is_hidden(server) || self.suspended.contains(server)
+    }
+
+    /// Turns one server off for this session, without touching the config a person would have to
+    /// keep in step (D123). Dropping the client kills its child, so off means off.
+    pub fn suspend(&mut self, server: &str) -> Result<String> {
+        if !self.entries.contains_key(server) {
+            bail!("`{server}` has no [mcp.{server}] table in config.toml");
+        }
+        self.suspended.insert(server.to_owned());
+        self.servers.remove(server);
+        let note = format!("{server} is off for this session");
+        Ok(note)
+    }
+
+    /// Turns it back on. Not started again: it starts on demand, or on `/mcp restart`.
+    pub fn resume(&mut self, server: &str) -> Result<String> {
+        if !self.suspended.remove(server) {
+            bail!("`{server}` is not off in this session");
+        }
+        self.failures.remove(server);
+        Ok(format!(
+            "{server} is available again; it starts when it is next needed"
+        ))
+    }
+
     /// Whether a server's table says `hidden`, in which case it is not started at all (D117).
     fn is_hidden(&self, server: &str) -> bool {
         self.entries
@@ -363,6 +394,8 @@ impl Registry {
                 format!("failed: {}", first_line(why))
             } else if entry.is_none() {
                 "no [mcp.{}] table".to_owned().replace("{}", &grant.server)
+            } else if self.suspended.contains(&grant.server) {
+                "off (this session)".to_owned()
             } else if entry.is_some_and(|e| e.exposure() == crate::mcp::Exposure::Hidden) {
                 "off".to_owned()
             } else {
@@ -403,8 +436,8 @@ impl Registry {
         if !self.grants.iter().any(|g| g.server == server) {
             bail!("`{server}` is not granted");
         }
-        if self.is_hidden(server) {
-            bail!("`{server}` is turned off in config.toml (`exposure = \"hidden\"`)");
+        if self.is_off(server) {
+            bail!("`{server}` is off: `/mcp enable {server}` first");
         }
         self.servers.remove(server);
         self.failures.remove(server);
@@ -447,7 +480,8 @@ impl Registry {
             // A hidden server or tool is not searched, called or started: the switch is in the
             // table, and a catalogue that somehow holds the tool must not be a way past it
             // (D117, D122).
-            if self.exposure(server, &tool.name) == crate::mcp::Exposure::Hidden
+            if self.is_off(server)
+                || self.exposure(server, &tool.name) == crate::mcp::Exposure::Hidden
                 || !self.granted(server, &tool.name)
             {
                 continue;
@@ -491,6 +525,9 @@ impl Registry {
     pub fn declared(&self) -> Vec<ToolDef> {
         let mut keys: BTreeSet<String> = self.loaded.clone();
         for (key, (server, tool)) in &self.catalogue {
+            if self.is_off(server) {
+                continue;
+            }
             let direct = self.exposure(server, &tool.name) == crate::mcp::Exposure::Direct;
             if direct && self.granted(server, &tool.name) {
                 keys.insert(key.clone());
@@ -548,7 +585,11 @@ impl Registry {
         // grant is recorded below — the same shape every other tool's allow carries, with the
         // arguments hashed rather than quoted (D24).
         let arguments = arguments_record(input);
-        let refusal = if self.exposure(&server, &tool.name) == crate::mcp::Exposure::Hidden {
+        let refusal = if self.suspended.contains(&server) {
+            Some(format!(
+                "`{server}` is off for this session: `/mcp enable {server}`"
+            ))
+        } else if self.exposure(&server, &tool.name) == crate::mcp::Exposure::Hidden {
             Some(format!(
                 "`{server}` is turned off in config.toml (`exposure = \"hidden\"`)"
             ))
@@ -659,6 +700,46 @@ impl Registry {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_server_can_be_turned_off_for_this_session_without_editing_the_config() {
+        // D123: pi's `/mcp` toggle, made session-scoped. Off means off for search, declaration and
+        // calls, and the report says which kind of off it is — the table's or this session's.
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "scout".to_owned(),
+            McpEntry {
+                exposure: crate::mcp::Exposure::Direct,
+                ..McpEntry::default()
+            },
+        );
+        let mut registry = Registry::new(
+            vec![granted("scout", &["search"])],
+            entries,
+            Vec::new(),
+            None,
+        );
+        registry.attach("scout", Registry::tool("search"));
+        assert_eq!(registry.declared().len(), 1, "declared while it is on");
+
+        registry.suspend("scout").unwrap();
+        assert!(
+            registry.declared().is_empty(),
+            "a suspension must undeclare"
+        );
+        assert!(
+            registry.search("").is_empty(),
+            "and a search must not reach it"
+        );
+        assert!(
+            registry.report().join("\n").contains("off (this session)"),
+            "the report does not say why it is off: {:?}",
+            registry.report()
+        );
+
+        registry.resume("scout").unwrap();
+        assert_eq!(registry.declared().len(), 1, "and it comes back");
+    }
 
     #[test]
     fn one_tool_can_be_declared_or_hidden_beside_its_server() {
