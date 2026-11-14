@@ -2723,6 +2723,22 @@ server is a different host has to name that host in its reach — narrower than 
 so here rather than discovered at the worst moment. A token is never written to a log: the
 `authorization` header is recorded by name, and its value never (D48).
 
+**D117.** A server's table says how its tools reach the model, in pi's vocabulary and in the
+table rather than the grant, because this is presentation and not authority: the grant still
+decides what may be called, and no exposure value can widen it. `deferred` — the default — declares
+nothing until `tool_search` matches, which is what a large server wants. `direct` declares every
+granted tool in the prompt from the first request, so the model sees the schemas without searching,
+and the server is therefore started when the session opens: the schemas are needed before the model
+says anything, so the cost is paid at startup rather than at the first call. A direct server that
+fails to start is not fatal — the rest of the tools are still there, and the line mode says which
+one did not start. `hidden` is registered and reachable by nothing: it is the table's off switch, so
+a server can be turned off without the grant forgetting the tools it names, and turning it back on
+cannot be mistaken for granting it. `hidden` is checked where a tool is searched and where it is
+called, not only where a server is started, so a catalogue that somehow holds its tools is not a
+third way in. `codemode` is refused by name at load: saddle has no code-evaluation tool, and a
+person who asked for one asked for something this harness does not do, which a silent fall back to
+deferring would hide.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

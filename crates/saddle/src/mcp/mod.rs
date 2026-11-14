@@ -51,6 +51,53 @@ pub struct McpEntry {
     /// Seconds a single call may take.
     #[serde(default)]
     pub timeout: Option<u64>,
+    /// How this server's tools reach the model (D117). Presentation, not authority: the grant still
+    /// decides what may be called.
+    #[serde(default, deserialize_with = "exposure")]
+    pub exposure: Exposure,
+}
+
+/// How a server's tools reach the model, in pi's vocabulary (D117).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Exposure {
+    /// Not declared until `tool_search` matches one. The default, and the cheapest.
+    #[default]
+    Deferred,
+    /// Declared in the prompt from the first request, like a built-in. The server is started when
+    /// the session opens, because its schemas are needed before the model says anything.
+    Direct,
+    /// Registered and never reachable: the table can say "off" without the grant losing the tools
+    /// it names, so turning a server back on cannot be mistaken for granting it (D117).
+    Hidden,
+}
+
+impl Exposure {
+    /// The word in the table, refusing pi's `codemode` by name: a person who asked for it asked
+    /// for something saddle does not do, and a silent fall back to deferring would hide that.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "deferred" => Ok(Self::Deferred),
+            "direct" => Ok(Self::Direct),
+            "hidden" => Ok(Self::Hidden),
+            "codemode" | "codemode-deferred" => Err(
+                "saddle has no codemode: tools are called directly, so use `\"deferred\"` to \
+                 declare them through tool_search or `\"direct\"` to declare them up front"
+                    .to_owned(),
+            ),
+            other => Err(format!(
+                "`{other}` is not an exposure: use `\"deferred\"`, `\"direct\"` or `\"hidden\"`"
+            )),
+        }
+    }
+}
+
+/// An exposure written as a string, with the refusal above rather than serde's list of variants.
+fn exposure<'de, D>(deserializer: D) -> Result<Exposure, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let text = String::deserialize(deserializer)?;
+    Exposure::parse(&text).map_err(serde::de::Error::custom)
 }
 
 /// How a call reaches the server, which the table describes exactly one way (D104).
@@ -66,6 +113,11 @@ pub enum Transport<'a> {
 }
 
 impl McpEntry {
+    /// How this server's tools reach the model, which is the table's own choice (D117).
+    pub fn exposure(&self) -> Exposure {
+        self.exposure
+    }
+
     pub fn timeout(&self) -> Duration {
         self.timeout.map_or(DEFAULT_TIMEOUT, Duration::from_secs)
     }

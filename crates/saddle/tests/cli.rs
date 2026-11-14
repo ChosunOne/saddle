@@ -1305,6 +1305,80 @@ mcp     = [{{ server = "remote", tools = ["echo"], net = [{{ host = "127.0.0.1",
 }
 
 #[test]
+fn a_table_says_how_its_tools_reach_the_model_and_codemode_is_refused() {
+    // D117: exposure is the table's own word for what reaches the prompt. `direct` is the one a
+    // small frequent set wants, and `codemode` — pi's default — is a load error here rather than a
+    // silent fall back to deferring, because a person who asked for it asked for something saddle
+    // does not do.
+    let env = Env::new();
+    let script = env.ws.path().join("fake-mcp.sh");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}\n' ;;
+    *'"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search","description":"finds things","inputSchema":{}}]}}\n' ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let table = format!(
+        "\n[mcp.fake]\ncommand = {:?}\nexposure = \"direct\"\n",
+        script.display().to_string()
+    );
+    env.write_config(&table);
+    env.write_policy(
+        r#"
+version = 1
+
+[agent]
+fs-read = [{ root = "workspace" }]
+exec    = { timeout-secs = 20 }
+mcp     = [{ server = "fake", tools = ["search"] }]
+"#,
+    );
+    let out = env.saddle(&["check"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("in the prompt"),
+        "check does not say the tools are declared up front: {text}"
+    );
+    let out = env.saddle(&["mcp", "list"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("direct"),
+        "the listing hides the exposure: {text}"
+    );
+
+    // `write_config` prepends, so the codemode case gets its own workspace rather than a second
+    // `[mcp.fake]` table in the same file.
+    let env = Env::new();
+    let script = env.ws.path().join("fake-mcp.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    env.write_config(&format!(
+        "\n[mcp.fake]\ncommand = {:?}\nexposure = \"codemode\"\n",
+        script.display().to_string()
+    ));
+    let out = env.saddle(&["check"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("codemode"),
+        "the refusal does not name what was asked for: {text}"
+    );
+}
+
+#[test]
 fn mcp_call_runs_one_tool_as_the_model_would_and_refuses_an_ungranted_one() {
     // D111: one call without a conversation around it, decided by the same grant the model's call
     // is decided by. It is what a person checks a server with, and the only way to reach a remote

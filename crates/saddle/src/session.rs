@@ -247,7 +247,14 @@ impl Setup {
                 .map(|g| format!("granted [{}]", g.tools.join(", ")))
                 .unwrap_or_else(|| "not granted".to_owned());
             let deadline = entry.timeout().as_secs();
-            mcp.push(format!("{name} · {what} · {access} · {deadline}s per call"));
+            let exposure = match entry.exposure() {
+                crate::mcp::Exposure::Deferred => "searched for",
+                crate::mcp::Exposure::Direct => "in the prompt",
+                crate::mcp::Exposure::Hidden => "off",
+            };
+            mcp.push(format!(
+                "{name} · {what} · {access} · {exposure} · {deadline}s per call"
+            ));
         }
         if let Some(grants) = agent_grants {
             for grant in &grants.mcp {

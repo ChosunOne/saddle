@@ -134,6 +134,7 @@ impl Registry {
             .iter()
             .map(|g| g.server.clone())
             .filter(|name| !self.servers.contains_key(name) && !self.failures.contains_key(name))
+            .filter(|name| !self.is_hidden(name))
             .collect();
         for name in pending.into_iter() {
             if let Err(e) = self.connect(&name, session) {
@@ -259,6 +260,43 @@ impl Registry {
         }
     }
 
+    /// Whether a server's table says `hidden`, in which case it is not started at all (D117).
+    fn is_hidden(&self, server: &str) -> bool {
+        self.entries
+            .get(server)
+            .is_some_and(|entry| entry.exposure() == crate::mcp::Exposure::Hidden)
+    }
+
+    /// The servers whose table says `direct`, which are started when the session opens because
+    /// their schemas are needed before the model's first request (D117).
+    pub fn direct(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|(name, entry)| {
+                entry.exposure() == crate::mcp::Exposure::Direct
+                    && self.grants.iter().any(|g| &g.server == *name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Starts the `direct` servers. Called where the model loop is set up rather than from a
+    /// search, because there is nothing to search for: the table already said what to declare.
+    pub fn start_direct(&mut self, session: &mut Session) -> Vec<String> {
+        let mut notes = Vec::new();
+        for name in self.direct() {
+            if self.failures.contains_key(&name) {
+                continue;
+            }
+            if let Err(e) = self.connect(&name, session) {
+                let why = format!("{e:#}");
+                notes.push(format!("{name}: {why}"));
+                self.failures.insert(name, why);
+            }
+        }
+        notes
+    }
+
     /// Starts one server by name, so `saddle mcp call` reaches the one it was given rather than
     /// every granted server. The discovery path starts them all at once; this is the same
     /// `connect`, reached by name (D111).
@@ -284,7 +322,9 @@ impl Registry {
         let words: Vec<&str> = wanted.split_whitespace().collect();
         let mut scored: Vec<(usize, String)> = Vec::new();
         for (key, (server, tool)) in &self.catalogue {
-            if !self.granted(server, &tool.name) {
+            // A hidden server is not searched, called or started: the switch is in the table, and
+            // a catalogue that somehow holds its tools must not be a way past it (D117).
+            if self.is_hidden(server) || !self.granted(server, &tool.name) {
                 continue;
             }
             let haystack = format!("{key} {}", tool.description).to_lowercase();
@@ -319,10 +359,20 @@ impl Registry {
             .is_some_and(|g| g.allows(tool))
     }
 
-    /// The definitions to add to the tool list: what this session has declared, and nothing else.
+    /// The definitions to add to the tool list: what this session has declared by searching, plus
+    /// every granted tool of a server whose table says `direct` (D117). A `hidden` server
+    /// contributes nothing, which is what makes it a switch rather than a second grant.
     pub fn declared(&self) -> Vec<ToolDef> {
-        self.loaded
-            .iter()
+        let mut keys: BTreeSet<String> = self.loaded.clone();
+        for name in self.direct() {
+            for (key, (_, tool)) in &self.catalogue {
+                if key.starts_with(&format!("{PREFIX}{name}__")) && self.granted(&name, &tool.name)
+                {
+                    keys.insert(key.clone());
+                }
+            }
+        }
+        keys.iter()
             .filter_map(|key| {
                 let (server, tool) = self.catalogue.get(key)?;
                 if !self.granted(server, &tool.name) {
@@ -374,7 +424,11 @@ impl Registry {
         // grant is recorded below — the same shape every other tool's allow carries, with the
         // arguments hashed rather than quoted (D24).
         let arguments = arguments_record(input);
-        let refusal = if !self.grants.iter().any(|g| g.server == server) {
+        let refusal = if self.is_hidden(&server) {
+            Some(format!(
+                "`{server}` is turned off in config.toml (`exposure = \"hidden\"`)"
+            ))
+        } else if !self.grants.iter().any(|g| g.server == server) {
             Some(format!("`{server}` is not granted"))
         } else if !self.granted(&server, &tool.name) {
             Some(format!(
@@ -471,6 +525,68 @@ impl Registry {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_direct_server_is_declared_without_a_search_and_a_hidden_one_never_is() {
+        // D117: exposure is presentation, so it decides what reaches the prompt and nothing about
+        // what may be called. `direct` declares the granted tools up front; `hidden` declares none
+        // however loudly the server advertises them.
+        let tool = |name: &str| Tool {
+            name: name.to_owned(),
+            description: format!("{name} does things"),
+            schema: json!({ "type": "object" }),
+        };
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "front".to_owned(),
+            McpEntry {
+                exposure: crate::mcp::Exposure::Direct,
+                ..McpEntry::default()
+            },
+        );
+        entries.insert(
+            "off".to_owned(),
+            McpEntry {
+                exposure: crate::mcp::Exposure::Hidden,
+                ..McpEntry::default()
+            },
+        );
+        let mut registry = Registry::new(
+            vec![
+                granted("front", &["search", "fetch"]),
+                granted("off", &["search"]),
+            ],
+            entries,
+            Vec::new(),
+            None,
+        );
+        registry.attach("front", tool("search"));
+        registry.attach("front", tool("fetch"));
+        registry.attach("front", tool("rm_rf"));
+        registry.attach("off", tool("search"));
+
+        let names: Vec<String> = registry
+            .declared()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                Registry::name("front", "fetch"),
+                Registry::name("front", "search")
+            ],
+            "a direct server declares what is granted, and only that, in name order"
+        );
+        assert!(registry.loaded().is_empty(), "and nothing was searched for");
+
+        // The server that was told to stay off does not even answer a search for everything.
+        let declared = registry.search("");
+        assert!(
+            !declared.iter().any(|key| key.starts_with("mcp__off")),
+            "a hidden server was declared: {declared:?}"
+        );
+    }
 
     #[test]
     fn a_restored_declaration_is_checked_against_the_grant_again() {

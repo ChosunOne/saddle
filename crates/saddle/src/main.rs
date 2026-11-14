@@ -437,6 +437,17 @@ fn run_agent(
         None
     };
     let max_steps = header.max_steps;
+    // A `direct` server is started now rather than at the first search, because its schemas are
+    // part of the first request (D117). A failure here is not fatal: the model gets the rest of
+    // the tools, and `/mcp` says which server did not start.
+    let mcp_notes = {
+        // The registry is a field of the session it has to ask, so it is taken out for the start
+        // and put back, the way a tool call does it (D108).
+        let mut registry = std::mem::take(&mut session.mcp);
+        let notes = registry.start_direct(&mut session);
+        session.mcp = registry;
+        notes
+    };
     let base = agent::base_prompt(&session, &context);
     let system = agent::system_prompt(&session, &context);
     let mut agent = Agent::new(
@@ -456,8 +467,12 @@ fn run_agent(
     agent.set_context(context.clone());
 
     if interactive {
+        // `/mcp` is where a failure shows in the interface; a line is the whole screen here.
         tui::run(agent, session, header, paths, start, latest)?;
         return Ok(ExitCode::SUCCESS);
+    }
+    for note in &mcp_notes {
+        eprintln!("saddle: an mcp server did not start — {note}");
     }
     let mut out = if args.json {
         output::Output::Json(output::Json::stdout())
@@ -1528,7 +1543,12 @@ impl OneServer<'_> {
                 client.tools(session)?
             }
         };
-        let mut out = vec![format!("{}  {} tool(s)", grant.server, tools.len())];
+        let mut out = vec![format!(
+            "{}  {} tool(s)  {}",
+            grant.server,
+            tools.len(),
+            exposure(entry)
+        )];
         for tool in tools {
             let access = if grant.allows(&tool.name) {
                 "granted"
@@ -1545,6 +1565,15 @@ impl OneServer<'_> {
             out.push(format!("  denied  {denial}"));
         }
         Ok(out)
+    }
+}
+
+/// How a server's tools reach the model, in one word (D117).
+fn exposure(entry: &McpEntry) -> &'static str {
+    match entry.exposure() {
+        crate::mcp::Exposure::Deferred => "deferred",
+        crate::mcp::Exposure::Direct => "direct",
+        crate::mcp::Exposure::Hidden => "hidden",
     }
 }
 
