@@ -51,6 +51,11 @@ impl AuthStore {
         self.providers.get(provider).and_then(|c| c.oauth.as_ref())
     }
 
+    /// Forgets one entry entirely, which is what a sign-out is (D121).
+    pub fn forget(&mut self, provider: &str) -> bool {
+        self.providers.remove(provider).is_some()
+    }
+
     pub fn set(&mut self, provider: &str, api_key: String) {
         self.providers.insert(
             provider.to_owned(),

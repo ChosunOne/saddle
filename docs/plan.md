@@ -2763,6 +2763,25 @@ put an untrusted picture into the model's context through a path (D58) built for
 attached, and no server has asked for that path yet. Each of these can be revisited by writing a
 new decision; what must not happen is one of them arriving as an accident of a transport.
 
+**D120.** A granted server is one line in the prompt, because a model cannot search for what it
+does not know exists. The line says the server's name, how its tools are reached (`direct` or
+`deferred`), the tool names the grant allows, and the description a person wrote in the table. Only
+that description appears: a server's own instructions and tool descriptions are its prose, and the
+prompt is not where prose a server controls belongs (D104). A granted server with no table is said
+to be unable to start, which is the one case where a search would otherwise fail with no
+explanation. The section also states whose words a result is — the server's, not the user's — and
+that such text can grant nothing, which is the honest mitigation for prompt injection rather than a
+claim to prevent it. A session with no MCP grant gets no section at all, so nobody pays for a line
+about a feature they do not use. The section is part of the base prompt, not the grants, so a policy
+reload that replaces the grants (D47) cannot lose it.
+
+**D121.** `saddle mcp logout <server>` removes the `mcp:<server>` entry from `auth.json`. That entry
+is the whole of a sign-in — there is nowhere else a token lives — so removing it is a complete sign
+out, and the next call is refused with the command that signs in again rather than retried without
+a token. Another provider's credential in the same file is untouched, and a second logout says there
+was nothing to forget instead of failing. The TUI's `/mcp` signs out the same way; there is no
+separate path.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

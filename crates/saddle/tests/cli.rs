@@ -1154,6 +1154,38 @@ fn mock_token_mcp() -> (
 }
 
 #[test]
+fn mcp_logout_forgets_the_token_so_the_next_call_says_how_to_sign_in() {
+    // D121: signing out is removing the one entry a token lives in. Afterwards the call is refused
+    // with the command that fixes it, rather than retried without a token.
+    let env = Env::new();
+    let auth_path = env.xdg.path().join("state/saddle/auth.json");
+    std::fs::create_dir_all(auth_path.parent().expect("the state directory")).unwrap();
+    std::fs::write(
+        &auth_path,
+        r#"{"mcp:remote":{"oauth":{"access":"a-token","refresh":"r","expires-at":0}},"openai":{"api-key":"sk-keep"}}"#,
+    )
+    .unwrap();
+
+    let out = env.saddle(&["mcp", "logout", "remote"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("signed out"), "{text}");
+
+    let stored = std::fs::read_to_string(&auth_path).unwrap();
+    assert!(!stored.contains("mcp:remote"), "{stored}");
+    assert!(
+        stored.contains("sk-keep"),
+        "another provider's credential was removed too: {stored}"
+    );
+
+    // Nothing to forget the second time, and that is not a failure.
+    let out = env.saddle(&["mcp", "logout", "remote"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("nothing to forget"), "{text}");
+}
+
+#[test]
 fn the_transport_sends_the_stored_token_and_says_how_to_get_one() {
     // D116: a token the person obtained is sent as a bearer, and a server that refuses without one
     // is told nothing by a retry — the error has to name the command that fixes it.

@@ -297,6 +297,45 @@ impl Registry {
         notes
     }
 
+    /// The `mcp_servers` section of the prompt: one line per granted server, saying how its tools
+    /// are reached and what the person wrote about it (D120). Only the person's own words appear —
+    /// a server's instructions and tool descriptions are its text, and the prompt is not the place
+    /// for prose a server controls (D104).
+    pub fn prompt_lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for grant in &self.grants {
+            let Some(entry) = self.entries.get(&grant.server) else {
+                out.push(format!(
+                    "  {} — granted, but no [mcp.{}] table in config.toml, so it cannot start",
+                    grant.server, grant.server
+                ));
+                continue;
+            };
+            if entry.exposure() == crate::mcp::Exposure::Hidden {
+                continue;
+            }
+            let how = match entry.exposure() {
+                crate::mcp::Exposure::Direct => "direct: its tools are in your list already",
+                crate::mcp::Exposure::Deferred | crate::mcp::Exposure::Hidden => {
+                    "deferred: search for one to declare it"
+                }
+            };
+            let description = entry
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(|d| format!(" — {}", first_line(d)))
+                .unwrap_or_default();
+            out.push(format!(
+                "  {} — {how} — tools: {}{description}",
+                grant.server,
+                grant.tools.join(", ")
+            ));
+        }
+        out
+    }
+
     /// What `/mcp` shows: one line per granted server, its exposure, whether it is running, how
     /// much of what it offers is granted, and what went wrong if anything did (D118).
     pub fn report(&self) -> Vec<String> {

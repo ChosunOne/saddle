@@ -148,6 +148,11 @@ enum McpCmd {
         /// The server's name, as `[mcp.<name>]` spells it.
         server: String,
     },
+    /// Forget the token a server's sign-in stored.
+    Logout {
+        /// The server's name, as `[mcp.<name>]` spells it.
+        server: String,
+    },
     /// Call one tool of a declared server, the way the model would, with no conversation around it.
     Call {
         /// The server's name, as `[mcp.<name>]` and the grant spell it.
@@ -1242,12 +1247,29 @@ fn mcp_cmd(
     match cmd {
         McpCmd::List => mcp_list(dir, session, paths, overrides),
         McpCmd::Auth { server } => mcp_auth(dir, session, paths, overrides, &server),
+        McpCmd::Logout { server } => mcp_logout(paths, &server),
         McpCmd::Call {
             server,
             tool,
             input,
         } => mcp_call(dir, session, paths, overrides, &server, &tool, &input),
     }
+}
+
+/// `saddle mcp logout <server>`: forget the token a sign-in stored (D121). The entry is the whole of
+/// it — there is nowhere else a token lives — so removing it is a complete sign-out, and a call
+/// afterwards says how to sign in again rather than silently retrying without one.
+fn mcp_logout(paths: &paths::Paths, server: &str) -> Result<ExitCode> {
+    let store_path = paths.auth_store();
+    let mut store = auth::AuthStore::load(&store_path)?;
+    let key = format!("mcp:{server}");
+    if !store.forget(&key) {
+        println!("{server}: no stored token, so there is nothing to forget");
+        return Ok(ExitCode::SUCCESS);
+    }
+    store.save(&store_path)?;
+    println!("{server}: signed out");
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `saddle mcp auth <server>`: the OAuth sign-in a remote server needs, discovered from the server

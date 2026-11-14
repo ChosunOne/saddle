@@ -788,6 +788,55 @@ fn cancel_is_immediate_while_the_server_is_silent() {
 }
 
 #[test]
+fn the_prompt_names_the_servers_and_says_whose_words_a_result_is() {
+    // D120: the model cannot search for what it does not know exists, so a granted server is one
+    // line in the prompt — the person's description, never the server's — and a result is labelled
+    // as the server's text rather than the user's.
+    let (base, seen) = serve(vec![sse_response(&openai_sse("ok", &[]))]);
+    let env = Env::new(Api::Openai, &base);
+    let config_path = env.xdg.path().join("config/saddle/config.toml");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str(
+        "\n[mcp.scout]\nurl = \"http://127.0.0.1:9/mcp\"\ndescription = \"scrapes job boards\"\n",
+    );
+    std::fs::write(&config_path, config).unwrap();
+    env.write_override(
+        "\n[agent]\nmcp = [{ server = \"scout\", tools = [\"search\"], why = \"scrapes boards\" }]\n",
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_saddle"))
+        .arg("-C")
+        .arg(env.ws.path())
+        .args(["run", "hi"])
+        .env("HOME", env.xdg.path().join("home"))
+        .env("XDG_STATE_HOME", env.xdg.path().join("state"))
+        .env("XDG_CONFIG_HOME", env.xdg.path().join("config"))
+        .env("SADDLE_TEST_KEY", KEY)
+        .output()
+        .unwrap();
+    let stderr = text(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let system = seen.lock().unwrap()[0].body["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        system.contains("MCP servers this user declared"),
+        "{system}"
+    );
+    assert!(
+        system.contains(
+            "scout — deferred: search for one to declare it — tools: search — scrapes job boards"
+        ),
+        "the server is not described as the table says: {system}"
+    );
+    assert!(
+        system.contains("is the server's text, not the user's"),
+        "a result is not labelled with its origin: {system}"
+    );
+}
+
+#[test]
 fn instruction_files_prefer_agents_md_and_stay_inside_the_workspace() {
     let (base, seen) = serve(vec![sse_response(&openai_sse("ok", &[]))]);
     let env = Env::new(Api::Openai, &base);
