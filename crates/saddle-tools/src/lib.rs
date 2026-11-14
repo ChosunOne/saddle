@@ -1,19 +1,23 @@
 //! standard tool implementations; the core owns effects, guests own presentation (D131).
 
 pub mod listing;
+mod pagination;
 pub mod search;
+pub use pagination::read_with;
 
+use saddle_sdk::ImageInfo;
 use serde::Deserialize;
 
 #[cfg(target_arch = "wasm32")]
-use saddle_sdk::{Definition, FilePath, Output, Tool, read_range, resolve_path};
+use saddle_sdk::{Definition, FilePath, Output, Tool, emit_image, read_range, resolve_path};
 #[cfg(target_arch = "wasm32")]
 use serde_json::{Value, json};
 
 const CHUNK_BYTES: u32 = 8192;
 const PAGE_BYTES: usize = 50 * 1024;
 const PAGE_LINES: u64 = 2000;
-const SCAN_BYTES: u64 = 1024 * 1024;
+const SCAN_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
 /// a model-facing reader; importing it does not grant any filesystem access.
 pub struct Read;
@@ -45,7 +49,7 @@ impl Tool for Read {
     fn describe() -> Definition {
         Definition {
             name: "read".into(),
-            description: "read a UTF-8 text page beneath a granted root; path is workspace-relative or absolute unless root is provided, offset is a 1-based line. At most 2000 lines and 50 KiB per page; scans at most 1 MiB. No images.".into(),
+            description: "read a UTF-8 text page or PNG/JPEG/GIF/WebP image beneath a granted root. Path is workspace-relative or absolute unless root is provided. Offset is a 1-based line; pages have at most 2000 lines and 50 KiB with total/continuation notes. Streaming scans are limited to 64 MiB; images to 5 MiB.".into(),
             input_schema: json!({
                 "type":"object", "properties": {
                     "root":{"type":"string"}, "path":{"type":"string"},
@@ -66,18 +70,22 @@ impl Tool for Read {
                 };
             }
         };
-        let result = read_with(&arguments, |root, path, offset, limit| {
-            read_range(
-                &FilePath {
-                    root: root.into(),
-                    relative: path.into(),
-                },
-                offset,
-                limit,
-            )
-            .map(|chunk| (chunk.bytes, chunk.eof))
-            .map_err(|error| format!("read failed: {error:?}"))
-        });
+        let result = read_with_media(
+            &arguments,
+            |root, path, offset, limit| {
+                read_range(
+                    &FilePath {
+                        root: root.into(),
+                        relative: path.into(),
+                    },
+                    offset,
+                    limit,
+                )
+                .map(|chunk| (chunk.bytes, chunk.eof))
+                .map_err(|error| format!("read failed: {error:?}"))
+            },
+            |name, bytes| emit_image(name, bytes),
+        );
         match result {
             Ok(text) => Output {
                 text,
@@ -111,103 +119,55 @@ fn normalize_path(arguments: &str, default: Option<&str>) -> Result<String, Stri
     Ok(arguments.to_string())
 }
 
-/// runs the tool against a bounded range service; native tests use an in-memory service.
-pub fn read_with(
+/// detects images in guest code and emits existing bytes, never a host-selected file path.
+pub fn read_with_media(
     arguments: &str,
     mut read: impl FnMut(&str, &str, u64, u32) -> Result<(Vec<u8>, bool), String>,
+    mut emit: impl FnMut(&str, &[u8]) -> Result<ImageInfo, String>,
 ) -> Result<String, String> {
     let args: Arguments =
         serde_json::from_str(arguments).map_err(|error| format!("invalid arguments: {error}"))?;
     if args.offset == 0 || args.limit == 0 {
         return Err("offset and limit must be positive integers".into());
     }
-    // No line numbers: exact text remains suitable for an edit operation (D51).
-    let last = args.offset.saturating_add(args.limit.min(PAGE_LINES) - 1);
-    let mut line = 1u64;
-    let mut offset = 0u64;
-    let mut output = Vec::new();
-    let mut clipped = false;
-    let mut line_start = true;
-    loop {
-        if offset >= SCAN_BYTES {
-            return Err("read would scan more than 1 MiB; request a nearer line offset or use a byte-range tool".into());
-        }
-        let (bytes, eof) = read(&args.root, &args.path, offset, CHUNK_BYTES)?;
-        if bytes.len() > CHUNK_BYTES as usize || (bytes.is_empty() && !eof) {
-            return Err("invalid reply from range service".into());
-        }
-        offset += bytes.len() as u64;
-        for segment in bytes.split_inclusive(|byte| *byte == b'\n') {
-            if line > last {
-                return finish(output, args.offset, line - 1, true, clipped);
-            }
-            if line >= args.offset {
-                let room = PAGE_BYTES.saturating_sub(output.len());
-                if room == 0 && line_start {
-                    return finish(output, args.offset, line - 1, true, false);
-                }
-                output.extend_from_slice(&segment[..segment.len().min(room)]);
-                if segment.len() > room {
-                    clipped = true;
-                }
-                if clipped {
-                    // The current oversized line is deliberately truncated, like native read.
-                    return finish(output, args.offset, line, true, true);
-                }
-            }
-            if segment.ends_with(b"\n") {
-                line += 1;
-                line_start = true;
-            } else {
-                line_start = false;
-            }
-        }
-        if eof {
-            if output.is_empty() {
-                return Ok(if offset == 0 {
-                    "the file is empty".into()
-                } else {
-                    format!("offset {} is past the end of the file", args.offset)
-                });
-            }
-            return finish(output, args.offset, line, false, clipped);
-        }
+    let (mut bytes, mut eof) = read(&args.root, &args.path, 0, CHUNK_BYTES)?;
+    if bytes.len() > CHUNK_BYTES as usize || (bytes.is_empty() && !eof) {
+        return Err("invalid reply from range service".into());
     }
-}
-
-fn finish(
-    mut bytes: Vec<u8>,
-    first: u64,
-    last: u64,
-    more: bool,
-    clipped: bool,
-) -> Result<String, String> {
-    if bytes.contains(&0) {
-        return Err("file contains NUL bytes; this tool reads text only".into());
-    }
-    // A byte cap can split one UTF-8 scalar. Remove only that incomplete suffix, never invalid data.
-    let text = loop {
-        match String::from_utf8(bytes) {
-            Ok(text) => break text,
-            Err(error) if clipped && error.utf8_error().error_len().is_none() => {
-                let end = error.utf8_error().valid_up_to();
-                bytes = error.into_bytes();
-                bytes.truncate(end);
+    let image = bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || bytes.starts_with(&[255, 216, 255])
+        || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"));
+    if image {
+        while !eof {
+            let want = (MAX_IMAGE_BYTES - bytes.len()).min(65536) as u32;
+            if want == 0 {
+                return Err("image is over the 5120 KiB limit".into());
             }
-            Err(_) => return Err("file page is not UTF-8".into()),
+            let (chunk, end) = read(&args.root, &args.path, bytes.len() as u64, want)?;
+            if chunk.len() > want as usize || (chunk.is_empty() && !end) {
+                return Err("invalid reply from range service".into());
+            }
+            bytes.extend_from_slice(&chunk);
+            eof = end;
         }
-    };
-    let mut text = text;
-    if clipped {
-        text.push_str("\n\n[page byte limit reached; the final line may be truncated]");
-    }
-    if more {
-        text.push_str(&format!(
-            "\n\n[showing lines {first}-{last}; call read again with offset={} for more]",
-            last.saturating_add(1)
+        let name = args.path.rsplit('/').next().unwrap_or("image");
+        let info = emit(name, &bytes)?;
+        return Ok(format!(
+            "{} is an image: {}×{}, {}",
+            args.path, info.width, info.height, info.media_type
         ));
     }
-    Ok(text)
+    let mut initial = Some((bytes, eof));
+    read_with(arguments, |root, path, offset, limit| {
+        if offset == 0
+            && let Some(initial) = initial.take()
+        {
+            return Ok(initial);
+        }
+        read(root, path, offset, limit)
+    })
 }
 
 #[cfg(test)]
@@ -257,7 +217,7 @@ mod tests {
                 r#"{"path":"file","offset":15000,"limit":1}"#
             )
             .unwrap()
-            .starts_with("hello\n\n\n[showing")
+            .starts_with("hello\n\n[showing")
         );
     }
 
@@ -265,12 +225,12 @@ mod tests {
     fn bounds_binary_errors_empty_files_and_invalid_arguments() {
         let text = page("é".repeat(PAGE_BYTES).as_bytes(), r#"{"path":"file"}"#).unwrap();
         assert!(text.len() < 64 * 1024);
-        assert!(text.contains("truncated"));
+        assert!(text.contains("bytes; the first"));
         assert!(page(b"\xff", r#"{"path":"file"}"#).is_err());
         assert!(page(b"a\0b", r#"{"path":"file"}"#).is_err());
         assert_eq!(
             page(b"", r#"{"path":"file"}"#).unwrap(),
-            "the file is empty"
+            "\n\nthe file is empty"
         );
         for args in [
             r#"{"path":"file","limit":0}"#,
@@ -302,11 +262,11 @@ mod tests {
             &vec![b'x'; SCAN_BYTES as usize + 1],
             r#"{"path":"file","offset":2}"#,
         );
-        assert!(out.unwrap_err().contains("scan more than 1 MiB"));
+        assert!(out.unwrap_err().contains("scan more than 64 MiB"));
         assert!(read_with(r#"{"path":"file"}"#, |_, _, _, _| Ok((Vec::new(), false))).is_err());
         assert!(
             read_with(r#"{"path":"file"}"#, |_, _, _, _| Ok((
-                vec![b'x'; CHUNK_BYTES as usize + 1],
+                vec![b'x'; 65537],
                 true
             )))
             .is_err()
@@ -316,5 +276,48 @@ mod tests {
             Err("denied by host".into())
         });
         assert_eq!(out.unwrap_err(), "denied by host");
+    }
+
+    #[test]
+    fn images_are_detected_from_bytes_and_assembled_through_bounded_ranges() {
+        let mut data = b"\x89PNG\r\n\x1a\n".to_vec();
+        data.resize(100_000, 0);
+        let mut emitted = 0;
+        let text = read_with_media(
+            r#"{"path":"misnamed.txt"}"#,
+            |_, _, offset, limit| {
+                let start = offset as usize;
+                let end = (start + limit as usize).min(data.len());
+                Ok((data[start..end].to_vec(), end == data.len()))
+            },
+            |name, bytes| {
+                assert_eq!(name, "misnamed.txt");
+                assert_eq!(bytes, data);
+                emitted += 1;
+                Ok(ImageInfo {
+                    media_type: "image/png".into(),
+                    width: 1,
+                    height: 2,
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(emitted, 1);
+        assert!(text.contains("1×2, image/png"));
+        assert!(
+            read_with_media(
+                r#"{"path":"file"}"#,
+                |_, _, offset, limit| {
+                    let mut bytes = vec![0; limit as usize];
+                    if offset == 0 {
+                        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+                    }
+                    Ok((bytes, false))
+                },
+                |_, _| panic!("oversized images must not be emitted")
+            )
+            .unwrap_err()
+            .contains("5120 KiB")
+        );
     }
 }

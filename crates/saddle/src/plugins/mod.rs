@@ -285,8 +285,13 @@ impl Registry {
         let open = format!("<plugin-output-{}", self.nonce);
         let close = format!("</plugin-output-{}", self.nonce);
         let clean: String = text
-            .chars()
-            .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+            .char_indices()
+            .filter(|(i, c)| {
+                !c.is_control()
+                    || matches!(c, '\n' | '\t')
+                    || (*c == '\r' && text.as_bytes().get(i + 1) == Some(&b'\n'))
+            })
+            .map(|(_, c)| c)
             .collect();
         // A separator, not deletion: deleting a nested prefix could join two fragments into a
         // fresh closing delimiter after the replacement pass (D25).
@@ -360,11 +365,14 @@ impl Registry {
             &call,
         )?;
         let mut output = match result {
-            Ok(Reply::Output(output)) => {
+            Ok(Reply::Output { output, images }) => {
                 if output.is_error {
                     ToolOutput::err(output.text)
                 } else {
-                    ToolOutput::ok(output.text)
+                    ToolOutput {
+                        images,
+                        ..ToolOutput::ok(output.text)
+                    }
                 }
             }
             Ok(_) => ToolOutput::err("plugin returned the wrong invocation response"),
@@ -459,6 +467,8 @@ mod tests {
         assert_eq!(wrapped.matches("</plugin-output-abc").count(), 1);
         assert!(!wrapped.contains('\x1b'));
         assert!(wrapped.starts_with("<plugin-output-abc plugin=\"reader\">"));
+        let wrapped = registry.wrap(&id, "line\r\nnext\rreplacement");
+        assert!(wrapped.contains("line\r\nnextreplacement"));
     }
 
     #[test]

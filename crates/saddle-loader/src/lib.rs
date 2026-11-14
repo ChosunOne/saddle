@@ -18,6 +18,7 @@ use saddle_wit::saddle::host::fs_list::{self, Host as ListHost, Page as Director
 use saddle_wit::saddle::host::fs_paths::{self, Host as PathsHost};
 use saddle_wit::saddle::host::fs_read::{self, Failure, Host, Path};
 use saddle_wit::saddle::host::fs_read_range::{self, Chunk, Host as RangeHost};
+use saddle_wit::saddle::host::tool_result::{self, Host as ResultHost, ImageInfo};
 use sha2::{Digest, Sha256};
 use wasmtime::component::types::{Component as ComponentType, ComponentItem};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
@@ -27,6 +28,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 /// native I/O must enforce this cap before allocating or reading the entire source.
 pub const MAX_FILE_BYTES: usize = 64 * 1024;
 pub const MAX_DIRECTORY_ENTRIES: usize = 128;
+pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_COMPONENT_BYTES: usize = 4 * 1024 * 1024;
 const TICK: Duration = Duration::from_millis(10);
 
@@ -67,7 +69,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             memory_bytes: 16 * 1024 * 1024,
-            fuel: 10_000_000,
+            fuel: 100_000_000,
             timeout: Duration::from_secs(2),
             input_bytes: 64 * 1024,
             output_bytes: 64 * 1024,
@@ -108,6 +110,14 @@ impl Invocation {
 /// root-relative paths and symlinks, and bound/cancel I/O independently of Wasm's epoch deadline.
 /// `Err` is a host failure (including audit failure), not a guest-visible policy denial.
 pub trait HostServices: Send + 'static {
+    fn emit_image(
+        &mut self,
+        _call: &Invocation,
+        _name: String,
+        _bytes: Vec<u8>,
+    ) -> anyhow::Result<Result<ImageInfo, String>> {
+        Ok(Err("host does not implement image results".into()))
+    }
     fn read_file(
         &mut self,
         call: &Invocation,
@@ -156,6 +166,7 @@ struct State<H> {
     limits: StoreLimits,
     wasi: WasiCtx,
     resources: ResourceTable,
+    emitted_images: usize,
 }
 
 impl<H: HostServices> WasiView for State<H> {
@@ -226,6 +237,29 @@ impl<H: HostServices> ListHost for State<H> {
         if matches!(&result, Ok(page) if page.entries.len() > MAX_DIRECTORY_ENTRIES || page.entries.len() as u64 > u64::from(limit) || page.entries.iter().map(|entry| entry.name.len()).sum::<usize>() > MAX_FILE_BYTES)
         {
             return Ok(Err(Failure::TooLarge));
+        }
+        Ok(result)
+    }
+}
+
+impl<H: HostServices> ResultHost for State<H> {
+    fn emit_image(
+        &mut self,
+        name: String,
+        bytes: Vec<u8>,
+    ) -> anyhow::Result<Result<ImageInfo, String>> {
+        if self.call.cancelled() || Instant::now() >= self.call.deadline {
+            return Err(anyhow!("plugin call cancelled or timed out"));
+        }
+        if name.len() > 256 || bytes.len() > MAX_IMAGE_BYTES || self.emitted_images != 0 {
+            return Ok(Err("image result exceeds name, byte or count limit".into()));
+        }
+        let result = self.host.emit_image(&self.call, name, bytes)?;
+        if let Ok(info) = &result {
+            if info.media_type.len() > 64 {
+                return Ok(Err("invalid image metadata".into()));
+            }
+            self.emitted_images += 1;
         }
         Ok(result)
     }
@@ -333,6 +367,7 @@ impl Loader {
                     | "saddle:host/fs-read-range@0.1.0"
                     | "saddle:host/fs-paths@0.1.0"
                     | "saddle:host/fs-list@0.1.0"
+                    | "saddle:host/tool-result@0.1.0"
             ) && !ambient::supports(name)
             {
                 return Err(Error::Refused(format!(
@@ -351,6 +386,10 @@ impl Loader {
                 .map_err(runtime("linking fs-paths"))?;
             fs_list::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
                 .map_err(runtime("linking fs-list"))?;
+        }
+        if scopes.contains(&Scope::Tool) {
+            tool_result::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+                .map_err(runtime("linking tool-result"))?;
         }
         check_tool_types(engine, &ty)?;
         let pre = linker
@@ -480,6 +519,7 @@ impl<H: HostServices> Prepared<H> {
                 table.set_max_capacity(128);
                 table
             },
+            emitted_images: 0,
         };
         let mut store = Store::new(&self.runtime.engine, state);
         store.limiter(|state| &mut state.limits);
@@ -553,6 +593,7 @@ mod tests {
     use std::io::Read;
     use std::path::PathBuf;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     use cap_std::fs::Dir;
     use saddle_cap::{Location, PluginId, Policy, RelPath, RootName, Roots};
@@ -567,6 +608,71 @@ mod tests {
 
     const READER: &str = include_str!("fixtures/read-tool.wat");
     const GRANTS: &str = "[agent]\nfs-read=[{root='workspace',exclude=['.env*']}]\n[plugin.reader]\ntool={}\nfs-read=[{root='workspace',exclude=['private']}]\n";
+
+    struct ImageHost(Arc<AtomicUsize>);
+    impl HostServices for ImageHost {
+        fn read_file(
+            &mut self,
+            _: &Invocation,
+            _: Path,
+        ) -> anyhow::Result<Result<Vec<u8>, Failure>> {
+            Ok(Err(Failure::Denied("unused".into())))
+        }
+        fn emit_image(
+            &mut self,
+            _: &Invocation,
+            _: String,
+            _: Vec<u8>,
+        ) -> anyhow::Result<Result<ImageInfo, String>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Ok(ImageInfo {
+                media_type: "image/png".into(),
+                width: 1,
+                height: 1,
+            }))
+        }
+    }
+
+    #[test]
+    fn image_adapter_limits_bytes_names_and_count_before_calling_the_host() {
+        let (_dir, agent, plugin) = grants(GRANTS);
+        let prepared = Loader::new()
+            .unwrap()
+            .prepare::<ImageHost>(
+                &manifest(),
+                &agent,
+                &plugin,
+                &wat::parse_str(READER).unwrap(),
+                Limits::default(),
+            )
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut store = prepared
+            .store(ImageHost(calls.clone()), cancelled())
+            .unwrap();
+        assert!(
+            ResultHost::emit_image(store.data_mut(), "x".into(), vec![0; MAX_IMAGE_BYTES + 1])
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            ResultHost::emit_image(store.data_mut(), "x".repeat(257), Vec::new())
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(
+            ResultHost::emit_image(store.data_mut(), "x".into(), Vec::new())
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            ResultHost::emit_image(store.data_mut(), "x".into(), Vec::new())
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
 
     struct NoHost;
     impl HostServices for NoHost {

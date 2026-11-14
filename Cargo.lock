@@ -2467,6 +2467,7 @@ dependencies = [
  "saddle-loader",
  "saddle-policy",
  "saddle-sandbox",
+ "saddle-tools",
  "saddle-wit",
  "serde",
  "serde_json",
@@ -2561,6 +2562,7 @@ name = "saddle-tools"
 version = "0.0.1"
 dependencies = [
  "globset",
+ "memchr",
  "regex",
  "saddle-ignore",
  "saddle-sdk",

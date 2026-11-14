@@ -2991,6 +2991,32 @@ oversized searched files are skipped. The guest identifies direct readable file 
 unreadable explicit file targets may still report a directory error, a documented parity gap.
 Workspace paths are shown relatively and other roots as `root:relative`, not guessed host base paths.
 
+**D134.** Plugin tools can emit one bounded image during invocation through the additive
+`saddle:host/tool-result@0.1.0` import, requiring their explicit `tool` grant. This is result data,
+not filesystem authority: bytes must already be in guest memory, and no supplied name is opened.
+The core validates bytes using D58's PNG/JPEG/GIF/WebP detection and 5 MiB image limit, strips
+terminal controls from names, prefixes the host-assigned principal and attaches images through the
+existing provider/store/UI result path. Metadata comes from bytes, never guest MIME/dimensions.
+Description-time emission is refused; failed/trapped/cancelled invocations publish no images.
+Image emission is audited with call identity, byte count and digest, never raw/base64 image data.
+The existing text-output limit remains separate, and existing compiled tool exports are unchanged.
+
+**D135.** The standard reader implements D51 pagination as a bounded-memory streaming scan, not a
+1 MiB prefix-only reader. It counts the complete file, validates UTF-8 across chunk boundaries,
+selects up to 2,000 lines/50 KiB, preserves full-file bytes and final newlines where D51 does, and
+reports total lines and the exact next line. Long first lines have byte-length/truncation notes;
+later lines that do not fit are deferred to the next page rather than silently partially consumed.
+CRLF pairs survive D25's result sanitization; standalone carriage returns and other terminal
+controls remain removed. Empty leading lines are preserved in partial pages too.
+Native pagination receives the same empty-line join fix, and only returns original full-file bytes
+when those raw bytes fit the page cap; CRLF normalization must not hide an oversized raw return.
+
+Scans request at most 64 KiB per host read and retain only bounded page/line/validation buffers,
+with an explicit 64 MiB scan ceiling. Runtime defaults increase to 100 million fuel units to permit
+streaming scans and image assembly; the independent two-second deadline and memory/output limits
+are unchanged and may stop work earlier. This remains a bounded alternative to native read's
+whole-file allocation, not a promise to scan unlimited files or stalled filesystems.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

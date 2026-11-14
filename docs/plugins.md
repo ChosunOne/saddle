@@ -116,11 +116,13 @@ explicitly granted true root. With `root`, `path` is root-relative. `offset` is 
 Pages have at most 2,000 lines and 50 KiB of text plus a bounded continuation/truncation note. Plain
 text, CRLF and trailing newlines are preserved, without line-number prefixes that could interfere
 with exact edits. Oversized lines may be truncated; continuation advances past the truncated line.
-Only selected page bytes are UTF-8 validated. Binary/NUL-containing pages are refused.
+UTF-8 validation covers the entire scan, including characters split across range boundaries.
+Binary/NUL-containing files are refused.
 
-Each invocation scans at most 1 MiB from the beginning, using 8 KiB ranges and bounded guest memory.
+Each invocation scans at most 64 MiB from the beginning, using ranges up to 64 KiB and bounded guest memory.
 The normal fuel/deadline still applies and may stop it earlier. Release builds are recommended;
-debug guest code can consume substantially more fuel. A very distant line offset is refused rather
+debug guest code can consume substantially more fuel. Total line counts and native-style continuation
+notes are reported, including for offsets beyond 1 MiB. A scan exceeding the bound is refused rather
 than reading indefinitely. Ranges are individually authorized, reopened and audited with offset,
 limit and call identity; they are not a snapshot if the file changes concurrently.
 
@@ -130,8 +132,16 @@ flag. Each range is limited to 1–65,536 bytes; the host may read one extra byt
 SDK hosts other than Saddle must implement `HostServices::read_range` to support it; its default
 returns an unsupported-operation error. Existing compiled reader components remain compatible.
 
-This is an incremental migration, not a replacement of built-in `read` yet. Images,
-shared tool-visible directories and a person-controlled tool-selection/default
+PNG, JPEG, GIF and WebP files are detected from bytes, assembled from bounded ranges (at most
+5 MiB), and attached as real image results through the existing provider/UI/store pipeline. The
+extension is not trusted. The additive `tool-result.emit-image` service validates media type and
+dimensions with the same header-based detection as native read; it does not open the supplied name
+or perform image decoding/recompression. Only one image per invocation is accepted. Failed/trapped
+calls publish no images, and saved image data/provenance survives replay. The 64 KiB text result
+limit is not enlarged to accommodate image bytes.
+
+This is an incremental migration, not a replacement of built-in `read` yet. Shared tool-visible
+directories and a person-controlled tool-selection/default
 grant story still need parity work. Standard plugins are not silently enabled or given the agent's
 authority merely because their source ships in the repository.
 
@@ -228,7 +238,7 @@ No standard component is silently aliased over a built-in or given implicit gran
 
 | Tool | Guest implementation | Remaining parity/adapters |
 | --- | --- | --- |
-| `read` | text pagination and bounded range reads | images, deep-offset cursors, managed tool paths |
+| `read` | native-style text pagination/totals, deep offsets, bounded range reads and image results | managed tool paths, scans beyond resource bounds, standard-tool selection |
 | `ls` | filtered directory pages, suffixes, sorted output | managed tool paths; bounded/non-UTF-8 listing differences |
 | `find`, `grep` | guest traversal, shared ignore syntax, glob/regex matching | large-tree/performance edges, host-path display and unreadable-file metadata |
 | `write`, `edit`, `patch` | not migrated | scoped mutation/atomic transaction services, reserved paths, preflight all patch paths |
@@ -281,9 +291,9 @@ accepts every schema.
 Manifests are capped at 16 KiB and component artifacts at 4 MiB. Artifact paths must stay under
 the protected plugin directory without symlinks; manifest identity and the configured digest must match.
 
-Defaults per invocation are 10 million fuel units, a two-second deadline, 16 MiB per linear memory
+Defaults per invocation are 100 million fuel units, a two-second deadline, 16 MiB per linear memory
 (at most four), 10,000 elements per table (at most eight), at most 32 core instances, and 64 KiB
-input/output/file-read limits. Initialization and `describe` share these bounds. The epoch clock
+input/output/file-read limits. Image emission has a separate one-image/5 MiB cap. Initialization and `describe` share the execution bounds. The epoch clock
 runs every 10 ms while any prepared plugin needs it.
 
 WASI starts with empty environment/arguments, no working directory or preopened descriptors, closed

@@ -917,6 +917,95 @@ fn plugin_results_have_host_provenance_saved_and_replayed_without_rewrapping() {
 }
 
 #[test]
+fn plugin_images_are_validated_delivered_saved_and_discarded_on_traps() {
+    for fail_after in [false, true] {
+        let (base, seen) = serve(vec![
+            sse_response(&openai_sse(
+                "",
+                &[("picture", "plugin__reader__reader", json!({}))],
+            )),
+            sse_response(&openai_sse("done", &[])),
+        ]);
+        let env = Env::new(Api::Openai, &base);
+        plugin_fixture::configure(
+            &env.xdg.path().join("config/saddle/config.toml"),
+            &plugin_fixture::image_emitter(&plugin_fixture::png(), fail_after),
+            "tool={}",
+        );
+        let out = env.saddle(&["run", "--json", "show the picture"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let seen = seen.lock().unwrap();
+        let mut sent = String::new();
+        strings(&seen[1].body, &mut sent);
+        assert_eq!(
+            sent.contains("data:image/png;base64,"),
+            !fail_after,
+            "{sent}"
+        );
+        let connection = Connection::open(env.xdg.path().join("state/saddle/sessions.db")).unwrap();
+        let mut query = connection
+            .prepare("SELECT body FROM nodes WHERE kind='item' ORDER BY id")
+            .unwrap();
+        let saved = query
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|row| serde_json::from_str::<Value>(&row.unwrap()).unwrap())
+            .find_map(|item| item.get("tool-results").and_then(|r| r.get(0)).cloned())
+            .unwrap();
+        assert_eq!(
+            saved["images"].as_array().map_or(0, Vec::len),
+            usize::from(!fail_after)
+        );
+        assert_eq!(saved["provenance"]["principal"], "plugin.reader");
+        if !fail_after {
+            assert_eq!(saved["images"][0]["width"], 1);
+            assert_eq!(saved["images"][0]["media_type"], "image/png");
+            assert!(
+                saved["images"][0]["name"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("plugin.reader:")
+            );
+        }
+        let audit = fs::read_to_string(env.audit_log()).unwrap();
+        assert!(audit.contains("emit-image"));
+        assert!(!audit.contains("iVBORw0KGgo"));
+    }
+}
+
+#[test]
+#[ignore = "build the standard read component first; see docs/plugins.md"]
+fn standard_read_plugin_sends_file_images_to_the_model() {
+    let (base, seen) = serve(vec![
+        sse_response(&openai_sse(
+            "",
+            &[(
+                "picture",
+                "plugin__reader__read",
+                json!({"path":"photo.txt"}),
+            )],
+        )),
+        sse_response(&openai_sse("seen", &[])),
+    ]);
+    let env = Env::new(Api::Openai, &base);
+    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/read-plugin/read.component.wasm");
+    plugin_fixture::configure(
+        &env.xdg.path().join("config/saddle/config.toml"),
+        &fs::read(component).unwrap(),
+        plugin_fixture::GRANTS,
+    );
+    fs::write(env.ws.path().join("photo.txt"), plugin_fixture::png()).unwrap();
+    let out = env.saddle(&["run", "show the picture"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let seen = seen.lock().unwrap();
+    let mut sent = String::new();
+    strings(&seen[1].body, &mut sent);
+    assert!(sent.contains("data:image/png;base64,"), "{sent}");
+    assert!(sent.contains("1×1, image/png"));
+}
+
+#[test]
 fn failed_plugins_are_not_advertised_and_do_not_remove_native_tools() {
     let (base, seen) = serve(vec![sse_response(&openai_sse("ok", &[]))]);
     let env = Env::new(Api::Openai, &base);

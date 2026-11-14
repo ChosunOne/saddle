@@ -302,6 +302,22 @@ fn special_and_oversized_files_fail_without_unbounded_reads() {
 }
 
 #[test]
+fn image_results_need_no_filesystem_authority_and_reject_invalid_bytes() {
+    let env = Env::new(&fixture::image_emitter(&fixture::png(), false), "tool={}");
+    let out = call(&env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("image/png"));
+    assert!(
+        env.records()
+            .iter()
+            .any(|r| r["args"]["operation"] == "emit-image" && r["principal"] == "plugin.reader")
+    );
+    no_file_reads(&env);
+    let env = Env::new(&fixture::image_emitter(b"not an image", false), "tool={}");
+    assert_eq!(call(&env).status.code(), Some(1));
+}
+
+#[test]
 fn metadata_services_use_plugin_grants_and_do_not_borrow_native_tool_path_authority() {
     let env = Env::new(&fixture::directory_reader(".", "", 1), fixture::GRANTS);
     fs::write(env.ws().join(".env"), "parent secret").unwrap();
@@ -414,11 +430,8 @@ fn standard_read_component_paginates_large_files_through_the_production_host() {
         .filter(|row| row["scope"] == "fs-read" && row["args"]["offset"].is_u64())
         .collect();
     assert!(reads.len() > 1);
-    assert!(
-        reads
-            .iter()
-            .all(|row| row["principal"] == "plugin.reader" && row["args"]["limit"] == 8192)
-    );
+    assert!(reads.iter().all(|row| row["principal"] == "plugin.reader"
+        && matches!(row["args"]["limit"].as_u64(), Some(8192 | 65536))));
     assert!(
         reads
             .iter()
@@ -446,6 +459,26 @@ fn standard_read_component_paginates_large_files_through_the_production_host() {
     let out = env.run(&["plugin", "call", "reader", &absolute]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("offset=3"));
+    fs::write(env.ws().join("deep"), "deep line\n".repeat(180_000)).unwrap();
+    let out = env.run(&[
+        "plugin",
+        "call",
+        "reader",
+        r#"{"path":"deep","offset":170000,"limit":2}"#,
+    ]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("lines 170000-170001 of 180000"));
+    let mut image = fixture::png();
+    image.resize(100_000, 0);
+    fs::write(env.ws().join("misnamed.txt"), image).unwrap();
+    let out = env.run(&["plugin", "call", "reader", r#"{"path":"misnamed.txt"}"#]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("1×1, image/png"));
+    assert!(
+        env.records()
+            .iter()
+            .any(|row| row["args"]["operation"] == "emit-image")
+    );
 }
 
 #[test]

@@ -21,6 +21,7 @@ saddle-sandbox = { path = "crates/saddle-sandbox" }
 saddle-wit = { path = "crates/saddle-wit" }
 saddle-loader = { path = "crates/saddle-loader" }
 saddle-sdk = { path = "crates/saddle-sdk" }
+saddle-tools = { path = "crates/saddle-tools" }
 saddle-ignore = { path = "crates/saddle-ignore" }
 
 # D14, D127: one deliberately pinned runtime line; 36 supports the workspace's Rust 1.88 MSRV.
@@ -64,5 +65,6 @@ unicode-width = "0.2"
 toml_edit = "0.25"
 similar = "3"
 regex = "1"
+memchr = "2"
 # The session store (D53). Bundled, so no system SQLite is required to build or run.
 rusqlite = { version = "0.41", features = ["bundled", "hooks", "limits"] }

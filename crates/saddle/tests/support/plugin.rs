@@ -3,6 +3,9 @@
 use std::fs;
 use std::path::Path;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+
 use saddle_policy::audit::sha256_hex;
 
 const READER: &str = include_str!("../../../saddle-loader/src/fixtures/read-tool.wat");
@@ -85,6 +88,25 @@ pub fn path_resolver(path: &str) -> Vec<u8> {
         .replace("i32.const 256 i32.const 9 ", "")
         .replace("i32.const 36 i32.load", "i32.const 44 i32.load")
         .replace("i32.const 40 i32.load", "i32.const 48 i32.load");
+    wat::parse_str(source).unwrap()
+}
+
+pub fn png() -> Vec<u8> {
+    STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lXkAAAAASUVORK5CYII=").unwrap()
+}
+
+pub fn image_emitter(data: &[u8], fail_after: bool) -> Vec<u8> {
+    let escaped: String = data.iter().map(|byte| format!("\\{byte:02x}")).collect();
+    let mut source = reader_source("workspace", "dummy")
+        .replace("fs-read@0.1.0", "tool-result@0.1.0")
+        .replace("\"read-file\"", "\"emit-image\"")
+        .replace("(type $result (result (list u8) (error $failure)))", "(type $info-type (record (field \"media-type\" string) (field \"width\" u32) (field \"height\" u32))) (export \"image-info\" (type $info (eq $info-type))) (type $result (result $info (error string)))")
+        .replace("(func (param \"path\" $path) (result $result))", "(func (param \"name\" string) (param \"bytes\" (list u8)) (result $result))")
+        .replace("(data (i32.const 300) \"dummy\")", &format!("(data (i32.const 300) \"{escaped}\")"))
+        .replace("i32.const 300 i32.const 5", &format!("i32.const 300 i32.const {}", data.len()));
+    if fail_after {
+        source = source.replace("i32.const 64)", "unreachable i32.const 64)");
+    }
     wat::parse_str(source).unwrap()
 }
 

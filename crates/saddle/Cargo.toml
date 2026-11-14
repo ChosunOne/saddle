@@ -42,6 +42,7 @@ syntect.workspace = true
 two-face.workspace = true
 
 [dev-dependencies]
+saddle-tools.workspace = true
 wat.workspace = true
 tempfile.workspace = true
 # The end-to-end tests read the session store directly to check what was saved (D53).

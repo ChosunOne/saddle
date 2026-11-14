@@ -91,6 +91,7 @@ pub fn classify(direction: Direction, name: &str) -> Requirement {
         (Import, "saddle", "host", i) => match i {
             "exec" => scope(Scope::Exec),
             "fs-read" | "fs-read-range" | "fs-paths" | "fs-list" => scope(Scope::FsRead),
+            "tool-result" => scope(Scope::Tool),
             "fs-write" => scope(Scope::FsWrite),
             "transcript-read" => scope(Scope::TranscriptRead),
             "context-contribute" => scope(Scope::ContextContribute),

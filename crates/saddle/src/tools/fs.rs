@@ -121,7 +121,7 @@ fn page(text: &str, offset: Option<u64>, limit: Option<u64>) -> (String, Option<
             cut_short = true;
             break;
         }
-        if !out.is_empty() {
+        if last != first - 1 {
             out.push('\n');
         }
         out.push_str(line);
@@ -154,7 +154,7 @@ fn page(text: &str, offset: Option<u64>, limit: Option<u64>) -> (String, Option<
     // A file that fits on one page is returned exactly as it is on disk. Splitting it into lines
     // would drop a trailing newline, and `edit` matches text exactly, so a file would be read
     // without the newline it ends with and then never match (D51).
-    if note.is_none() && first == 1 && !truncated {
+    if note.is_none() && first == 1 && !truncated && text.len() <= MAX_READ_BYTES {
         return (text.to_owned(), None);
     }
     // A page that ends with the file keeps the newline the file ends with, for the same reason.
@@ -471,6 +471,45 @@ fn write_beneath(session: &Session, loc: &Location, bytes: &[u8]) -> io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use saddle_tools::read_with as plugin_read;
+    use serde_json::json;
+
+    #[test]
+    fn guest_streaming_pages_match_native_pages_including_deep_offsets_and_boundaries() {
+        let cases = [
+            String::new(),
+            "one\ntwo\n".into(),
+            "\n\nlast\n".into(),
+            "αβ\r\nlast\r\n".into(),
+            format!("{}é\r\nlast\n", "x".repeat(65535)),
+            format!("{}\r\n", "x".repeat(24)).repeat(2000),
+            "é".repeat(MAX_READ_BYTES),
+            format!("{}\nlast\n", "a".repeat(MAX_READ_BYTES - 1)),
+            "hello\n".repeat(220_000),
+        ];
+        for text in &cases {
+            for (offset, limit) in [(1, 2000), (1, 1), (2, 2), (2001, 2000), (210_000, 3)] {
+                let (body, note) = page(text, Some(offset), Some(limit));
+                let expected =
+                    note.map_or_else(|| body.clone(), |note| format!("{body}\n\n{note}"));
+                let result = plugin_read(
+                    &json!({"path":"file","offset":offset,"limit":limit}).to_string(),
+                    |_, _, offset, limit| {
+                        let first = (offset as usize).min(text.len());
+                        let last = (first + limit as usize).min(text.len());
+                        Ok((text.as_bytes()[first..last].to_vec(), last == text.len()))
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    result,
+                    expected,
+                    "offset={offset} limit={limit} bytes={}",
+                    text.len()
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_small_file_is_one_page_and_is_returned_exactly_as_it_is_on_disk() {

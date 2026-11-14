@@ -3,6 +3,8 @@
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::io::{Read, Seek, SeekFrom};
+use std::mem;
+use std::path::Path as NativePath;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
@@ -18,9 +20,11 @@ use saddle_wit::exports::saddle::plugin::tool::{Definition, Output};
 use saddle_wit::saddle::host::fs_list::Page as DirectoryPage;
 use saddle_wit::saddle::host::fs_read::{Failure, Path};
 use saddle_wit::saddle::host::fs_read_range::Chunk;
+use saddle_wit::saddle::host::tool_result::ImageInfo;
 use serde_json::json;
 
 use super::filesystem;
+use crate::provider::Image;
 use crate::session::Session;
 use crate::tools::fs::resolve_beneath;
 use crate::{cancel, fs_access};
@@ -31,7 +35,7 @@ pub enum Job {
 }
 pub enum Reply {
     Description(Definition),
-    Output(Output),
+    Output { output: Output, images: Vec<Image> },
 }
 
 /// audit and host failures stop the session; they are never downgraded to a broken extension.
@@ -48,7 +52,7 @@ impl StdError for Fatal {
     }
 }
 
-type HostReply<T> = Result<Result<T, Failure>, String>;
+type HostReply<T, E = Failure> = Result<Result<T, E>, String>;
 type FileReply = HostReply<Chunk>;
 enum Event {
     Read {
@@ -72,6 +76,13 @@ enum Event {
         limit: u32,
         answer: SyncSender<HostReply<DirectoryPage>>,
     },
+    Image {
+        who: Principal,
+        deadline: Instant,
+        name: String,
+        bytes: Vec<u8>,
+        answer: SyncSender<HostReply<ImageInfo, String>>,
+    },
     Finished(Result<Reply, String>),
 }
 
@@ -79,6 +90,27 @@ pub struct Host {
     events: SyncSender<Event>,
 }
 impl HostServices for Host {
+    fn emit_image(
+        &mut self,
+        call: &Invocation,
+        name: String,
+        bytes: Vec<u8>,
+    ) -> Result<Result<ImageInfo, String>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        self.events
+            .send(Event::Image {
+                who: call.principal().clone(),
+                deadline: call.deadline(),
+                name,
+                bytes,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        result
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(|_| anyhow!("plugin image request timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
     fn resolve_path(&mut self, call: &Invocation, value: String) -> Result<Result<Path, Failure>> {
         let (answer, result) = mpsc::sync_channel(1);
         self.events
@@ -164,6 +196,8 @@ pub fn execute(
     job: Job,
     call: &str,
 ) -> Result<Result<Reply, String>> {
+    let invoking = matches!(job, Job::Invoke(_));
+    let mut images = Vec::new();
     let (events, pending) = mpsc::sync_channel(1);
     let host = Host {
         events: events.clone(),
@@ -176,7 +210,12 @@ pub fn execute(
             let result = match job {
                 Job::Describe => prepared.describe(host, flag).map(Reply::Description),
                 Job::Invoke(arguments) => {
-                    prepared.invoke(host, &arguments, flag).map(Reply::Output)
+                    prepared
+                        .invoke(host, &arguments, flag)
+                        .map(|output| Reply::Output {
+                            output,
+                            images: Vec::new(),
+                        })
                 }
             }
             .map_err(|e| e.to_string());
@@ -231,7 +270,37 @@ pub fn execute(
                     &cancelled,
                 );
             }
-            Ok(Event::Finished(result)) => break result,
+            Ok(Event::Image {
+                who,
+                deadline,
+                name,
+                bytes,
+                answer,
+            }) => {
+                respond(
+                    emit_image(
+                        session,
+                        &who,
+                        call,
+                        deadline,
+                        name,
+                        bytes,
+                        if invoking { Some(&mut images) } else { None },
+                    ),
+                    answer,
+                    &mut fatal,
+                    &cancelled,
+                );
+            }
+            Ok(Event::Finished(result)) => {
+                break result.map(|reply| match reply {
+                    Reply::Output { output, .. } if !output.is_error => Reply::Output {
+                        output,
+                        images: mem::take(&mut images),
+                    },
+                    reply => reply,
+                });
+            }
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => {
                 break Err("plugin worker stopped without a reply".into());
@@ -248,9 +317,48 @@ pub fn execute(
     Ok(result)
 }
 
-fn respond<T>(
-    result: Result<Result<T, Failure>>,
-    answer: SyncSender<HostReply<T>>,
+fn emit_image(
+    session: &mut Session,
+    who: &Principal,
+    call: &str,
+    deadline: Instant,
+    name: String,
+    bytes: Vec<u8>,
+    images: Option<&mut Vec<Image>>,
+) -> Result<Result<ImageInfo, String>> {
+    let request = Request::Plain(Scope::Tool);
+    let decision = session.engine.decide(who, &request);
+    session.audit.decision_for_call_details(who, &request, &decision, call, json!({"operation":"emit-image", "bytes":bytes.len(), "sha256":sha256_hex(&bytes), "name_sha256":sha256_hex(name.as_bytes())}))?;
+    if !decision.allow {
+        return Ok(Err(decision.explanation));
+    }
+    if cancel::FLAG.load(Ordering::Relaxed) || Instant::now() >= deadline {
+        return Ok(Err("plugin image cancelled or timed out".into()));
+    }
+    let Some(images) = images else {
+        return Ok(Err("images may only be emitted during invocation".into()));
+    };
+    if !images.is_empty() || name.len() > 256 {
+        return Ok(Err("image result exceeds name or count limit".into()));
+    }
+    let name: String = name.chars().filter(|c| !c.is_control()).collect();
+    let mut image = match Image::read(NativePath::new(&name), bytes) {
+        Ok(image) => image,
+        Err(why) => return Ok(Err(why)),
+    };
+    image.name = format!("{who}:{}", image.name);
+    let info = ImageInfo {
+        media_type: image.media_type.clone(),
+        width: image.width,
+        height: image.height,
+    };
+    images.push(image);
+    Ok(Ok(info))
+}
+
+fn respond<T, E>(
+    result: Result<Result<T, E>>,
+    answer: SyncSender<HostReply<T, E>>,
     fatal: &mut Option<HostError>,
     cancelled: &AtomicBool,
 ) {

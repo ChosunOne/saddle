@@ -6,5 +6,6 @@ world read-tool {
     import fs-read-range;
     import fs-paths;
     import fs-list;
+    import tool-result;
     export saddle:plugin/tool@0.1.0;
 }

@@ -43,3 +43,13 @@ interface fs-list {
     }
     read-directory: func(path: path, after: string, limit: u32) -> result<page, failure>;
 }
+
+// Result presentation carries data, not filesystem or network authority.
+interface tool-result {
+    record image-info {
+        media-type: string,
+        width: u32,
+        height: u32,
+    }
+    emit-image: func(name: string, bytes: list<u8>) -> result<image-info, string>;
+}
