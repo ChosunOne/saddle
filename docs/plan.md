@@ -2699,6 +2699,30 @@ and a server that asks anyway learns why instead of waiting forever. `notificati
 marks that server's catalogue stale, and the next search re-reads it before scoring, so a tool a
 server has withdrawn is not offered and one it has added is not invisible.
 
+**D115.** A remote server's OAuth is discovered, not configured: a 401 says where the authorization
+server is (RFC 9728's protected-resource metadata, or the server's own origin when it publishes
+none), and that server's metadata says where to authorize, to exchange and to register. Saddle
+registers itself as a public client, generates a PKCE verifier, prints a URL and catches the
+loopback redirect on a port it reserved, so nothing about the flow is a fixed port or a hand-written
+client id. The callback's `state` must be the one this sign-in sent, because a code that arrives with
+someone else's state is a code that was put in the person's browser. Tokens are stored in `auth.json`
+under `mcp:<server>`, outside every root, beside the provider credentials and unreadable by any
+command (D16, D42). Every request the flow makes — metadata, registration, exchange — is decided
+against the *person's* own net grants and audited, because the hosts come from a document the server
+supplied, which is exactly what a grant is for; the label in the record names the server it was for.
+`saddle mcp auth <server>` is the only way a token is obtained: nothing here signs in on its own
+initiative, so a server cannot pull a person into an authorization flow by answering 401.
+
+**D116.** A stored token is sent as `Authorization: Bearer`, and a 401 is answered with one refresh
+and one retry — never a loop, because a server that refuses twice will refuse again and the person's
+account is not saddle's to spend on finding that out. A refusal with no refresh token, or a refresh
+that fails, ends in an error naming `saddle mcp auth <server>`: the terminal message has to say what
+fixes it. The refresh is decided against the server's *own* reach rather than the person's, because
+it happens while a session runs rather than at a terminal, which means a server whose authorization
+server is a different host has to name that host in its reach — narrower than the sign-in, and said
+so here rather than discovered at the worst moment. A token is never written to a log: the
+`authorization` header is recorded by name, and its value never (D48).
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

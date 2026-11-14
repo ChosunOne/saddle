@@ -6,6 +6,7 @@
 pub mod host;
 pub mod http;
 pub mod lower;
+pub mod oauth;
 pub mod protocol;
 pub mod registry;
 pub mod stdio;

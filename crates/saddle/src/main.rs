@@ -142,6 +142,12 @@ enum Cmd {
 enum McpCmd {
     /// Start each declared and granted server, and say what it offers against what is granted.
     List,
+    /// Sign in to a remote server's authorization server, storing the token where no command can
+    /// read it.
+    Auth {
+        /// The server's name, as `[mcp.<name>]` spells it.
+        server: String,
+    },
     /// Call one tool of a declared server, the way the model would, with no conversation around it.
     Call {
         /// The server's name, as `[mcp.<name>]` and the grant spell it.
@@ -1220,12 +1226,74 @@ fn mcp_cmd(
 ) -> Result<ExitCode> {
     match cmd {
         McpCmd::List => mcp_list(dir, session, paths, overrides),
+        McpCmd::Auth { server } => mcp_auth(dir, session, paths, overrides, &server),
         McpCmd::Call {
             server,
             tool,
             input,
         } => mcp_call(dir, session, paths, overrides, &server, &tool, &input),
     }
+}
+
+/// `saddle mcp auth <server>`: the OAuth sign-in a remote server needs, discovered from the server
+/// itself (D115). Every request it makes is decided against the person's own net grants, because a
+/// host named by a document the server supplied is exactly what a grant is for.
+fn mcp_auth(
+    dir: &Path,
+    session: &str,
+    paths: &paths::Paths,
+    overrides: &config::Overrides,
+    server: &str,
+) -> Result<ExitCode> {
+    let workspace = dir
+        .canonicalize()
+        .map(|abs| paths::find_workspace(&abs))
+        .unwrap_or_else(|_| dir.to_path_buf());
+    let picked = gate_workspace(paths, &workspace, session)?;
+    let id = picked.as_deref().unwrap_or(session);
+    let mut session = Session::open_with(dir, Some(id), overrides)?;
+    let user = UserConfig::load(&session.setup.paths.user_config())?;
+    let entry = match user.mcp.get(server) {
+        Some(entry) => entry.clone(),
+        None => {
+            session.close()?;
+            bail!("`{server}` has no [mcp.{server}] table in config.toml");
+        }
+    };
+    let url = match entry.transport()? {
+        Transport::Http { url } => url.to_owned(),
+        Transport::Stdio { .. } => {
+            session.close()?;
+            bail!("`{server}` is a stdio server: it needs no sign-in");
+        }
+    };
+    let reach = session
+        .engine
+        .policy()
+        .grants(&Principal::Agent)
+        .map(|g| g.net.clone())
+        .unwrap_or_default();
+    let store_path = session.setup.paths.auth_store();
+    let timeout = entry.timeout();
+    let mut flow = mcp::oauth::Flow {
+        session: &mut session,
+        reach,
+        label: format!("oauth:{server}"),
+        timeout,
+    };
+    let out = mcp::oauth::sign_in(&mut flow, server, &url, &store_path);
+    let code = match out {
+        Ok(line) => {
+            println!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            println!("{server}  failed: {e:#}");
+            ExitCode::FAILURE
+        }
+    };
+    session.close()?;
+    Ok(code)
 }
 
 /// `saddle mcp call <server> <tool> '<json>'`: one call, decided and audited exactly as the model's

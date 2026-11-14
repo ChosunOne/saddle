@@ -1,6 +1,7 @@
 //! End to end through the binary: the policy in force, decisions, reserved paths, the exec sandbox,
 //! network grants and the audit log, in a throwaway workspace with its own XDG directories.
 
+use std::io::BufRead as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -967,6 +968,340 @@ mcp     = [{ server = "fake", tools = ["search"] }]
         took < std::time::Duration::from_secs(20),
         "it waited past the deadline its table names: {took:?}"
     );
+}
+
+/// A loopback authorization server: metadata, registration and a token endpoint, each echoing the
+/// `client_id` it was given so the exchange can be checked end to end.
+fn mock_auth_server() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    listener
+        .set_nonblocking(true)
+        .expect("a non-blocking listener");
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::clone(&stop);
+    let handle = std::thread::spawn(move || {
+        let base = format!("http://127.0.0.1:{port}");
+        while !done.load(Ordering::SeqCst) {
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+            };
+            let mut stream = stream;
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match std::io::Read::read(&mut stream, &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => raw.extend_from_slice(&buf[..n]),
+                }
+                let text = String::from_utf8_lossy(&raw).to_string();
+                if let Some(head) = text.find("\r\n\r\n") {
+                    let length = text[..head]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= head + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let text = String::from_utf8_lossy(&raw).to_string();
+            let request_line = text.lines().next().unwrap_or_default().to_owned();
+            let body = text
+                .find("\r\n\r\n")
+                .map(|at| text[at + 4..].to_owned())
+                .unwrap_or_default();
+            let answer = if request_line.contains("/.well-known/oauth-protected-resource") {
+                format!(r#"{{"resource":"{base}/mcp","authorization_servers":["{base}"]}}"#)
+            } else if request_line.contains("/.well-known/oauth-authorization-server") {
+                format!(
+                    r#"{{"issuer":"{base}","authorization_endpoint":"{base}/authorize","token_endpoint":"{base}/token","registration_endpoint":"{base}/register"}}"#
+                )
+            } else if request_line.contains("/register") {
+                r#"{"client_id":"saddle-test-client"}"#.to_owned()
+            } else if request_line.contains("/token") {
+                // The code the test sends back is echoed in the access token, so the assertion can
+                // see the whole round trip and not just that something was stored.
+                let code = body
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("code="))
+                    .unwrap_or("none")
+                    .to_owned();
+                format!(
+                    r#"{{"access_token":"access-{code}","refresh_token":"refresh-1","expires_in":3600,"token_type":"Bearer"}}"#
+                )
+            } else {
+                r#"{"error":"not found"}"#.to_owned()
+            };
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                answer.len()
+            );
+            let _ = std::io::Write::write_all(&mut stream, header.as_bytes());
+            let _ = std::io::Write::write_all(&mut stream, answer.as_bytes());
+        }
+    });
+    (format!("http://127.0.0.1:{port}/mcp"), stop, handle)
+}
+
+/// The headers a mock server was sent, kept for the assertion.
+type SeenHeaders = Arc<std::sync::Mutex<Vec<String>>>;
+
+/// An MCP server that wants a bearer token: 401 without one, and the value it saw kept for the
+/// assertion (D116).
+fn mock_token_mcp() -> (
+    String,
+    SeenHeaders,
+    Arc<AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    listener
+        .set_nonblocking(true)
+        .expect("a non-blocking listener");
+    let seen: SeenHeaders = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let record = Arc::clone(&seen);
+    let done = Arc::clone(&stop);
+    let handle = std::thread::spawn(move || {
+        while !done.load(Ordering::SeqCst) {
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+            };
+            let mut stream = stream;
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match std::io::Read::read(&mut stream, &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => raw.extend_from_slice(&buf[..n]),
+                }
+                let text = String::from_utf8_lossy(&raw).to_string();
+                if let Some(head) = text.find("\r\n\r\n") {
+                    let length = text[..head]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= head + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let text = String::from_utf8_lossy(&raw).to_string();
+            let body = text
+                .find("\r\n\r\n")
+                .map(|at| text[at + 4..].to_owned())
+                .unwrap_or_default();
+            let token = text.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim().to_owned())
+            });
+            if let Some(token) = &token
+                && let Ok(mut held) = record.lock()
+            {
+                held.push(token.clone());
+            }
+            let (status, answer) = if token.as_deref() == Some("Bearer planted-token") {
+                let reply = if body.contains("tools/list") {
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"says it back","inputSchema":{}}]}}"#
+                } else if body.contains("tools/call") {
+                    r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"it works"}]}}"#
+                } else if body.contains("notifications/initialized") {
+                    ""
+                } else {
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}"#
+                };
+                ("200 OK", reply.to_owned())
+            } else {
+                (
+                    "401 Unauthorized",
+                    r#"{"error":"token required"}"#.to_owned(),
+                )
+            };
+            let head = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                answer.len()
+            );
+            let _ = std::io::Write::write_all(&mut stream, head.as_bytes());
+            let _ = std::io::Write::write_all(&mut stream, answer.as_bytes());
+        }
+    });
+    (format!("http://127.0.0.1:{port}/mcp"), seen, stop, handle)
+}
+
+#[test]
+fn the_transport_sends_the_stored_token_and_says_how_to_get_one() {
+    // D116: a token the person obtained is sent as a bearer, and a server that refuses without one
+    // is told nothing by a retry — the error has to name the command that fixes it.
+    let env = Env::new();
+    let (url, seen, stop, handle) = mock_token_mcp();
+    env.write_config(&format!("\n[mcp.remote]\nurl = {url:?}\n"));
+    let port = url
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .and_then(|authority| authority.rsplit(':').next())
+        .expect("a port in the url");
+    env.write_policy(format!(
+        r#"
+version = 1
+
+[agent]
+fs-read = [{{ root = "workspace" }}]
+net     = [{{ host = "127.0.0.1", scheme = "http", port = {port} }}]
+mcp     = [{{ server = "remote", tools = ["echo"], net = [{{ host = "127.0.0.1", scheme = "http", port = {port} }}] }}]
+"#
+    ));
+
+    // No token yet: the failure has to say which command obtains one.
+    let out = env.saddle(&["mcp", "call", "remote", "echo", "{}"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("saddle mcp auth remote"),
+        "the refusal does not say how to sign in: {text}"
+    );
+
+    // The token the person stored is sent, and the call completes.
+    let auth_path = env.xdg.path().join("state/saddle/auth.json");
+    std::fs::create_dir_all(auth_path.parent().expect("the state directory")).unwrap();
+    std::fs::write(
+        &auth_path,
+        // `AuthStore` is transparent over its map, so the key is the top level.
+        r#"{"mcp:remote":{"oauth":{"access":"planted-token","refresh":"","expires-at":0}}}"#,
+    )
+    .unwrap();
+    let out = env.saddle(&["mcp", "call", "remote", "echo", "{}"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("it works"), "{text}");
+    let tokens = seen.lock().expect("the record").clone();
+    assert!(
+        tokens.iter().any(|t| t == "Bearer planted-token"),
+        "the transport did not send the stored token: {tokens:?}"
+    );
+    stop.store(true, Ordering::SeqCst);
+    let _ = handle.join();
+}
+
+#[test]
+fn mcp_auth_signs_in_and_stores_the_token_outside_every_root() {
+    // D115: the whole flow, driven by the test pretending to be the browser. The URL is taken from
+    // what saddle printed, the callback is sent back with the state it carried, and what is stored
+    // is the token from the round trip — in `auth.json`, which no command can read.
+    let env = Env::new();
+    let (url, stop, handle) = mock_auth_server();
+    env.write_config(&format!("\n[mcp.remote]\nurl = {url:?}\n"));
+    let port = url
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .and_then(|authority| authority.rsplit(':').next())
+        .expect("a port in the url");
+    env.write_policy(format!(
+        r#"
+version = 1
+
+[agent]
+fs-read = [{{ root = "workspace" }}]
+net     = [{{ host = "127.0.0.1", scheme = "http", port = {port} }}]
+mcp     = [{{ server = "remote", tools = ["echo"], net = [{{ host = "127.0.0.1", scheme = "http", port = {port} }}] }}]
+"#
+    ));
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_saddle"))
+        .args(["mcp", "auth", "remote"])
+        .current_dir(env.ws.path())
+        .env("XDG_CONFIG_HOME", env.xdg.path().join("config"))
+        .env("XDG_STATE_HOME", env.xdg.path().join("state"))
+        .env("HOME", env.home.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawning saddle mcp auth");
+
+    // Read until the URL, then behave like the browser: a GET on the redirect the URL names.
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut lines = std::io::BufReader::new(stdout).lines();
+    let mut printed = String::new();
+    let mut authorize = String::new();
+    while let Some(Ok(line)) = lines.next() {
+        printed.push_str(&line);
+        printed.push('\n');
+        if let Some(rest) = line.trim().strip_prefix("http") {
+            authorize = format!("http{rest}");
+            break;
+        }
+    }
+    assert!(
+        !authorize.is_empty(),
+        "no sign-in URL was printed: {printed}"
+    );
+    let redirect = authorize
+        .split("redirect_uri=")
+        .nth(1)
+        .and_then(|rest| rest.split('&').next())
+        .map(|encoded| encoded.replace("%3A", ":").replace("%2F", "/"))
+        .expect("a redirect_uri in the url");
+    let state = authorize
+        .split("state=")
+        .nth(1)
+        .and_then(|rest| rest.split('&').next())
+        .expect("a state in the url")
+        .to_owned();
+    let authority = redirect
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .expect("a host in the redirect");
+    let mut browser = std::net::TcpStream::connect(authority).expect("reaching the callback");
+    std::io::Write::write_all(
+        &mut browser,
+        format!("GET /callback?code=the-code&state={state} HTTP/1.1\r\nhost: {authority}\r\n\r\n")
+            .as_bytes(),
+    )
+    .expect("sending the callback");
+    let status = child.wait().expect("waiting for the sign-in");
+    let rest: String = lines.map_while(Result::ok).collect();
+    assert!(status.success(), "the sign-in failed: {printed}{rest}");
+
+    let stored = std::fs::read_to_string(env.xdg.path().join("state/saddle/auth.json"))
+        .expect("auth.json was not written");
+    assert!(
+        stored.contains("access-the-code"),
+        "the token from the exchange was not stored: {stored}"
+    );
+    assert!(stored.contains("mcp:remote"), "{stored}");
+    assert!(
+        !env.ws.path().join("auth.json").exists(),
+        "the token must not land inside the workspace"
+    );
+    stop.store(true, Ordering::SeqCst);
+    let _ = handle.join();
 }
 
 #[test]

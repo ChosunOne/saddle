@@ -38,6 +38,8 @@ const MAX_BODY: u64 = 4 * 1024 * 1024;
 /// One remote server.
 pub struct Client {
     server: String,
+    /// The URL as the table spells it, for the discovery a refresh has to do (D116).
+    url: String,
     target: Target,
     /// The server's own net grants, narrowed from the agent's (D105).
     reach: Vec<saddle_cap::policy::NetGrant>,
@@ -57,6 +59,7 @@ impl Client {
         let target = Target::parse(url).map_err(|why| anyhow!("{url}: {why}"))?;
         Ok(Self {
             server: server.to_owned(),
+            url: url.to_owned(),
             target,
             reach,
             session_id: None,
@@ -192,8 +195,8 @@ impl Client {
         }
         if status == 401 || status == 403 {
             bail!(
-                "`{}` answered {status}: it wants an OAuth token, which this build cannot yet \
-                 obtain (`saddle mcp auth {}` is not built)",
+                "`{}` answered {status} and no usable token is stored: run `saddle mcp auth {}` to \
+                 sign in",
                 self.server,
                 self.server
             );
@@ -220,8 +223,7 @@ impl Client {
         Ok(reply(&body))
     }
 
-    /// One POST, decided and then sent. The headers the decision is shown are the ones that go out,
-    /// so a name in the record is a name on the wire (D48, D110).
+    /// One POST, decided and then sent.
     fn post(
         &mut self,
         session: &mut Session,
@@ -235,60 +237,65 @@ impl Client {
         if let Some(id) = &self.session_id {
             headers.push(("mcp-session-id", id.clone()));
         }
-        let names: Vec<String> = headers.iter().map(|(name, _)| (*name).to_owned()).collect();
-        let request = Request::Net {
-            method: "POST",
-            scheme: &self.target.scheme,
-            host: &self.target.host,
-            port: self.target.port,
-            path: self.target.request_path(),
-            headers: &names,
-        };
-        // A private address is reachable only when the server's own grant spells it out (D40).
-        let named = Session::mcp_names_host(&self.reach, &self.target.host);
-        let decision = session.decide_mcp_net(&self.server, &self.reach, &request)?;
-        if !decision.allow {
-            return Err(Denied(decision.explanation).into());
+        // A token the person stored is sent; there is no path here that asks for one by itself,
+        // because obtaining one is a person's act at a terminal (D115).
+        let store_path = session.setup.paths.auth_store();
+        let held = crate::auth::AuthStore::load(&store_path)
+            .ok()
+            .and_then(|store| store.oauth(&format!("mcp:{}", self.server)).cloned());
+        if let Some(tokens) = &held {
+            headers.push(("authorization", format!("Bearer {}", tokens.access)));
         }
-        if !named && let Err(why) = resolve_public(&self.target.host, self.target.port) {
-            return Err(Denied(why).into());
+        let mut answer = self.attempt(session, &headers, payload)?;
+        let refused = answer.status == 401 || answer.status == 403;
+        // One refresh and one retry: a loop here would spend the person's account on a server that
+        // will never accept it (D116). A token with no refresh is left alone — the error below
+        // names `saddle mcp auth`, which is the only thing that can fix it.
+        if refused && let Some(held) = held.clone().filter(|t| !t.refresh.is_empty()) {
+            let mut flow = crate::mcp::oauth::Flow {
+                session,
+                reach: self.reach.clone(),
+                label: format!("oauth:{}", self.server),
+                timeout: self.timeout,
+            };
+            let fresh =
+                crate::mcp::oauth::refresh(&mut flow, &self.server, &self.url, &held, &store_path)
+                    .with_context(|| {
+                        format!(
+                            "refreshing the token for `{}`; `saddle mcp auth {}` signs in again",
+                            self.server, self.server
+                        )
+                    })?;
+            headers.retain(|(name, _)| *name != "authorization");
+            headers.push(("authorization", format!("Bearer {}", fresh.access)));
+            answer = self.attempt(session, &headers, payload)?;
         }
-        let url = format!(
-            "{}://{}{}",
-            self.target.scheme,
-            authority(
-                &self.target.host,
-                self.target.port,
-                self.target.scheme == "https"
-            ),
-            self.target.request_path()
-        );
-        let agent = crate::tools::fetch::agent_for(named, self.timeout);
-        let mut outgoing = agent.post(&url);
-        for (name, value) in &headers {
-            outgoing = outgoing.header(*name, value.as_str());
-        }
-        let mut response = match outgoing.send(payload) {
-            Ok(response) => response,
-            Err(e) => return Err(anyhow!("{url}: {e}")),
-        };
-        let status = response.status().as_u16();
-        let header = |response: &ureq::http::Response<ureq::Body>, name: &str| {
-            response
-                .headers()
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned)
-        };
-        let content_type = header(&response, "content-type").unwrap_or_default();
-        let session_id = header(&response, "mcp-session-id");
-        let body = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_BODY)
-            .read_to_string()
-            .context("reading the server's reply")?;
-        Ok((status, content_type, session_id, body))
+        Ok((
+            answer.status,
+            answer.content_type,
+            answer.session_id,
+            answer.body,
+        ))
+    }
+
+    /// One decided POST with these headers, so a retry after a refresh sends the new token through
+    /// exactly the same gate as the first attempt (D116).
+    fn attempt(
+        &self,
+        session: &mut Session,
+        headers: &[(&str, String)],
+        payload: &str,
+    ) -> Result<Answer> {
+        send(
+            session,
+            &self.server,
+            &self.reach,
+            &self.target,
+            "POST",
+            headers,
+            Some(payload),
+            self.timeout,
+        )
     }
 
     fn send(&mut self, session: &mut Session, payload: &str) -> Result<()> {
@@ -348,4 +355,93 @@ fn content_text(result: &Value) -> String {
         }
     }
     out.join("\n")
+}
+
+/// One request the host makes for a server, decided against that server's reach before it is sent
+/// (D110) and recorded whatever the answer. It is shared with OAuth discovery, because a metadata
+/// document fetched from a URL a server named is exactly as much of an egress as a tool call is
+/// (D115).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn send(
+    session: &mut Session,
+    label: &str,
+    reach: &[saddle_cap::policy::NetGrant],
+    target: &Target,
+    method: &str,
+    headers: &[(&str, String)],
+    body: Option<&str>,
+    timeout: Duration,
+) -> Result<Answer> {
+    let names: Vec<String> = headers.iter().map(|(name, _)| (*name).to_owned()).collect();
+    let request = Request::Net {
+        method,
+        scheme: &target.scheme,
+        host: &target.host,
+        port: target.port,
+        path: target.request_path(),
+        headers: &names,
+    };
+    // A private address is reachable only when the reach spells it out (D40).
+    let named = Session::mcp_names_host(reach, &target.host);
+    let decision = session.decide_mcp_net(label, reach, &request)?;
+    if !decision.allow {
+        return Err(Denied(decision.explanation).into());
+    }
+    if !named && let Err(why) = resolve_public(&target.host, target.port) {
+        return Err(Denied(why).into());
+    }
+    let url = format!(
+        "{}://{}{}",
+        target.scheme,
+        authority(&target.host, target.port, target.scheme == "https"),
+        target.request_path()
+    );
+    let agent = crate::tools::fetch::agent_for(named, timeout);
+    // ureq types a request by whether it carries a body, so the two are built apart.
+    let outcome = if method == "GET" {
+        let mut request = agent.get(&url);
+        for (name, value) in headers {
+            request = request.header(*name, value.as_str());
+        }
+        request.call()
+    } else if method == "POST" {
+        let mut request = agent.post(&url);
+        for (name, value) in headers {
+            request = request.header(*name, value.as_str());
+        }
+        request.send(body.unwrap_or_default())
+    } else {
+        return Err(anyhow!("{method} is not a method this client makes"));
+    };
+    let mut response = outcome.map_err(|e| anyhow!("{url}: {e}"))?;
+    let header = |response: &ureq::http::Response<ureq::Body>, name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    let status = response.status().as_u16();
+    let content_type = header(&response, "content-type").unwrap_or_default();
+    let session_id = header(&response, "mcp-session-id");
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_BODY)
+        .read_to_string()
+        .context("reading the server's reply")?;
+    Ok(Answer {
+        status,
+        content_type,
+        session_id,
+        body,
+    })
+}
+
+/// What one request came back with.
+pub(crate) struct Answer {
+    pub status: u16,
+    pub content_type: String,
+    pub session_id: Option<String>,
+    pub body: String,
 }
