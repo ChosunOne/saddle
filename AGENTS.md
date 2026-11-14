@@ -1,8 +1,9 @@
 # Working in this repository
 
-Saddle is a coding-agent harness in Rust. Its planned plugin boundary is WASI components whose
-authority is a *declared* scope set, checked before instantiation. The current v0 has built-in tools
-and the component interface checker, but no plugin loader yet.
+Saddle is a coding-agent harness in Rust. Its plugin boundary is WASI components whose
+authority is a *declared* scope set, checked before instantiation and bounded by the agent's reach.
+The current v0 has built-in tools; the initial v1 loader, canonical WIT and read-only SDK are library
+crates, not yet wired into the binary's config, host services or model-visible tool registry.
 `docs/plan.md` is the specification; read it before changing behaviour in the policy, sandbox or tool
 layer.
 
@@ -16,8 +17,11 @@ because it is followed.
 
 | crate | owns |
 | --- | --- |
-| `crates/saddle-cap` | scopes, roots, grants, policy and manifest parsing, the component import check, the exec lowering, and the narrowing of a delegated principal's reach (D105). No wasmtime dependency. |
+| `crates/saddle-cap` | scopes, roots, grants, policy and manifest parsing, the component import check, the exec lowering, and the narrowing of a delegated principal's reach (D105, D126). No wasmtime dependency. |
 | `crates/saddle-policy` | per-call decisions (`engine`) and the hash-chained audit log (`audit`) |
+| `crates/saddle-wit` | canonical read-tool WIT and generated host bindings (D127) |
+| `crates/saddle-loader` | actual component inspection, bounded delegation, grant-shaped pre-linking, fresh bounded instances and a narrow host-services trait, without a dependency on the binary's session (D126, D127) |
+| `crates/saddle-sdk` | guest bindings from the same WIT and a read-only example; no `std::fs` authority (D12, D127) |
 | `crates/saddle-sandbox` | applies a sandbox spec to the current process and execs the target, including the command's own network namespace and the relay in it (D79); starts a long-lived child whose stdin and stdout belong to the caller, with the spec on fd 3 (D106); also builds the `saddle-sandbox` helper binary used by its own tests |
 | `crates/saddle` | the binary: built-in tools, model providers, the model loop, the TUI |
 
@@ -62,7 +66,9 @@ adding a `net` grant to the policy, never widening the sandbox allowlist. A gran
 because that exemption needs a grant that names the address. `saddle tool <name> '<json>'` runs any one
 of them as the agent through the gate, which is the most direct way to check a policy change by hand.
 
-Planned but not yet present: `saddle-wit`, `saddle-loader`, `saddle-sdk` (v1, D15). MCP
+The initial WASI library surface and its development commands are in `docs/plugins.md`. Plugin
+installation/configuration, binary host adapters, a registry and model-visible provenance remain to
+be implemented; no repository auto-loading or plugin-to-MCP adapter exists. MCP
 prompts, MCP resources, `codemode` and images in a tool result are refused rather than missing
 (D119) — a boundary that is written down, not an omission.
 
@@ -285,7 +291,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D125 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D127 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

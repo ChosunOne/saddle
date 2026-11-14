@@ -1,0 +1,7 @@
+package saddle:host@0.1.0;
+
+// This is a read-only tool world, not a world that imports every possible capability.
+world read-tool {
+    import fs-read;
+    export saddle:plugin/tool@0.1.0;
+}

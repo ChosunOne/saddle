@@ -1,0 +1,18 @@
+package saddle:plugin@0.1.0;
+
+interface tool {
+    // JSON is confined to the model-facing boundary, never the host service protocol.
+    record definition {
+        name: string,
+        description: string,
+        input-schema: string,
+    }
+
+    record output {
+        text: string,
+        is-error: bool,
+    }
+
+    describe: func() -> definition;
+    invoke: func(arguments: string) -> output;
+}

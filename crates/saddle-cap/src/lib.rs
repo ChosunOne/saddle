@@ -2,6 +2,7 @@
 //! import check, per-call policy decisions, and the exec sandbox spec.
 
 pub mod component;
+pub mod delegate;
 pub mod manifest;
 pub mod narrow;
 pub mod policy;

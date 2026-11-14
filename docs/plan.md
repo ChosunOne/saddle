@@ -17,7 +17,9 @@ The agent does not get to negotiate.
 
 v0 is in place: the capability crate, the policy engine with its audit log, the exec sandbox, and a
 model loop that sends every built-in tool call through the gate. `saddle` opens it in a full-screen
-terminal UI, and `saddle run "<prompt>"` runs one turn without it. The plugin loader starts v1. Sections 3 to 6 are settled and can be built against. Section 8 lists work that was
+terminal UI, and `saddle run "<prompt>"` runs one turn without it. The v1 loader, canonical WIT and
+read-only SDK are now library crates (D126, D127); installation, session host adapters and
+model-visible registration are not wired into the binary yet. Sections 3 to 6 are settled and can be built against. Section 8 lists work that was
 considered and deferred.
 
 ## 3. Settled decisions
@@ -2843,6 +2845,45 @@ another generation; there is no claim of exactly-once inference or fabricated us
 response. WebSocket reads have the same 300-second idle bound as HTTP streams, and writes a
 30-second bound, rather than waiting forever on a silent peer.
 
+**D126.** A plugin is a bounded delegate of the agent, never an independent source of operational
+authority. This adds an outer ceiling to D9: the agent's effective grants, then the manifest's
+requested scope ceiling, then that plugin's explicit policy grants. An omitted plugin grant means
+no authority, not inheritance. Asking above either ceiling is a load error rather than a silent
+trim. Filesystem exclusions from both principals apply; a sibling principal cannot supply a grant.
+The principal assigned by the host supplies attribution and budgeting, not additional reach.
+
+`tool` is permission to register an extension point, not permission to perform what the tool asks
+for. The agent already dispatches native tools (D17) without an explicit `tool` grant; a plugin's
+explicit `tool` grant permits its export but never supplies filesystem, network or other operational
+grants the agent lacks. Other extension points and plugin-local storage remain unavailable in the
+initial runtime, pending their own bounded host implementations. No plugin-to-MCP adapter is implied.
+
+**D127.** The first runtime is the D15 loader and canonical WIT/SDK boundary, before automatic
+installation or model-visible registration. It accepts bytes supplied explicitly by the host,
+hashes and compiles those same bytes, inspects every top-level import and export, and applies D11
+and D126 before any initialization. Top-level functions, modules and other unsupported shapes are
+refused. The initial Saddle ABI is exactly `0.1.0`; names on the supported minor line with a type
+mismatch still fail pre-linking. A granted but unimplemented interface fails closed.
+
+The first world exports one typed `saddle:plugin/tool` with `describe` and `invoke`, and imports
+`saddle:host/fs-read` with root-relative paths and typed failures. JSON is only the tool's schema
+and model arguments. The loader does not depend on the binary's session: a narrow host-services
+trait receives the host-assigned plugin and invocation identity. Implementations must decide and
+audit each operation against that identity; neither guest arguments nor tool names select it.
+
+Wasmtime and WASI are pinned to `36.0.20` (Rust 1.86 minimum, within our 1.88 MSRV); the future
+WASI-HTTP adapter must use that same exact version. WASI remains 0.2, and guest bindings use
+`wit-bindgen` 0.45.0. Each invocation has a fresh store and
+instance, bounded linear memories, tables, fuel and argument/result sizes, plus an epoch wall-clock
+deadline and cancellation. These bounds also cover initialization and `describe`. Ambient WASI has
+empty args/environment, no inherited streams or preopens, a 128-entry host resource table and
+64 KiB random-byte requests. Its default stdout/stderr are discarded in this slice; a bounded
+debug-log sink is still to come. Raw sockets, outgoing HTTP and synchronous `wasi:io/poll` are not
+linked in this slice: poll could otherwise wait forever on a guest-chosen clock subscription inside
+native code. Host services must bound their own I/O: epochs cannot interrupt a blocking
+native host call. Installing artifacts, reload/revocation, model-visible provenance (D25), a registry,
+and remaining host adapters are subsequent steps, not implicit authority in this runtime.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
@@ -2911,10 +2952,13 @@ but was removed by D44 after D42 moved policy outside the agent's reach.
 **v1.** One plugin, one scope, one load-time refusal. Deliverable is a hostile plugin that imports
 `saddle:host/fs-read` without the grant and fails to instantiate, plus a test asserting the failure.
 The test runs at two levels: against `saddle_cap::component::check_component` with a hand-written
-import list, and end to end with the compiled component.
+import list, and through `saddle-loader` with a compiled component, including a trapping start
+function that must never run. These library-level tests are in place (D127); host adapter and binary
+integration follow. `docs/plugins.md` describes the current development surface and its limits.
 
-**v2.** Remaining scopes and their host interfaces, `veto`, the D25 provenance wrapper, then
-presentation.
+**v2.** Remaining scopes and their host interfaces, `veto`, then presentation. The minimum D25
+provenance wrapper moves forward to the first model-visible plugin tool, before registration, not
+after unlabelled output has already reached a conversation.
 
 The v1 test is the whole thesis. If a plugin that imports `fs-read` without the grant still loads, the
 model is decorative.
@@ -2922,6 +2966,8 @@ model is decorative.
 ## 8. Deferred
 
 - Long-lived plugin instances (`lifetime = "session"`, D13).
+- Isolating component compilation under independent time/memory limits before automatic loading
+  of untrusted artifacts; D127 caps input bytes but fuel/epochs bound execution, not the compiler.
 - `exec` on macOS through Seatbelt.
 - A mount namespace with read-only bind mounts for reserved paths and empty mounts over excluded
   paths, replacing the D20 snapshot and making `exclude` bind `exec`.

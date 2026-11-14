@@ -1,0 +1,17 @@
+package saddle:host@0.1.0;
+
+interface fs-read {
+    record path {
+        root: string,
+        relative: string,
+    }
+
+    variant failure {
+        denied(string),
+        invalid-path(string),
+        io(string),
+        too-large,
+    }
+
+    read-file: func(path: path) -> result<list<u8>, failure>;
+}
