@@ -2813,6 +2813,31 @@ therefore collapsed too, which is the case that matters most: thirty lines of it
 conversation being continued off the screen. The text is still the conversation's — selection copies
 the rendered lines (D87), and expanding is what puts them on screen.
 
+**D125.** A Responses request that fails transiently before any text or reasoning is shown gets
+one automatic recovery attempt, after a one-second wait that cancellation can interrupt (or the
+error event's `Retry-After`, capped at sixty seconds). Recovery
+uses HTTP and the full conversation, never a delta from a broken WebSocket. This covers a socket
+that accepts a send and then closes, a read error or stream ending before completion, and an error
+event reporting overload, a temporary rate limit, a server fault or the WebSocket's connection-age
+limit. In particular, `websocket_connection_limit_reached` is recoverable even with status 400;
+the service says the socket reached its sixty-minute lifetime, not that the prompt is invalid.
+
+Authentication, permissions, exhausted quota, invalid requests and malformed events are not
+automatically retried. Neither is a partial visible reply: restarting it would splice two answers
+together. A tool call buffered by a failed parser is discarded rather than executed, so a retry
+cannot execute it twice. A deliberate incomplete response (token limit or refusal) remains a reply,
+not a transient failure. The failed socket is not cached, and only a completed response can seed a
+continuation (D102). A missing previous response is still resent once on its existing socket (D101),
+but only before output from that request, so it cannot splice two replies either.
+
+The person sees a transport/retry note; it is not a conversation item and cannot become model
+instructions. Existing HTTP send-time retries stay bounded as before; this is one additional
+stream-recovery attempt, not a loop around tool execution or an unlimited retry policy. The
+provider may already have generated tokens before the connection failed, so recovery can cost
+another generation; there is no claim of exactly-once inference or fabricated usage for the lost
+response. WebSocket reads have the same 300-second idle bound as HTTP streams, and writes a
+30-second bound, rather than waiting forever on a silent peer.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

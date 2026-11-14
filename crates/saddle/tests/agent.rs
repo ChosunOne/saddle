@@ -50,7 +50,11 @@ fn model_request(listener: &TcpListener) -> (TcpStream, BufReader<TcpStream>, St
         }
         if head.starts_with("get ") {
             let path = head.split_whitespace().nth(1).unwrap();
-            assert!(matches!(path, "/models" | "/v1/models?limit=1000"));
+            assert!(
+                matches!(path, "/models" | "/v1/models?limit=1000")
+                    || path.starts_with("/models?client_version="),
+                "{path}"
+            );
             stream
                 .write_all(error_response("200 OK", None, &json!({"data": []})).as_bytes())
                 .unwrap();
@@ -577,6 +581,49 @@ fn overload_is_retried_and_a_bad_request_fails_the_turn() {
                 .as_str()
                 .is_some_and(|e| e.contains("bad model"))
     }));
+}
+
+#[test]
+fn responses_recovers_a_transient_stream_failure_without_a_second_user_prompt() {
+    let failed = json!({"type":"response.failed","response":{
+        "error":{"code":"server_error","message":"temporary backend failure"}}});
+    let answer = [
+        json!({"type":"response.output_text.delta","delta":"Recovered."}),
+        json!({"type":"response.completed","response":{"id":"resp_ok","status":"completed",
+            "model":"mock-model","usage":{"input_tokens":10,"output_tokens":2}}}),
+    ];
+    let answer: String = answer
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect();
+    let (base, seen) = serve(vec![
+        sse_response(&format!("data: {failed}\n\n")),
+        sse_response(&answer),
+    ]);
+    let env = Env::new(Api::Openai, &base);
+    let config = env.xdg.path().join("config/saddle/config.toml");
+    let text = fs::read_to_string(&config)
+        .unwrap()
+        .replace("api = \"openai\"", "api = \"openai-responses\"");
+    fs::write(config, text).unwrap();
+
+    let out = env.saddle(&["run", "hello"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .matches("Recovered.")
+            .count(),
+        1
+    );
+    assert!(stderr.contains("retrying once over HTTP"), "{stderr}");
+    let sent = seen.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(
+        sent[0].body, sent[1].body,
+        "retry must not append another prompt or transport note"
+    );
+    assert_eq!(sent[1].body["input"].as_array().unwrap().len(), 1);
 }
 
 #[test]

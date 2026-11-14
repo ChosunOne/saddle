@@ -6,9 +6,8 @@
 //! is kept between requests: a new connection starts from the whole history, because the state a
 //! delta refers to was left behind on the old one.
 //!
-//! Everything here falls back. A connection that cannot be made, or a frame that cannot be sent,
-//! leaves the caller on the SSE path it used before, so the worst case is the request that was
-//! already being made — never a failed turn.
+//! D125: opening or sending failures fall back to HTTP, and a read-time failure can be retried
+//! there before any reply text or reasoning is shown. Partial replies are never silently replayed.
 
 use std::collections::HashMap;
 use std::net::TcpStream;
@@ -16,15 +15,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tungstenite::client::ClientRequestBuilder;
 use tungstenite::http::Uri;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, connect};
 
 use super::http::{self, Msg};
+use super::retry::Transient;
 use super::sse;
 use super::{ProviderConfig, codex_backend};
 
@@ -32,6 +34,8 @@ use super::{ProviderConfig, codex_backend};
 struct Link {
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
     continuation: Option<Continuation>,
+    /// D102: a kept socket belongs to its endpoint and authentication context as well as its session.
+    affinity: [u8; 32],
 }
 
 /// What makes the next request on this connection a delta rather than a whole history.
@@ -78,6 +82,7 @@ pub struct Pending {
     body: String,
     /// Everything the server holds once this request has been answered.
     baseline: Vec<Value>,
+    affinity: [u8; 32],
 }
 
 /// The socket a finished stream gives back, and the response it ended on.
@@ -111,6 +116,7 @@ impl Pending {
             self.session,
             Link {
                 socket: handed.socket,
+                affinity: self.affinity,
                 continuation: Some(Continuation {
                     body: self.body,
                     response_id,
@@ -131,7 +137,11 @@ pub fn stream(
     headers: &[(String, String)],
     body: &Value,
 ) -> Result<(http::EventStream, Pending)> {
-    let kept = links().remove(session);
+    // Hash the full headers, never retaining another copy of credentials in the socket cache.
+    let affinity: [u8; 32] = Sha256::digest(serde_json::to_vec(&(url, headers))?).into();
+    let kept = links()
+        .remove(session)
+        .filter(|link| link.affinity == affinity);
     let reused = kept.is_some();
     let (mut socket, continuation) = match kept {
         Some(link) => (link.socket, link.continuation),
@@ -149,9 +159,23 @@ pub fn stream(
         fresh
             .send(Message::Text(frame.to_string().into()))
             .context("sending the first frame")?;
-        return run(fresh, session, stripped(body), baseline, body.clone());
+        return run(
+            fresh,
+            session,
+            stripped(body),
+            baseline,
+            body.clone(),
+            affinity,
+        );
     }
-    run(socket, session, stripped(body), baseline, body.clone())
+    run(
+        socket,
+        session,
+        stripped(body),
+        baseline,
+        body.clone(),
+        affinity,
+    )
 }
 
 fn run(
@@ -160,6 +184,7 @@ fn run(
     body: String,
     baseline: Vec<Value>,
     whole: Value,
+    affinity: [u8; 32],
 ) -> Result<(http::EventStream, Pending)> {
     let stop = Arc::new(AtomicBool::new(false));
     let handed = Arc::new(Mutex::new(None));
@@ -177,6 +202,7 @@ fn run(
             session: session.to_owned(),
             body,
             baseline,
+            affinity,
         },
     ))
 }
@@ -188,6 +214,16 @@ fn open(url: &str, headers: &[(String, String)]) -> Result<WebSocket<MaybeTlsStr
         request = request.with_header(name.as_str(), value.as_str());
     }
     let (socket, _) = connect(request).context("opening the websocket")?;
+    // Match the HTTP stream's idle-read bound; an unresponsive peer must eventually recover too.
+    let tcp = match socket.get_ref() {
+        MaybeTlsStream::Plain(tcp) => Some(tcp),
+        MaybeTlsStream::Rustls(tls) => Some(&tls.sock),
+        _ => None,
+    };
+    if let Some(tcp) = tcp {
+        tcp.set_read_timeout(Some(Duration::from_secs(300)))?;
+        tcp.set_write_timeout(Some(Duration::from_secs(30)))?;
+    }
     Ok(socket)
 }
 
@@ -207,6 +243,7 @@ fn pump(
     // costs one frame to find out, and resending the whole history is what turns a stale
     // connection into the request that would have been made anyway (D101).
     let mut retried = false;
+    let mut saw_output = false;
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
@@ -216,11 +253,14 @@ fn pump(
                 let data = text.as_str().to_owned();
                 let event: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
                 let kind = event["type"].as_str().unwrap_or_default().to_owned();
-                if !retried && kind == "error" && continuation_lost(&event) {
+                if !retried && !saw_output && kind == "error" && continuation_lost(&event) {
                     retried = true;
                     let mut full = whole.clone();
                     full["type"] = json!("response.create");
-                    if socket.send(Message::Text(full.to_string().into())).is_err() {
+                    if let Err(error) = socket.send(Message::Text(full.to_string().into())) {
+                        let _ = tx.send(Msg::Failed(
+                            Transient::new(format!("websocket resend: {error}")).into(),
+                        ));
                         return;
                     }
                     continue;
@@ -229,9 +269,32 @@ fn pump(
                     kind.as_str(),
                     "response.completed" | "response.done" | "response.incomplete"
                 );
-                let response_id = done
+                let completed = matches!(kind.as_str(), "response.completed" | "response.done")
+                    && !matches!(
+                        event["response"]["status"].as_str(),
+                        Some("incomplete" | "failed")
+                    );
+                let response_id = completed
                     .then(|| event["response"]["id"].as_str().map(str::to_owned))
                     .flatten();
+                if done {
+                    // D102: publish the socket before the terminal event. The parser may finish
+                    // immediately on that event, and only a completed response seeds a delta.
+                    if completed && let Ok(mut slot) = handed.lock() {
+                        *slot = Some(Handed {
+                            socket,
+                            response_id,
+                        });
+                    }
+                    let _ = tx.send(Msg::Event(sse::Event {
+                        event: String::new(),
+                        data,
+                    }));
+                    return;
+                }
+                saw_output |= kind.starts_with("response.output")
+                    || kind.starts_with("response.reasoning")
+                    || kind.starts_with("response.function_call");
                 if tx
                     .send(Msg::Event(sse::Event {
                         event: String::new(),
@@ -241,24 +304,23 @@ fn pump(
                 {
                     return;
                 }
-                if done {
-                    if let Ok(mut slot) = handed.lock() {
-                        *slot = Some(Handed {
-                            socket,
-                            response_id,
-                        });
-                    }
-                    return;
-                }
                 if kind == "error" || kind == "response.failed" {
                     return;
                 }
+            }
+            Ok(Message::Close(_)) => {
+                let _ = tx.send(Msg::Failed(
+                    Transient::new("websocket closed before response.completed").into(),
+                ));
+                return;
             }
             // tungstenite answers a ping itself while reading; a pong it does not answer is ours
             // to ignore, and a binary frame is not part of this API.
             Ok(_) => {}
             Err(error) => {
-                let _ = tx.send(Msg::Failed(anyhow::anyhow!("websocket: {error}")));
+                let _ = tx.send(Msg::Failed(
+                    Transient::new(format!("websocket: {error}")).into(),
+                ));
                 return;
             }
         }
@@ -319,8 +381,9 @@ fn stripped(body: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::ErrorKind;
     use std::net::TcpListener;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use tungstenite::accept;
 
@@ -558,5 +621,134 @@ mod tests {
         drain(events);
         pending.finish(vec![json!({"role":"assistant","content":[]})]);
         assert!(!links().contains_key("s3"));
+    }
+
+    #[test]
+    fn the_socket_is_available_before_the_completed_event_is_published() {
+        let (url, handle) = server(|_| reply("resp_1", "one"));
+        let body = body(json!([{"role":"user","content":"hello"}]));
+        let mut sink = Silent;
+        for _ in 0..32 {
+            let (mut events, pending) = stream("handover", &url, &[], &body).unwrap();
+            loop {
+                let event = events.next(&mut sink).unwrap().unwrap();
+                let event: Value = serde_json::from_str(&event.data).unwrap();
+                if event["type"] == "response.completed" {
+                    assert!(pending.handed.lock().unwrap().is_some());
+                    break;
+                }
+            }
+            drop(events);
+            pending.finish(Vec::new());
+            assert!(links().contains_key("handover"));
+        }
+        assert_eq!(handle.join().unwrap().len(), 32);
+    }
+
+    #[test]
+    fn an_incomplete_response_does_not_seed_a_continuation() {
+        let (url, handle) = server(|_| {
+            vec![json!({"type":"response.incomplete",
+            "response":{"id":"resp_partial","status":"incomplete"}})]
+        });
+        let (events, pending) = stream("incomplete", &url, &[], &body(json!([]))).unwrap();
+        assert_eq!(drain(events).len(), 1);
+        pending.finish(Vec::new());
+        assert!(!links().contains_key("incomplete"));
+        assert_eq!(handle.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_changed_endpoint_starts_a_new_connection_with_full_input() {
+        let (old_url, old_server) = server(|_| reply("old_response", "old"));
+        let (new_url, new_server) = server(|_| reply("new_response", "new"));
+        let first = body(json!([{"role":"user","content":"hello"}]));
+        let (events, pending) = stream("destination", &old_url, &[], &first).unwrap();
+        drain(events);
+        pending.finish(Vec::new());
+        let (events, pending) = stream("destination", &new_url, &[], &first).unwrap();
+        drain(events);
+        pending.finish(Vec::new());
+        assert_eq!(old_server.join().unwrap().len(), 1);
+        let received = new_server.join().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["input"], first["input"]);
+        assert!(received[0].get("previous_response_id").is_none());
+    }
+
+    fn accept_connection(listener: &TcpListener) -> TcpStream {
+        let start = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(5),
+                        "expected a fresh connection"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn changed_credentials_do_not_reuse_an_authenticated_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("ws://{}/responses", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let mut sockets = Vec::new();
+            let mut received = Vec::new();
+            for _ in 0..2 {
+                let mut socket = accept(accept_connection(&listener)).unwrap();
+                let Message::Text(frame) = socket.read().unwrap() else {
+                    panic!("expected response.create");
+                };
+                received.push(serde_json::from_str::<Value>(frame.as_str()).unwrap());
+                for event in reply("resp_1", "one") {
+                    socket
+                        .send(Message::Text(event.to_string().into()))
+                        .unwrap();
+                }
+                // Keep both server sockets alive: a reconnect must be caused by the changed
+                // identity, not a server-side close that would repair a wrong reuse by accident.
+                sockets.push(socket);
+            }
+            received
+        });
+        let first = body(json!([{"role":"user","content":"hello"}]));
+        for token in ["first-test-token", "second-test-token"] {
+            let headers = [("authorization".into(), format!("Bearer {token}"))];
+            let (events, pending) = stream("credentials", &url, &headers, &first).unwrap();
+            assert_eq!(drain(events).len(), 2);
+            pending.finish(Vec::new());
+        }
+        let received = handle.join().unwrap();
+        assert_eq!(received.len(), 2);
+        assert!(received[1].get("previous_response_id").is_none());
+        assert_eq!(received[1]["input"], first["input"]);
+    }
+
+    #[test]
+    fn a_missing_continuation_after_output_is_not_silently_resent() {
+        let (url, handle) = server(|_| {
+            vec![
+                json!({"type":"response.output_text.delta","delta":"partial"}),
+                json!({"type":"error","code":"previous_response_not_found"}),
+            ]
+        });
+        let (events, pending) = stream("partial", &url, &[], &body(json!([]))).unwrap();
+        assert_eq!(drain(events).len(), 2);
+        pending.finish(Vec::new());
+        assert!(!links().contains_key("partial"));
+        assert_eq!(handle.join().unwrap().len(), 1);
     }
 }

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
+use super::retry::Transient;
 use super::{Api, Cancelled, Price, Provider, Quota, Sink, sse};
 
 const ATTEMPTS: u32 = 4;
@@ -133,7 +134,10 @@ impl Request {
             return Ok(());
         };
         let mut events = sse::Reader::new(body);
-        while let Some(event) = events.next_event()? {
+        while let Some(event) = events
+            .next_event()
+            .map_err(|error| Transient::new(format!("reading the response stream: {error}")))?
+        {
             if self.stopped() || self.tx.send(Msg::Event(event)).is_err() {
                 break;
             }

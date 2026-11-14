@@ -12,12 +12,13 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Error as AnyError, Result, anyhow};
 use serde_json::{Value, json};
 
+use super::retry::{self, Transient};
 use super::{
-    Api, Conversation, Item, Part, Provider, Reply, Sink, Stop, ToolCall, Usage, http,
-    prompt_cache_key, prompt_cache_retention, ws,
+    Api, Conversation, Item, Part, Provider, ProviderConfig, Reply, Sink, Stop, ToolCall, Usage,
+    http, prompt_cache_key, prompt_cache_retention, ws,
 };
 use super::{Cancelled, SUMMARY_INTRO, sse};
 
@@ -34,35 +35,49 @@ pub const CLIENT_VERSION: &str = "0.169.0";
 
 pub fn complete(p: &Provider, conv: &Conversation<'_>, sink: &mut dyn Sink) -> Result<Reply> {
     let url = format!("{}/responses", p.config.base_url.trim_end_matches('/'));
-    let headers = p.request_headers_for(conv.session);
-    let body = body(&p.config, conv);
-    // D101: the subscription backend speaks WebSocket, and a kept connection is what makes sending
-    // only the newest items legal. Anything that goes wrong here falls back to the request that was
-    // already being made, so the fallback can only be as good as the old path, never worse.
-    let mut pending = None;
-    let streamed = match ws::websocket_url(&p.config, &url)
-        .filter(|_| !conv.session.is_empty())
-        .map(|ws_url| (ws_url, conv.session))
-    {
-        Some((ws_url, session)) => match ws::stream(session, &ws_url, &headers, &body) {
-            Ok((events, kept)) => {
-                pending = Some(kept);
-                events
-            }
-            Err(_) => http::stream(p, url.clone(), headers.clone(), &body)?,
-        },
-        None => http::stream(p, url.clone(), headers.clone(), &body)?,
-    };
-    let reply = read_stream(streamed, sink)?;
-    if let Some(pending) = pending {
-        // What the next request will send for this reply, not what the server called its output:
-        // the shapes differ, and the baseline has to match what saddle writes.
-        pending.finish(input(&[Item::Assistant(reply.parts.clone())]));
-    }
-    Ok(reply)
+    let ws_url = ws::websocket_url(&p.config, &url).filter(|_| !conv.session.is_empty());
+    complete_at(p, conv, sink, &url, ws_url.as_deref())
 }
 
-pub fn body(cfg: &super::ProviderConfig, conv: &Conversation<'_>) -> Value {
+fn complete_at(
+    p: &Provider,
+    conv: &Conversation<'_>,
+    sink: &mut dyn Sink,
+    url: &str,
+    ws_url: Option<&str>,
+) -> Result<Reply> {
+    let headers = p.request_headers_for(conv.session);
+    let body = body(&p.config, conv);
+    // D125: a successful send does not prove the socket is alive. Recover read-time failures too,
+    // but only before output. The second attempt always uses HTTP and the whole input, not a delta.
+    retry::once(sink, |retry, sink| {
+        let mut pending = None;
+        let streamed = match ws_url.filter(|_| !retry) {
+            Some(ws_url) => match ws::stream(conv.session, ws_url, &headers, &body) {
+                Ok((events, kept)) => {
+                    pending = Some(kept);
+                    events
+                }
+                Err(_) => {
+                    sink.note("websocket unavailable; falling back to HTTP");
+                    if sink.cancelled() {
+                        return Err(Cancelled.into());
+                    }
+                    http::stream(p, url.to_owned(), headers.clone(), &body)?
+                }
+            },
+            None => http::stream(p, url.to_owned(), headers.clone(), &body)?,
+        };
+        let reply = read_stream(streamed, sink)?;
+        if let Some(pending) = pending {
+            // The next request's input shape, not the server's response.output shape (D101).
+            pending.finish(input(&[Item::Assistant(reply.parts.clone())]));
+        }
+        Ok(reply)
+    })
+}
+
+pub fn body(cfg: &ProviderConfig, conv: &Conversation<'_>) -> Value {
     let tools: Vec<Value> = conv
         .tools
         .iter()
@@ -307,7 +322,7 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
                     pending.done = true;
                 }
             }
-            "response.completed" | "response.incomplete" => {
+            "response.completed" | "response.done" | "response.incomplete" => {
                 let response = &event["response"];
                 model = response["model"].as_str().unwrap_or_default().to_owned();
                 status = response["status"].as_str().unwrap_or_default().to_owned();
@@ -337,14 +352,16 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
             }
             "response.failed" => {
                 let error = &event["response"]["error"];
-                bail!("{}", message_of(error));
+                return Err(stream_error(error));
             }
-            "error" => bail!("{}", message_of(&event)),
+            "error" => return Err(stream_error(&event)),
             _ => {}
         }
     }
     if !finished {
-        bail!("the reply stream ended before the response was completed");
+        return Err(
+            Transient::new("the reply stream ended before the response was completed").into(),
+        );
     }
 
     let mut parts = Vec::new();
@@ -440,11 +457,71 @@ fn message_of(error: &Value) -> String {
         .map_or_else(|| error.to_string(), str::to_owned)
 }
 
+fn stream_error(event: &Value) -> AnyError {
+    let error = event.get("error").unwrap_or(event);
+    let code = error["code"]
+        .as_str()
+        .or_else(|| event["code"].as_str())
+        .or_else(|| error["type"].as_str())
+        .unwrap_or_default();
+    let status = event["status"]
+        .as_u64()
+        .or_else(|| event["status_code"].as_u64());
+    let permanent = [code, error["type"].as_str().unwrap_or_default()]
+        .into_iter()
+        .any(|kind| {
+            matches!(
+                kind,
+                "insufficient_quota"
+                    | "usage_limit_reached"
+                    | "billing_hard_limit_reached"
+                    | "context_length_exceeded"
+                    | "invalid_api_key"
+                    | "authentication_error"
+                    | "permission_denied"
+            )
+        });
+    let transient = !permanent
+        && (code == "websocket_connection_limit_reached"
+            || match status {
+                Some(status) => matches!(status, 408 | 409 | 429 | 500..=599),
+                None => matches!(
+                    code,
+                    "server_error"
+                        | "internal_error"
+                        | "internal_server_error"
+                        | "rate_limit_exceeded"
+                        | "overloaded"
+                        | "service_unavailable"
+                        | "temporarily_unavailable"
+                ),
+            });
+    let message = message_of(event);
+    if transient {
+        let retry_after = [event.get("headers"), error.get("headers")]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+            .flat_map(|headers| headers.iter())
+            .filter(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+            .filter_map(|(_, value)| value.as_str()?.trim().parse::<u64>().ok())
+            .max();
+        Transient::new(message).with_retry_after(retry_after).into()
+    } else {
+        anyhow!(message)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::provider::CacheRetention;
-    use crate::provider::{Auth, ProviderConfig, ToolDef, ToolResult};
+    use crate::provider::{Auth, ProviderConfig, Reported, ToolDef, ToolResult};
+    use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+    use tungstenite::{Message, accept};
 
     struct Script(Vec<(&'static str, &'static str)>);
 
@@ -466,6 +543,347 @@ mod tests {
                     data: data.to_owned(),
                 })
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct Capture {
+        text: String,
+        reasoning: String,
+        notes: Vec<String>,
+        cancel_on_note: bool,
+        cancelled: bool,
+    }
+
+    impl Sink for Capture {
+        fn text(&mut self, text: &str) {
+            self.text.push_str(text);
+        }
+        fn reasoning(&mut self, text: &str) {
+            self.reasoning.push_str(text);
+        }
+        fn note(&mut self, note: &str) {
+            self.notes.push(note.to_owned());
+            self.cancelled |= self.cancel_on_note;
+        }
+        fn cancelled(&self) -> bool {
+            self.cancelled
+        }
+    }
+
+    fn accept_request(listener: &TcpListener) -> TcpStream {
+        let start = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(5),
+                        "request never arrived"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        }
+    }
+
+    /// a real upgrade and HTTP fallback on one endpoint, with no external credentials or requests.
+    fn transports(
+        ws_events: Option<Vec<Value>>,
+        http_replies: Vec<Vec<Value>>,
+    ) -> (String, String, JoinHandle<Vec<Value>>) {
+        exchanges(ws_events.into_iter().collect(), http_replies)
+    }
+
+    fn exchanges(
+        ws_replies: Vec<Vec<Value>>,
+        http_replies: Vec<Vec<Value>>,
+    ) -> (String, String, JoinHandle<Vec<Value>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            if !ws_replies.is_empty() {
+                let mut socket = accept(accept_request(&listener)).unwrap();
+                for events in ws_replies {
+                    let Message::Text(frame) = socket.read().unwrap() else {
+                        panic!("expected response.create");
+                    };
+                    requests.push(serde_json::from_str(frame.as_str()).unwrap());
+                    for event in events {
+                        socket
+                            .send(Message::Text(event.to_string().into()))
+                            .unwrap();
+                    }
+                }
+                // Deliberately drop without a close handshake, including after a successful send.
+            }
+            for events in http_replies {
+                let mut reader = BufReader::new(accept_request(&listener));
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line.to_ascii_lowercase());
+                }
+                assert!(head.starts_with("post /responses "), "{head}");
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .unwrap()
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap();
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).unwrap();
+                requests.push(serde_json::from_slice(&bytes).unwrap());
+                let body: String = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect();
+                write!(reader.get_mut(), "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        (
+            format!("http://{address}/responses"),
+            format!("ws://{address}/responses"),
+            handle,
+        )
+    }
+
+    fn completed(text: &str) -> Vec<Value> {
+        vec![
+            json!({"type":"response.output_text.delta","delta":text}),
+            json!({"type":"response.completed","response":{"id":"resp_ok","status":"completed","model":"m"}}),
+        ]
+    }
+
+    fn request(http: &str, ws: Option<&str>, sink: &mut dyn Sink) -> Result<Reply> {
+        let provider = Provider::new("mock", config(), None, &Reported::default());
+        let items = [Item::User("hello".into())];
+        let conv = Conversation {
+            system: "s",
+            tools: &[],
+            items: &items,
+            session: "recovery-test",
+        };
+        complete_at(&provider, &conv, sink, http, ws)
+    }
+
+    #[test]
+    fn a_websocket_that_drops_after_send_recovers_the_same_request_over_http() {
+        let (http, ws, handle) = transports(Some(Vec::new()), vec![completed("recovered")]);
+        let mut sink = Capture::default();
+        let reply = request(&http, Some(&ws), &mut sink).unwrap();
+        assert_eq!(sink.text, "recovered");
+        assert_eq!(reply.parts, [Part::Text("recovered".into())]);
+        assert_eq!(sink.notes.len(), 1);
+        assert!(sink.notes[0].contains("retrying once over HTTP"));
+        let mut requests = handle.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["type"], "response.create");
+        requests[0].as_object_mut().unwrap().remove("type");
+        assert_eq!(
+            requests[0], requests[1],
+            "the full input, not a continuation"
+        );
+        assert!(requests[1].get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn a_failed_delta_recovers_with_the_entire_conversation() {
+        let (http, ws, handle) = exchanges(
+            vec![completed("first"), Vec::new()],
+            vec![completed("second")],
+        );
+        let mut sink = Capture::default();
+        let first = request(&http, Some(&ws), &mut sink).unwrap();
+        let provider = Provider::new("mock", config(), None, &Reported::default());
+        let items = [
+            Item::User("hello".into()),
+            Item::Assistant(first.parts),
+            Item::User("again".into()),
+        ];
+        let conv = Conversation {
+            system: "s",
+            tools: &[],
+            items: &items,
+            session: "recovery-test",
+        };
+        let mut sink = Capture::default();
+        complete_at(&provider, &conv, &mut sink, &http, Some(&ws)).unwrap();
+        assert_eq!(sink.text, "second");
+        let requests = handle.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1]["previous_response_id"], "resp_ok");
+        assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
+        assert_eq!(requests[2], body(&provider.config, &conv));
+        assert_eq!(requests[2]["input"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn connection_age_limit_and_server_fault_events_recover_without_resending_the_prompt() {
+        for event in [
+            json!({"type":"error","status":400,"error":{"code":"websocket_connection_limit_reached","message":"connection reached 60 minutes"}}),
+            json!({"type":"response.failed","response":{"error":{"code":"server_error","message":"try again"}}}),
+        ] {
+            let (http, ws, handle) = transports(Some(vec![event]), vec![completed("ok")]);
+            let mut sink = Capture::default();
+            request(&http, Some(&ws), &mut sink).unwrap();
+            assert_eq!(sink.text, "ok");
+            assert_eq!(sink.notes.len(), 1);
+            assert_eq!(handle.join().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn permanent_websocket_errors_are_not_retried() {
+        for event in [
+            json!({"type":"error","status":401,"error":{"code":"invalid_api_key","message":"sign in"}}),
+            json!({"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"quota exhausted"}}),
+            json!({"type":"error","status":400,"error":{"type":"invalid_request_error","message":"invalid request"}}),
+        ] {
+            let (http, ws, handle) = transports(Some(vec![event]), Vec::new());
+            let mut sink = Capture::default();
+            assert!(request(&http, Some(&ws), &mut sink).is_err());
+            assert!(sink.notes.is_empty());
+            assert_eq!(handle.join().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_dropped_partial_reply_is_not_replayed_or_spliced() {
+        for kind in [
+            "response.output_text.delta",
+            "response.reasoning_summary_text.delta",
+        ] {
+            let (http, ws, handle) = transports(
+                Some(vec![json!({"type":kind,"delta":"partial"})]),
+                Vec::new(),
+            );
+            let mut sink = Capture::default();
+            assert!(request(&http, Some(&ws), &mut sink).is_err());
+            assert_eq!(format!("{}{}", sink.text, sink.reasoning), "partial");
+            assert!(sink.notes.is_empty());
+            assert_eq!(handle.join().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn cancellation_on_the_retry_notice_prevents_another_request() {
+        let (http, ws, handle) = transports(Some(Vec::new()), Vec::new());
+        let mut sink = Capture {
+            cancel_on_note: true,
+            ..Capture::default()
+        };
+        let error = request(&http, Some(&ws), &mut sink).unwrap_err();
+        assert!(error.downcast_ref::<Cancelled>().is_some());
+        assert_eq!(handle.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_second_interrupted_http_stream_is_the_end_of_recovery() {
+        let (http, _, handle) = transports(None, vec![Vec::new(), Vec::new()]);
+        let mut sink = Capture::default();
+        assert!(request(&http, None, &mut sink).is_err());
+        assert_eq!(sink.notes.len(), 1);
+        assert_eq!(handle.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn buffered_tool_arguments_from_a_failed_attempt_are_discarded() {
+        let partial = json!({"type":"response.output_item.added","output_index":0,
+            "item":{"type":"function_call","id":"fc_bad","call_id":"call_bad","name":"write"}});
+        let (http, ws, handle) = transports(Some(vec![partial]), vec![completed("no tool")]);
+        let mut sink = Capture::default();
+        let reply = request(&http, Some(&ws), &mut sink).unwrap();
+        assert_eq!(reply.calls().count(), 0);
+        assert_eq!(reply.parts, [Part::Text("no tool".into())]);
+        assert_eq!(handle.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_temporary_rate_limit_uses_the_servers_retry_after() {
+        let event = json!({"type":"error","status":429,
+            "error":{"code":"rate_limit_exceeded","message":"try again"},
+            "headers":{"Retry-After":"0"}});
+        let (http, ws, handle) = transports(Some(vec![event]), vec![completed("ok")]);
+        let mut sink = Capture::default();
+        request(&http, Some(&ws), &mut sink).unwrap();
+        assert_eq!(sink.text, "ok");
+        assert!(sink.notes[0].ends_with("in 0s"));
+        assert_eq!(handle.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn handshake_failure_falls_back_to_http_with_a_notice() {
+        let (http, _, handle) = transports(None, vec![completed("http")]);
+        let mut sink = Capture::default();
+        request(&http, Some("not a websocket URL"), &mut sink).unwrap();
+        assert_eq!(sink.text, "http");
+        assert_eq!(sink.notes, ["websocket unavailable; falling back to HTTP"]);
+        assert_eq!(handle.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn malformed_events_and_deliberate_incomplete_replies_are_not_retried() {
+        let mut attempts = 0;
+        let error = retry::once(&mut Silent, |_, sink| {
+            attempts += 1;
+            read_stream(Script(vec![("", "not JSON")]), sink)
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("unreadable stream event"));
+        assert_eq!(attempts, 1);
+
+        let incomplete = json!({"type":"response.incomplete","response":{
+            "id":"resp_partial","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}});
+        let (http, ws, handle) = transports(Some(vec![incomplete]), Vec::new());
+        let mut sink = Capture::default();
+        let reply = request(&http, Some(&ws), &mut sink).unwrap();
+        assert_eq!(reply.stop, Stop::MaxTokens);
+        assert!(sink.notes.is_empty());
+        assert_eq!(handle.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn error_classification_does_not_turn_auth_or_quota_into_a_transient_failure() {
+        for event in [
+            json!({"status":401,"error":{"code":"server_error","message":"sign in"}}),
+            json!({"status":403,"error":{"code":"server_error","message":"forbidden"}}),
+            json!({"status":429,"error":{"code":"rate_limit_exceeded","type":"usage_limit_reached"}}),
+            json!({"status":429,"error":{"code":"insufficient_quota"}}),
+            json!({"status":400,"error":{"code":"invalid_value"}}),
+        ] {
+            assert!(
+                stream_error(&event).downcast_ref::<Transient>().is_none(),
+                "{event}"
+            );
+        }
+        for event in [
+            json!({"status_code":503,"error":{"message":"temporarily unavailable"}}),
+            json!({"error":{"type":"server_error"}}),
+            json!({"status":400,"error":{"code":"websocket_connection_limit_reached"}}),
+        ] {
+            assert!(
+                stream_error(&event).downcast_ref::<Transient>().is_some(),
+                "{event}"
+            );
         }
     }
 

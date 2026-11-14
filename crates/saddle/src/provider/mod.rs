@@ -20,6 +20,7 @@ mod openai;
 mod openai_account;
 mod reported;
 mod responses;
+mod retry;
 mod ws;
 
 pub use ws::websocket_url;
