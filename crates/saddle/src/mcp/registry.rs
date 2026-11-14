@@ -260,6 +260,16 @@ impl Registry {
         }
     }
 
+    /// What one tool's exposure is, from its table: the tool's own word, the server's, or `hidden`
+    /// when there is no table to ask (D117, D122).
+    fn exposure(&self, server: &str, tool: &str) -> crate::mcp::Exposure {
+        self.entries
+            .get(server)
+            .map_or(crate::mcp::Exposure::Deferred, |entry| {
+                entry.exposure_of(tool)
+            })
+    }
+
     /// Whether a server's table says `hidden`, in which case it is not started at all (D117).
     fn is_hidden(&self, server: &str) -> bool {
         self.entries
@@ -434,9 +444,12 @@ impl Registry {
         let words: Vec<&str> = wanted.split_whitespace().collect();
         let mut scored: Vec<(usize, String)> = Vec::new();
         for (key, (server, tool)) in &self.catalogue {
-            // A hidden server is not searched, called or started: the switch is in the table, and
-            // a catalogue that somehow holds its tools must not be a way past it (D117).
-            if self.is_hidden(server) || !self.granted(server, &tool.name) {
+            // A hidden server or tool is not searched, called or started: the switch is in the
+            // table, and a catalogue that somehow holds the tool must not be a way past it
+            // (D117, D122).
+            if self.exposure(server, &tool.name) == crate::mcp::Exposure::Hidden
+                || !self.granted(server, &tool.name)
+            {
                 continue;
             }
             let haystack = format!("{key} {}", tool.description).to_lowercase();
@@ -472,16 +485,15 @@ impl Registry {
     }
 
     /// The definitions to add to the tool list: what this session has declared by searching, plus
-    /// every granted tool of a server whose table says `direct` (D117). A `hidden` server
-    /// contributes nothing, which is what makes it a switch rather than a second grant.
+    /// every granted tool whose exposure is `direct` — whether the server said so or the tool's own
+    /// entry did (D117, D122). A hidden server or tool contributes nothing, which is what makes the
+    /// word a switch rather than a second grant.
     pub fn declared(&self) -> Vec<ToolDef> {
         let mut keys: BTreeSet<String> = self.loaded.clone();
-        for name in self.direct() {
-            for (key, (_, tool)) in &self.catalogue {
-                if key.starts_with(&format!("{PREFIX}{name}__")) && self.granted(&name, &tool.name)
-                {
-                    keys.insert(key.clone());
-                }
+        for (key, (server, tool)) in &self.catalogue {
+            let direct = self.exposure(server, &tool.name) == crate::mcp::Exposure::Direct;
+            if direct && self.granted(server, &tool.name) {
+                keys.insert(key.clone());
             }
         }
         keys.iter()
@@ -536,7 +548,7 @@ impl Registry {
         // grant is recorded below — the same shape every other tool's allow carries, with the
         // arguments hashed rather than quoted (D24).
         let arguments = arguments_record(input);
-        let refusal = if self.is_hidden(&server) {
+        let refusal = if self.exposure(&server, &tool.name) == crate::mcp::Exposure::Hidden {
             Some(format!(
                 "`{server}` is turned off in config.toml (`exposure = \"hidden\"`)"
             ))
@@ -647,6 +659,49 @@ impl Registry {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn one_tool_can_be_declared_or_hidden_beside_its_server() {
+        // D122: exposure per tool, on top of the server's own word. A `direct` tool of a deferred
+        // server is in the prompt, a `hidden` tool of the same server is not reachable at all, and
+        // neither can widen what the grant allows.
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "scout".to_owned(),
+            McpEntry {
+                exposure: crate::mcp::Exposure::Deferred,
+                tool_exposure: BTreeMap::from([
+                    ("search".to_owned(), crate::mcp::Exposure::Direct),
+                    ("rm_rf".to_owned(), crate::mcp::Exposure::Hidden),
+                ]),
+                ..McpEntry::default()
+            },
+        );
+        let mut registry = Registry::new(
+            vec![granted("scout", &["search", "rm_rf"])],
+            entries,
+            Vec::new(),
+            None,
+        );
+        registry.attach("scout", Registry::tool("search"));
+        registry.attach("scout", Registry::tool("rm_rf"));
+
+        let declared: Vec<String> = registry
+            .declared()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(
+            declared,
+            [Registry::name("scout", "search")],
+            "only the tool the table said was direct is declared"
+        );
+        let searched = registry.search("");
+        assert!(
+            !searched.iter().any(|key| key.contains("rm_rf")),
+            "a hidden tool was declared by a search: {searched:?}"
+        );
+    }
 
     #[test]
     fn the_report_says_what_each_server_is_doing() {

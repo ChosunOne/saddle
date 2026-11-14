@@ -247,13 +247,20 @@ impl Setup {
                 .map(|g| format!("granted [{}]", g.tools.join(", ")))
                 .unwrap_or_else(|| "not granted".to_owned());
             let deadline = entry.timeout().as_secs();
+            // A table with per-tool words says so, so `check` never reports a server as one thing
+            // while a tool of it is another (D122).
+            let per_tool = if entry.tool_exposure.is_empty() {
+                String::new()
+            } else {
+                format!(" · {} tool override(s)", entry.tool_exposure.len())
+            };
             let exposure = match entry.exposure() {
                 crate::mcp::Exposure::Deferred => "searched for",
                 crate::mcp::Exposure::Direct => "in the prompt",
                 crate::mcp::Exposure::Hidden => "off",
             };
             mcp.push(format!(
-                "{name} · {what} · {access} · {exposure} · {deadline}s per call"
+                "{name} · {what} · {access} · {exposure}{per_tool} · {deadline}s per call"
             ));
         }
         if let Some(grants) = agent_grants {

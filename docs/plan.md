@@ -2782,6 +2782,16 @@ a token. Another provider's credential in the same file is untouched, and a seco
 was nothing to forget instead of failing. The TUI's `/mcp` signs out the same way; there is no
 separate path.
 
+**D122.** `tool-exposure` gives one tool a different word from its server's: a deferred server can
+put its most-used tool in the prompt, and a direct server can keep one out of it or off entirely.
+The key is an **exact tool name**, and a pattern is refused at load — this is the one file a person
+writes by hand, and the grant beside it names tools exactly, so a wildcard here would be the single
+place a name could arrive that nobody wrote. The effective word is the tool's own, else the server's,
+and it is asked at every point that already asked about a server: what is declared at startup, what
+a search may declare, and whether a call is refused. A hidden tool is refused with the table named,
+so a model that guessed the name learns why rather than getting a transport error. The grant is
+still the only authority: exposure changes where a schema appears, never whether a call is allowed.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

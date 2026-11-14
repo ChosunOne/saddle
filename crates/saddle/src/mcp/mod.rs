@@ -55,6 +55,10 @@ pub struct McpEntry {
     /// decides what may be called.
     #[serde(default, deserialize_with = "exposure")]
     pub exposure: Exposure,
+    /// Per-tool overrides, by exact tool name (D122). A pattern is refused: the grant names tools
+    /// exactly, and a wildcard here would be the one pattern in a file a person writes by hand.
+    #[serde(default, rename = "tool-exposure", deserialize_with = "tool_exposures")]
+    pub tool_exposure: BTreeMap<String, Exposure>,
 }
 
 /// How a server's tools reach the model, in pi's vocabulary (D117).
@@ -100,6 +104,27 @@ where
     Exposure::parse(&text).map_err(serde::de::Error::custom)
 }
 
+/// The per-tool map (D122): every value is an exposure, and every key is an exact tool name.
+fn tool_exposures<'de, D>(deserializer: D) -> Result<BTreeMap<String, Exposure>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = BTreeMap::<String, String>::deserialize(deserializer)?;
+    let mut out = BTreeMap::new();
+    for (name, text) in raw {
+        if name.contains('*') {
+            return Err(serde::de::Error::custom(format!(
+                "`{name}` is a pattern: tool-exposure names tools exactly, the way the grant does"
+            )));
+        }
+        out.insert(
+            name,
+            Exposure::parse(&text).map_err(serde::de::Error::custom)?,
+        );
+    }
+    Ok(out)
+}
+
 /// A description as one line of at most 100 characters, since a server may write a paragraph.
 pub fn first_line(text: &str) -> String {
     let line = text.lines().next().unwrap_or_default().trim();
@@ -127,6 +152,14 @@ impl McpEntry {
     /// How this server's tools reach the model, which is the table's own choice (D117).
     pub fn exposure(&self) -> Exposure {
         self.exposure
+    }
+
+    /// What one tool's exposure is: its own override, or the server's (D122).
+    pub fn exposure_of(&self, tool: &str) -> Exposure {
+        self.tool_exposure
+            .get(tool)
+            .copied()
+            .unwrap_or(self.exposure)
     }
 
     pub fn timeout(&self) -> Duration {
