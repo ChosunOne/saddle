@@ -103,6 +103,15 @@ pub struct FsGrant {
 }
 
 impl FsGrant {
+    /// keeps the compiled matcher in step with the written exclusions when delegating a grant.
+    pub(crate) fn with_exclusions(&self, exclude: Vec<String>) -> Result<Self, String> {
+        Ok(Self {
+            exclude_set: exclude_set(&exclude)?,
+            exclude,
+            ..self.clone()
+        })
+    }
+
     /// Whether this grant's exclusions cover `rel`. Patterns without a `/` match at any depth, as
     /// in `.gitignore`, and a pattern that names a directory also covers everything beneath it.
     pub fn excludes(&self, rel: &RelPath) -> bool {

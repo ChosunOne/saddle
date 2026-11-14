@@ -55,8 +55,7 @@ fn narrow_fs(
                 }
             }
         }
-        let mut narrowed = want.clone();
-        narrowed.exclude = exclude;
+        let mut narrowed = want.with_exclusions(exclude)?;
         // The rule names the grant that asked, so a denial in the audit points at a line in the
         // policy rather than at the agent's own grant.
         narrowed.rule = want.rule.clone();
@@ -147,7 +146,7 @@ pub fn rules_of(grants: &Grants) -> Vec<&RuleId> {
 mod tests {
     use super::*;
     use crate::policy::Policy;
-    use crate::roots::Roots;
+    use crate::roots::{RelPath, Roots};
     use std::fs;
     use std::path::Path;
 
@@ -216,6 +215,8 @@ net      = [{ host = "*.example.com" }, { host = "api.other.test" }]
         let narrowed = narrow(agent, &grant.reach, grant.rule.as_str()).unwrap();
         assert_eq!(narrowed.fs_read.len(), 1);
         assert_eq!(narrowed.fs_read[0].root.as_str(), "workspace");
+        assert!(narrowed.fs_read[0].excludes(&RelPath::new(".env").unwrap()));
+        assert!(narrowed.fs_read[0].excludes(&RelPath::new("secrets/key").unwrap()));
         let mut exclude = narrowed.fs_read[0].exclude.clone();
         exclude.sort();
         assert_eq!(
