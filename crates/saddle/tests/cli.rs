@@ -4,6 +4,8 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const POLICY: &str = r#"
 version = 1
@@ -168,6 +170,14 @@ impl Env {
                     .unwrap_or_default()
             })
             .collect()
+    }
+
+    /// What the most recent run recorded, as text.
+    fn audit(&self) -> String {
+        self.audit_logs()
+            .last()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default()
     }
 
     fn audit_logs(&self) -> Vec<PathBuf> {
@@ -766,6 +776,157 @@ mcp     = [{ server = "scout", tools = ["search"] }, { server = "ghost", tools =
         text.contains("ghost · granted, but no [mcp.ghost] table"),
         "{text}"
     );
+}
+
+/// A loopback streamable-HTTP MCP server: JSON for `initialize`, an event stream for `tools/list`,
+/// so both framings a server may answer with are exercised (D110). It stops when the test says so,
+/// because a refused request never reaches it and would otherwise leave a thread waiting forever.
+fn mock_http_mcp() -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("the bound address").port();
+    listener
+        .set_nonblocking(true)
+        .expect("a non-blocking listener");
+    let seen = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let count = Arc::clone(&seen);
+    let done = Arc::clone(&stop);
+    let handle = std::thread::spawn(move || {
+        while !done.load(Ordering::SeqCst) {
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+            };
+            count.fetch_add(1, Ordering::SeqCst);
+            let mut stream = stream;
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Headers first, then exactly as many bytes of body as they announced.
+            loop {
+                match std::io::Read::read(&mut stream, &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => raw.extend_from_slice(&buf[..n]),
+                }
+                let text = String::from_utf8_lossy(&raw).to_string();
+                if let Some(head) = text.find("\r\n\r\n") {
+                    let length = text[..head]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= head + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let text = String::from_utf8_lossy(&raw).to_string();
+            let body = text
+                .find("\r\n\r\n")
+                .map(|at| &text[at + 4..])
+                .unwrap_or_default();
+            let answer = if body.contains("tools/list") {
+                // An event stream, which is what a server may answer any request with.
+                let event = r#"data: {"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"says it back","inputSchema":{}}]}}
+
+"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{event}",
+                    event.len()
+                )
+            } else if body.contains("notifications/initialized") {
+                "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
+            } else {
+                let reply = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"mock"}}}"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: mock-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+            };
+            let _ = std::io::Write::write_all(&mut stream, answer.as_bytes());
+        }
+    });
+    (format!("http://127.0.0.1:{port}/mcp"), seen, stop, handle)
+}
+
+#[test]
+fn an_http_server_is_reached_only_through_its_own_narrowed_reach() {
+    // D110: an HTTP server has no child to confine, so its authority is asked at every request —
+    // against its own reach, narrowed from the agent's. The same server with the same grant but no
+    // net reach is refused before anything is sent, and the record says which server it was for.
+    let env = Env::new();
+    let (url, seen, stop, handle) = mock_http_mcp();
+    env.write_config(&format!("\n[mcp.remote]\nurl = {url:?}\n"));
+    let port = url
+        .rsplit(':')
+        .next()
+        .and_then(|rest| rest.split('/').next())
+        .expect("a port in the url");
+    env.write_policy(format!(
+        r#"
+version = 1
+
+[agent]
+fs-read = [{{ root = "workspace" }}]
+net     = [{{ host = "127.0.0.1", scheme = "http", port = {port} }}]
+mcp     = [{{ server = "remote", tools = ["echo"], net = [{{ host = "127.0.0.1", scheme = "http", port = {port} }}] }}]
+"#
+    ));
+    let out = env.saddle(&["mcp", "list"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("remote  1 tool(s)"), "not spoken to: {text}");
+    assert!(text.contains("echo"), "{text}");
+    assert!(text.contains("granted"), "{text}");
+    let asked = seen.load(Ordering::SeqCst);
+
+    // The same server, granted the tool and a reach that is *narrower* than the agent's: it names
+    // another port, so the agent's own grant for this one does not answer for it. Refused before
+    // anything is sent, and the mock hears nothing more.
+    env.write_policy(format!(
+        r#"
+version = 1
+
+[agent]
+fs-read = [{{ root = "workspace" }}]
+net     = [
+  {{ host = "127.0.0.1", scheme = "http", port = {port} }},
+  {{ host = "127.0.0.1", scheme = "http", port = 9 }},
+]
+mcp     = [{{ server = "remote", tools = ["echo"], net = [{{ host = "127.0.0.1", scheme = "http", port = 9 }}] }}]
+"#
+    ));
+    let out = env.saddle(&["mcp", "list"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("no net grant covering"),
+        "the refusal did not say what was missing: {text}"
+    );
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        asked,
+        "a refused request must not be sent"
+    );
+
+    let log = env.audit();
+    assert!(
+        log.contains("\"via\":\"mcp\"") && log.contains("\"server\":\"remote\""),
+        "the decision does not name the server it was for: {log}"
+    );
+    stop.store(true, Ordering::SeqCst);
+    let _ = handle.join();
 }
 
 #[test]

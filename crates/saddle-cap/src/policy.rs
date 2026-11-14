@@ -213,6 +213,26 @@ pub struct NetGrant {
     pub port: Option<u16>,
 }
 
+/// One list of net grants against one request. A server's reach is a narrowed list rather than a
+/// principal the engine resolves, so the question is asked here and answered the same way (D110).
+pub fn net_allows<'a>(
+    grants: &'a [NetGrant],
+    scheme: &str,
+    host: &str,
+    port: u16,
+) -> Option<&'a NetGrant> {
+    grants.iter().find(|g| g.allows(scheme, host, port))
+}
+
+/// Whether a list of grants spells the host out rather than covering it with a pattern. Only a
+/// grant that names an address can reach loopback or private space (D40), and a server's narrowed
+/// reach has to be asked the same question the agent's grants are (D110).
+pub fn names_host(grants: &[NetGrant], host: &str) -> bool {
+    grants
+        .iter()
+        .any(|g| matches!(&g.host, HostPattern::Exact(h) if h.eq_ignore_ascii_case(host)))
+}
+
 impl NetGrant {
     pub fn allows(&self, scheme: &str, host: &str, port: u16) -> bool {
         scheme == self.scheme.as_str()
@@ -282,9 +302,7 @@ impl Grants {
     /// Whether a grant names `host` exactly, which is what lets a private address be reached
     /// (D28): a wildcard grant is not a name, so it does not open loopback (D40).
     pub fn names_host(&self, host: &str) -> bool {
-        self.net
-            .iter()
-            .any(|g| matches!(&g.host, HostPattern::Exact(h) if h.eq_ignore_ascii_case(host)))
+        names_host(&self.net, host)
     }
 
     pub fn scopes(&self) -> BTreeSet<Scope> {

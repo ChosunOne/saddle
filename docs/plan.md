@@ -2649,6 +2649,20 @@ trusted. The stored row is a name, never a schema or a reach: what a tool does i
 server afresh, so a server that changed its arguments cannot have a stale definition called with
 an old shape. A new conversation declares nothing, whatever the process still has running.
 
+**D110.** A server reached over streamable HTTP has no child process, so the host makes every
+request itself — and each one is decided at the moment it is made, against that server's own reach
+rather than the agent's whole list. The reach is the net grants narrowed from the agent's in D105's
+way, so a server that names one host cannot reach another the agent may, and one that names nothing
+inherits the agent's reach as before. A private address still needs a grant that spells it out, and
+the question is asked of the narrowed list, not of the agent's. The record names the server
+(`via: mcp`), because there is no argv or cwd to point at, and the header names are recorded and
+never their values. The transport itself is the one the spec describes: a POST carrying one
+JSON-RPC object, a reply that may be JSON or an event stream and is read either way, `Mcp-Session-Id`
+kept from the handshake and sent back, `notifications/initialized` before anything else, and
+`nextCursor` followed so a paginated catalogue is complete. A 401 or 403 is a failure, not a retry:
+without a token there is nothing to retry with, and looping would spend a quota to learn the same
+thing twice. OAuth is the next decision and not a silent fallback here.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

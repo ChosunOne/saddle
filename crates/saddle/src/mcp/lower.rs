@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use saddle_cap::narrow::narrow;
+use saddle_cap::policy::{Grants, McpGrant, NetGrant};
 use saddle_cap::sandbox::{ExecRequest, SandboxSpec, lower_exec};
 use saddle_cap::{Location, Principal, RelPath, RootName};
 
@@ -12,18 +13,13 @@ use crate::session::Session;
 
 pub fn spec(
     session: &Session,
-    grant: &saddle_cap::McpGrant,
+    grant: &McpGrant,
     entry: &McpEntry,
     command: &str,
     args: &[String],
     host_env: &[(String, String)],
 ) -> Result<SandboxSpec> {
-    let agent = session
-        .engine
-        .policy()
-        .grants(&Principal::Agent)
-        .context("the policy gives the agent no grants")?;
-    let narrowed = narrow(agent, &grant.reach, grant.rule.as_str()).map_err(|e| anyhow!("{e}"))?;
+    let narrowed = narrowed(session, grant)?;
     let mut argv = vec![command.to_owned()];
     argv.extend(args.iter().cloned());
     let cwd = Location::new(RootName::workspace(), RelPath::new("")?);
@@ -47,4 +43,22 @@ pub fn spec(
         lowered.spec.env.sort();
     }
     Ok(lowered.spec)
+}
+
+/// One server's grants: its own list narrowed so it is never wider than the agent's (D105). Asking
+/// for more than the agent holds is an error, not a silent trim, so a policy that cannot be
+/// satisfied says so at the point the server is started.
+pub fn narrowed(session: &Session, grant: &McpGrant) -> Result<Grants> {
+    let agent = session
+        .engine
+        .policy()
+        .grants(&Principal::Agent)
+        .context("the policy gives the agent no grants")?;
+    narrow(agent, &grant.reach, grant.rule.as_str()).map_err(|e| anyhow!("{e}"))
+}
+
+/// The net grants a server may use. An HTTP server has no child, so this list is what every one of
+/// its requests is decided against (D110).
+pub fn net_reach(session: &Session, grant: &McpGrant) -> Result<Vec<NetGrant>> {
+    Ok(narrowed(session, grant)?.net)
 }

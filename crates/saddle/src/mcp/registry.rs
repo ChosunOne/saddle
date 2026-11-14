@@ -31,9 +31,15 @@ fn parse(key: &str) -> Option<(&str, &str)> {
     (!server.is_empty() && !tool.is_empty()).then_some((server, tool))
 }
 
+/// How one running server is spoken to: a child's pipes, or the host's own requests (D107, D110).
+pub enum Connection {
+    Stdio(Client),
+    Http(crate::mcp::http::Client),
+}
+
 /// One running server and its relay.
 pub struct Running {
-    client: Client,
+    conn: Connection,
     bridge: Option<Bridge>,
 }
 
@@ -112,36 +118,66 @@ impl Registry {
             .get(server)
             .cloned()
             .ok_or_else(|| anyhow!("`{server}` has no [mcp.{server}] table in config.toml"))?;
-        let (command, args) = match entry.transport()? {
-            crate::mcp::Transport::Stdio { command, args } => (command.to_owned(), args.to_vec()),
-            crate::mcp::Transport::Http { url } => {
-                bail!("{url} is a streamable-HTTP server, which is not built yet")
-            }
-        };
-        let helper = self.helper.clone().context("locating the saddle binary")?;
-        let mut spec =
-            crate::mcp::lower::spec(session, &grant, &entry, &command, &args, &self.host_env)?;
-        let mut bridge = self.tmp.as_deref().and_then(|dir| Bridge::start(dir).ok());
-        if let Some(bridge) = &bridge {
-            spec.net = Some(bridge.spec());
-        }
-        let mut client = Client::start(server, &helper, &spec)?;
-        let tools = {
-            let mut service = || {
-                if let Some(bridge) = bridge.as_mut() {
-                    bridge.service(session);
+        match entry.transport()? {
+            crate::mcp::Transport::Stdio { command, args } => {
+                let helper = self.helper.clone().context("locating the saddle binary")?;
+                let mut spec = crate::mcp::lower::spec(
+                    session,
+                    &grant,
+                    &entry,
+                    command,
+                    args,
+                    &self.host_env,
+                )?;
+                let mut bridge = self.tmp.as_deref().and_then(|dir| Bridge::start(dir).ok());
+                if let Some(bridge) = &bridge {
+                    spec.net = Some(bridge.spec());
                 }
-            };
-            client.initialize(&mut service)?;
-            client.tools(&mut service)?
-        };
+                let mut client = Client::start(server, &helper, &spec)?;
+                let tools = {
+                    let mut service = || {
+                        if let Some(bridge) = bridge.as_mut() {
+                            bridge.service(session);
+                        }
+                    };
+                    client.initialize(&mut service)?;
+                    client.tools(&mut service)?
+                };
+                self.record(server, tools);
+                self.servers.insert(
+                    server.to_owned(),
+                    Running {
+                        conn: Connection::Stdio(client),
+                        bridge,
+                    },
+                );
+            }
+            crate::mcp::Transport::Http { url } => {
+                // A server with no child still has a reach: its net grants, narrowed from the
+                // agent's, are what every request of its own is decided against (D105, D110).
+                let reach = crate::mcp::lower::net_reach(session, &grant)?;
+                let mut client = crate::mcp::http::Client::start(server, url, reach)?;
+                client.initialize(session)?;
+                let tools = client.tools(session)?;
+                self.record(server, tools);
+                self.servers.insert(
+                    server.to_owned(),
+                    Running {
+                        conn: Connection::Http(client),
+                        bridge: None,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Files what a server offers under namespaced keys (D108).
+    fn record(&mut self, server: &str, tools: Vec<Tool>) {
         for tool in tools {
             let key = Self::name(server, &tool.name);
             self.catalogue.insert(key, (server.to_owned(), tool));
         }
-        self.servers
-            .insert(server.to_owned(), Running { client, bridge });
-        Ok(())
     }
 
     /// Declares what matches `query`. An empty query declares everything the granted servers offer,
@@ -254,21 +290,28 @@ impl Registry {
             .servers
             .get_mut(&server)
             .ok_or_else(|| anyhow!("`{server}` is not running"))?;
-        let outcome = {
-            // Borrowed as two fields, so the relay can be serviced while the client is being
-            // waited on: they are different things that happen to live together.
-            let Running { client, bridge } = running;
-            let mut service = || {
-                if let Some(bridge) = bridge.as_mut() {
-                    denials.extend(bridge.service(session));
+        let Running { conn, bridge } = running;
+        let outcome = match conn {
+            Connection::Stdio(client) => {
+                let mut service = || {
+                    if let Some(bridge) = bridge.as_mut() {
+                        denials.extend(bridge.service(session));
+                    }
+                };
+                let (ok, text) = client.call(&tool.name, input, &mut service)?;
+                if ok {
+                    ToolOutput::ok(text)
+                } else {
+                    ToolOutput::err(text)
                 }
-            };
-            client.call(&tool.name, input, &mut service)
-        }?;
-        let mut out = match outcome {
-            (true, text) => ToolOutput::ok(text),
-            (false, text) => ToolOutput::err(text),
+            }
+            Connection::Http(client) => match client.call(session, &tool.name, input)? {
+                crate::mcp::http::Outcome::Answered(text) => ToolOutput::ok(text),
+                crate::mcp::http::Outcome::Failed(text) => ToolOutput::err(text),
+                crate::mcp::http::Outcome::Denied(why) => ToolOutput::denied(&why),
+            },
         };
+        let mut out = outcome;
         for denial in denials {
             out.content.push_str(&format!("\n{denial}"));
         }

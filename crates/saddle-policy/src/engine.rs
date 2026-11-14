@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use globset::GlobSet;
-use saddle_cap::policy::{FsGrant, POLICY_FILE, exclude_set};
+use saddle_cap::policy::{FsGrant, NetGrant, POLICY_FILE, exclude_set, net_allows};
 use saddle_cap::{Location, Policy, Principal, RelPath, RootName, RuleId, Scope};
 use serde_json::{Value, json};
 
@@ -183,6 +183,25 @@ pub struct Engine {
     policy: Policy,
     reserved: Reserved,
     spent: Mutex<BTreeMap<Principal, u64>>,
+}
+
+/// One narrowed list of net grants against one request (D110). A component or a server has a list
+/// of its own rather than a principal the policy resolves, so the question is asked here — with the
+/// same constructors and the same explanation an ordinary decision gets — and the caller names what
+/// it was answering for.
+pub fn net_decision(reach: &[NetGrant], req: &Request<'_>, who: &str) -> Decision {
+    match req {
+        Request::Net {
+            scheme, host, port, ..
+        } => match net_allows(reach, scheme, host, *port) {
+            Some(grant) => Decision::allow(Scope::Net, &grant.rule, &grant.why),
+            None => Decision::deny(
+                Scope::Net,
+                format!("{who} has no net grant covering {scheme}://{host}:{port}"),
+            ),
+        },
+        _ => Decision::deny(Scope::Net, format!("{req:?} is not a network request")),
+    }
 }
 
 impl Engine {

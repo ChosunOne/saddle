@@ -1249,16 +1249,11 @@ fn mcp_list(
             failed = true;
             continue;
         };
+        // A stdio server needs its command and arguments before it can be lowered; an HTTP one is
+        // reached by the URL its table already holds.
         let stdio = match entry.transport() {
-            Ok(Transport::Stdio { command, args }) => (command.to_owned(), args.to_vec()),
-            Ok(Transport::Http { url }) => {
-                println!(
-                    "{}  {url}: the streamable-HTTP transport is not built yet",
-                    grant.server
-                );
-                failed = true;
-                continue;
-            }
+            Ok(Transport::Stdio { command, args }) => Some((command.to_owned(), args.to_vec())),
+            Ok(Transport::Http { .. }) => None,
             Err(e) => {
                 println!("{}  {e:#}", grant.server);
                 failed = true;
@@ -1270,7 +1265,7 @@ fn mcp_list(
             tmp: tmp.as_deref(),
             host_env: &host_env,
         };
-        match one.list(&mut session, grant, entry, &stdio) {
+        match one.list(&mut session, grant, entry, stdio.as_ref()) {
             Ok(lines) => {
                 for line in lines {
                     println!("{line}");
@@ -1304,27 +1299,43 @@ impl OneServer<'_> {
         session: &mut Session,
         grant: &McpGrant,
         entry: &McpEntry,
-        stdio: &(String, Vec<String>),
+        stdio: Option<&(String, Vec<String>)>,
     ) -> Result<Vec<String>> {
-        let (command, args) = stdio;
-        // One lowering, shared with the session's registry (D105, D107).
-        let mut spec =
-            crate::mcp::lower::spec(session, grant, entry, command, args, self.host_env)?;
-        // A server gets the same network a command gets (D79): the relay here, one door out.
-        let mut bridge = self.tmp.and_then(|dir| Bridge::start(dir).ok());
-        if let Some(bridge) = &bridge {
-            spec.net = Some(bridge.spec());
-        }
-        let mut client = Client::start(&grant.server, self.helper, &spec)?;
         let mut denials: Vec<String> = Vec::new();
-        let tools = {
-            let mut service = || {
-                if let Some(bridge) = bridge.as_mut() {
-                    denials.extend(bridge.service(session));
+        let tools = match (entry.transport()?, stdio) {
+            (crate::mcp::Transport::Stdio { command, args }, Some(_)) => {
+                // One lowering, shared with the session's registry (D105, D107).
+                let mut spec =
+                    mcp::lower::spec(session, grant, entry, command, args, self.host_env)?;
+                // A server gets the same network a command gets (D79): the relay here, one way out.
+                let mut bridge = self.tmp.and_then(|dir| Bridge::start(dir).ok());
+                if let Some(bridge) = &bridge {
+                    spec.net = Some(bridge.spec());
                 }
-            };
-            client.initialize(&mut service)?;
-            client.tools(&mut service)?
+                let mut client = Client::start(&grant.server, self.helper, &spec)?;
+                let mut service = || {
+                    if let Some(bridge) = bridge.as_mut() {
+                        denials.extend(bridge.service(session));
+                    }
+                };
+                client.initialize(&mut service)?;
+                let tools = client.tools(&mut service)?;
+                // Dropped here, which kills the process group: a listing has no reason to leave a
+                // server running once it has answered.
+                drop(client);
+                tools
+            }
+            (crate::mcp::Transport::Http { url }, _) => {
+                // No child to start, so the listing makes the requests itself, decided against the
+                // server's own reach like every other one (D110).
+                let reach = mcp::lower::net_reach(session, grant)?;
+                let mut client = mcp::http::Client::start(&grant.server, url, reach)?;
+                client.initialize(session)?;
+                client.tools(session)?
+            }
+            (crate::mcp::Transport::Stdio { .. }, None) => {
+                bail!("`{}` is a stdio server with no command", grant.server)
+            }
         };
         let mut out = vec![format!("{}  {} tool(s)", grant.server, tools.len())];
         for tool in tools {
@@ -1342,9 +1353,6 @@ impl OneServer<'_> {
         for denial in denials {
             out.push(format!("  denied  {denial}"));
         }
-        // Dropped here, which kills the process group: a listing has no reason to leave a server
-        // running once it has answered.
-        drop(client);
         Ok(out)
     }
 }

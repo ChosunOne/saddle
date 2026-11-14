@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use saddle_cap::policy::POLICY_FILE;
+use saddle_cap::policy::{NetGrant, POLICY_FILE};
 use saddle_cap::sandbox::SandboxExtras;
-use saddle_cap::{Location, Policy, Principal, RootName, Roots, Scope};
+use saddle_cap::{Location, Policy, Principal, RootName, Roots, Scope, names_host};
 use saddle_policy::audit::sha256_hex;
-use saddle_policy::{AuditLog, Decision, Engine, Kind, Request};
+use saddle_policy::{AuditLog, Decision, Engine, Kind, Request, net_decision};
 use serde_json::json;
 
 use crate::config::UserConfig;
@@ -515,6 +515,38 @@ impl Session {
     /// dialled (D28, D40). Not a decision, so it is not logged: the request that follows is.
     pub fn net_names_host(&self, who: &Principal, host: &str) -> bool {
         self.engine.net_names_host(who, host)
+    }
+
+    /// Decides one request an MCP server's HTTP transport makes (D110). It is the server's own
+    /// narrowed reach that answers, not the agent's whole list, so a server whose grant names one
+    /// host cannot reach another the agent may — and the record says which server it was for,
+    /// because an HTTP transport has no child process to point at.
+    pub fn decide_mcp_net(
+        &mut self,
+        server: &str,
+        reach: &[NetGrant],
+        req: &Request<'_>,
+    ) -> Result<Decision> {
+        let decision = net_decision(reach, req, &format!("`{server}`"));
+        let mut args = req.args();
+        args["via"] = serde_json::json!("mcp");
+        args["server"] = serde_json::json!(server);
+        self.audit
+            .event(
+                Kind::Decision,
+                Some(&Principal::Agent),
+                Some(Scope::Net),
+                Some(decision.allow),
+                args,
+                decision.explanation.clone(),
+            )
+            .context("writing the audit log")?;
+        Ok(decision)
+    }
+
+    /// Whether a server's reach spells this host out, which is what reaches loopback (D40, D110).
+    pub fn mcp_names_host(reach: &[NetGrant], host: &str) -> bool {
+        names_host(reach, host)
     }
 
     pub fn decide(&mut self, who: &Principal, req: &Request<'_>) -> Result<Decision> {

@@ -32,7 +32,7 @@ pub const MAX_BYTES: u64 = 100 * 1024;
 /// A URL as the policy and the request need it: the parts are separate because a grant matches on
 /// scheme, host and port rather than on the whole string.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Target {
+pub(crate) struct Target {
     pub scheme: String,
     pub host: String,
     pub port: u16,
@@ -91,7 +91,7 @@ impl Target {
     }
 
     /// The address as it goes in the audit record: the query is redacted by the engine (D24).
-    fn request_path(&self) -> &str {
+    pub(crate) fn request_path(&self) -> &str {
         &self.path
     }
 }
@@ -350,7 +350,7 @@ fn get(target: &Target, named: bool, headers: &[(String, String)]) -> ToolOutput
 
 /// The authority for the request line: the default port is left out, and an IPv6 literal is
 /// bracketed again.
-fn authority(host: &str, port: u16, https: bool) -> String {
+pub(crate) fn authority(host: &str, port: u16, https: bool) -> String {
     let host = if host.contains(':') {
         format!("[{host}]")
     } else {
@@ -410,7 +410,7 @@ pub(crate) fn private(ip: IpAddr) -> Option<&'static str> {
 }
 
 /// Checks where a name resolves before a request is built, so a refusal can say why (D28).
-fn resolve_public(host: &str, port: u16) -> Result<(), String> {
+pub(crate) fn resolve_public(host: &str, port: u16) -> Result<(), String> {
     let addrs: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("{host} did not resolve: {e}"))?
