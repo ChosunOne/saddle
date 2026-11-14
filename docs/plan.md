@@ -2802,6 +2802,17 @@ the table, because one is a runtime convenience and the other is a decision the 
 Enabling does not start the server: it starts on demand or on `/mcp restart`, so turning one back on
 costs nothing until it is used.
 
+**D124.** A compaction summary is collapsed in the transcript the way a tool's output is, rather
+than printed in full: the marker line says what was summarized, then at most five lines of the
+summary and a note saying how many are hidden and that ctrl+o shows them. A finished summary shows
+its **first** lines, because the beginning is its gist; a streaming one shows its **last**, because
+the text that just arrived is what the reader is waiting for, exactly as `bash` shows the tail where
+the errors are. ctrl+o is one switch for both, so a person who wants the whole thing asks once and
+the rest of the transcript answers the same way. A summary loaded with a resumed session is
+therefore collapsed too, which is the case that matters most: thirty lines of it used to push the
+conversation being continued off the screen. The text is still the conversation's — selection copies
+the rendered lines (D87), and expanding is what puts them on screen.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

@@ -229,6 +229,8 @@ left alone** at `idle-fraction` (half) for `idle-seconds` (D77). Both of the las
 rows and a `[compaction]` switch, because each spends a request. A background summary is silent until
 it lands, and is discarded if the conversation changed while it was written. Neither feature exists in
 pi or opencode, so there is no reference behaviour — `docs/plan.md` is the specification.
+A compaction summary is collapsed in the transcript like a tool's output — five lines and a note,
+its first when done and its last while it streams, with ctrl+o showing all (D124).
 `/thinking` (or shift+tab) changes the reasoning effort for the session (D57), `/name` and
 `/session` name and describe it (D55), and escape twice on an empty prompt opens the message tree (D54), where a prompt can be sent again to
 make another branch; `/clone` copies the branch into a separate session instead. `/new` (or `/clear`,
@@ -283,7 +285,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D123 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D124 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

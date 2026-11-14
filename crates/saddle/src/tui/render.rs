@@ -848,10 +848,13 @@ fn entry_rows(entry: &Entry, view: View, theme: &Theme) -> Vec<Row> {
 }
 
 /// A compaction as a shaded block: what is being summarized, then the model's reasoning (unless
-/// hidden with ctrl+t) and the summary as they stream in, then what was kept.
+/// hidden with ctrl+t) and a preview of the summary, then what was kept. The summary is collapsed
+/// the way a tool's output is (D124): while it streams the last few lines are shown, because the
+/// new text is at the end, and once it is done the first few, because the beginning is its gist.
 fn compaction_block(
     v: &CompactionView,
     thinking: bool,
+    expand: bool,
     spinner: usize,
     theme: &Theme,
     room: usize,
@@ -891,7 +894,30 @@ fn compaction_block(
     }
     if !v.summary.trim().is_empty() {
         rows.push(Row::default());
-        rows.extend(markdown(&v.summary, theme, room));
+        let lines: Vec<&str> = v.summary.trim_end().lines().collect();
+        let running = matches!(v.state, CompactState::Running);
+        if expand || lines.len() <= PREVIEW_LINES {
+            rows.extend(markdown(&v.summary, theme, room));
+        } else {
+            let note = muted.add_modifier(Modifier::ITALIC);
+            let (shown, hidden) = if running {
+                let hidden = lines.len() - PREVIEW_LINES;
+                (
+                    lines[hidden..].join("\n"),
+                    format!("… {hidden} earlier lines"),
+                )
+            } else {
+                (
+                    lines[..PREVIEW_LINES].join("\n"),
+                    format!("… {} more lines", lines.len() - PREVIEW_LINES),
+                )
+            };
+            rows.extend(markdown(&shown, theme, room));
+            rows.push(Row::plain(vec![Span::styled(
+                format!("{hidden} · ctrl+o shows all"),
+                note,
+            )]));
+        }
     }
     match &v.state {
         CompactState::Done(line) if !line.is_empty() => {
@@ -1182,6 +1208,7 @@ fn transcript_with_images(
                     let (rows, bg) = compaction_block(
                         v,
                         view.thinking,
+                        view.expand,
                         view.spinner,
                         &app.theme,
                         width as usize,
@@ -2966,6 +2993,75 @@ mod tests {
         assert!(tiny.iter().sum::<usize>() <= 3, "{tiny:?}");
         // An empty table is not a panic.
         assert_eq!(column_widths(&[], &[], 40), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_finished_compaction_shows_its_first_lines_and_ctrl_o_shows_the_rest() {
+        // D124: the summary is collapsed like a tool's output, so a long one does not push the
+        // conversation up by thirty lines every time the context is compacted.
+        let summary = (1..=20)
+            .map(|n| format!("line {n} of the summary"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = |state: CompactState, expand: bool| {
+            let view = CompactionView {
+                header: "24 messages".to_owned(),
+                reasoning: String::new(),
+                summary: summary.clone(),
+                state,
+                blocks: true,
+            };
+            let (rows, _) = compaction_block(&view, false, expand, 0, &Theme::default(), 80);
+            rows.iter()
+                .flat_map(|r| text(&wrap(r, 80)))
+                .collect::<Vec<_>>()
+        };
+
+        let collapsed = block(CompactState::Done(String::new()), false);
+        assert!(
+            collapsed
+                .iter()
+                .any(|l| l.contains("line 1 of the summary")),
+            "the gist is not shown: {collapsed:#?}"
+        );
+        assert!(
+            collapsed
+                .iter()
+                .any(|l| l.contains("… 15 more lines · ctrl+o shows all")),
+            "a collapsed summary does not say how much it hides: {collapsed:#?}"
+        );
+        assert!(
+            !collapsed
+                .iter()
+                .any(|l| l.contains("line 20 of the summary")),
+            "a collapsed summary showed its end: {collapsed:#?}"
+        );
+        assert!(
+            collapsed.len() < 12,
+            "a collapsed summary took {} lines",
+            collapsed.len()
+        );
+
+        let expanded = block(CompactState::Done(String::new()), true);
+        assert!(
+            expanded
+                .iter()
+                .any(|l| l.contains("line 20 of the summary")),
+            "ctrl+o did not show the whole summary: {expanded:#?}"
+        );
+
+        // While it streams, the lines that just arrived are the informative end, as for bash.
+        let running = block(CompactState::Running, false);
+        assert!(
+            running.iter().any(|l| l.contains("line 20 of the summary")),
+            "a streaming summary hides the text that just arrived: {running:#?}"
+        );
+        assert!(
+            running
+                .iter()
+                .any(|l| l.contains("… 15 earlier lines · ctrl+o shows all")),
+            "a streaming summary does not say how much came before: {running:#?}"
+        );
     }
 
     #[test]
