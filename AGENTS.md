@@ -62,7 +62,9 @@ adding a `net` grant to the policy, never widening the sandbox allowlist. A gran
 because that exemption needs a grant that names the address. `saddle tool <name> '<json>'` runs any one
 of them as the agent through the gate, which is the most direct way to check a policy change by hand.
 
-Planned but not yet present: `saddle-wit`, `saddle-loader`, `saddle-sdk` (v1, D15).
+Planned but not yet present: `saddle-wit`, `saddle-loader`, `saddle-sdk` (v1, D15). MCP
+prompts, MCP resources, `codemode` and images in a tool result are refused rather than missing
+(D119) — a boundary that is written down, not an omission.
 
 OpenAI API-key sessions use published standard token prices for known non-tiered models when the
 config and catalogue state none (D93); compatible servers do not inherit them. ChatGPT login uses
@@ -281,7 +283,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D118 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D119 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

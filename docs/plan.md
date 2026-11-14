@@ -2749,6 +2749,20 @@ changing its credentials under a running session. The registry is taken out of t
 call and put back, the same shape a tool call uses (D108), because starting a server needs the
 engine and the audit log that the session owns.
 
+**D119.** Three parts of MCP are refused, and the refusals are decisions rather than gaps. **MCP
+prompts** (`prompts/list`, `prompts/get`) are not implemented in v1: a prompt is a user-invoked
+template, which is what a skill already is, and a second mechanism for a person to start a turn
+would be a second place a server's prose enters the conversation. **MCP resources**
+(`resources/list`, `resources/read`) are not implemented either: a resource is a read, and the read
+tool already decides reads through a root; a server offering a URI would be a second way to name
+what may be read, which is the failure this project exists to prevent. **`codemode`** is refused at
+load (D117) rather than emulated: tools stay typed calls through one engine, and generated code
+would need an evaluator whose own reach is a second authority. **Images in a tool result** are
+described, not shown — an `image` block becomes `[an image, image/png]` — because showing it would
+put an untrusted picture into the model's context through a path (D58) built for pictures a person
+attached, and no server has asked for that path yet. Each of these can be revisited by writing a
+new decision; what must not happen is one of them arriving as an accident of a transport.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
