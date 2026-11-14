@@ -2,7 +2,7 @@
 
 Saddle is a coding-agent harness in Rust. Its plugin boundary is WASI components whose
 authority is a *declared* scope set, checked before instantiation and bounded by the agent's reach.
-The binary supports explicitly installed, digest-pinned capability-gated tool plugins (D126–D143), alongside
+The binary supports explicitly installed, digest-pinned capability-gated tool plugins (D126–D144), alongside
 built-in tools and MCP; the loader, canonical WIT and SDK are separate library crates.
 `docs/plan.md` is the specification; read it before changing behaviour in the policy, sandbox or tool
 layer.
@@ -321,7 +321,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D143 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D144 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

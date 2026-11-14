@@ -1,7 +1,7 @@
 # WASI tool plugins
 
 Saddle loads explicitly installed, digest-pinned WASI components as model-callable tools
-(D126–D143). The runtime supports bounded filesystem and transcript services, not arbitrary extensions. A manifest
+(D126–D144). The runtime supports bounded filesystem and transcript services, not arbitrary extensions. A manifest
 in a repository never executes automatically. Installation, enablement and grants are separate steps
 performed by a person; an agent cannot write its own protected configuration.
 
@@ -490,6 +490,13 @@ cargo nextest run --test plugins --run-ignored all -E 'test(standard_fetch)'
 cargo nextest run --test agent --run-ignored all -E 'test(standard_search)'
 ```
 
+Search path presentation uses the permission-gated `fs-paths.label-root` metadata operation (D144).
+The core supplies a display prefix once; guests join result paths themselves. Workspace-contained
+results are workspace-relative, external/named-root results are usable absolute paths, never opaque
+routing identifiers. Unreadable descendants are skipped with a note; an unreadable requested start
+is an error. Non-UTF-8 names are counted as unrepresentable rather than lossy-renamed. Tree/file/page
+limits are intentional standard-tool bounds, not native fallbacks.
+
 ## Built-in migration tracking
 
 No standard component is silently aliased over a built-in or given implicit grants.
@@ -497,8 +504,8 @@ No standard component is silently aliased over a built-in or given implicit gran
 | Tool | Guest implementation | Remaining parity/adapters |
 | --- | --- | --- |
 | `read` | native-style text pagination/totals, deep offsets, bounded range reads, explicit image mode and optional managed paths | scans beyond resource bounds, standard-component delivery |
-| `ls` | filtered directory pages, suffixes, sorted output, optional managed paths | bounded/non-UTF-8 listing differences |
-| `find`, `grep` | guest traversal, shared ignore syntax, glob/regex matching | large-tree/performance edges, host-path display and unreadable-file metadata |
+| `ls` | filtered directory pages, suffixes, sorted output, optional managed paths | standard delivery; explicit listing bounds and counted non-UTF-8 name skips |
+| `find`, `grep` | guest traversal, shared ignore syntax, glob/regex matching, usable external paths and unreadable-child handling | standard delivery; explicit tree/file/result bounds |
 | `write`, `edit`, `patch` | guest workflows over bounded, preflight-all mutation batches and optimistic preconditions | standard delivery; documented size/atomicity and bounded diff presentation differences |
 | `bash` | guest shell workflow over delegated sandbox execution, bounded capture, timeout/cancellation and reservation restore | standard delivery; documented capture/presentation and process-group limitations |
 | `fetch`, `websearch` | guest schemas/workflows/parsing/presentation over attributed HTTP and protected search services | standard delivery; bounded presentation and blocking-I/O cancellation limits |

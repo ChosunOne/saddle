@@ -802,6 +802,13 @@ fn managed_standard_components_read_list_find_and_grep_shared_files_through_the_
         let out = env.run(&["plugin", "call", "reader", arguments]);
         assert!(out.status.success(), "{name}: {}", text(&out));
         assert!(text(&out).contains(expected), "{name}: {}", text(&out));
+        if name == "find" || name == "grep" {
+            assert!(
+                text(&out).contains(shared.to_str().unwrap()),
+                "search results must be usable absolute external paths: {}",
+                text(&out)
+            );
+        }
         assert!(!text(&out).contains("@tool:"), "{}", text(&out));
         assert!(!text(&out).contains("hidden.txt"), "{}", text(&out));
         assert!(

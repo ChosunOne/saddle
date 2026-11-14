@@ -10,9 +10,9 @@ use serde::Deserialize;
 use crate::normalize_path;
 use crate::workspace;
 #[cfg(target_arch = "wasm32")]
-use saddle_sdk::{Definition, FilePath, Output, Tool, read_directory, read_range};
+use saddle_sdk::{Definition, FilePath, Output, Tool, label_root, read_directory, read_range};
 #[cfg(target_arch = "wasm32")]
-use serde_json::json;
+use serde_json::{Value, json};
 
 const MAX_VISITED: usize = 100_000;
 const MAX_PENDING: usize = 2048;
@@ -85,6 +85,8 @@ fn dot() -> String {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FindArguments {
+    #[serde(default, rename = "__display-root")]
+    display_root: Option<String>,
     #[serde(default = "workspace")]
     root: String,
     #[serde(default = "dot")]
@@ -94,6 +96,8 @@ struct FindArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GrepArguments {
+    #[serde(default, rename = "__display-root")]
+    display_root: Option<String>,
     #[serde(default = "workspace")]
     root: String,
     #[serde(default = "dot")]
@@ -125,7 +129,7 @@ impl Tool for Find {
     }
     fn invoke(arguments: String) -> Output {
         output(
-            normalize_path(&arguments, Some("."))
+            normalize_search_path(&arguments)
                 .and_then(|arguments| find_with(&arguments, &mut HostFilesystem)),
         )
     }
@@ -137,10 +141,24 @@ impl Tool for Grep {
     }
     fn invoke(arguments: String) -> Output {
         output(
-            normalize_path(&arguments, Some("."))
+            normalize_search_path(&arguments)
                 .and_then(|arguments| grep_with(&arguments, &mut HostFilesystem)),
         )
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn normalize_search_path(arguments: &str) -> Result<String, String> {
+    let arguments = normalize_path(arguments, Some("."))?;
+    let mut value: Value =
+        serde_json::from_str(&arguments).map_err(|error| format!("invalid arguments: {error}"))?;
+    let root = value
+        .get("root")
+        .and_then(Value::as_str)
+        .unwrap_or("workspace");
+    let label = label_root(root).map_err(|error| format!("root label failed: {error:?}"))?;
+    value["__display-root"] = label.into();
+    Ok(value.to_string())
 }
 
 fn relative(path: &str) -> Result<String, String> {
@@ -186,7 +204,15 @@ fn matches(glob: &(GlobMatcher, bool), path: &str, start: &str) -> bool {
     };
     glob.0.is_match(path)
 }
-fn shown(root: &str, path: &str) -> String {
+fn shown(root: &str, path: &str, label: Option<&str>) -> String {
+    if let Some(label) = label {
+        return if label.is_empty() {
+            path.into()
+        } else {
+            format!("{}/{path}", label.trim_end_matches('/'))
+        };
+    }
+
     if root == "workspace" || root.starts_with("@tool:") {
         path.into()
     } else {
@@ -259,7 +285,14 @@ fn walk<F: Filesystem>(
         let mut child_bytes = 0;
         let mut observed_skips = 0;
         loop {
-            let page = fs.directory(root, &directory, &after)?;
+            let page = match fs.directory(root, &directory, &after) {
+                Ok(page) => page,
+                Err(error) if directory == start => return Err(error),
+                Err(_) => {
+                    result.skipped = result.skipped.saturating_add(1);
+                    break;
+                }
+            };
             if page.entries.len() > 128 || (page.more && page.entries.is_empty()) {
                 return Err("invalid directory page".into());
             }
@@ -318,7 +351,7 @@ fn notes(text: &mut String, walked: &Walk) {
     }
     if walked.skipped > 0 {
         text.push_str(&format!(
-            "\n({} paths skipped by policy or unrepresentable names)",
+            "\n({} paths skipped by policy, unreadable directories or unrepresentable names)",
             walked.skipped
         ));
     }
@@ -339,7 +372,7 @@ pub fn find_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, St
         if !matches(&pattern, path, &start) {
             return Ok(true);
         }
-        let path = shown(&args.root, path);
+        let path = shown(&args.root, path, args.display_root.as_deref());
         if found >= MAX_FOUND || text.len() + path.len() + 1 > MAX_TEXT {
             return Ok(false);
         }
@@ -412,7 +445,7 @@ pub fn grep_with<F: Filesystem>(arguments: &str, fs: &mut F) -> Result<String, S
                 let suffix = if end < line.len() { "…" } else { "" };
                 let row = format!(
                     "{}:{}: {}{suffix}",
-                    shown(&args.root, path),
+                    shown(&args.root, path, args.display_root.as_deref()),
                     number + 1,
                     &line[..end]
                 );
@@ -465,6 +498,7 @@ mod tests {
     struct Memory {
         files: BTreeMap<String, Vec<u8>>,
         links: Vec<String>,
+        unreadable: Vec<String>,
     }
     impl Memory {
         fn put(&mut self, path: &str, text: &str) {
@@ -479,6 +513,9 @@ mod tests {
             after: &str,
         ) -> Result<DirectoryPage, String> {
             assert_eq!(root, "workspace");
+            if self.unreadable.iter().any(|name| name == path) {
+                return Err("unreadable directory".into());
+            }
             if self.files.contains_key(path) {
                 return Err("not a directory".into());
             }
@@ -531,6 +568,29 @@ mod tests {
                 None => FileRead::Unavailable,
             })
         }
+    }
+
+    #[test]
+    fn display_labels_are_usable_paths_and_unreadable_children_do_not_abort_siblings() {
+        let mut fs = Memory::default();
+        fs.put("good/file.txt", "needle");
+        fs.put("blocked/file.txt", "hidden");
+        fs.unreadable.push("blocked".into());
+        let arguments = r#"{"pattern":"*.txt","__display-root":"/configured/notes"}"#;
+        let text = find_with(arguments, &mut fs).unwrap();
+        assert!(text.contains("/configured/notes/good/file.txt"), "{text}");
+        assert!(!text.contains("blocked/file.txt"));
+        assert!(text.contains("unreadable directories"));
+        assert!(find_with(r#"{"path":"blocked","pattern":"*"}"#, &mut fs).is_err());
+        let text = grep_with(
+            r#"{"pattern":"needle","__display-root":"/configured/notes"}"#,
+            &mut fs,
+        )
+        .unwrap();
+        assert!(
+            text.contains("/configured/notes/good/file.txt:1: needle"),
+            "{text}"
+        );
     }
 
     #[test]

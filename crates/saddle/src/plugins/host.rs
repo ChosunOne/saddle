@@ -65,6 +65,12 @@ impl StdError for Fatal {
 type HostReply<T, E = Failure> = Result<Result<T, E>, String>;
 type FileReply = HostReply<Chunk>;
 enum Event {
+    Label {
+        who: Principal,
+        deadline: Instant,
+        root: String,
+        answer: SyncSender<HostReply<String>>,
+    },
     Http {
         who: Principal,
         deadline: Instant,
@@ -160,6 +166,21 @@ impl Host {
     }
 }
 impl HostServices for Host {
+    fn label_root(&mut self, call: &Invocation, root: String) -> Result<Result<String, Failure>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        self.events
+            .send(Event::Label {
+                who: call.principal().clone(),
+                deadline: call.deadline(),
+                root,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        result
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(|_| anyhow!("root label request timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
     fn http_get(
         &mut self,
         call: &Invocation,
@@ -468,6 +489,19 @@ pub fn execute(
             cancelled.store(true, Ordering::Relaxed);
         }
         match pending.recv_timeout(Duration::from_millis(10)) {
+            Ok(Event::Label {
+                who,
+                deadline,
+                root,
+                answer,
+            }) => {
+                respond(
+                    filesystem::label_root(session, &who, call, deadline, root),
+                    answer,
+                    &mut fatal,
+                    &cancelled,
+                );
+            }
             Ok(Event::Http {
                 who,
                 deadline,

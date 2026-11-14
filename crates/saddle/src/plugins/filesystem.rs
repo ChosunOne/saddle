@@ -192,6 +192,56 @@ pub(crate) fn open_read_path(
     Ok(Ok((dir, real)))
 }
 
+/// labels describe resource identity only after the caller's read gate, not a new authority (D144).
+pub fn label_root(
+    session: &mut Session,
+    who: &Principal,
+    call: &str,
+    deadline: Instant,
+    root: String,
+) -> Result<Result<String, Failure>> {
+    let (path, managed) = decode_path(
+        Path {
+            root,
+            relative: ".".into(),
+        },
+        false,
+    );
+    if path.root.len() > 128 || expired(deadline) {
+        return refuse(
+            session,
+            who,
+            call,
+            json!({"operation":"label-root"}),
+            "root label request cancelled, timed out or too long",
+            managed,
+        );
+    }
+    let name = match RootName::new(&path.root) {
+        Ok(name) => name,
+        Err(_) => return Ok(Err(Failure::InvalidPath("invalid root identifier".into()))),
+    };
+    let loc = Location::new(name, RelPath::default());
+    if let Some(failure) = gate(
+        session,
+        who,
+        call,
+        &loc,
+        json!({"operation":"label-root"}),
+        managed,
+    )? {
+        return Ok(Err(failure));
+    }
+    let Some(base) = session.base_of(&loc.root) else {
+        return Ok(Err(Failure::InvalidPath("unknown filesystem root".into())));
+    };
+    let label = match base.strip_prefix(&session.setup.workspace) {
+        Ok(relative) => relative.to_string_lossy().into_owned(),
+        Err(_) => base.display().to_string(),
+    };
+    Ok(Ok(label))
+}
+
 pub fn resolve_path(
     session: &mut Session,
     who: &Principal,

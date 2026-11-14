@@ -3229,6 +3229,16 @@ anonymous Exa MCP path retains unstructured result semantics rather than inventi
 Standard text presentation is bounded to about 60 KiB, explicitly labelled when cut; installation,
 standard delivery and native-entry-point removal remain separate follow-on work.
 
+**D144.** Search results are usable paths, not opaque routing identifiers. The additive
+`fs-paths.label-root` returns a display prefix only after the caller's ordinary root/tool-read gate:
+workspace-contained paths are workspace-relative, other granted roots/configured directories are
+absolute. It neither adds directories nor grants reads. Guests request the prefix once and own
+per-result joining/formatting; they do not infer host paths from generated `@tool:` identifiers.
+Unreadable descendant directories are skipped with an explicit note while an unreadable requested
+start directory remains an error. Names that WIT strings cannot represent are skipped with counts,
+never lossy-renamed into ambiguous targets. Tree, result, text and file limits are the documented
+bounded standard-tool contract; they produce limits/errors/notes, not a hidden native fallback.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

@@ -128,6 +128,15 @@ impl Invocation {
 /// filesystem callbacks may hold any filesystem capability; determine authority per operation/path,
 /// never from the existence of a linked interface (D139, D140).
 pub trait HostServices: Send + 'static {
+    fn label_root(
+        &mut self,
+        _call: &Invocation,
+        _root: String,
+    ) -> anyhow::Result<Result<String, Failure>> {
+        Ok(Err(Failure::Denied(
+            "host does not implement root labels".into(),
+        )))
+    }
     fn http_get(
         &mut self,
         _call: &Invocation,
@@ -470,6 +479,18 @@ impl<H: HostServices> RangeHost for State<H> {
 }
 
 impl<H: HostServices> PathsHost for State<H> {
+    fn label_root(&mut self, root: String) -> anyhow::Result<Result<String, Failure>> {
+        if root.len() > 128 || self.call.cancelled() || Instant::now() >= self.call.deadline {
+            return Ok(Err(Failure::Denied(
+                "invalid root label request or timed out".into(),
+            )));
+        }
+        let result = self.host.label_root(&self.call, root)?;
+        if matches!(&result,Ok(label) if label.len() > 8192) {
+            return Ok(Err(Failure::TooLarge));
+        }
+        Ok(result)
+    }
     fn resolve_path(&mut self, value: String) -> anyhow::Result<Result<Path, Failure>> {
         if self.call.cancelled() || Instant::now() >= self.call.deadline {
             return Err(anyhow!("plugin call cancelled or timed out"));

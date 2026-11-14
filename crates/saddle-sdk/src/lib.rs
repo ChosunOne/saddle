@@ -10,6 +10,7 @@ pub use exports::saddle::plugin::tool::{Definition, Guest as Tool, Output};
 pub use saddle::host::exec::{Command, Reply as ExecReply, run as execute};
 pub use saddle::host::fs_list::read_directory;
 pub use saddle::host::fs_list::{Entry as DirectoryEntry, EntryKind, Page as DirectoryPage};
+pub use saddle::host::fs_paths::label_root;
 pub use saddle::host::fs_paths::resolve_path;
 pub use saddle::host::fs_read::read_file;
 pub use saddle::host::fs_read::{Failure, Path as FilePath};

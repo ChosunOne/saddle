@@ -83,6 +83,7 @@ interface fs-read-range {
 interface fs-paths {
     use fs-read.{path, failure};
     resolve-path: func(value: string) -> result<path, failure>;
+    label-root: func(root: string) -> result<string, failure>;
 }
 
 interface fs-list {
