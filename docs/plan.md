@@ -3017,6 +3017,15 @@ streaming scans and image assembly; the independent two-second deadline and memo
 are unchanged and may stop work earlier. This remains a bounded alternative to native read's
 whole-file allocation, not a promise to scan unlimited files or stalled filesystems.
 
+**D136.** The standard plugin reader selects its operation from an explicit `format` argument,
+not file contents or extensions. The default is `text`: UTF-8 validation and D135 pagination apply,
+including to files named as images or beginning with an image signature. `format = "image"` assembles
+bounded image bytes and submits them to D134's result service; image errors never fall back to text.
+Only `text` and `image` are accepted. Offset and limit select text lines, not image regions. Host-side
+header inspection still determines image metadata for attachments, but never chooses the operation.
+Native read and existing compiled plugins are unchanged; rebuilt standard readers expose this schema.
+This changes content handling, not filesystem authority, image emission grants or resource bounds.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

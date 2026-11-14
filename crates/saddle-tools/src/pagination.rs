@@ -3,7 +3,7 @@
 use memchr::memchr_iter;
 use std::str;
 
-use crate::{Arguments, PAGE_BYTES, PAGE_LINES, SCAN_BYTES};
+use crate::{Arguments, PAGE_BYTES, PAGE_LINES, ReadFormat, SCAN_BYTES};
 
 const RANGE_BYTES: u32 = 65536;
 
@@ -82,6 +82,9 @@ pub fn read_with(
 ) -> Result<String, String> {
     let args: Arguments =
         serde_json::from_str(arguments).map_err(|error| format!("invalid arguments: {error}"))?;
+    if args.format != ReadFormat::Text {
+        return Err("text pagination requires format=text".into());
+    }
     if args.offset == 0 || args.limit == 0 {
         return Err("offset and limit must be positive integers".into());
     }

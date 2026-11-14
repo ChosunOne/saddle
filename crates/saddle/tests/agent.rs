@@ -982,7 +982,7 @@ fn standard_read_plugin_sends_file_images_to_the_model() {
             &[(
                 "picture",
                 "plugin__reader__read",
-                json!({"path":"photo.txt"}),
+                json!({"path":"photo.txt","format":"image"}),
             )],
         )),
         sse_response(&openai_sse("seen", &[])),

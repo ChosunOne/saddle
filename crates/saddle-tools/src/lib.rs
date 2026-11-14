@@ -28,10 +28,20 @@ struct Arguments {
     #[serde(default = "workspace")]
     root: String,
     path: String,
+    #[serde(default)]
+    format: ReadFormat,
     #[serde(default = "first_line")]
     offset: u64,
     #[serde(default = "page_lines")]
     limit: u64,
+}
+
+#[derive(Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum ReadFormat {
+    #[default]
+    Text,
+    Image,
 }
 
 fn workspace() -> String {
@@ -49,10 +59,11 @@ impl Tool for Read {
     fn describe() -> Definition {
         Definition {
             name: "read".into(),
-            description: "read a UTF-8 text page or PNG/JPEG/GIF/WebP image beneath a granted root. Path is workspace-relative or absolute unless root is provided. Offset is a 1-based line; pages have at most 2000 lines and 50 KiB with total/continuation notes. Streaming scans are limited to 64 MiB; images to 5 MiB.".into(),
+            description: "read a file beneath a granted root in the explicitly selected format. Format defaults to text (UTF-8); use image for PNG/JPEG/GIF/WebP attachments. No automatic detection or fallback between modes. Path is workspace-relative or absolute unless root is provided. Offset is a 1-based text line; text pages have at most 2000 lines and 50 KiB with total/continuation notes. Text scans are limited to 64 MiB; images to 5 MiB.".into(),
             input_schema: json!({
                 "type":"object", "properties": {
                     "root":{"type":"string"}, "path":{"type":"string"},
+                    "format":{"type":"string","enum":["text","image"],"default":"text"},
                     "offset":{"type":"integer","minimum":1},
                     "limit":{"type":"integer","minimum":1}
                 }, "required":["path"], "additionalProperties":false
@@ -119,7 +130,7 @@ fn normalize_path(arguments: &str, default: Option<&str>) -> Result<String, Stri
     Ok(arguments.to_string())
 }
 
-/// detects images in guest code and emits existing bytes, never a host-selected file path.
+/// reads the requested format without detection or fallback between text and images (D136).
 pub fn read_with_media(
     arguments: &str,
     mut read: impl FnMut(&str, &str, u64, u32) -> Result<(Vec<u8>, bool), String>,
@@ -127,6 +138,9 @@ pub fn read_with_media(
 ) -> Result<String, String> {
     let args: Arguments =
         serde_json::from_str(arguments).map_err(|error| format!("invalid arguments: {error}"))?;
+    if args.format == ReadFormat::Text {
+        return read_with(arguments, read);
+    }
     if args.offset == 0 || args.limit == 0 {
         return Err("offset and limit must be positive integers".into());
     }
@@ -134,40 +148,24 @@ pub fn read_with_media(
     if bytes.len() > CHUNK_BYTES as usize || (bytes.is_empty() && !eof) {
         return Err("invalid reply from range service".into());
     }
-    let image = bytes.starts_with(b"\x89PNG\r\n\x1a\n")
-        || bytes.starts_with(b"GIF87a")
-        || bytes.starts_with(b"GIF89a")
-        || bytes.starts_with(&[255, 216, 255])
-        || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"));
-    if image {
-        while !eof {
-            let want = (MAX_IMAGE_BYTES - bytes.len()).min(65536) as u32;
-            if want == 0 {
-                return Err("image is over the 5120 KiB limit".into());
-            }
-            let (chunk, end) = read(&args.root, &args.path, bytes.len() as u64, want)?;
-            if chunk.len() > want as usize || (chunk.is_empty() && !end) {
-                return Err("invalid reply from range service".into());
-            }
-            bytes.extend_from_slice(&chunk);
-            eof = end;
+    while !eof {
+        let want = (MAX_IMAGE_BYTES - bytes.len()).min(65536) as u32;
+        if want == 0 {
+            return Err("image is over the 5120 KiB limit".into());
         }
-        let name = args.path.rsplit('/').next().unwrap_or("image");
-        let info = emit(name, &bytes)?;
-        return Ok(format!(
-            "{} is an image: {}×{}, {}",
-            args.path, info.width, info.height, info.media_type
-        ));
+        let (chunk, end) = read(&args.root, &args.path, bytes.len() as u64, want)?;
+        if chunk.len() > want as usize || (chunk.is_empty() && !end) {
+            return Err("invalid reply from range service".into());
+        }
+        bytes.extend_from_slice(&chunk);
+        eof = end;
     }
-    let mut initial = Some((bytes, eof));
-    read_with(arguments, |root, path, offset, limit| {
-        if offset == 0
-            && let Some(initial) = initial.take()
-        {
-            return Ok(initial);
-        }
-        read(root, path, offset, limit)
-    })
+    let name = args.path.rsplit('/').next().unwrap_or("image");
+    let info = emit(name, &bytes)?;
+    Ok(format!(
+        "{} is an image: {}×{}, {}",
+        args.path, info.width, info.height, info.media_type
+    ))
 }
 
 #[cfg(test)]
@@ -279,12 +277,58 @@ mod tests {
     }
 
     #[test]
-    fn images_are_detected_from_bytes_and_assembled_through_bounded_ranges() {
+    fn format_is_explicit_defaults_to_text_and_never_falls_back() {
+        for arguments in [
+            r#"{"path":"notes.png"}"#,
+            r#"{"path":"notes.png","format":"text"}"#,
+        ] {
+            let text = read_with_media(
+                arguments,
+                |_, _, _, _| Ok((b"GIF89a is also a valid text prefix\n".to_vec(), true)),
+                |_, _| panic!("text mode must never emit an image"),
+            )
+            .unwrap();
+            assert_eq!(text, "GIF89a is also a valid text prefix\n");
+        }
+        let error = read_with_media(
+            r#"{"path":"picture.png"}"#,
+            |_, _, _, _| Ok((b"\x89PNG\r\n\x1a\n".to_vec(), true)),
+            |_, _| panic!("invalid text must not switch to image mode"),
+        )
+        .unwrap_err();
+        assert!(error.contains("UTF-8"));
+        let error = read_with_media(
+            r#"{"path":"notes.png","format":"image"}"#,
+            |_, _, _, _| Ok((b"plain text".to_vec(), true)),
+            |_, bytes| {
+                assert_eq!(bytes, b"plain text");
+                Err("invalid image from host".into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "invalid image from host");
+        for arguments in [
+            r#"{"path":"file","format":"auto"}"#,
+            r#"{"path":"file","format":null}"#,
+        ] {
+            assert!(
+                read_with_media(
+                    arguments,
+                    |_, _, _, _| panic!("invalid format must fail before reading"),
+                    |_, _| panic!("invalid format must not emit an image"),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_images_are_assembled_through_bounded_ranges() {
         let mut data = b"\x89PNG\r\n\x1a\n".to_vec();
         data.resize(100_000, 0);
         let mut emitted = 0;
         let text = read_with_media(
-            r#"{"path":"misnamed.txt"}"#,
+            r#"{"path":"misnamed.txt","format":"image"}"#,
             |_, _, offset, limit| {
                 let start = offset as usize;
                 let end = (start + limit as usize).min(data.len());
@@ -306,7 +350,7 @@ mod tests {
         assert!(text.contains("1×2, image/png"));
         assert!(
             read_with_media(
-                r#"{"path":"file"}"#,
+                r#"{"path":"file","format":"image"}"#,
                 |_, _, offset, limit| {
                     let mut bytes = vec![0; limit as usize];
                     if offset == 0 {

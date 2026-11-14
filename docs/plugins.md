@@ -132,13 +132,18 @@ flag. Each range is limited to 1–65,536 bytes; the host may read one extra byt
 SDK hosts other than Saddle must implement `HostServices::read_range` to support it; its default
 returns an unsupported-operation error. Existing compiled reader components remain compatible.
 
-PNG, JPEG, GIF and WebP files are detected from bytes, assembled from bounded ranges (at most
-5 MiB), and attached as real image results through the existing provider/UI/store pipeline. The
-extension is not trusted. The additive `tool-result.emit-image` service validates media type and
-dimensions with the same header-based detection as native read; it does not open the supplied name
-or perform image decoding/recompression. Only one image per invocation is accepted. Failed/trapped
-calls publish no images, and saved image data/provenance survives replay. The 64 KiB text result
-limit is not enlarged to accommodate image bytes.
+The reader's `format` argument explicitly selects the operation (D136). It defaults to `"text"`:
+`{"path":"notes.png"}` reads UTF-8 text regardless of extension or signature. Use
+`{"path":"screenshot","format":"image"}` for a PNG, JPEG, GIF or WebP attachment. There is no
+automatic mode detection or fallback: invalid UTF-8 fails in text mode, and invalid image metadata
+fails in image mode. `offset` and `limit` select text lines only. The native reader is unchanged.
+
+In image mode, bytes are assembled from bounded ranges (at most 5 MiB) and attached as real image
+results through the existing provider/UI/store pipeline. The additive `tool-result.emit-image`
+service determines media type and dimensions from image headers; this does not select the read mode,
+open the supplied name or perform image decoding/recompression. Only one image per invocation is
+accepted. Failed/trapped calls publish no images, and saved image data/provenance survives replay.
+The 64 KiB text result limit is not enlarged to accommodate image bytes.
 
 This is an incremental migration, not a replacement of built-in `read` yet. Shared tool-visible
 directories and a person-controlled tool-selection/default

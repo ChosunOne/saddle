@@ -435,7 +435,7 @@ fn standard_read_component_paginates_large_files_through_the_production_host() {
     assert!(
         reads
             .iter()
-            .any(|row| row["args"]["offset"].as_u64().unwrap() > 65536)
+            .any(|row| row["args"]["offset"].as_u64().unwrap() >= 65536)
     );
     let log = env.log();
     assert!(
@@ -468,10 +468,35 @@ fn standard_read_component_paginates_large_files_through_the_production_host() {
     ]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("lines 170000-170001 of 180000"));
+    fs::write(env.ws().join("notes.png"), "GIF89a is plain text here\n").unwrap();
+    let out = env.run(&["plugin", "call", "reader", r#"{"path":"notes.png"}"#]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("GIF89a is plain text here"));
+    fs::write(env.ws().join("ordinary.txt"), "ordinary text").unwrap();
+    let out = env.run(&[
+        "plugin",
+        "call",
+        "reader",
+        r#"{"path":"ordinary.txt","format":"image"}"#,
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(!text(&out).contains("ordinary text"));
     let mut image = fixture::png();
     image.resize(100_000, 0);
     fs::write(env.ws().join("misnamed.txt"), image).unwrap();
     let out = env.run(&["plugin", "call", "reader", r#"{"path":"misnamed.txt"}"#]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        !env.records()
+            .iter()
+            .any(|row| row["args"]["operation"] == "emit-image")
+    );
+    let out = env.run(&[
+        "plugin",
+        "call",
+        "reader",
+        r#"{"path":"misnamed.txt","format":"image"}"#,
+    ]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("1×1, image/png"));
     assert!(
