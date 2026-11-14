@@ -1,8 +1,14 @@
+use crate::namespaces;
+use crate::relay;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::env;
+use std::env::consts;
+use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::ptr;
 
 use landlock::{
     ABI, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetCreatedAttr,
@@ -22,7 +28,7 @@ pub(crate) fn landlock_abi() -> Option<i32> {
     let abi = unsafe {
         libc::syscall(
             libc::SYS_landlock_create_ruleset,
-            std::ptr::null::<libc::c_void>(),
+            ptr::null::<libc::c_void>(),
             0usize,
             LANDLOCK_CREATE_RULESET_VERSION,
         )
@@ -34,7 +40,7 @@ pub(crate) fn enter(spec: &SandboxSpec) -> Result<Infallible, SandboxError> {
     // The network comes first: it needs `/proc/self/uid_map` and the loopback interface, and
     // landlock refuses both once it is applied (D79).
     let networked = start_network(spec);
-    std::env::set_current_dir(&spec.cwd)?;
+    env::set_current_dir(&spec.cwd)?;
     let program = resolve_program(&spec.argv[0], &spec.env)?;
     apply_landlock(spec)?;
     apply_seccomp(networked)?;
@@ -60,16 +66,16 @@ fn start_network(spec: &SandboxSpec) -> bool {
     };
     // Read before landlock restricts /etc to reading, and before the command exists, so the
     // resolver list cannot be influenced by anything the command does.
-    let resolvers = std::fs::read_to_string("/etc/resolv.conf")
-        .map(|text| crate::namespaces::resolvers(&text))
+    let resolvers = fs::read_to_string("/etc/resolv.conf")
+        .map(|text| namespaces::resolvers(&text))
         .unwrap_or_default();
-    if let Err(why) = crate::namespaces::enter(&resolvers) {
+    if let Err(why) = namespaces::enter(&resolvers) {
         // Said out loud rather than swallowed: the command still runs, but with no network, and a
         // person needs to know which of the two they got and why.
         eprintln!("saddle-sandbox: no network for this command: {why}");
         return false;
     }
-    if let Err(why) = crate::relay::spawn(net, &resolvers) {
+    if let Err(why) = relay::spawn(net, &resolvers) {
         eprintln!("saddle-sandbox: no network for this command: {why}");
         return false;
     }
@@ -164,7 +170,7 @@ fn apply_seccomp(networked: bool) -> Result<(), SandboxError> {
         rules.insert(nr, Vec::new());
     }
 
-    let arch = TargetArch::try_from(std::env::consts::ARCH).map_err(sc)?;
+    let arch = TargetArch::try_from(consts::ARCH).map_err(sc)?;
     let filter = SeccompFilter::new(
         rules,
         SeccompAction::Allow,

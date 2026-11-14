@@ -12,6 +12,7 @@
 //! [`crate::provider::Item`]s and never from a note.
 
 use crate::provider::{Price, Usage};
+use crate::tui::status;
 
 /// The smallest prompt a provider caches: Anthropic's floor is 1024 tokens, and below it nothing is
 /// cacheable, so a warning there would be noise on every short request.
@@ -54,7 +55,7 @@ impl Watcher {
 fn text(tokens: u64, price: Option<Price>) -> String {
     let head = format!(
         "cache miss: {} tokens read at full price",
-        crate::tui::status::tokens(tokens)
+        status::tokens(tokens)
     );
     match price.and_then(|p| extra(tokens, p)) {
         Some(extra) => format!("{head}, ${extra:.4} more than cached"),

@@ -5,6 +5,14 @@
 //! completions. The second covers OpenAI, DeepSeek, OpenRouter and local servers such as
 //! llama-server, vLLM and Ollama.
 
+use crate::provider::oauth::Flow;
+use base64::engine::general_purpose;
+use std::env;
+use std::error::Error;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
+use std::time::SystemTime;
 mod anthropic;
 mod http;
 pub(crate) mod oauth;
@@ -135,7 +143,7 @@ impl Image {
     ///
     /// The extension is not trusted: a `.png` that is really a JPEG is sent as a JPEG, which is what
     /// makes it render rather than fail at the provider.
-    pub fn read(path: &std::path::Path, data: Vec<u8>) -> Result<Self, String> {
+    pub fn read(path: &Path, data: Vec<u8>) -> Result<Self, String> {
         if data.len() as u64 > MAX_IMAGE_BYTES {
             return Err(format!(
                 "{} KiB is over the {} KiB limit for one image",
@@ -220,12 +228,12 @@ fn sniff(d: &[u8]) -> Option<(&'static str, u32, u32)> {
 
 /// Standard base64 with padding, which is what both APIs take.
 pub fn base64_encode(bytes: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(bytes)
+    general_purpose::STANDARD.encode(bytes)
 }
 
 /// The bytes back, or `None` if the string is not base64.
 pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    base64::engine::general_purpose::STANDARD.decode(text).ok()
+    general_purpose::STANDARD.decode(text).ok()
 }
 
 impl Item {
@@ -427,7 +435,7 @@ impl Quota {
 ///
 /// A provider that spells the reset as a duration (`6m0s`) is not second-guessed: that is already
 /// short, and converting it would mean guessing the instant it was measured from.
-pub fn reset_left(spelled: &str, now: std::time::SystemTime) -> String {
+pub fn reset_left(spelled: &str, now: SystemTime) -> String {
     let Ok(at) = humantime::parse_rfc3339(spelled) else {
         return spelled.to_owned();
     };
@@ -504,13 +512,13 @@ pub trait Sink {
 #[derive(Debug)]
 pub struct Cancelled;
 
-impl std::fmt::Display for Cancelled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for Cancelled {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.write_str("cancelled")
     }
 }
 
-impl std::error::Error for Cancelled {}
+impl Error for Cancelled {}
 
 /// One `[providers.<name>]` table in `config.toml`, or a built-in preset. Fields set in the
 /// config override the preset of the same name.
@@ -552,7 +560,7 @@ pub struct ProviderEntry {
     /// from the store `/login` writes, and is refreshed when it expires.
     pub auth: Option<Auth>,
     /// This provider's OAuth endpoints, from a preset or `[providers.<name>.oauth]` (D85).
-    pub oauth: Option<crate::provider::oauth::Flow>,
+    pub oauth: Option<Flow>,
 }
 
 /// How a provider authenticates (D85).
@@ -608,7 +616,7 @@ pub struct ProviderConfig {
     pub cache_affinity: bool,
     /// How the provider authenticates, and where, when it is OAuth (D85).
     pub auth: Auth,
-    pub oauth: Option<crate::provider::oauth::Flow>,
+    pub oauth: Option<Flow>,
 }
 
 /// Built-in providers.
@@ -914,8 +922,8 @@ pub enum WindowSource {
     Default,
 }
 
-impl std::fmt::Display for WindowSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for WindowSource {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.write_str(match self {
             WindowSource::Config => "set in config.toml",
             WindowSource::Endpoint => "stated by the provider",
@@ -1093,7 +1101,7 @@ pub fn available_key(config: &ProviderConfig, stored_key: Option<&str>) -> Optio
     config
         .api_key_env
         .as_ref()
-        .and_then(|var| std::env::var(var).ok())
+        .and_then(|var| env::var(var).ok())
         .filter(|k| !k.is_empty())
         .or_else(|| stored_key.filter(|k| !k.is_empty()).map(str::to_owned))
 }
@@ -1391,6 +1399,7 @@ mod tests {
     use super::*;
     use crate::provider::http::ModelInfo;
     use serde_json::json;
+    use std::path::Path;
 
     #[test]
     fn the_prose_in_a_reasoning_block_depends_on_the_surface_that_sent_it() {
@@ -1980,7 +1989,7 @@ output = 0.000015
     fn an_image_is_recognised_by_its_bytes_not_its_name() {
         // A 1x1 PNG.
         let png = base64_decode(PNG_1X1).unwrap();
-        let image = Image::read(std::path::Path::new("shot.txt"), png.clone()).unwrap();
+        let image = Image::read(Path::new("shot.txt"), png.clone()).unwrap();
         assert_eq!(image.media_type, "image/png");
         assert_eq!((image.width, image.height), (1, 1));
         // The name is only for showing; the type came from the bytes.
@@ -1989,17 +1998,17 @@ output = 0.000015
 
         // The same bytes behind the wrong extension are still a PNG (D58).
         let gif = base64_decode(GIF_1X1).unwrap();
-        let image = Image::read(std::path::Path::new("x.png"), gif).unwrap();
+        let image = Image::read(Path::new("x.png"), gif).unwrap();
         assert_eq!(image.media_type, "image/gif");
         assert_eq!((image.width, image.height), (1, 1));
 
         // Text is refused with a reason rather than sent and rejected by the provider.
-        let e = Image::read(std::path::Path::new("a.txt"), b"hello".to_vec()).unwrap_err();
+        let e = Image::read(Path::new("a.txt"), b"hello".to_vec()).unwrap_err();
         assert!(e.contains("not a PNG, JPEG, GIF or WebP"), "{e}");
         // And so is a picture over the limit.
         let mut big = png.clone();
         big.resize(MAX_IMAGE_BYTES as usize + 1, 0);
-        let e = Image::read(std::path::Path::new("big.png"), big).unwrap_err();
+        let e = Image::read(Path::new("big.png"), big).unwrap_err();
         assert!(e.contains("over the"), "{e}");
     }
 
@@ -2015,7 +2024,7 @@ output = 0.000015
         d.extend_from_slice(&[0u8; 14]);
         d.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x64, 0x00, 0xc8]);
         d.extend_from_slice(&[0u8; 4]);
-        let image = Image::read(std::path::Path::new("a.jpg"), d).unwrap();
+        let image = Image::read(Path::new("a.jpg"), d).unwrap();
         assert_eq!(image.media_type, "image/jpeg");
         assert_eq!((image.width, image.height), (200, 100));
     }

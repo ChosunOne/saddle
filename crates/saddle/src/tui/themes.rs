@@ -156,6 +156,7 @@ impl ThemePicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::catppuccin;
 
     /// `ThemeTables` is the contents of `[themes]`, so these are the tables inside it.
     fn tables(text: &str) -> ThemeTables {
@@ -263,7 +264,7 @@ mod tests {
         // A flavour is picked by looking at it, so it has to be in the list, and the note has to
         // say which kind of terminal it belongs on — Latte on a dark terminal is unreadable (D76).
         let p = ThemePicker::collect(&tables(""), "default");
-        for name in crate::tui::catppuccin::NAMES {
+        for name in catppuccin::NAMES {
             let entry = p
                 .entries
                 .iter()

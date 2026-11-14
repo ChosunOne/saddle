@@ -8,8 +8,12 @@
 //! server supplied, so they are exactly the kind of address a grant has to allow rather than a
 //! harness constant; the label in the record says it was authorization and for which server.
 
+use crate::provider::oauth;
+use saddle_cap::policy::NetGrant;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
+use std::path::Path;
+use std::str;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -38,7 +42,7 @@ pub struct AuthServer {
 pub struct Flow<'a> {
     pub session: &'a mut Session,
     /// The net grants these requests are decided against, and the label they are recorded under.
-    pub reach: Vec<saddle_cap::policy::NetGrant>,
+    pub reach: Vec<NetGrant>,
     pub label: String,
     pub timeout: Duration,
 }
@@ -186,12 +190,7 @@ pub fn register(flow: &mut Flow<'_>, auth: &AuthServer, redirect: &str) -> Resul
 
 /// The whole sign-in: discover, register, send the person to the browser, catch the callback, and
 /// store what comes back.
-pub fn sign_in(
-    flow: &mut Flow<'_>,
-    server: &str,
-    url: &str,
-    store_path: &std::path::Path,
-) -> Result<String> {
+pub fn sign_in(flow: &mut Flow<'_>, server: &str, url: &str, store_path: &Path) -> Result<String> {
     let auth = discover(flow, url)?;
     // A loopback listener on any port: the registration names the redirect, so it need not be
     // fixed, and a fixed port is the one thing most likely to be taken.
@@ -200,7 +199,7 @@ pub fn sign_in(
     let redirect = format!("http://127.0.0.1:{port}/callback");
     let client_id = register(flow, &auth, &redirect)?;
     let (verifier, challenge) = pkce();
-    let state = crate::provider::oauth::random_b64(16);
+    let state = oauth::random_b64(16);
     let mut authorize = format!(
         "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}\
          &code_challenge_method=S256",
@@ -236,7 +235,7 @@ pub fn refresh(
     server: &str,
     url: &str,
     tokens: &Tokens,
-    store_path: &std::path::Path,
+    store_path: &Path,
 ) -> Result<Tokens> {
     let client = tokens
         .client_id
@@ -284,7 +283,7 @@ fn tokens_from(answer: &Answer, endpoint: &str) -> Result<Tokens> {
         expires_at: if lifetime == 0 {
             0
         } else {
-            crate::provider::oauth::now() + lifetime
+            oauth::now() + lifetime
         },
         client_id: value["client_id"].as_str().map(str::to_owned),
         account_id: None,
@@ -377,7 +376,7 @@ fn decode(text: &str) -> String {
     while at < bytes.len() {
         match bytes[at] {
             b'%' if at + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[at + 1..at + 3]).unwrap_or_default();
+                let hex = str::from_utf8(&bytes[at + 1..at + 3]).unwrap_or_default();
                 match u8::from_str_radix(hex, 16) {
                     Ok(byte) => {
                         out.push(byte);

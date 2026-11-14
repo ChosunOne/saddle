@@ -1,6 +1,9 @@
 //! Built-in tools (D17). Each one is called with the JSON input the model would send, passes the
 //! policy engine for every access, and returns the text the model would see.
 
+use crate::mcp::registry;
+use crate::provider::Image;
+use std::mem;
 mod bash;
 mod diff;
 pub(crate) mod fetch;
@@ -27,7 +30,7 @@ pub struct ToolOutput {
     /// For the transcript only: a line diff of the file the call changed.
     pub diff: Option<String>,
     /// Pictures the call produced, such as a screenshot `read` was asked for (D58).
-    pub images: Vec<crate::provider::Image>,
+    pub images: Vec<Image>,
 }
 
 impl ToolOutput {
@@ -372,9 +375,9 @@ pub fn call(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutp
         "websearch" => websearch::search(session, input),
         "session_query" => session_query::run(session, input),
         "tool_search" => tool_search::search(session, input),
-        _ if name.starts_with(crate::mcp::registry::PREFIX) => {
+        _ if name.starts_with(registry::PREFIX) => {
             // Same reason as `tool_search`: the registry is a field of the session it has to ask.
-            let mut registry = std::mem::take(&mut session.mcp);
+            let mut registry = mem::take(&mut session.mcp);
             let out = registry.call(name, input, session);
             session.mcp = registry;
             out

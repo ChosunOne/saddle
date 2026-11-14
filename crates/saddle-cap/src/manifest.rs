@@ -2,6 +2,7 @@
 //! declares; a grant above the ceiling is a load error.
 
 use std::collections::BTreeSet;
+use toml::de::Error;
 
 use serde::Deserialize;
 
@@ -19,7 +20,7 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
+    pub fn parse(text: &str) -> Result<Self, Error> {
         toml::from_str(text)
     }
 }

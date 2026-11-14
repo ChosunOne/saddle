@@ -11,6 +11,7 @@
 //! until every file's new contents have been computed in memory.
 
 use std::fmt::Write as _;
+use std::iter::Peekable;
 
 use anyhow::Result;
 use saddle_cap::Location;
@@ -275,9 +276,7 @@ impl Patch {
 }
 
 /// The hunks of one update, and its `*** Move to:` if it has one.
-fn parse_hunks<'a, I>(
-    lines: &mut std::iter::Peekable<I>,
-) -> Result<(Vec<Hunk>, Option<String>), String>
+fn parse_hunks<'a, I>(lines: &mut Peekable<I>) -> Result<(Vec<Hunk>, Option<String>), String>
 where
     I: Iterator<Item = &'a str>,
 {

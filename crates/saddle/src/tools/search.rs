@@ -5,6 +5,7 @@
 //! Directories are walked beneath their root with cap-std and symlinks are never followed. find
 //! and grep also skip `.git` and whatever `.gitignore` files list.
 
+use crate::ignore;
 use std::io::Read as _;
 use std::path::Path;
 
@@ -43,7 +44,7 @@ struct Walk {
 
 /// Adds the rules of every ignore file in `base`, which is a directory relative to `root`.
 fn load_ignores(root: &Dir, rules: &mut Rules, base: &str) {
-    for name in crate::ignore::FILES {
+    for name in ignore::FILES {
         let file = if base.is_empty() {
             (*name).to_owned()
         } else {
@@ -458,6 +459,8 @@ pub fn list_files(dir: &Path, limit: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs as unix_fs;
 
     fn tree() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
@@ -477,10 +480,10 @@ mod tests {
             (".git/config", "[core]\n"),
             (".env", "SECRET=1\n"),
         ] {
-            std::fs::create_dir_all(p.join(path).parent().unwrap()).unwrap();
-            std::fs::write(p.join(path), text).unwrap();
+            fs::create_dir_all(p.join(path).parent().unwrap()).unwrap();
+            fs::write(p.join(path), text).unwrap();
         }
-        std::os::unix::fs::symlink("/etc", p.join("etc-link")).unwrap();
+        unix_fs::symlink("/etc", p.join("etc-link")).unwrap();
         d
     }
 

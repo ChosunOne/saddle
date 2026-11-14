@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result, bail};
 use ratatui::style::Color;
+use std::collections::BTreeMap;
 
 use super::theme::{Appearance, Theme, colour_value, palette};
 
@@ -362,8 +363,7 @@ impl Palette {
     pub fn from_table(table: &toml::Table, base: Palette) -> Result<Self> {
         let mut palette = base;
         let mut given = Vec::new();
-        let mut vars: std::collections::BTreeMap<String, String> =
-            std::collections::BTreeMap::new();
+        let mut vars: BTreeMap<String, String> = BTreeMap::new();
         if let Some(table) = table.get("vars") {
             let Some(table) = table.as_table() else {
                 bail!("`vars` must be a table of colours");
@@ -562,8 +562,8 @@ pub struct PiTheme {
     pub name: Option<String>,
     pub appearance: Option<String>,
     #[serde(default)]
-    pub vars: std::collections::BTreeMap<String, serde_json::Value>,
-    pub colors: std::collections::BTreeMap<String, serde_json::Value>,
+    pub vars: BTreeMap<String, serde_json::Value>,
+    pub colors: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     #[allow(dead_code)]
     pub export: Option<serde_json::Value>,
@@ -574,7 +574,7 @@ impl PiTheme {
     /// The palette file describes, starting from `base`.
     pub fn palette(&self, base: Palette) -> Result<Palette> {
         let mut palette = base;
-        let mut vars = std::collections::BTreeMap::new();
+        let mut vars = BTreeMap::new();
         for (key, value) in &self.vars {
             match value {
                 serde_json::Value::String(text) => {

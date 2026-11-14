@@ -4,6 +4,9 @@
 //! Raw escapes could move the cursor over host output, write the clipboard (OSC 52) or plant
 //! links (OSC 8).
 
+use crate::cancel;
+use crate::provider::Image;
+use std::io;
 use std::io::{IsTerminal, Write};
 
 use crate::agent::{Ui, call_detail};
@@ -22,7 +25,7 @@ pub struct Terminal {
 
 impl Terminal {
     pub fn new() -> Self {
-        let color = std::io::stderr().is_terminal();
+        let color = io::stderr().is_terminal();
         Self {
             mid_line: false,
             reasoning: false,
@@ -77,7 +80,7 @@ impl Sink for Terminal {
             self.reasoning = false;
         }
         print!("{s}");
-        let _ = std::io::stdout().flush();
+        let _ = io::stdout().flush();
         self.mid_line = !s.ends_with('\n');
     }
 
@@ -103,7 +106,7 @@ impl Sink for Terminal {
     }
 
     fn cancelled(&self) -> bool {
-        crate::cancel::requested()
+        cancel::requested()
     }
 }
 
@@ -119,7 +122,7 @@ impl Ui for Terminal {
         );
     }
 
-    fn attached(&mut self, images: &[crate::provider::Image]) {
+    fn attached(&mut self, images: &[Image]) {
         for image in images {
             self.info(&format!(
                 "attached {} ({}×{}, {})",

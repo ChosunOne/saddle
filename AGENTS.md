@@ -312,7 +312,10 @@ nearly every module header names the ones it implements, for example:
   Where two modules bring in the same name, both are imported with an alias that says which is
   which (`Row as PermissionRow`), rather than one of them being qualified where it is used. A test
   module's imports belong at the top of that module. `#[cfg(test)]` on an import is how a
-  test-only name stays out of the binary.
+  test-only name stays out of the binary. All crates inherit workspace Clippy denies for
+  `absolute_paths` and `items_after_statements`. These catch long qualified paths and imports
+  after statements; Clippy does not catch an import before a function's first statement, so the
+  module-level rule still applies there too. New crates must set `[lints] workspace = true`.
 - Doc comments are lowercase sentences and explain intent, not mechanics. `//!` opens a module with
   its purpose and its decision numbers; `///` covers public items.
 - `anyhow` with `bail!`/`Context` in the `saddle` binary crate; typed `thiserror` errors in the

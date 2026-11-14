@@ -1,11 +1,18 @@
 //! Drawing: the transcript, the queue, the activity line, the editor and the status line.
 
+use crate::provider;
+use crate::provider::Image;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use std::env;
+use std::iter;
+use std::mem;
+use std::path::Path;
+use std::time::SystemTime;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
@@ -24,8 +31,6 @@ use crate::tui::status::{Field, StatusData};
 use crate::tui::syntax::{self, Language, State};
 use crate::tui::theme::Theme;
 
-#[cfg(test)]
-use super::app::Action;
 #[cfg(test)]
 use super::login::{Choice, Listed, Outcome, Pick};
 
@@ -93,10 +98,7 @@ pub fn wrap(row: &Row, width: usize) -> Vec<Line<'static>> {
                     continue;
                 }
                 if used + w > limit {
-                    lines.push(Line::from(std::mem::replace(
-                        &mut current,
-                        row.rest.clone(),
-                    )));
+                    lines.push(Line::from(mem::replace(&mut current, row.rest.clone())));
                     limit = width.saturating_sub(spans_width(&row.rest)).max(1);
                     used = 0;
                     wrapped = true;
@@ -107,10 +109,7 @@ pub fn wrap(row: &Row, width: usize) -> Vec<Line<'static>> {
                 continue;
             }
             if used + w > limit && used > 0 {
-                lines.push(Line::from(std::mem::replace(
-                    &mut current,
-                    row.rest.clone(),
-                )));
+                lines.push(Line::from(mem::replace(&mut current, row.rest.clone())));
                 limit = width.saturating_sub(spans_width(&row.rest)).max(1);
                 used = 0;
                 wrapped = true;
@@ -123,10 +122,7 @@ pub fn wrap(row: &Row, width: usize) -> Vec<Line<'static>> {
             for c in piece.chars() {
                 let cw = c.width().unwrap_or(0);
                 if used + cw > limit && used > 0 {
-                    lines.push(Line::from(std::mem::replace(
-                        &mut current,
-                        row.rest.clone(),
-                    )));
+                    lines.push(Line::from(mem::replace(&mut current, row.rest.clone())));
                     limit = width.saturating_sub(spans_width(&row.rest)).max(1);
                     used = 0;
                     wrapped = true;
@@ -277,7 +273,7 @@ impl Markdown {
             return;
         }
         let (first, rest) = self.prefixes();
-        let spans = std::mem::take(&mut self.line);
+        let spans = mem::take(&mut self.line);
         self.rows.push(Row { first, rest, spans });
     }
 
@@ -826,10 +822,7 @@ fn entry_rows(entry: &Entry, view: View, theme: &Theme) -> Vec<Row> {
                 // width: kitty draws it at its pixel size when it fits, and scaled when it does
                 // not (D59).
                 let fit = image::fit((image.width, image.height), (view.room.0, image::MAX_ROWS));
-                out.extend(std::iter::repeat_n(
-                    Row::plain(Vec::new()),
-                    fit.rows as usize,
-                ));
+                out.extend(iter::repeat_n(Row::plain(Vec::new()), fit.rows as usize));
             }
             out
         }
@@ -1161,13 +1154,10 @@ fn shaded(rows: &[Row], bg: Color, width: usize) -> Vec<Line<'static>> {
 fn transcript_with_images(
     app: &mut App,
     width: u16,
-) -> (
-    Vec<Line<'static>>,
-    Vec<(usize, crate::provider::Image, u32)>,
-) {
+) -> (Vec<Line<'static>>, Vec<(usize, Image, u32)>) {
     // The third field is the terminal id: it comes from the entry's position, so the same picture
     // keeps the same id every frame and does not have to be re-sent (D59).
-    let mut images: Vec<(usize, crate::provider::Image, u32)> = Vec::new();
+    let mut images: Vec<(usize, Image, u32)> = Vec::new();
     let mut lines = Vec::new();
     for i in 0..app.entries.len() {
         let running = match &app.entries[i] {
@@ -1265,7 +1255,7 @@ fn shade(line: &mut Line<'static>, from: usize, to: usize, theme: &Theme) {
     }
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut index = 0usize;
-    for span in std::mem::take(&mut line.spans) {
+    for span in mem::take(&mut line.spans) {
         let text = span.content.into_owned();
         let mut run = String::new();
         let mut selected: Option<bool> = None;
@@ -1293,16 +1283,16 @@ fn flush(
     if run.is_empty() {
         return;
     }
-    let text = std::mem::take(run);
+    let text = mem::take(run);
     out.push(match selected {
         Some(true) => Span::styled(text, style.patch(selected_style(theme))),
         _ => Span::styled(text, style),
     });
 }
 
-pub(super) fn home_relative(path: &std::path::Path) -> String {
+pub(super) fn home_relative(path: &Path) -> String {
     let shown = path.display().to_string();
-    match std::env::var("HOME") {
+    match env::var("HOME") {
         Ok(home) if !home.is_empty() && shown.starts_with(&home) => {
             format!("~{}", &shown[home.len()..])
         }
@@ -1435,7 +1425,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         window: app.header.context_window,
         workspace: &home_relative(&app.header.workspace),
         // A refill is counted down from the moment the frame is drawn (D49).
-        now: std::time::SystemTime::now(),
+        now: SystemTime::now(),
     });
     // The workspace is drawn on the left unless the template already places it, so a user who
     // moves it into the line does not see it twice (D36).
@@ -1702,7 +1692,7 @@ fn draw_login(
                     Span::raw(visible),
                 ]));
                 if f.masked() {
-                    if let Some(page) = crate::provider::key_page(&login.choice().name) {
+                    if let Some(page) = provider::key_page(&login.choice().name) {
                         lines.push(Line::from(Span::styled(
                             format!("get one at {page}"),
                             dim(theme),
@@ -2038,7 +2028,7 @@ fn draw_resume(frame: &mut Frame<'_>, picker: &SessionPicker, area: Rect, theme:
     let width = area.width.saturating_sub(4).min(96);
     let inner = width.saturating_sub(2) as usize;
     let accent = Style::new().fg(theme.accent);
-    let now = std::time::SystemTime::now();
+    let now = SystemTime::now();
     let mut lines: Vec<Line> = Vec::new();
     let visible_filter = keep_tail(&picker.filter, inner.saturating_sub(10));
     let cursor = Some((0, 10 + visible_filter.width()));
@@ -2382,7 +2372,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let mut line = String::new();
     for word in text.split_whitespace() {
         if !line.is_empty() && line.width() + 1 + word.width() > width {
-            out.push(std::mem::take(&mut line));
+            out.push(mem::take(&mut line));
         }
         if !line.is_empty() {
             line.push(' ');
@@ -2413,7 +2403,7 @@ fn keep_tail(s: &str, max: usize) -> String {
         used += w;
         out.push(c);
     }
-    std::iter::once('…').chain(out.into_iter().rev()).collect()
+    iter::once('…').chain(out.into_iter().rev()).collect()
 }
 
 fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -2518,10 +2508,15 @@ mod tests {
     use super::*;
     use crate::agent::End;
     use crate::provider::Image;
+    use crate::provider::Usage;
     use crate::store::{Point, PointKind, Summary};
+    use crate::tui::app::Action;
     use crate::tui::app::{AgentEvent, Header};
     use crate::tui::permissions::{Kind, Permissions, Row as PermissionRow};
     use crate::tui::settings::Values;
+    use crate::tui::status;
+    use crate::tui::status::Template;
+    use crate::tui::theme;
     use crate::tui::theme::{Theme, ThemeTables};
     use crate::tui::tree::Tree;
     use ratatui::Terminal;
@@ -2529,6 +2524,9 @@ mod tests {
     use ratatui::crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
+    use ratatui::layout::Rect;
+    use std::time::Duration;
+    use std::time::SystemTime;
 
     fn img(name: &str, w: u32, h: u32) -> Image {
         Image {
@@ -2561,7 +2559,7 @@ mod tests {
         );
         assert_ne!(app.images[0].id, app.images[1].id, "with different ids");
         // And the drawing pass plans both, on their own rows.
-        let area = ratatui::layout::Rect::new(0, 0, 80, 40);
+        let area = Rect::new(0, 0, 80, 40);
         let (_, draw, _) = plan_images(image::Protocol::Kitty, &app.drawn, &app.images, area, 0);
         assert_eq!(draw.len(), 2, "{draw:?}");
         assert_ne!(draw[0].0, draw[1].0, "on different rows: {draw:?}");
@@ -3166,7 +3164,7 @@ mod tests {
         // its own text colour, and syntax in its own colours.
         let tables = ThemeTables::new();
         let mut app = bare_app();
-        app.theme = crate::tui::theme::build("catppuccin-mocha", &tables).unwrap();
+        app.theme = theme::build("catppuccin-mocha", &tables).unwrap();
         app.entries.push(Entry::User("hello".into()));
         app.cache.push(None);
         app.entries
@@ -3659,7 +3657,7 @@ mod tests {
         );
         assert_eq!(
             app.mouse(up(at.x + 3, at.y)),
-            Some(crate::tui::app::Action::OpenUrl(
+            Some(Action::OpenUrl(
                 "https://auth.openai.com/codex/device".into()
             ))
         );
@@ -3749,7 +3747,7 @@ mod tests {
             context_window: 128_000,
             priced: false,
             mouse: false,
-            status: crate::tui::status::Template::default(),
+            status: Template::default(),
             images: None,
             theme: None,
         })
@@ -3936,12 +3934,12 @@ mod tests {
     fn the_built_in_themes_build_and_the_light_one_differs() {
         // The shipped themes must be usable, not just parseable: a theme with a role left out would
         // be a colour nobody chose.
-        for name in crate::tui::theme::builtin_names() {
-            let theme = crate::tui::theme::build(name, &ThemeTables::new())
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        for name in theme::builtin_names() {
+            let theme =
+                theme::build(name, &ThemeTables::new()).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(theme.name, name);
         }
-        let light = crate::tui::theme::build("light", &ThemeTables::new()).unwrap();
+        let light = theme::build("light", &ThemeTables::new()).unwrap();
         let default = Theme::default();
         assert_ne!(light.accent, default.accent, "light is a different theme");
         assert_ne!(
@@ -4015,7 +4013,7 @@ mod tests {
             max_tokens: None,
             context_window: None,
             window: 262_144,
-            status: crate::tui::status::DEFAULT_STATUS.into(),
+            status: status::DEFAULT_STATUS.into(),
             max_steps: None,
             auto_compact: true,
             idle_compact: true,
@@ -4041,7 +4039,7 @@ mod tests {
         }
 
         app.settings = None;
-        let now = std::time::SystemTime::now();
+        let now = SystemTime::now();
         app.resume = Some(SessionPicker::new(vec![Summary {
             id: "a".into(),
             title: "fix the flaky test in the sandbox crate".into(),
@@ -4050,7 +4048,7 @@ mod tests {
             messages: 9,
             model: "mock-model".into(),
             forked_from: None,
-            updated: now - std::time::Duration::from_secs(600),
+            updated: now - Duration::from_secs(600),
         }]));
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let all = screen(&terminal);
@@ -4100,7 +4098,7 @@ mod tests {
             context_window: 128_000,
             priced: false,
             mouse: false,
-            status: crate::tui::status::Template::default(),
+            status: Template::default(),
             images: None,
             theme: None,
         });
@@ -4119,7 +4117,7 @@ mod tests {
             diff: None,
         });
         app.agent(AgentEvent::Reply {
-            usage: crate::provider::Usage {
+            usage: Usage {
                 input: 1200,
                 output: 80,
                 cache_read: 0,

@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use two_face::syntax;
 
 use ratatui::style::{Color, Style};
 use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
@@ -112,7 +113,7 @@ fn alias(tag: &str) -> String {
 /// set: the same grammars, plus everything else bat highlights, as one embedded dump.
 fn syntaxes() -> &'static SyntaxSet {
     static SET: OnceLock<SyntaxSet> = OnceLock::new();
-    SET.get_or_init(two_face::syntax::extra_newlines)
+    SET.get_or_init(syntax::extra_newlines)
 }
 
 /// The grammar a language names, if this build has one.

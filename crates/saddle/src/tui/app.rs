@@ -1,7 +1,26 @@
 //! TUI state and input handling. Nothing here touches the terminal, so it is tested directly.
 
+use crate::provider;
+use crate::provider::Image;
+use crate::provider::Quota;
+use crate::skills;
+use crate::skills::Skill;
+use crate::store::Point;
+use crate::tools::search;
+use crate::tui::image::Fit;
+use crate::tui::image::Protocol;
+use crate::tui::permissions::Change as PermissionsChange;
+use crate::tui::permissions::Permissions;
+use crate::tui::status::Template;
+use crate::tui::theme::Theme;
+use crate::tui::themes::ThemePicker;
+use crate::tui::tree::Tree;
+use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::mem;
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::Instant;
 
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -42,7 +61,7 @@ pub enum AgentEvent {
         content: String,
         diff: Option<String>,
         /// Pictures the call returned, such as a screenshot `read` was asked for (D58).
-        images: Vec<crate::provider::Image>,
+        images: Vec<Image>,
     },
     /// A reply: what it used, and what it cost (D36).
     Reply {
@@ -50,9 +69,9 @@ pub enum AgentEvent {
         cost: f64,
     },
     /// What the provider said about the allowance left (D36).
-    Quota(crate::provider::Quota),
+    Quota(Quota),
     /// The skills a re-discovery found, for the `/` menu (D70).
-    Skills(Vec<crate::skills::Skill>),
+    Skills(Vec<Skill>),
     TurnEnd(End),
     /// The host failed (for example, the audit log could not be written). The session is over.
     Fatal(String),
@@ -74,10 +93,10 @@ pub enum AgentEvent {
     /// request would carry (D35).
     Resumed(Resumed),
     /// The branch as rows, for `/tree` (D54).
-    Tree(Vec<crate::store::Point>),
+    Tree(Vec<Point>),
     /// Images attached to the prompt just sent, to show beside it (D58).
-    Attached(Vec<crate::provider::Image>),
-    Compaction(crate::compact::Event),
+    Attached(Vec<Image>),
+    Compaction(CompactEvent),
 }
 
 /// A change to the reasoning effort (D57).
@@ -127,7 +146,7 @@ pub enum Action {
     /// Settle the context window again now that the endpoint has answered.
     SettleWindow,
     /// One change from the permissions editor.
-    Grant(crate::tui::permissions::Change),
+    Grant(PermissionsChange),
     /// Open the permissions editor (D45).
     OpenPermissions,
     /// Show the conversation tree, to continue from an earlier message (D54).
@@ -217,7 +236,7 @@ pub struct Placed {
     /// The id the terminal knows it by, so it can be taken back off the screen (D59).
     pub id: u32,
     /// The picture's full size: cells, and pixels.
-    pub box_: crate::tui::image::Fit,
+    pub box_: Fit,
     pub pixels: (u32, u32),
     /// The encoded file, kept so the escape can be built for whatever band is on screen (D59).
     pub png: Vec<u8>,
@@ -237,10 +256,10 @@ pub struct Drawn {
 }
 
 /// How long two escapes may be apart and still count as one gesture (D54).
-pub const DOUBLE_ESCAPE: std::time::Duration = std::time::Duration::from_millis(500);
+pub const DOUBLE_ESCAPE: Duration = Duration::from_millis(500);
 
 /// How long "copied …" stays in the activity line.
-pub const COPY_NOTE: std::time::Duration = std::time::Duration::from_secs(3);
+pub const COPY_NOTE: Duration = Duration::from_secs(3);
 
 /// A list shown above the editor while typing: `/` commands or `@` files.
 pub struct Popup {
@@ -252,7 +271,7 @@ pub struct Popup {
 /// Files the `@` picker offers, at most.
 const PICKER_FILES: usize = 20_000;
 /// The picker's file list is reread when it is older than this.
-const PICKER_REFRESH: std::time::Duration = std::time::Duration::from_secs(15);
+const PICKER_REFRESH: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoteKind {
@@ -278,7 +297,7 @@ pub enum Entry {
     Note(NoteKind, String),
     /// An image attached to the prompt above it (D58). Drawn where the terminal can, and as this
     /// entry's text everywhere else (D59).
-    Image(crate::provider::Image),
+    Image(Image),
     /// A compaction, streamed as it runs, or a summary loaded with a resumed session.
     Compaction(Box<CompactionView>),
 }
@@ -323,7 +342,7 @@ pub struct Header {
     /// Whether the model has a price, so `{cost}` can show `$0.00` rather than nothing (D36).
     pub priced: bool,
     /// The status line, parsed from `[ui] status` (D36).
-    pub status: crate::tui::status::Template,
+    pub status: Template,
     /// Whether the terminal's mouse is reported to saddle. Off by default so a drag selects text
     /// in the terminal itself (D35); `[ui] mouse = true` turns it back on for wheel scrolling.
     pub mouse: bool,
@@ -458,7 +477,7 @@ pub struct App {
     pub header: Header,
     /// What discovery offered, so `/skill:name` can put a body into the conversation without going
     /// back to the agent thread (D69). The text was read and recorded at discovery.
-    pub skills: Vec<crate::skills::Skill>,
+    pub skills: Vec<Skill>,
     pub entries: Vec<Entry>,
     /// Parallel to `entries`; `None` means re-render.
     pub cache: Vec<Option<Cached>>,
@@ -482,30 +501,30 @@ pub struct App {
     /// The transcript geometry of the last draw, which turns a screen point into a character.
     pub seen: Option<Seen>,
     /// When the last copy happened, for the note in the activity line.
-    pub copied: Option<std::time::Instant>,
+    pub copied: Option<Instant>,
     /// What was copied, for the confirmation (D86).
     pub copied_what: &'static str,
     /// Where the sign-in link was drawn, so a click on it opens the browser (D86).
-    pub open_url_at: Option<ratatui::layout::Rect>,
+    pub open_url_at: Option<Rect>,
     /// The text of the dialog that is open, as it was drawn, so its text can be selected and copied
     /// exactly as the transcript's can (D87).
     pub dialog_seen: Option<Seen>,
     /// When escape was last pressed on an empty editor, so two of them open the tree (D54).
-    last_escape: Option<std::time::Instant>,
+    last_escape: Option<Instant>,
     pub total_lines: usize,
     /// Where each image sits in the transcript, and the escape that draws it (D59).
     pub images: Vec<Placed>,
     /// What this terminal can draw, detected once at startup (D59).
-    pub protocol: crate::tui::image::Protocol,
+    pub protocol: Protocol,
     /// The colours to draw with (D71). Every role the renderer paints comes from here.
-    pub theme: crate::tui::theme::Theme,
+    pub theme: Theme,
     /// What the last frame drew, and where (D59).
     pub drawn: Drawn,
     pub usage: Usage,
     /// Dollars spent this session, when a price is known (D36).
     pub cost: f64,
     /// The model's context window and price, and the allowance the provider last stated.
-    pub quota: Option<crate::provider::Quota>,
+    pub quota: Option<Quota>,
     /// Tokens in the context at the last reply.
     pub context: u64,
     pub spinner: usize,
@@ -515,14 +534,14 @@ pub struct App {
     pub resume: Option<SessionPicker>,
     pub settings: Option<SettingsDialog>,
     /// The conversation tree, drawn over everything else while open (D53).
-    pub tree: Option<crate::tui::tree::Tree>,
+    pub tree: Option<Tree>,
     /// The permissions editor, drawn over everything else while open (D45).
-    pub permissions: Option<crate::tui::permissions::Permissions>,
+    pub permissions: Option<Permissions>,
     /// The theme list, drawn over everything else while open, and previewed as it moves (D74).
-    pub themes: Option<crate::tui::themes::ThemePicker>,
+    pub themes: Option<ThemePicker>,
     /// The theme in force when the list opened — its name and its colours — so escape puts back
     /// exactly what was there (D74).
-    theme_before: Option<(String, crate::tui::theme::Theme)>,
+    theme_before: Option<(String, Theme)>,
     /// The agent's per-prompt limit, shown in /settings.
     /// Model requests per prompt, or `None` for no limit (D37).
     pub max_steps: Option<usize>,
@@ -535,7 +554,7 @@ pub struct App {
     /// Esc hid the menu for this exact text.
     menu_dismissed: Option<String>,
     /// Workspace files for the `@` picker, and when they were listed.
-    files: Option<(Vec<String>, std::time::Instant)>,
+    files: Option<(Vec<String>, Instant)>,
 }
 
 const KEYS: &str = "\
@@ -573,7 +592,7 @@ pub fn help() -> String {
 
 impl App {
     /// The image an entry holds, for the renderer that has to find a place to draw it (D59).
-    pub fn cached_image(&self, i: usize) -> Option<crate::provider::Image> {
+    pub fn cached_image(&self, i: usize) -> Option<Image> {
         match self.entries.get(i) {
             Some(Entry::Image(image)) => Some(image.clone()),
             _ => None,
@@ -608,8 +627,8 @@ impl App {
             last_escape: None,
             total_lines: 0,
             images: Vec::new(),
-            protocol: crate::tui::image::Protocol::Text,
-            theme: crate::tui::theme::Theme::default(),
+            protocol: Protocol::Text,
+            theme: Theme::default(),
             drawn: Drawn::default(),
             usage: Usage::default(),
             cost: 0.0,
@@ -643,7 +662,7 @@ impl App {
             app.header.audit.display()
         );
         app.push(Entry::Note(NoteKind::Info, intro));
-        for note in std::mem::take(&mut app.header.notes) {
+        for note in mem::take(&mut app.header.notes) {
             app.push(Entry::Note(NoteKind::Info, note));
         }
         app
@@ -845,8 +864,8 @@ impl App {
             .as_ref()
             .is_none_or(|(_, at)| at.elapsed() > PICKER_REFRESH);
         if stale {
-            let list = crate::tools::search::list_files(&self.header.workspace, PICKER_FILES);
-            self.files = Some((list, std::time::Instant::now()));
+            let list = search::list_files(&self.header.workspace, PICKER_FILES);
+            self.files = Some((list, Instant::now()));
         }
         let files = self
             .files
@@ -1120,7 +1139,7 @@ impl App {
                     let twice = self
                         .last_escape
                         .is_some_and(|at| at.elapsed() < DOUBLE_ESCAPE);
-                    self.last_escape = Some(std::time::Instant::now());
+                    self.last_escape = Some(Instant::now());
                     if twice {
                         self.last_escape = None;
                         return Some(Action::OpenTree);
@@ -1196,7 +1215,7 @@ impl App {
     /// and nothing in it would otherwise be copyable (D87). The one other pointer target is the
     /// sign-in link, which opens rather than selects (D86).
     /// Opens the theme list on the theme in force, remembering what to put back (D74).
-    pub fn open_themes(&mut self, mut picker: crate::tui::themes::ThemePicker) {
+    pub fn open_themes(&mut self, mut picker: ThemePicker) {
         let name = self
             .header
             .theme
@@ -1466,7 +1485,7 @@ impl App {
             self.editor.set(self.history[pos + 1].clone());
         } else {
             self.history_pos = None;
-            self.editor.set(std::mem::take(&mut self.draft));
+            self.editor.set(mem::take(&mut self.draft));
         }
     }
 
@@ -1510,12 +1529,12 @@ impl App {
                     NoteKind::Error,
                     &format!(
                         "no skill `{name}`; this session has {}",
-                        crate::skills::names(&self.skills)
+                        skills::names(&self.skills)
                     ),
                 );
                 return None;
             };
-            let prompt = crate::skills::invocation(skill, args);
+            let prompt = skills::invocation(skill, args);
             let name = skill.name.clone();
             self.push(Entry::User(prompt.clone()));
             self.busy = Some(Activity::Waiting);
@@ -1576,12 +1595,12 @@ impl App {
                     return Some(Action::Effort(Effort::Cycle));
                 }
                 let level = level.to_ascii_lowercase();
-                if !crate::provider::EFFORTS.contains(&level.as_str()) {
+                if !provider::EFFORTS.contains(&level.as_str()) {
                     self.note(
                         NoteKind::Error,
                         &format!(
                             "`{level}` is not a reasoning level; the levels are {}",
-                            crate::provider::EFFORTS.join(", ")
+                            provider::EFFORTS.join(", ")
                         ),
                     );
                     return None;
@@ -1839,7 +1858,7 @@ impl App {
                         "nothing to fork from yet: this session has no prompt",
                     );
                 } else {
-                    self.tree = Some(crate::tui::tree::Tree::new(points));
+                    self.tree = Some(Tree::new(points));
                 }
             }
             AgentEvent::Attached(images) => {
@@ -1861,7 +1880,7 @@ impl App {
 /// Transcript entries for a saved conversation: prompts, reasoning, replies, and each tool call
 /// with its result.
 pub fn entries_from(items: &[Item]) -> Vec<Entry> {
-    let mut results = std::collections::HashMap::new();
+    let mut results = HashMap::new();
     for item in items {
         if let Item::ToolResults(rs) = item {
             for r in rs {
@@ -1974,8 +1993,15 @@ fn display(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::Usage;
     use crate::provider::{Api, ToolCall, ToolResult};
+    use crate::skills;
+    use crate::skills::Skill;
+    use crate::store::Model;
     use crate::tui::login::{Choice, Login, Outcome as LoginOutcome};
+    use crate::tui::status::Template;
+    use crate::tui::theme::ThemeTables;
+    use crate::tui::themes::ThemePicker;
 
     fn app() -> App {
         App::new(Header {
@@ -1990,7 +2016,7 @@ mod tests {
             context_window: 128_000,
             priced: false,
             mouse: false,
-            status: crate::tui::status::Template::default(),
+            status: Template::default(),
             images: None,
             theme: None,
         })
@@ -2112,7 +2138,7 @@ mod tests {
         a.agent(AgentEvent::Resumed(Resumed {
             items: vec![Item::User("earlier".into())],
             declared: Vec::new(),
-            usage: crate::provider::Usage {
+            usage: Usage {
                 input: 1_500,
                 output: 200,
                 cache_read: 900,
@@ -2121,7 +2147,7 @@ mod tests {
             cost: 0.42,
             context: 2_600,
             // The same model this session is already on, so resuming asks for no switch (D91).
-            model: Some(crate::store::Model {
+            model: Some(Model {
                 provider: "mock".into(),
                 model: "m".into(),
             }),
@@ -2138,7 +2164,7 @@ mod tests {
 
         // Replies after the resume add to those totals rather than replacing them.
         a.agent(AgentEvent::Reply {
-            usage: crate::provider::Usage {
+            usage: Usage {
                 input: 10,
                 output: 5,
                 cache_read: 1,
@@ -2404,7 +2430,7 @@ mod tests {
         // D69: `/skill:name` puts the instructions into the conversation and the rest of the line
         // after them as the request, which is how pi forces a skill the model did not pick.
         let mut a = app();
-        a.skills = vec![crate::skills::Skill {
+        a.skills = vec![Skill {
             name: "manim".into(),
             description: "Animate a proof.".into(),
             dir: PathBuf::from("/ws/.agents/skills/manim"),
@@ -2460,12 +2486,12 @@ mod tests {
         // D74: a theme is chosen by looking at it. Moving the highlight draws with the new one;
         // escape restores both the drawing and the name in the status line; enter keeps it.
         let mut a = app();
-        let tables: crate::tui::theme::ThemeTables =
+        let tables: ThemeTables =
             toml::from_str("[mine]\ntext = \"#ffffff\"\naccent = \"#ff0000\"\n").unwrap();
         let was = a.theme.name.clone();
         // Opened on a theme that is not the app's, so "opens on the one in force" is a real claim,
         // and not the last entry, so there is somewhere to move to.
-        let picker = crate::tui::themes::ThemePicker::collect(&tables, "dark");
+        let picker = ThemePicker::collect(&tables, "dark");
         a.open_themes(picker);
         assert_eq!(
             a.theme.name, "dark",
@@ -2488,7 +2514,7 @@ mod tests {
         assert_eq!(a.header.theme.as_deref(), Some(was.as_str()));
 
         // Enter keeps the highlight: the action carries the name to save.
-        let picker = crate::tui::themes::ThemePicker::collect(&tables, &was);
+        let picker = ThemePicker::collect(&tables, &was);
         a.open_themes(picker);
         a.key(key(KeyCode::Down));
         let chosen = a.themes.as_ref().unwrap().current().name.clone();
@@ -2504,9 +2530,9 @@ mod tests {
     fn the_theme_list_takes_every_key_while_it_is_open() {
         // A picker that let a letter reach the editor would send a prompt instead of choosing.
         let mut a = app();
-        let tables = crate::tui::theme::ThemeTables::new();
+        let tables = ThemeTables::new();
         let name = a.theme.name.clone();
-        a.open_themes(crate::tui::themes::ThemePicker::collect(&tables, &name));
+        a.open_themes(ThemePicker::collect(&tables, &name));
         assert!(a.dialog_open());
         assert!(a.menu().is_empty(), "no / menu over a dialog");
         for c in ['x', '/', 'q'] {
@@ -2524,7 +2550,7 @@ mod tests {
         type_text(&mut a, "/reload");
         assert_eq!(a.key(key(KeyCode::Enter)), Some(Action::Reload));
         // And the list it comes back with replaces what the menu offers.
-        a.agent(AgentEvent::Skills(vec![crate::skills::Skill {
+        a.agent(AgentEvent::Skills(vec![Skill {
             name: "fresh".into(),
             description: "Just written.".into(),
             dir: PathBuf::from("/ws/.agents/skills/fresh"),
@@ -2557,7 +2583,7 @@ mod tests {
         // `disable-model-invocation` keeps a skill out of the prompt; the command is the point of
         // it, so it must still appear in the menu and still load.
         let mut a = app();
-        a.skills = vec![crate::skills::Skill {
+        a.skills = vec![Skill {
             name: "forced".into(),
             description: "Only when asked for.".into(),
             dir: PathBuf::from("/ws/.agents/skills/forced"),
@@ -2566,7 +2592,7 @@ mod tests {
             hidden: true,
         }];
         assert_eq!(
-            crate::skills::listing(&a.skills),
+            skills::listing(&a.skills),
             "",
             "not advertised in the prompt"
         );
@@ -2579,7 +2605,7 @@ mod tests {
     #[test]
     fn an_unknown_skill_name_says_which_exist() {
         let mut a = app();
-        a.skills = vec![crate::skills::Skill {
+        a.skills = vec![Skill {
             name: "manim".into(),
             description: "d".into(),
             dir: PathBuf::from("/ws/.agents/skills/manim"),
@@ -2683,7 +2709,7 @@ mod tests {
         a.agent(AgentEvent::Resumed(Resumed {
             items,
             declared: Vec::new(),
-            usage: crate::provider::Usage::default(),
+            usage: Usage::default(),
             cost: 0.0,
             context: 0,
             model: None,

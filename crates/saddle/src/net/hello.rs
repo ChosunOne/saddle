@@ -14,6 +14,7 @@
 //! answer either names a host or names nothing.
 
 /// What the first bytes of a connection say about the host it is for.
+use std::str;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Peek<'a> {
     /// More bytes are needed before this can be answered.
@@ -130,7 +131,7 @@ fn server_name(data: &[u8]) -> Option<&str> {
         let name = list.get(at + 3..at + 3 + n)?;
         // A name that is not text is not a hostname, so it names nothing.
         if kind == 0 {
-            return std::str::from_utf8(name).ok();
+            return str::from_utf8(name).ok();
         }
         at += 3 + n;
     }
@@ -154,6 +155,7 @@ fn be24(at: Option<&[u8]>) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net;
 
     /// A syntactically valid client hello, so the parser is tested against the shape it will see
     /// rather than against bytes chosen to make it pass.
@@ -270,7 +272,7 @@ mod tests {
 
     #[test]
     fn a_host_is_compared_without_its_root_dot_or_its_case() {
-        assert_eq!(crate::net::normalise_host("Crates.IO."), "crates.io");
-        assert_eq!(crate::net::normalise_host("crates.io"), "crates.io");
+        assert_eq!(net::normalise_host("Crates.IO."), "crates.io");
+        assert_eq!(net::normalise_host("crates.io"), "crates.io");
     }
 }

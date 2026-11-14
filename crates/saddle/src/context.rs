@@ -6,6 +6,8 @@
 //! Project files are read through the policy as the agent, like the read tool, so a file the
 //! agent may not read (or a symlink leading out of the workspace) never reaches the prompt.
 
+use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -30,7 +32,7 @@ pub struct ContextFile {
 }
 
 pub(crate) fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME")
+    env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
 }
@@ -100,8 +102,8 @@ pub fn load(
     let mut files = Vec::new();
     let mut notes = Vec::new();
     if let Some(path) = global_file(cfg, paths) {
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         files.push(ContextFile {
             label: label_of(&path),
             text: cap(text),
@@ -156,6 +158,7 @@ pub fn load(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn directories_run_from_the_root_down_to_the_start() {
@@ -187,20 +190,20 @@ mod tests {
             state: dir.path().join("state"),
             config: dir.path().join("config"),
         };
-        std::fs::create_dir_all(&paths.config).unwrap();
+        fs::create_dir_all(&paths.config).unwrap();
         let off = ContextConfig {
             global: Some(String::new()),
             claude_fallback: None,
         };
         assert_eq!(global_file(&off, &paths), None);
-        std::fs::write(paths.config.join("AGENTS.md"), "be terse").unwrap();
+        fs::write(paths.config.join("AGENTS.md"), "be terse").unwrap();
         let default = ContextConfig::default();
         assert_eq!(
             global_file(&default, &paths),
             Some(paths.config.join("AGENTS.md"))
         );
         let elsewhere = dir.path().join("mine.md");
-        std::fs::write(&elsewhere, "x").unwrap();
+        fs::write(&elsewhere, "x").unwrap();
         let custom = ContextConfig {
             global: Some(elsewhere.display().to_string()),
             claude_fallback: Some(false),

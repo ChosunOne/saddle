@@ -8,7 +8,16 @@
 //! a pipe). A 401 is not retried: without OAuth there is nothing to retry with, and a loop of
 //! refusals would spend the person's quota to learn the same thing twice.
 
+use crate::auth::AuthStore;
+use crate::mcp::oauth;
+use crate::tools::fetch;
+use saddle_cap::policy::NetGrant;
+use std::error::Error;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
 use std::time::Duration;
+use ureq::http::Response;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -42,7 +51,7 @@ pub struct Client {
     url: String,
     target: Target,
     /// The server's own net grants, narrowed from the agent's (D105).
-    reach: Vec<saddle_cap::policy::NetGrant>,
+    reach: Vec<NetGrant>,
     session_id: Option<String>,
     next: u64,
     /// The entry's `timeout`: the deadline every request of this server gets (D113).
@@ -50,12 +59,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn start(
-        server: &str,
-        url: &str,
-        reach: Vec<saddle_cap::policy::NetGrant>,
-        timeout: Duration,
-    ) -> Result<Self> {
+    pub fn start(server: &str, url: &str, reach: Vec<NetGrant>, timeout: Duration) -> Result<Self> {
         let target = Target::parse(url).map_err(|why| anyhow!("{url}: {why}"))?;
         Ok(Self {
             server: server.to_owned(),
@@ -240,7 +244,7 @@ impl Client {
         // A token the person stored is sent; there is no path here that asks for one by itself,
         // because obtaining one is a person's act at a terminal (D115).
         let store_path = session.setup.paths.auth_store();
-        let held = crate::auth::AuthStore::load(&store_path)
+        let held = AuthStore::load(&store_path)
             .ok()
             .and_then(|store| store.oauth(&format!("mcp:{}", self.server)).cloned());
         if let Some(tokens) = &held {
@@ -258,14 +262,13 @@ impl Client {
                 label: format!("oauth:{}", self.server),
                 timeout: self.timeout,
             };
-            let fresh =
-                crate::mcp::oauth::refresh(&mut flow, &self.server, &self.url, &held, &store_path)
-                    .with_context(|| {
-                        format!(
-                            "refreshing the token for `{}`; `saddle mcp auth {}` signs in again",
-                            self.server, self.server
-                        )
-                    })?;
+            let fresh = oauth::refresh(&mut flow, &self.server, &self.url, &held, &store_path)
+                .with_context(|| {
+                    format!(
+                        "refreshing the token for `{}`; `saddle mcp auth {}` signs in again",
+                        self.server, self.server
+                    )
+                })?;
             headers.retain(|(name, _)| *name != "authorization");
             headers.push(("authorization", format!("Bearer {}", fresh.access)));
             answer = self.attempt(session, &headers, payload)?;
@@ -308,13 +311,13 @@ impl Client {
 #[derive(Debug)]
 pub struct Denied(pub String);
 
-impl std::fmt::Display for Denied {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for Denied {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.write_str(&self.0)
     }
 }
 
-impl std::error::Error for Denied {}
+impl Error for Denied {}
 
 /// The text of a `CallToolResult`, with anything that is not text named rather than dropped.
 fn content_text(result: &Value) -> String {
@@ -365,7 +368,7 @@ fn content_text(result: &Value) -> String {
 pub(crate) fn send(
     session: &mut Session,
     label: &str,
-    reach: &[saddle_cap::policy::NetGrant],
+    reach: &[NetGrant],
     target: &Target,
     method: &str,
     headers: &[(&str, String)],
@@ -396,7 +399,7 @@ pub(crate) fn send(
         authority(&target.host, target.port, target.scheme == "https"),
         target.request_path()
     );
-    let agent = crate::tools::fetch::agent_for(named, timeout);
+    let agent = fetch::agent_for(named, timeout);
     // ureq types a request by whether it carries a body, so the two are built apart.
     let outcome = if method == "GET" {
         let mut request = agent.get(&url);
@@ -414,7 +417,7 @@ pub(crate) fn send(
         return Err(anyhow!("{method} is not a method this client makes"));
     };
     let mut response = outcome.map_err(|e| anyhow!("{url}: {e}"))?;
-    let header = |response: &ureq::http::Response<ureq::Body>, name: &str| {
+    let header = |response: &Response<ureq::Body>, name: &str| {
         response
             .headers()
             .get(name)

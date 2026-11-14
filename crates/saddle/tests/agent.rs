@@ -2,12 +2,18 @@
 //! asks for tool calls, and the test checks what the policy let through, what went back to the
 //! model, and what reached the audit log.
 
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs as unix_fs;
 use std::path::Path;
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 use serde_json::{Value, json};
 
@@ -206,13 +212,13 @@ impl Env {
             xdg: tempfile::tempdir().unwrap(),
         };
         let ws = env.ws.path();
-        std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
-        std::fs::create_dir_all(env.xdg.path().join("state/saddle")).unwrap();
-        std::fs::create_dir_all(env.xdg.path().join("home")).unwrap();
+        fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+        fs::create_dir_all(env.xdg.path().join("state/saddle")).unwrap();
+        fs::create_dir_all(env.xdg.path().join("home")).unwrap();
         let config = env.xdg.path().join("config/saddle");
-        std::fs::create_dir_all(&config).unwrap();
+        fs::create_dir_all(&config).unwrap();
         let policy: toml::Table = POLICY.parse().unwrap();
-        std::fs::write(
+        fs::write(
             config.join("config.toml"),
             format!(
                 "provider = \"mock\"\n{}\n[providers.mock]\napi = \"{}\"\nbase-url = \"{base}\"\n\
@@ -233,8 +239,8 @@ impl Env {
             .trim_start_matches('/')
             .replace(['/', '\\', ':'], "-");
         let dir = self.xdg.path().join("config/saddle/policies");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
             dir.join(format!("--{key}--.toml")),
             format!("workspace = {:?}\n{text}", ws.display().to_string()),
         )
@@ -257,9 +263,9 @@ impl Env {
         self.command(args).output().unwrap()
     }
 
-    fn audit_log(&self) -> std::path::PathBuf {
+    fn audit_log(&self) -> PathBuf {
         let dir = self.xdg.path().join("state/saddle/audit");
-        let mut logs: Vec<_> = std::fs::read_dir(dir)
+        let mut logs: Vec<_> = fs::read_dir(dir)
             .unwrap()
             .map(|e| e.unwrap().path())
             .collect();
@@ -286,7 +292,7 @@ fn strings(v: &Value, out: &mut String) {
 }
 
 fn records(log: &Path) -> Vec<Value> {
-    std::fs::read_to_string(log)
+    fs::read_to_string(log)
         .unwrap()
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
@@ -328,7 +334,7 @@ fn tool_loop(api: Api) {
 
     let ws = env.ws.path();
     assert_eq!(
-        std::fs::read_to_string(ws.join("notes/hello.txt")).unwrap(),
+        fs::read_to_string(ws.join("notes/hello.txt")).unwrap(),
         "hi"
     );
     assert!(!ws.join(".git/hooks/pre-commit").exists());
@@ -600,7 +606,7 @@ fn missing_key_stops_before_the_session_opens() {
 fn a_key_stored_by_login_is_used_when_the_variable_is_unset() {
     let (base, seen) = serve(vec![sse_response(&anthropic_sse("Hi.", &[]))]);
     let env = Env::new(Api::Anthropic, &base);
-    std::fs::write(
+    fs::write(
         env.xdg.path().join("state/saddle/auth.json"),
         r#"{"mock": {"api-key": "stored-secret"}}"#,
     )
@@ -630,12 +636,12 @@ fn a_workspace_with_no_override_uses_the_global_policy() {
     ]);
     let env = Env::new(Api::Anthropic, &base);
     // No workspace override: the global policy applies as it is (D43).
-    std::fs::write(env.ws.path().join(".env"), "TOKEN=1\n").unwrap();
+    fs::write(env.ws.path().join(".env"), "TOKEN=1\n").unwrap();
 
     let out = env.saddle(&["run", "go"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(
-        std::fs::read_to_string(env.ws.path().join("made.txt")).unwrap(),
+        fs::read_to_string(env.ws.path().join("made.txt")).unwrap(),
         "ok"
     );
     let mut second = String::new();
@@ -665,13 +671,13 @@ fn sigint_cancels_a_running_command_in_line_mode() {
     let env = Env::new(Api::Anthropic, &base);
     let child = env
         .command(&["run", "wait"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     // Long enough for the mock reply and the sandbox to start the sleep.
-    thread::sleep(std::time::Duration::from_millis(1500));
-    let start = std::time::Instant::now();
+    thread::sleep(Duration::from_millis(1500));
+    let start = Instant::now();
     let killed = Command::new("kill")
         .args(["-INT", &child.id().to_string()])
         .status()
@@ -679,16 +685,12 @@ fn sigint_cancels_a_running_command_in_line_mode() {
     assert!(killed.success());
     let out = child.wait_with_output().unwrap();
     let stderr = text(&out.stderr);
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(5),
-        "{stderr}"
-    );
+    assert!(start.elapsed() < Duration::from_secs(5), "{stderr}");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("cancelled by the user"), "{stderr}");
     // The model was not asked again, and the session closed normally.
     assert_eq!(seen.lock().unwrap().len(), 1);
-    let index =
-        std::fs::read_to_string(env.xdg.path().join("state/saddle/sessions.jsonl")).unwrap();
+    let index = fs::read_to_string(env.xdg.path().join("state/saddle/sessions.jsonl")).unwrap();
     assert_eq!(index.lines().count(), 1);
 }
 
@@ -757,20 +759,18 @@ fn cancel_is_immediate_while_the_server_is_silent() {
     thread::spawn(move || {
         let (stream, _reader, _head) = model_request(&listener);
         ready.send(()).unwrap();
-        thread::sleep(std::time::Duration::from_secs(60));
+        thread::sleep(Duration::from_secs(60));
         drop(stream);
     });
     let env = Env::new(Api::Openai, &base);
     let child = env
         .command(&["run", "hello"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    accepted
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .unwrap();
-    let start = std::time::Instant::now();
+    accepted.recv_timeout(Duration::from_secs(10)).unwrap();
+    let start = Instant::now();
     let killed = Command::new("kill")
         .args(["-INT", &child.id().to_string()])
         .status()
@@ -779,10 +779,7 @@ fn cancel_is_immediate_while_the_server_is_silent() {
     let out = child.wait_with_output().unwrap();
     let elapsed = start.elapsed();
     let stderr = text(&out.stderr);
-    assert!(
-        elapsed < std::time::Duration::from_secs(2),
-        "{elapsed:?}: {stderr}"
-    );
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}: {stderr}");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("cancelled"), "{stderr}");
 }
@@ -795,11 +792,11 @@ fn the_prompt_names_the_servers_and_says_whose_words_a_result_is() {
     let (base, seen) = serve(vec![sse_response(&openai_sse("ok", &[]))]);
     let env = Env::new(Api::Openai, &base);
     let config_path = env.xdg.path().join("config/saddle/config.toml");
-    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    let mut config = fs::read_to_string(&config_path).unwrap();
     config.push_str(
         "\n[mcp.scout]\nurl = \"http://127.0.0.1:9/mcp\"\ndescription = \"scrapes job boards\"\n",
     );
-    std::fs::write(&config_path, config).unwrap();
+    fs::write(&config_path, config).unwrap();
     env.write_override(
         "\n[agent]\nmcp = [{ server = \"scout\", tools = [\"search\"], why = \"scrapes boards\" }]\n",
     );
@@ -842,20 +839,20 @@ fn instruction_files_prefer_agents_md_and_stay_inside_the_workspace() {
     let env = Env::new(Api::Openai, &base);
     let ws = env.ws.path();
     // Root: both files, so AGENTS.md wins. A subdirectory: CLAUDE.md only, plus a local file.
-    std::fs::write(ws.join("AGENTS.md"), "root agents rules").unwrap();
-    std::fs::write(ws.join("CLAUDE.md"), "root claude rules").unwrap();
-    std::fs::create_dir_all(ws.join("sub/deeper")).unwrap();
-    std::fs::write(ws.join("sub/CLAUDE.md"), "sub claude rules").unwrap();
-    std::fs::write(ws.join("sub/AGENTS.local.md"), "my local rules").unwrap();
+    fs::write(ws.join("AGENTS.md"), "root agents rules").unwrap();
+    fs::write(ws.join("CLAUDE.md"), "root claude rules").unwrap();
+    fs::create_dir_all(ws.join("sub/deeper")).unwrap();
+    fs::write(ws.join("sub/CLAUDE.md"), "sub claude rules").unwrap();
+    fs::write(ws.join("sub/AGENTS.local.md"), "my local rules").unwrap();
     // A symlink out of the workspace must not leak into the prompt.
     let outside = tempfile::tempdir().unwrap();
-    std::fs::write(outside.path().join("secret"), "aws secret key").unwrap();
-    std::os::unix::fs::symlink(
+    fs::write(outside.path().join("secret"), "aws secret key").unwrap();
+    unix_fs::symlink(
         outside.path().join("secret"),
         ws.join("sub/deeper/AGENTS.md"),
     )
     .unwrap();
-    std::fs::write(
+    fs::write(
         env.xdg.path().join("config/saddle/AGENTS.md"),
         "global rules",
     )
@@ -918,7 +915,7 @@ fn json_mode_is_one_object_per_line_on_stdout_and_usable_without_prose() {
         sse_response(&openai_sse("Done.", &[])),
     ]);
     let env = Env::new(Api::Openai, &base);
-    std::fs::write(env.ws.path().join("note.txt"), "hi\n").unwrap();
+    fs::write(env.ws.path().join("note.txt"), "hi\n").unwrap();
     let out = env.saddle(&["run", "--json", "look around"]);
     let stdout = text(&out.stdout);
     assert!(out.status.success(), "{}{}", stdout, text(&out.stderr));
@@ -1009,12 +1006,12 @@ fn search_tools_follow_the_policy_and_edits_keep_their_diff_out_of_the_request()
 fs-read = [{ root = "workspace", exclude = [".env*"], why = "reads the repo" }]
 "#,
     );
-    std::fs::create_dir_all(ws.join("src")).unwrap();
-    std::fs::create_dir_all(ws.join("target")).unwrap();
-    std::fs::write(ws.join("src/main.rs"), "fn main() {}\n").unwrap();
-    std::fs::write(ws.join("target/gen.rs"), "fn main() {}\n").unwrap();
-    std::fs::write(ws.join(".gitignore"), "target/\n").unwrap();
-    std::fs::write(ws.join(".env"), "SECRET=hunter2\n").unwrap();
+    fs::create_dir_all(ws.join("src")).unwrap();
+    fs::create_dir_all(ws.join("target")).unwrap();
+    fs::write(ws.join("src/main.rs"), "fn main() {}\n").unwrap();
+    fs::write(ws.join("target/gen.rs"), "fn main() {}\n").unwrap();
+    fs::write(ws.join(".gitignore"), "target/\n").unwrap();
+    fs::write(ws.join(".env"), "SECRET=hunter2\n").unwrap();
 
     let out = env.saddle(&["run", "look around"]);
     assert!(out.status.success(), "{}", text(&out.stderr));

@@ -2,6 +2,34 @@
 //! reads keys and draws. They talk over two channels, and cancelling goes through the process-wide
 //! flag in [`crate::cancel`].
 
+use crate::agent;
+use crate::compact::Event as CompactEvent;
+use crate::compact::Settings;
+use crate::config::Overrides;
+use crate::context;
+use crate::provider::Image;
+use crate::provider::Price;
+use crate::provider::Quota;
+use crate::session;
+use crate::skills;
+use crate::tui::app::Effort;
+use crate::tui::theme::Theme;
+use crate::tui::themes::ThemePicker;
+use base64::Engine as _;
+use base64::engine::general_purpose;
+use ratatui::crossterm::terminal as crossterm_terminal;
+use ratatui::layout::Rect;
+use std::env;
+use std::fs;
+use std::fs::OpenOptions;
+use std::io;
+use std::mem;
+use std::os::unix::fs::OpenOptionsExt;
+use std::panic;
+use std::path::Path;
+use std::process;
+use std::process::Command as ProcessCommand;
+use std::sync::Mutex;
 mod app;
 mod browser;
 pub mod catppuccin;
@@ -73,13 +101,13 @@ enum Command {
     /// A window the endpoint stated after the session opened (D34).
     SetWindow(u64),
     /// A price the endpoint stated after the session opened (D36).
-    SetPrice(crate::provider::Price),
+    SetPrice(Price),
     /// Read the policy again after a grant changed, so the session acts on it and the model's next
     /// request carries the new grants (D47).
     ReloadPolicy,
     /// Read the skills and instruction files again and rebuild the prompt (D70).
     Reload,
-    SetCompaction(crate::compact::Settings),
+    SetCompaction(Settings),
     /// Continue a saved conversation, by its id in the session store (D53).
     Resume(String),
     /// Read the prompts on the branch, to offer them in `/tree` (D53).
@@ -97,7 +125,7 @@ enum Command {
     /// Remove a saved conversation (D55).
     Delete(String),
     /// Change the reasoning effort (D57).
-    Effort(crate::tui::app::Effort),
+    Effort(Effort),
     Shell {
         command: String,
         share: bool,
@@ -147,7 +175,7 @@ pub fn run(
     let mut app = App::new(header);
     app.skills = skills;
     // What this terminal can draw is decided once, from the setting and the environment (D59).
-    app.protocol = image::detect(app.header.images.as_deref(), &|k| std::env::var(k).ok());
+    app.protocol = image::detect(app.header.images.as_deref(), &|k| env::var(k).ok());
     // The colours, from config.toml (D71). A theme that does not build is reported and the default
     // is drawn: a bad colour must not stop a session from opening, and the person has to be told
     // rather than quietly shown the wrong thing.
@@ -160,7 +188,7 @@ pub fn run(
         events: ev_tx_ui,
         paths,
         store,
-        signing: std::sync::Mutex::new(None),
+        signing: Mutex::new(None),
     };
     if let Some(path) = resume {
         control.send(&mut app, Command::Resume(path));
@@ -226,7 +254,7 @@ pub fn run(
 /// The theme the config selects, or the default (D71). Reads the file again, so `/reload` after a
 /// hand edit picks it up without a restart.
 /// The theme `[ui] theme` selects, for a caller that only wants to know it builds (D71).
-pub fn theme_selected(user: &UserConfig) -> Result<crate::tui::theme::Theme> {
+pub fn theme_selected(user: &UserConfig) -> Result<Theme> {
     let name = user
         .ui
         .theme
@@ -235,17 +263,17 @@ pub fn theme_selected(user: &UserConfig) -> Result<crate::tui::theme::Theme> {
     // Ask the terminal about its colours once, here, before the screen is taken over (D73, D75).
     // Not only when the chosen theme needs an answer: `/theme` can choose `system` mid-session, and
     // there is no safe moment to ask after this one.
-    crate::tui::terminal::prime();
-    crate::tui::theme::build(&name, &user.themes)
+    terminal::prime();
+    theme::build(&name, &user.themes)
 }
 
-fn theme_from_config(paths: &Paths, selected: &Option<String>) -> Result<crate::tui::theme::Theme> {
+fn theme_from_config(paths: &Paths, selected: &Option<String>) -> Result<Theme> {
     let user = UserConfig::load(&paths.user_config())?;
     let name = selected
         .clone()
         .or(user.ui.theme.clone())
         .unwrap_or_else(|| "default".to_owned());
-    crate::tui::theme::build(&name, &user.themes)
+    theme::build(&name, &user.themes)
 }
 
 fn work(
@@ -263,7 +291,7 @@ fn work(
     loop {
         let command = match commands.recv_timeout(tick) {
             Ok(command) => command,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(RecvTimeoutError::Timeout) => {
                 // A background summary that finished while nobody was looking lands here, within a
                 // tick of finishing (D78).
                 if let Err(e) = agent.poll_background(&mut session, &mut ui) {
@@ -276,7 +304,7 @@ fn work(
                 // not ask for, so it only happens when the conversation is half full and the
                 // session has been left alone (D77).
                 if agent.idle_compaction_due(last_activity.elapsed()) {
-                    match agent.compact(&mut session, crate::compact::Reason::Idle, None, &mut ui) {
+                    match agent.compact(&mut session, Reason::Idle, None, &mut ui) {
                         Ok(_) => {}
                         Err(e) => {
                             let msg = format!("{e:#}");
@@ -291,7 +319,7 @@ fn work(
                 }
                 continue;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Disconnected) => break,
         };
         match command {
             Command::Prompt { text, skill } => match skill
@@ -336,7 +364,7 @@ fn work(
                 Ok(()) => {
                     // The prompt is sent with every request, so replacing its grants section is
                     // what tells the model (D47).
-                    agent.set_grants(crate::agent::grants_section(&session));
+                    agent.set_grants(agent::grants_section(&session));
                     let _ = events.send(AgentEvent::Note(
                         "grants reloaded; the model is told on its next request".into(),
                     ));
@@ -354,7 +382,7 @@ fn work(
             Command::Reload => {
                 let cfg = session.setup.context.clone();
                 let paths = session.setup.paths.clone();
-                let notes = match crate::context::load(&mut session, &cfg, &paths) {
+                let notes = match context::load(&mut session, &cfg, &paths) {
                     Ok((files, refused)) => {
                         let added = agent.rebuild_prompt(&session, files.clone());
                         agent.note_context(&added);
@@ -370,7 +398,7 @@ fn work(
                 };
                 match session.reload_skills() {
                     Ok(()) => {
-                        let names = crate::skills::names(&session.skills);
+                        let names = skills::names(&session.skills);
                         let _ = events.send(AgentEvent::Skills(session.skills.clone()));
                         let mut said = vec![format!("skills reloaded: {names}")];
                         said.extend(session.skill_notes.clone());
@@ -454,10 +482,8 @@ fn work(
                 // A cycle starts from what is in force, so shift+tab walks the same list
                 // `/thinking` accepts (D57).
                 let next = match change {
-                    crate::tui::app::Effort::Set(value) => value,
-                    crate::tui::app::Effort::Cycle => {
-                        crate::provider::next_effort(agent.effort().as_deref())
-                    }
+                    Effort::Set(value) => value,
+                    Effort::Cycle => provider::next_effort(agent.effort().as_deref()),
                 };
                 let applied = agent.set_effort(next);
                 let text = match applied.as_deref() {
@@ -491,7 +517,7 @@ fn work(
             Command::Mcp(arg) => {
                 // The registry lives on the session, and starting a server needs it, so it is
                 // taken out for the call and put back (D108, D118).
-                let mut registry = std::mem::take(&mut session.mcp);
+                let mut registry = mem::take(&mut session.mcp);
                 let outcome = match arg.split_once(' ') {
                     Some(("restart", name)) => registry.restart(name.trim(), &mut session),
                     Some(("disable", name)) => registry.suspend(name.trim()),
@@ -595,7 +621,7 @@ impl Sink for ChannelUi {
         let _ = self.0.send(AgentEvent::Reasoning(s.to_owned()));
     }
 
-    fn quota(&mut self, quota: &crate::provider::Quota) {
+    fn quota(&mut self, quota: &Quota) {
         let _ = self.0.send(AgentEvent::Quota(quota.clone()));
     }
 
@@ -605,7 +631,7 @@ impl Sink for ChannelUi {
 }
 
 impl Ui for ChannelUi {
-    fn attached(&mut self, images: &[crate::provider::Image]) {
+    fn attached(&mut self, images: &[Image]) {
         let _ = self.0.send(AgentEvent::Attached(images.to_vec()));
     }
 
@@ -632,7 +658,7 @@ impl Ui for ChannelUi {
         });
     }
 
-    fn compaction(&mut self, event: crate::compact::Event) {
+    fn compaction(&mut self, event: CompactEvent) {
         let _ = self.0.send(AgentEvent::Compaction(event));
     }
 }
@@ -652,7 +678,7 @@ fn plan_images(
     protocol: image::Protocol,
     drawn: &Drawn,
     images: &[Placed],
-    area: ratatui::layout::Rect,
+    area: Rect,
     top: usize,
 ) -> (Vec<u32>, Vec<(usize, String)>, Drawn) {
     let height = area.height as usize;
@@ -730,7 +756,7 @@ fn draw_images(app: &mut App) {
     }
     // Leave the cursor where the frame put it, so the editor's caret does not jump.
     let _ = write!(out, "\x1b[?25h");
-    let mut stdout = std::io::stdout();
+    let mut stdout = io::stdout();
     let _ = stdout.write_all(out.as_bytes());
     let _ = stdout.flush();
 }
@@ -741,11 +767,8 @@ const MODE_CHECK: u64 = 500;
 /// Puts raw mode back if it was lost, so the interface cannot end up echoing every keystroke
 /// instead of receiving it (D75).
 fn keep_raw_mode() {
-    if matches!(
-        ratatui::crossterm::terminal::is_raw_mode_enabled(),
-        Ok(false)
-    ) {
-        let _ = ratatui::crossterm::terminal::enable_raw_mode();
+    if matches!(crossterm_terminal::is_raw_mode_enabled(), Ok(false)) {
+        let _ = crossterm_terminal::enable_raw_mode();
     }
 }
 
@@ -849,7 +872,7 @@ struct Controller {
     store: store::Store,
     /// The sign-in the login dialog is waiting on, so a cancel or a second attempt stops the poll
     /// that is no longer wanted (D85).
-    signing: std::sync::Mutex<Option<Arc<AtomicBool>>>,
+    signing: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl Controller {
@@ -979,7 +1002,7 @@ impl Controller {
                 // if the program it started then failed, which is the silent case a person cannot
                 // see (D86).
                 let events = self.events.clone();
-                let say: browser::Report = std::sync::Arc::new(move |why: String| {
+                let say: browser::Report = Arc::new(move |why: String| {
                     let _ = events.send(AgentEvent::Unopened(why));
                 });
                 browser::open_or_say(&url, &say);
@@ -1012,7 +1035,7 @@ impl Controller {
                 let env = entry
                     .api_key_env
                     .clone()
-                    .filter(|var| std::env::var(var).is_ok_and(|k| !k.is_empty()));
+                    .filter(|var| env::var(var).is_ok_and(|k| !k.is_empty()));
                 let stored = auth.key(&name).is_some();
                 // An OAuth provider's credential is the token a sign-in stored, and it is not a
                 // key: showing "not logged in" beside a key page would send a person looking for
@@ -1127,7 +1150,7 @@ impl Controller {
                         if stop.load(Ordering::Relaxed) {
                             return;
                         }
-                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        thread::sleep(Duration::from_secs(1));
                     }
                 };
                 let outcome =
@@ -1302,13 +1325,14 @@ impl Controller {
         thread::Builder::new()
             .name("saddle-models-all".into())
             .spawn(move || {
+                type Answer = (String, String, Result<Vec<provider::ModelInfo>, String>);
+
                 let mut picks: Vec<Pick> = Vec::new();
                 let mut failed = failed;
                 // One thread per provider, all of them joined: the answer is one list, so it can
                 // only be assembled once every provider has answered or given up. Each thread
                 // returns its models *and* its own name and base URL, so nothing has to be matched
                 // up afterwards.
-                type Answer = (String, String, Result<Vec<provider::ModelInfo>, String>);
                 let answers: Vec<Answer> = thread::scope(|scope| {
                     let handles: Vec<_> = built
                         .iter()
@@ -1445,11 +1469,11 @@ impl Controller {
     fn apply_grant(&self, app: &mut App, change: &permissions::Change) -> Result<()> {
         let setup = Setup::load(
             &app.header.workspace,
-            &std::env::temp_dir(),
-            &crate::config::Overrides::default(),
+            &env::temp_dir(),
+            &Overrides::default(),
         )?;
         // The roots the session would resolve, so the write is validated as a session would.
-        let roots = crate::session::roots_for_validation()?;
+        let roots = session::roots_for_validation()?;
         if let permissions::Change::Add(what) = change {
             let added = grant::add(&setup.workspace_policy_path, None, what, &roots)?;
             app.note(
@@ -1600,10 +1624,7 @@ impl Controller {
                 .clone()
                 .or(user.ui.theme.clone())
                 .unwrap_or_else(|| "default".to_owned());
-            app.open_themes(crate::tui::themes::ThemePicker::collect(
-                &user.themes,
-                &current,
-            ));
+            app.open_themes(ThemePicker::collect(&user.themes, &current));
             return;
         };
         let user = match UserConfig::load(&self.paths.user_config()) {
@@ -1612,11 +1633,11 @@ impl Controller {
         };
         // Built before it is written: a name that does not build must not be saved, or the next
         // session would open on an error the person cannot see the cause of.
-        let theme = match crate::tui::theme::build(&name, &user.themes) {
+        let theme = match theme::build(&name, &user.themes) {
             Ok(theme) => theme,
             Err(e) => return app.note(NoteKind::Error, &format!("{e:#}")),
         };
-        if let Err(e) = crate::config::edit(&self.paths.user_config(), |doc| {
+        if let Err(e) = config::edit(&self.paths.user_config(), |doc| {
             if doc.get("ui").is_none() {
                 doc.insert("ui", toml_edit::Item::Table(toml_edit::Table::new()));
             }
@@ -1641,7 +1662,7 @@ impl Controller {
             Ok(())
         })?;
         let user = UserConfig::load(&path)?;
-        let settings = crate::compact::Settings::from_config(&user.compaction);
+        let settings = Settings::from_config(&user.compaction);
         self.send(app, Command::SetCompaction(settings));
         Ok(())
     }
@@ -1687,7 +1708,7 @@ impl Controller {
         self.reload_theme(app);
         app.max_steps = user.max_steps.filter(|n| *n > 0);
         self.send(app, Command::SetMaxSteps(app.max_steps));
-        let compaction = crate::compact::Settings::from_config(&user.compaction);
+        let compaction = Settings::from_config(&user.compaction);
         self.send(app, Command::SetCompaction(compaction));
         // The provider and the model are this conversation's own (D91), so a file that now names
         // another provider is what the next session starts with, not a command to move this one.
@@ -1723,7 +1744,7 @@ impl Controller {
         app.expand_tools = user.ui.expand_tools.unwrap_or(false);
         app.max_steps = user.max_steps.filter(|n| *n > 0);
         self.send(app, Command::SetMaxSteps(app.max_steps));
-        let compaction = crate::compact::Settings::from_config(&user.compaction);
+        let compaction = Settings::from_config(&user.compaction);
         self.send(app, Command::SetCompaction(compaction));
         // What the file says about the provider in force — effort, limits, the address — is what
         // was just edited, so it is re-read; its model is the default for new sessions, so the
@@ -1745,7 +1766,7 @@ impl Controller {
 
     fn after_policy_edit(&self, app: &mut App) {
         let path = self.paths.user_config();
-        let checked = std::fs::read_to_string(&path)
+        let checked = fs::read_to_string(&path)
             .map_err(anyhow::Error::from)
             .and_then(|text| Ok(text.parse::<toml::Table>()?));
         match checked {
@@ -1788,8 +1809,8 @@ impl Controller {
     fn permission_rows(&self, app: &App) -> Result<Vec<Row>> {
         let setup = Setup::load(
             &app.header.workspace,
-            &std::env::temp_dir(),
-            &crate::config::Overrides::default(),
+            &env::temp_dir(),
+            &Overrides::default(),
         )?;
         let policy = setup.parse_policy()?;
         let Some(grants) = policy.grants(&saddle_cap::Principal::Agent) else {
@@ -1871,8 +1892,8 @@ impl Controller {
         let rows = self.permission_rows(app)?;
         let setup = Setup::load(
             &app.header.workspace,
-            &std::env::temp_dir(),
-            &crate::config::Overrides::default(),
+            &env::temp_dir(),
+            &Overrides::default(),
         )?;
         app.permissions = Some(Permissions::new(
             rows,
@@ -1994,7 +2015,7 @@ impl Controller {
             .config
             .api_key_env
             .as_ref()
-            .filter(|var| req.key.is_some() && std::env::var(var).is_ok_and(|k| !k.is_empty()))
+            .filter(|var| req.key.is_some() && env::var(var).is_ok_and(|k| !k.is_empty()))
         {
             msg.push_str(&format!(
                 "; ${var} is set and is used instead of the key you entered"
@@ -2114,13 +2135,9 @@ struct Screen {
 /// Ctrl+G: the prompt goes to a private file, `$EDITOR` edits it, and the result comes back into
 /// the editor.
 fn edit_prompt(terminal: &mut DefaultTerminal, app: &mut App, paths: &Paths) -> Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::create_dir_all(&paths.state)?;
-    let path = paths
-        .state
-        .join(format!("prompt-{}.md", std::process::id()));
-    let mut file = std::fs::OpenOptions::new()
+    fs::create_dir_all(&paths.state)?;
+    let path = paths.state.join(format!("prompt-{}.md", process::id()));
+    let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
@@ -2129,8 +2146,8 @@ fn edit_prompt(terminal: &mut DefaultTerminal, app: &mut App, paths: &Paths) -> 
     file.write_all(app.editor.text().as_bytes())?;
     drop(file);
     let edited = edit_file(terminal, &path, app.header.mouse);
-    let text = std::fs::read_to_string(&path);
-    let _ = std::fs::remove_file(&path);
+    let text = fs::read_to_string(&path);
+    let _ = fs::remove_file(&path);
     edited?;
     if let Ok(text) = text {
         app.editor.set(text.trim_end_matches('\n').to_owned());
@@ -2139,20 +2156,17 @@ fn edit_prompt(terminal: &mut DefaultTerminal, app: &mut App, paths: &Paths) -> 
 }
 
 /// Hands the terminal to `$VISUAL` or `$EDITOR` (or vi) for `path`, then takes it back.
-fn edit_file(terminal: &mut DefaultTerminal, path: &std::path::Path, mouse: bool) -> Result<()> {
+fn edit_file(terminal: &mut DefaultTerminal, path: &Path, mouse: bool) -> Result<()> {
     leave_modes();
     ratatui::restore();
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
+    let editor = env::var("VISUAL")
+        .or_else(|_| env::var("EDITOR"))
         .ok()
         .filter(|e| !e.trim().is_empty())
         .unwrap_or_else(|| "vi".into());
     let mut words = editor.split_whitespace();
     let program = words.next().unwrap_or("vi").to_owned();
-    let status = std::process::Command::new(&program)
-        .args(words)
-        .arg(path)
-        .status();
+    let status = ProcessCommand::new(&program).args(words).arg(path).status();
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen)?;
     enter_modes(mouse)?;
@@ -2171,8 +2185,7 @@ fn edit_file(terminal: &mut DefaultTerminal, path: &std::path::Path, mouse: bool
 /// sequence leaves the highlight as the only feedback; shift+drag still reaches the terminal in most
 /// of them (D35).
 fn copy_to_clipboard(text: &str) -> Result<()> {
-    use std::io::Write as _;
-    let tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
+    let tmux = env::var_os("TMUX").is_some_and(|v| !v.is_empty());
     let mut stdout = stdout();
     stdout.write_all(clipboard_sequence(text, tmux).as_bytes())?;
     stdout.flush()?;
@@ -2183,8 +2196,7 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
 /// tmux forwards an escape sequence only when it is wrapped in one of its own, with every ESC
 /// inside doubled, so that form is built here rather than in the writer.
 fn clipboard_sequence(text: &str, tmux: bool) -> String {
-    use base64::Engine as _;
-    let payload = base64::engine::general_purpose::STANDARD.encode(text);
+    let payload = general_purpose::STANDARD.encode(text);
     let sequence = format!("\x1b]52;c;{payload}\x07");
     if tmux {
         format!("\x1bPtmux;{}\x1b\\", sequence.replace('\x1b', "\x1b\x1b"))
@@ -2219,11 +2231,11 @@ impl Screen {
         let terminal = ratatui::try_init().context("starting the terminal UI")?;
         // A reply to the startup's colour query that arrived after its deadline is a keystroke as
         // far as this loop is concerned, and would be typed into the prompt (D75).
-        crate::tui::terminal::discard_pending();
+        terminal::discard_pending();
         enter_modes(mouse)?;
         // ratatui's hook restores raw mode and the screen; this one also turns off the modes above.
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
             leave_modes();
             previous(info);
         }));
@@ -2240,7 +2252,17 @@ impl Drop for Screen {
 
 #[cfg(test)]
 mod tests {
+    use crate::agent::Resumed;
+    use crate::provider::Usage;
+    use crate::tui::Header;
+    use crate::tui::image::Fit;
+    use crate::tui::status::Template;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::layout::Rect;
+    use std::fs;
+    use std::path::Path;
+    use std::sync::Mutex;
+    use std::sync::mpsc;
 
     use super::*;
     use crate::auth::AuthStore;
@@ -2248,26 +2270,26 @@ mod tests {
 
     /// A controller over a throwaway config, so a slash command can be followed all the way to
     /// what it does (D74).
-    fn controller(dir: &std::path::Path, config: &str) -> Controller {
+    fn controller(dir: &Path, config: &str) -> Controller {
         let paths = Paths {
             state: dir.join("state"),
             config: dir.join("config"),
         };
-        std::fs::create_dir_all(paths.user_config().parent().unwrap()).unwrap();
-        std::fs::write(paths.user_config(), config).unwrap();
-        let (commands, _) = std::sync::mpsc::channel();
-        let (events, _) = std::sync::mpsc::channel();
+        fs::create_dir_all(paths.user_config().parent().unwrap()).unwrap();
+        fs::write(paths.user_config(), config).unwrap();
+        let (commands, _) = mpsc::channel();
+        let (events, _) = mpsc::channel();
         Controller {
             commands,
             events,
             store: store::Store::open(&paths.sessions_index(), dir.to_path_buf()).unwrap(),
             paths,
-            signing: std::sync::Mutex::new(None),
+            signing: Mutex::new(None),
         }
     }
 
     fn an_app() -> App {
-        App::new(crate::tui::Header {
+        App::new(Header {
             provider: "mock".into(),
             model: "mock-model".into(),
             workspace: ".".into(),
@@ -2279,7 +2301,7 @@ mod tests {
             context_window: 128_000,
             priced: false,
             mouse: false,
-            status: crate::tui::status::Template::default(),
+            status: Template::default(),
             images: None,
             theme: None,
         })
@@ -2296,8 +2318,8 @@ mod tests {
             state: dir.path().join("state"),
             config: dir.path().join("config"),
         };
-        std::fs::create_dir_all(paths.user_config().parent().unwrap()).unwrap();
-        std::fs::write(
+        fs::create_dir_all(paths.user_config().parent().unwrap()).unwrap();
+        fs::write(
             paths.user_config(),
             "[providers.mine]\napi = \"openai\"\n\
              base-url = \"http://127.0.0.1:9/v1\"\nmodel = \"m\"\n\
@@ -2309,14 +2331,14 @@ mod tests {
              device-token-url = \"http://127.0.0.1:9/device-token\"\n",
         )
         .unwrap();
-        let (commands, _) = std::sync::mpsc::channel();
-        let (events, answers) = std::sync::mpsc::channel();
+        let (commands, _) = mpsc::channel();
+        let (events, answers) = mpsc::channel();
         let c = Controller {
             commands,
             events,
             store: store::Store::open(&paths.sessions_index(), dir.path().to_path_buf()).unwrap(),
             paths,
-            signing: std::sync::Mutex::new(None),
+            signing: Mutex::new(None),
         };
         let mut app = an_app();
         // An unreachable endpoint is a failure the dialog has to be told about, not a hang: nothing
@@ -2440,7 +2462,7 @@ mod tests {
         assert_eq!(pick.model, "picked-b");
         c.perform(&mut app, Action::Use(pick));
         assert_eq!(app.header.model, "picked-b");
-        let written = std::fs::read_to_string(c.paths.user_config()).unwrap();
+        let written = fs::read_to_string(c.paths.user_config()).unwrap();
         assert!(
             written.contains("hf:zai-org/GLM-5.3"),
             "the default is still the one it was: {written}"
@@ -2509,7 +2531,7 @@ mod tests {
         // The key was stored, and the file was not touched at all.
         let auth = AuthStore::load(&c.paths.auth_store()).unwrap();
         assert_eq!(auth.key("synthetic"), Some("sk-entered"));
-        let written = std::fs::read_to_string(c.paths.user_config()).unwrap();
+        let written = fs::read_to_string(c.paths.user_config()).unwrap();
         assert!(
             written.contains("the-default") && !written.contains("chosen-at-login"),
             "the default is what it was: {written}"
@@ -2532,7 +2554,7 @@ mod tests {
                 base_url: Some("http://127.0.0.1:8080/v1".into()),
             }),
         );
-        let written = std::fs::read_to_string(c.paths.user_config()).unwrap();
+        let written = fs::read_to_string(c.paths.user_config()).unwrap();
         assert!(written.contains("[providers.mine]"), "{written}");
         assert!(written.contains("http://127.0.0.1:8080/v1"), "{written}");
         assert!(
@@ -2561,7 +2583,7 @@ mod tests {
             }),
         );
         assert_eq!(app.header.model, "kept");
-        let written = std::fs::read_to_string(c.paths.user_config()).unwrap();
+        let written = fs::read_to_string(c.paths.user_config()).unwrap();
         assert!(written.contains("kept"), "{written}");
     }
 
@@ -2577,10 +2599,10 @@ mod tests {
         let mut app = an_app();
         app.header.provider = "synthetic".into();
         app.header.model = "a-new-default".into();
-        let event = AgentEvent::Resumed(crate::agent::Resumed {
+        let event = AgentEvent::Resumed(Resumed {
             items: Vec::new(),
             declared: Vec::new(),
-            usage: crate::provider::Usage::default(),
+            usage: Usage::default(),
             cost: 0.0,
             context: 0,
             model: Some(store::Model {
@@ -2592,7 +2614,7 @@ mod tests {
         c.perform(&mut app, action);
         assert_eq!(app.header.model, "what-it-was-using");
         assert_eq!(app.header.provider, "synthetic");
-        let written = std::fs::read_to_string(c.paths.user_config()).unwrap();
+        let written = fs::read_to_string(c.paths.user_config()).unwrap();
         assert!(
             written.contains("a-new-default"),
             "the default is what another session set it to: {written}"
@@ -2601,6 +2623,10 @@ mod tests {
 
     #[test]
     fn typing_slash_model_and_pressing_enter_opens_the_picker() {
+        fn press(app: &mut App, code: KeyCode) -> Option<Action> {
+            app.key(KeyEvent::new(code, KeyModifiers::NONE))
+        }
+
         // The keyboard path, which is the only one that matters and the one I did not test: typing
         // the command with the `/` menu open, then enter. Testing `Action::Model(None)` directly
         // proved the dialog works and nothing about whether `/model` reaches it (D88).
@@ -2614,9 +2640,6 @@ mod tests {
         auth.save(&c.paths.auth_store()).unwrap();
         let mut app = an_app();
         app.header.provider = "synthetic".into();
-        fn press(app: &mut App, code: KeyCode) -> Option<Action> {
-            app.key(KeyEvent::new(code, KeyModifiers::NONE))
-        }
         for ch in "/model".chars() {
             press(&mut app, KeyCode::Char(ch));
         }
@@ -2639,7 +2662,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = controller(dir.path(), "provider = \"synthetic\"\n");
         // A config that cannot be parsed, so preparing the picker fails.
-        std::fs::write(c.paths.user_config(), "provider = ").unwrap();
+        fs::write(c.paths.user_config(), "provider = ").unwrap();
         let mut app = an_app();
         app.header.provider = "synthetic".into();
         let action = app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -2716,7 +2739,7 @@ mod tests {
         Placed {
             line,
             id,
-            box_: crate::tui::image::Fit {
+            box_: Fit {
                 cols: 10,
                 rows: 4,
                 scaled: false,
@@ -2726,8 +2749,8 @@ mod tests {
         }
     }
 
-    fn area() -> ratatui::layout::Rect {
-        ratatui::layout::Rect::new(0, 0, 80, 24)
+    fn area() -> Rect {
+        Rect::new(0, 0, 80, 24)
     }
 
     #[test]
@@ -2838,20 +2861,20 @@ mod tests {
             0,
         );
         // Wider only: the picture sits exactly where it did, so nothing is sent.
-        let wider = ratatui::layout::Rect::new(0, 0, 120, 24);
+        let wider = Rect::new(0, 0, 120, 24);
         let (remove, draw, _) =
             plan_images(image::Protocol::Kitty, &after, &[placed(10, 7)], wider, 0);
         assert!(remove.is_empty() && draw.is_empty());
         // A shorter transcript: only the first two rows of the picture are on screen, so it is
         // drawn again with a smaller band.
-        let shorter = ratatui::layout::Rect::new(0, 0, 80, 12);
+        let shorter = Rect::new(0, 0, 80, 12);
         let (remove, draw, after) =
             plan_images(image::Protocol::Kitty, &after, &[placed(10, 7)], shorter, 0);
         assert_eq!(remove, [7]);
         assert_eq!(draw.len(), 1);
         assert_eq!(after.shown, [(11, 7, 0, 1)], "one row of four");
         // Moved down the screen: every row shifts, so it is drawn again.
-        let moved = ratatui::layout::Rect::new(0, 2, 80, 24);
+        let moved = Rect::new(0, 2, 80, 24);
         let (remove, draw, _) =
             plan_images(image::Protocol::Kitty, &after, &[placed(10, 7)], moved, 0);
         assert_eq!(remove, [7]);

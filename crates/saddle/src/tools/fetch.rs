@@ -9,8 +9,11 @@
 //! that address itself. ureq receives checked addresses rather than resolving the name again, so
 //! DNS rebinding cannot swap one underneath.
 
+use std::net::Ipv4Addr;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::result::Result as StdResult;
 use std::time::Duration;
+use ureq::config::Config;
 
 use anyhow::Result;
 use saddle_cap::{Principal, Scope};
@@ -425,8 +428,7 @@ pub(crate) fn resolve_public(host: &str, port: u16) -> Result<(), String> {
     if addrs.is_empty() {
         return Err(format!("{host} did not resolve"));
     }
-    let public: Vec<&std::net::SocketAddr> =
-        addrs.iter().filter(|a| private(a.ip()).is_none()).collect();
+    let public: Vec<&SocketAddr> = addrs.iter().filter(|a| private(a.ip()).is_none()).collect();
     if public.is_empty() {
         let first = addrs.first().copied();
         let what = first
@@ -462,13 +464,12 @@ impl Resolver for Checked {
     fn resolve(
         &self,
         uri: &Uri,
-        config: &ureq::config::Config,
+        config: &Config,
         timeout: NextTimeout,
-    ) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
+    ) -> StdResult<ResolvedSocketAddrs, ureq::Error> {
         let addrs = self.inner.resolve(uri, config, timeout)?;
-        let mut out: ResolvedSocketAddrs = ArrayVec::from_fn(|_| {
-            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
-        });
+        let mut out: ResolvedSocketAddrs =
+            ArrayVec::from_fn(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
         for addr in addrs.iter() {
             if (self.named || private(addr.ip()).is_none()) && out.try_push(*addr).is_err() {
                 break;

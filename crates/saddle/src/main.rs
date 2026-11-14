@@ -1,3 +1,10 @@
+use crate::mcp::Exposure;
+use saddle_policy::audit;
+use std::env;
+use std::fs;
+use std::io;
+use std::mem;
+use std::time::SystemTime;
 mod agent;
 mod allow;
 mod auth;
@@ -200,7 +207,7 @@ enum AuditCmd {
 
 fn main() -> ExitCode {
     // The sandbox helper (D18) runs before anything else touches the environment or arguments.
-    if std::env::args_os().nth(1).is_some_and(|a| a == "__sandbox") {
+    if env::args_os().nth(1).is_some_and(|a| a == "__sandbox") {
         saddle_sandbox::helper_main();
     }
     let cli = Cli::parse();
@@ -224,7 +231,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let paths = paths::Paths::from_env()?;
     // Before the defaults are written, so a config created here does not shadow the grants an
     // older install still keeps in `policy.toml` (D63).
-    let migrated: Vec<std::path::PathBuf> =
+    let migrated: Vec<PathBuf> =
         config::migrate(&paths.user_config(), &paths.policies_dir()).unwrap_or_default();
     let mut created: Vec<String> = defaults::ensure(&paths)?
         .iter()
@@ -329,10 +336,8 @@ fn run_agent(
     let session = session.as_str();
     let auth = auth::AuthStore::load(&paths.auth_store())?;
     let mut reported = provider::Reported::stored(&paths.reported_windows());
-    let interactive = prompt.is_none()
-        && !args.json
-        && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal();
+    let interactive =
+        prompt.is_none() && !args.json && io::stdin().is_terminal() && io::stdout().is_terminal();
     let mut notes = created;
     // In the TUI, anything missing (a provider, its model, its key) opens the login dialog.
     // Without it there is nowhere to fix that, so it stops here.
@@ -448,7 +453,7 @@ fn run_agent(
     let mcp_notes = {
         // The registry is a field of the session it has to ask, so it is taken out for the start
         // and put back, the way a tool call does it (D108).
-        let mut registry = std::mem::take(&mut session.mcp);
+        let mut registry = mem::take(&mut session.mcp);
         let notes = registry.start_direct(&mut session);
         session.mcp = registry;
         notes
@@ -531,7 +536,7 @@ fn converse(
             _ => ExitCode::from(1),
         });
     }
-    let stdin = std::io::stdin();
+    let stdin = io::stdin();
     let mut line = String::new();
     loop {
         line.clear();
@@ -719,7 +724,7 @@ fn gate_workspace(paths: &paths::Paths, workspace: &Path, id: &str) -> Result<Op
     let reusable = allowance.for_workspace(workspace);
     // Record the request, so the id stays findable after this message has scrolled away.
     allowance.request(id, workspace)?;
-    let chosen = std::env::current_exe()
+    let chosen = env::current_exe()
         .ok()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "saddle".into());
@@ -767,7 +772,7 @@ fn gate_workspace(paths: &paths::Paths, workspace: &Path, id: &str) -> Result<Op
         "  or set `allow-sensitive = true` in config.toml if this machine's home holds no secrets",
     );
     // Only where a person is sitting: a picker that read from a pipe would eat a prompt.
-    if !reusable.is_empty() && std::io::stdin().is_terminal() {
+    if !reusable.is_empty() && io::stdin().is_terminal() {
         return pick_allowed(&reusable, workspace);
     }
     bail!("{message}")
@@ -789,9 +794,9 @@ fn pick_allowed(candidates: &[(String, allow::Entry)], workspace: &Path) -> Resu
         );
     }
     eprint!("  number or id: ");
-    let _ = std::io::stderr().flush();
+    let _ = io::stderr().flush();
     let mut typed = String::new();
-    if std::io::stdin().read_line(&mut typed)? == 0 {
+    if io::stdin().read_line(&mut typed)? == 0 {
         bail!("not approved: no session was opened");
     }
     match allow::Allowance::resolve(&typed, candidates)? {
@@ -921,7 +926,7 @@ fn session_cmd(cmd: SessionCmd, paths: &paths::Paths) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn check(dir: &std::path::Path, overrides: &config::Overrides) -> Result<ExitCode> {
+fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
     let tmp = PrivateTmp::create(&session_id())?;
     let setup = Setup::load(dir, tmp.path(), overrides)?;
     // The layering happens in `Setup::load`, so an invalid project file is reported here rather
@@ -1003,7 +1008,7 @@ fn check(dir: &std::path::Path, overrides: &config::Overrides) -> Result<ExitCod
     // What an attached picture will do, and what decided it, since a terminal that draws nothing
     // looks the same as one that was never asked (D59).
     {
-        let get = |k: &str| std::env::var(k).ok();
+        let get = |k: &str| env::var(k).ok();
         let setting = UserConfig::load(&setup.paths.user_config())?.ui.images;
         let protocol = tui::image::detect(setting.as_deref(), &get);
         let why = match &setting {
@@ -1050,7 +1055,7 @@ fn check(dir: &std::path::Path, overrides: &config::Overrides) -> Result<ExitCod
                             let (quota, spent) = provider::quota_from_page(&page);
                             println!(
                                 "usage      {}",
-                                usage_line(&quota, spent, std::time::SystemTime::now())
+                                usage_line(&quota, spent, SystemTime::now())
                             );
                             // When nothing was recognised, the field names are what is needed to
                             // teach the parser the shape; the figures are not printed (D36).
@@ -1121,7 +1126,7 @@ fn models_error(e: &provider::ModelsError) -> String {
 
 /// The usage page as `check` prints it, including "nothing found" rather than an empty line, since
 /// a shape the parser does not know is the likeliest reason a figure does not appear (D36).
-fn usage_line(quota: &provider::Quota, spent: Option<f64>, now: std::time::SystemTime) -> String {
+fn usage_line(quota: &provider::Quota, spent: Option<f64>, now: SystemTime) -> String {
     let mut parts = Vec::new();
     for window in &quota.windows {
         let mut text = format!("{} {:.0}% left", window.label, window.percent);
@@ -1188,7 +1193,7 @@ fn login(provider_name: &str, paths: &paths::Paths) -> Result<ExitCode> {
             let mut pause = |seconds: u64| thread::sleep(Duration::from_secs(seconds));
             let mut ask = |prompt: &str| -> Result<String> {
                 eprint!("saddle: {prompt}");
-                let _ = std::io::stderr().flush();
+                let _ = io::stderr().flush();
                 let mut line = String::new();
                 stdin().read_line(&mut line).context("reading from stdin")?;
                 Ok(line.trim().to_owned())
@@ -1429,7 +1434,7 @@ fn mcp_list(
         session.close()?;
         return Ok(ExitCode::SUCCESS);
     }
-    let helper = std::env::current_exe().context("locating the saddle binary")?;
+    let helper = env::current_exe().context("locating the saddle binary")?;
     let tmp = session.roots().get(&RootName::tmp()).map(Path::to_path_buf);
     let host_env = session.host_env.clone();
     let mut failed = false;
@@ -1593,14 +1598,14 @@ impl OneServer<'_> {
 /// How a server's tools reach the model, in one word (D117).
 fn exposure(entry: &McpEntry) -> &'static str {
     match entry.exposure() {
-        crate::mcp::Exposure::Deferred => "deferred",
-        crate::mcp::Exposure::Direct => "direct",
-        crate::mcp::Exposure::Hidden => "hidden",
+        Exposure::Deferred => "deferred",
+        Exposure::Direct => "direct",
+        Exposure::Hidden => "hidden",
     }
 }
 
 fn tool(
-    dir: &std::path::Path,
+    dir: &Path,
     name: &str,
     input: &str,
     session: &str,
@@ -1642,11 +1647,11 @@ fn tool(
     })
 }
 
-fn verify(log: &std::path::Path) -> Result<ExitCode> {
-    let v = saddle_policy::audit::verify(log).with_context(|| format!("{}", log.display()))?;
+fn verify(log: &Path) -> Result<ExitCode> {
+    let v = audit::verify(log).with_context(|| format!("{}", log.display()))?;
     println!("{} records, chain intact, head {}", v.records, v.head);
     let paths = paths::Paths::from_env()?;
-    let index = std::fs::read_to_string(paths.sessions_index()).unwrap_or_default();
+    let index = fs::read_to_string(paths.sessions_index()).unwrap_or_default();
     let canonical = log.canonicalize()?;
     let recorded = index
         .lines()
@@ -1678,6 +1683,7 @@ fn verify(log: &std::path::Path) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn the_usage_line_says_what_is_left_and_when_it_refills() {
@@ -1695,7 +1701,7 @@ mod tests {
         // An hour before the stamp in the page, so the line says how long is left rather than
         // repeating the date the provider already sent (D49).
         let regen = humantime::parse_rfc3339("2026-11-12T08:26:09.000Z").unwrap();
-        let now = regen - std::time::Duration::from_secs(3600);
+        let now = regen - Duration::from_secs(3600);
         assert_eq!(
             usage_line(&quota, spent, now),
             "94% of the plan left, resets in 1h"

@@ -11,10 +11,13 @@
 //! started before the filter applies and the command never sees it.
 
 use std::io::{self, Write};
+use std::net::Ipv4Addr;
+use std::net::TcpStream;
 use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::os::fd::RawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::path::PathBuf;
 use std::thread;
 
 use saddle_cap::sandbox::NetBridge;
@@ -93,7 +96,7 @@ fn wait_for_ready(fd: RawFd) -> Result<(), String> {
 
 struct Relay {
     /// The socket in the host process every accepted connection is carried to.
-    socket: std::path::PathBuf,
+    socket: PathBuf,
     tunnels: Vec<Dialect>,
     resolver: Vec<UdpSocket>,
 }
@@ -165,14 +168,11 @@ struct Dialect {
 }
 
 fn listen(port: u16) -> io::Result<TcpListener> {
-    TcpListener::bind(SocketAddr::new(
-        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        port,
-    ))
+    TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
 }
 
 /// Carries one guest connection to the proxy, saying which dialect it accepted first.
-fn carry(guest: std::net::TcpStream, socket: &Path, dialect: &str) -> io::Result<()> {
+fn carry(guest: TcpStream, socket: &Path, dialect: &str) -> io::Result<()> {
     let mut host = UnixStream::connect(socket)?;
     host.write_all(dialect.as_bytes())?;
     host.write_all(b"\n")?;

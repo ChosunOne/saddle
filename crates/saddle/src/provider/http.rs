@@ -1,11 +1,13 @@
 //! The provider's HTTP request, with retries for overload and rate limits.
 
+use std::cmp::Reverse;
 use std::io::{BufRead, BufReader};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use ureq::http::HeaderMap;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -213,9 +215,9 @@ impl Request {
 
     /// Sleeps for `wait`, returning early when the stream is abandoned.
     fn pause(&self, wait: Duration) {
-        let end = std::time::Instant::now() + wait;
+        let end = Instant::now() + wait;
         while !self.stopped() {
-            let left = end.saturating_duration_since(std::time::Instant::now());
+            let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
             }
@@ -810,7 +812,7 @@ fn model_entries(v: &Value) -> Vec<ModelInfo> {
         })
         .collect();
     // Stable: servers that give no dates keep their own order.
-    models.sort_by_key(|m| std::cmp::Reverse(m.0));
+    models.sort_by_key(|m| Reverse(m.0));
     models.dedup_by(|a, b| a.1.id == b.1.id);
     models.into_iter().map(|(_, m)| m).collect()
 }
@@ -833,7 +835,7 @@ fn retryable(status: u16) -> bool {
 /// limit alongside the remainder, and `anthropic-ratelimit-*`, which names the resource and then
 /// the field. Both are read from whichever header the server actually sent, since a server that
 /// states only one of the four is common.
-fn quota_from(headers: &ureq::http::HeaderMap) -> Option<Quota> {
+fn quota_from(headers: &HeaderMap) -> Option<Quota> {
     let mut primary = serde_json::Map::new();
     let mut secondary = serde_json::Map::new();
     for (prefix, window) in [("primary", &mut primary), ("secondary", &mut secondary)] {
@@ -1241,7 +1243,7 @@ mod tests {
 
     #[test]
     fn the_quota_headers_are_read_in_both_families() {
-        let mut h = ureq::http::HeaderMap::new();
+        let mut h = HeaderMap::new();
         h.insert("x-ratelimit-remaining-tokens", "48000".parse().unwrap());
         h.insert("x-ratelimit-limit-tokens", "1000000".parse().unwrap());
         h.insert("x-ratelimit-reset-tokens", "6m0s".parse().unwrap());
@@ -1251,7 +1253,7 @@ mod tests {
         assert_eq!(q.reset.as_deref(), Some("6m0s"));
 
         // Anthropic names the resource first, and often states only one of the pair.
-        let mut h = ureq::http::HeaderMap::new();
+        let mut h = HeaderMap::new();
         h.insert(
             "anthropic-ratelimit-input-tokens-remaining",
             "1200".parse().unwrap(),
@@ -1266,15 +1268,15 @@ mod tests {
         assert_eq!(q.tokens_limit, None);
 
         // A server that states neither leaves the status line as it was.
-        assert_eq!(quota_from(&ureq::http::HeaderMap::new()), None);
-        let mut other = ureq::http::HeaderMap::new();
+        assert_eq!(quota_from(&HeaderMap::new()), None);
+        let mut other = HeaderMap::new();
         other.insert("retry-after", "3".parse().unwrap());
         assert_eq!(quota_from(&other), None);
     }
 
     #[test]
     fn codex_headers_preserve_both_windows() {
-        let mut headers = ureq::http::HeaderMap::new();
+        let mut headers = HeaderMap::new();
         for (name, value) in [
             ("x-codex-primary-used-percent", "12.5"),
             ("x-codex-primary-window-minutes", "300"),

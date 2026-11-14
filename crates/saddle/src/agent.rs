@@ -1,7 +1,21 @@
 //! The model loop. A turn sends the conversation, runs the reply's tool calls through the policy
 //! gate, sends the results back, and ends when a reply calls no tool.
 
+use crate::provider::Image;
+use crate::provider::Price;
+use crate::skills;
+use saddle_policy::audit;
+use std::collections::HashSet;
+use std::env;
 use std::fmt::Write as _;
+use std::path::Path;
+use std::path::PathBuf;
+use std::slice;
+use std::sync::mpsc;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::TryRecvError;
+use std::thread::Builder;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use saddle_cap::Principal;
@@ -26,7 +40,7 @@ pub const RESULT_LIMIT: usize = 100 * 1024;
 pub trait Ui: Sink {
     fn call(&mut self, call: &ToolCall);
     /// An image was attached to the prompt, for a UI that can show it (D58).
-    fn attached(&mut self, _images: &[crate::provider::Image]) {}
+    fn attached(&mut self, _images: &[Image]) {}
     fn result(&mut self, out: &ToolOutput);
     /// A reply, and what it cost as far as the price is known (D36).
     fn reply(&mut self, reply: &Reply, cost: f64);
@@ -116,7 +130,7 @@ struct Landed<'a> {
 /// no UI — so it cannot disturb the turn that carries on while it runs. Only text, a model and a
 /// usage come back.
 struct Background {
-    done: std::sync::mpsc::Receiver<Result<Summary, String>>,
+    done: Receiver<Result<Summary, String>>,
     /// The prefix that was summarized, kept exactly, so the answer can be checked against the
     /// conversation before it is applied: a summary of text that is no longer there is discarded
     /// rather than pasted over something else.
@@ -219,7 +233,7 @@ fn digest(results: &[ToolOutput]) -> String {
         // A diff never reaches the model, so it is not part of what the model has seen.
         all.push('\u{1}');
     }
-    saddle_policy::audit::sha256_hex(all.as_bytes())
+    audit::sha256_hex(all.as_bytes())
 }
 
 /// A saved conversation read back, with what it has cost so far (D35).
@@ -447,7 +461,7 @@ impl Agent {
     ///
     /// The decision is a function of the conversation and the clock, so it can be argued with and
     /// tested without waiting two minutes. `idle_for` is how long nothing has happened.
-    pub fn idle_compaction_due(&self, idle_for: std::time::Duration) -> bool {
+    pub fn idle_compaction_due(&self, idle_for: Duration) -> bool {
         self.compaction.auto
             && self.compaction.idle
             && self.provider.is_some()
@@ -560,14 +574,14 @@ impl Agent {
             window: self.context_window(),
             messages: cut,
         });
-        let (tx, done) = std::sync::mpsc::channel();
+        let (tx, done) = mpsc::channel();
         self.background = Some(Background {
             done,
             prefix,
             before,
             cut,
         });
-        let spawned = std::thread::Builder::new()
+        let spawned = Builder::new()
             .name("saddle-compaction".into())
             .spawn(move || {
                 let _ = tx.send(job());
@@ -597,8 +611,8 @@ impl Agent {
                 self.finish_landed(result, session, ui)?;
                 Ok(true)
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(false),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err(TryRecvError::Empty) => Ok(false),
+            Err(TryRecvError::Disconnected) => {
                 self.finish_landed(
                     Err("the background compaction stopped without an answer".into()),
                     session,
@@ -930,12 +944,12 @@ impl Agent {
         session: &mut Session,
         prompt: &str,
         ui: &mut dyn Ui,
-    ) -> Result<(String, Vec<crate::provider::Image>)> {
+    ) -> Result<(String, Vec<Image>)> {
         let mut out = prompt.to_owned();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let mut total = 0;
         // Pictures are not text, so they cannot go in the prompt string; they ride beside it.
-        let mut images: Vec<crate::provider::Image> = Vec::new();
+        let mut images: Vec<Image> = Vec::new();
         for token in prompt.split_whitespace() {
             let Some(raw) = token.strip_prefix('@') else {
                 continue;
@@ -967,12 +981,12 @@ impl Agent {
             // A file that is an image is attached as one, before anything tries to read it as
             // text (D58).
             if tools::fs::looks_like_image(&bytes) {
-                match crate::provider::Image::read(std::path::Path::new(path), bytes) {
+                match Image::read(Path::new(path), bytes) {
                     Ok(image) => {
                         total += image.data.len();
                         // The UI decides how to show it: a picture where the terminal can
                         // draw one, a line where it cannot (D58, D59).
-                        ui.attached(std::slice::from_ref(&image));
+                        ui.attached(slice::from_ref(&image));
                         images.push(image);
                     }
                     Err(why) => ui.note(&format!("@{path} not attached: {why}")),
@@ -1399,7 +1413,7 @@ impl Agent {
     }
 
     /// Adopts a price the endpoint stated after the provider was built (D36).
-    pub fn set_price(&mut self, price: crate::provider::Price) {
+    pub fn set_price(&mut self, price: Price) {
         if let Some(provider) = &mut self.provider {
             provider.set_price(price);
         }
@@ -1696,8 +1710,8 @@ pub fn grants_section(session: &Session) -> String {
     }
     let extras = &session.setup.extras;
     // Paths, shown as written when they are inside home so the prompt stays readable.
-    let names = |list: &[std::path::PathBuf]| {
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let names = |list: &[PathBuf]| {
+        let home = env::var_os("HOME").map(PathBuf::from);
         list.iter()
             .map(|p| match &home {
                 Some(home) => match p.strip_prefix(home) {
@@ -1822,7 +1836,7 @@ pub fn base_prompt(session: &Session, context: &[ContextFile]) -> String {
             let _ = writeln!(s, "  {:<12} {}", path.tools.join(", "), path.written);
         }
     }
-    s.push_str(&crate::skills::listing(&session.skills));
+    s.push_str(&skills::listing(&session.skills));
     if !context.is_empty() {
         s.push_str(
             "\nInstructions from the user and the project follow, general first. Where they \
@@ -1843,6 +1857,16 @@ pub fn base_prompt(session: &Session, context: &[ContextFile]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compact;
+    use crate::compact::Settings;
+    use crate::compact::tests_support;
+    use crate::config::CompactionConfig;
+    use crate::provider::Api;
+    use crate::provider::Auth;
+    use crate::provider::ProviderConfig;
+    use crate::provider::Reported;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn only_an_instruction_file_that_was_not_there_before_is_an_addition() {
@@ -1877,7 +1901,7 @@ mod tests {
             Vec::new(),
             None,
             None,
-            crate::compact::Settings::default(),
+            Settings::default(),
         );
         agent.note_context(&[]);
         assert!(agent.items.is_empty(), "nothing to say, nothing said");
@@ -1906,13 +1930,13 @@ mod tests {
             Vec::new(),
             None,
             None,
-            crate::compact::Settings::default(),
+            Settings::default(),
         );
         agent.items.push(Item::User("earlier".into()));
         agent.cost = 1.25;
         agent.context_tokens = 40_000;
         agent.measured = 1;
-        let (_tx, rx) = std::sync::mpsc::channel();
+        let (_tx, rx) = mpsc::channel();
         agent.background = Some(Background {
             done: rx,
             prefix: vec![Item::User("earlier".into())],
@@ -1936,8 +1960,8 @@ mod tests {
     fn a_provider(window: u64) -> Provider {
         Provider::new(
             "mock",
-            crate::provider::ProviderConfig {
-                api: crate::provider::Api::Openai,
+            ProviderConfig {
+                api: Api::Openai,
                 base_url: "http://127.0.0.1:1/v1".into(),
                 model: "mock-model".into(),
                 api_key_env: None,
@@ -1951,16 +1975,16 @@ mod tests {
                 key_header: None,
                 cache_retention: Default::default(),
                 cache_affinity: false,
-                auth: crate::provider::Auth::ApiKey,
+                auth: Auth::ApiKey,
                 oauth: None,
             },
             Some("key"),
-            &crate::provider::Reported::default(),
+            &Reported::default(),
         )
     }
 
     /// An agent with a conversation of `tokens` estimated tokens and a window of `window`.
-    fn sized(tokens: usize, window: u64, settings: crate::compact::Settings) -> Agent {
+    fn sized(tokens: usize, window: u64, settings: Settings) -> Agent {
         let mut agent = Agent::new(
             None,
             String::new(),
@@ -1975,12 +1999,12 @@ mod tests {
         // Four characters a token, as the estimate counts (D33), spread over items small enough
         // that `keep_recent` can keep some of them: a real conversation is many small items, not
         // two enormous ones, and a cut point has to fall between two of them to exist at all.
-        agent.items = crate::compact::tests_support::conversation(tokens);
+        agent.items = tests_support::conversation(tokens);
         agent
     }
 
-    fn settings() -> crate::compact::Settings {
-        crate::compact::Settings::default()
+    fn settings() -> Settings {
+        Settings::default()
     }
 
     #[test]
@@ -1994,7 +2018,7 @@ mod tests {
             "half full and idle is the case it exists for"
         );
         assert!(
-            !agent.idle_compaction_due(idle - std::time::Duration::from_secs(1)),
+            !agent.idle_compaction_due(idle - Duration::from_secs(1)),
             "one second before the threshold is not idle"
         );
         let quiet = sized(10_000, window, settings());
@@ -2033,7 +2057,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
-                crate::compact::Settings {
+                Settings {
                     idle: false,
                     ..self.compaction
                 },
@@ -2055,13 +2079,13 @@ mod tests {
         agent.items = sized(76_000, window, settings()).items;
         assert!(agent.background_due(), "76% is");
         // Without the setting it does not happen; the turn compacts synchronously instead.
-        let off = crate::compact::Settings {
+        let off = Settings {
             background: false,
             ..settings()
         };
         assert!(!sized(76_000, window, off).background_due());
         // And it is behind the master switch like everything else.
-        let manual = crate::compact::Settings {
+        let manual = Settings {
             auto: false,
             ..settings()
         };
@@ -2145,7 +2169,7 @@ mod tests {
             "no second one starts while the first is in flight"
         );
         assert!(
-            !agent.idle_compaction_due(std::time::Duration::from_secs(3_600)),
+            !agent.idle_compaction_due(Duration::from_secs(3_600)),
             "and idle compaction does not repeat the same work"
         );
         // It says so, in the transcript, with the reason that does not claim the turn stopped.
@@ -2189,7 +2213,7 @@ mod tests {
     fn the_shares_of_the_window_are_read_as_a_person_meant_them() {
         // A share of 0 would compact a conversation with one message in it, and 1 would never fire
         // before the hard threshold; both are read as unset (D77, D78).
-        let c = |idle: Option<f64>, background: Option<f64>| crate::config::CompactionConfig {
+        let c = |idle: Option<f64>, background: Option<f64>| CompactionConfig {
             auto: None,
             reserve_tokens: None,
             keep_recent_tokens: None,
@@ -2199,13 +2223,10 @@ mod tests {
             background: None,
             background_fraction: background,
         };
-        let s = crate::compact::Settings::from_config(&c(Some(0.0), Some(1.0)));
-        assert_eq!(s.idle_fraction, crate::compact::DEFAULT_IDLE_FRACTION);
-        assert_eq!(
-            s.background_fraction,
-            crate::compact::DEFAULT_BACKGROUND_FRACTION
-        );
-        let s = crate::compact::Settings::from_config(&c(Some(0.3), Some(0.8)));
+        let s = Settings::from_config(&c(Some(0.0), Some(1.0)));
+        assert_eq!(s.idle_fraction, compact::DEFAULT_IDLE_FRACTION);
+        assert_eq!(s.background_fraction, compact::DEFAULT_BACKGROUND_FRACTION);
+        let s = Settings::from_config(&c(Some(0.3), Some(0.8)));
         assert_eq!(s.idle_fraction, 0.3);
         assert_eq!(s.background_fraction, 0.8);
         // Both features are on unless a config says otherwise.

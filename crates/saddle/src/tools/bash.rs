@@ -1,6 +1,8 @@
 //! bash: `sh -c <command>` in the workspace, inside the exec sandbox (D18, D19), with the reserved
 //! paths snapshotted and restored around it (D20).
 
+use crate::cancel;
+use std::env;
 use std::fmt::Write as _;
 use std::time::Duration;
 
@@ -88,14 +90,14 @@ pub fn run(session: &mut Session, input: &Value) -> Result<ToolOutput> {
 
     let ws = Dir::open_ambient_dir(&session.setup.workspace, cap_std::ambient_authority())?;
     let before = reserved::take(&ws).context("snapshotting reserved paths")?;
-    let helper = std::env::current_exe().context("locating the saddle binary")?;
+    let helper = env::current_exe().context("locating the saddle binary")?;
     let out = saddle_sandbox::run(
         &helper,
         &[HELPER_ARG],
         &lowered.spec,
         timeout,
         OUTPUT_LIMIT,
-        &crate::cancel::FLAG,
+        &cancel::FLAG,
         &mut || {
             if let Some(bridge) = bridge.as_mut() {
                 denials.extend(bridge.service(session));

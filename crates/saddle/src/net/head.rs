@@ -10,6 +10,7 @@
 //! be checked against a grant.
 
 use crate::tools::fetch::Target;
+use std::str;
 
 /// A request head this large is refused rather than buffered without bound.
 pub const MAX_HEAD: usize = 16 * 1024;
@@ -148,14 +149,14 @@ fn head_end(buf: &[u8]) -> Option<usize> {
 
 fn first_line(head: &[u8]) -> Option<&str> {
     let end = head.windows(2).position(|w| w == b"\r\n")?;
-    std::str::from_utf8(&head[..end]).ok()
+    str::from_utf8(&head[..end]).ok()
 }
 
 /// One header value by lowercase name. The first occurrence wins, as HTTP requires for `Host`.
 fn header(head: &[u8], name: &str) -> Option<String> {
     let mut lines = head.split(|b| *b == b'\n').skip(1);
     lines.find_map(|line| {
-        let line = std::str::from_utf8(line.strip_suffix(b"\r")?).ok()?;
+        let line = str::from_utf8(line.strip_suffix(b"\r")?).ok()?;
         let (key, value) = line.split_once(':')?;
         key.trim()
             .eq_ignore_ascii_case(name)
@@ -170,7 +171,7 @@ pub fn header_names(head: &[u8]) -> Vec<String> {
     head.split(|b| *b == b'\n')
         .skip(1)
         .filter_map(|line| {
-            let line = std::str::from_utf8(line.strip_suffix(b"\r")?).ok()?;
+            let line = str::from_utf8(line.strip_suffix(b"\r")?).ok()?;
             let (key, _) = line.split_once(':')?;
             Some(key.trim().to_ascii_lowercase())
         })

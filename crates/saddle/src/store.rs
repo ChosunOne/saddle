@@ -14,7 +14,14 @@
 //! Older files are imported once, on first open: a working tree that had sessions before this
 //! change keeps them, in the same order, with their tokens and cost intact.
 
+use std::collections::HashSet;
+use std::fs;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -172,7 +179,7 @@ impl Store {
     /// Opens (or creates) the database and, on a fresh one, imports any older session files.
     pub fn open(path: &Path, workspace: PathBuf) -> Result<Self> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         // Two writers are possible (the agent thread and the UI thread); WAL lets a reader in
@@ -621,7 +628,7 @@ impl Store {
     /// a view built from that alone would show nothing and strand everything.
     pub fn rows(&self, session: &str) -> Result<Vec<Point>> {
         // The nodes the next request will carry: the path from the leaf to the root.
-        let mut active = std::collections::HashSet::new();
+        let mut active = HashSet::new();
         let mut at = self.leaf(session)?;
         while let Some(id) = at {
             active.insert(id);
@@ -794,7 +801,7 @@ impl Store {
         let Some(dir) = db.parent().map(|d| d.join("sessions")) else {
             return Ok(());
         };
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Ok(entries) = fs::read_dir(&dir) else {
             return Ok(());
         };
         let mut files: Vec<PathBuf> = entries
@@ -809,7 +816,7 @@ impl Store {
                     // Renamed, not removed: if the import was wrong the file is still there.
                     let mut moved = file.clone().into_os_string();
                     moved.push(".imported");
-                    let _ = std::fs::rename(&file, PathBuf::from(moved));
+                    let _ = fs::rename(&file, PathBuf::from(moved));
                 }
                 Err(e) => eprintln!("saddle: could not import {}: {e:#}", file.display()),
             }
@@ -886,13 +893,13 @@ impl PointKind {
 /// An id that sorts by time, so a listing is a query and not a scan of every timestamp. The
 /// counter keeps two sessions opened in the same millisecond apart, which a fork can easily be.
 fn session_id() -> String {
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static NEXT: AtomicU32 = AtomicU32::new(0);
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{ms:012x}-{:x}-{n:x}", std::process::id())
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("{ms:012x}-{:x}-{n:x}", process::id())
 }
 
 /// A conversation read back: its items, and the tokens its replies have already cost.
@@ -1029,9 +1036,8 @@ enum Legacy {
 /// Reads one JSON Lines session into the database, keeping its id so a `--continue` that mentions
 /// it still works.
 fn import_one(conn: &Connection, path: &Path) -> Result<()> {
-    use std::io::BufRead;
-    let file = std::fs::File::open(path).with_context(|| format!("{}", path.display()))?;
-    let mut lines = std::io::BufReader::new(file).lines();
+    let file = File::open(path).with_context(|| format!("{}", path.display()))?;
+    let mut lines = BufReader::new(file).lines();
     let Some(Ok(first)) = lines.next() else {
         anyhow::bail!("no header");
     };
@@ -1095,6 +1101,9 @@ mod tests {
     use super::*;
     use crate::provider::{Api, ToolCall};
     use serde_json::json;
+    use std::fs;
+    use std::thread;
+    use std::time::Duration;
 
     fn store() -> Store {
         Store::in_memory("/ws").unwrap()
@@ -1733,7 +1742,7 @@ mod tests {
         s.append(&a, &Item::User("second".into())).unwrap();
         let empty = s.begin("p", "m").unwrap();
         // The ids sort by time; make the order unambiguous.
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(5));
         let b = s.begin("p", "m").unwrap();
         s.append(&b, &Item::User("later task".into())).unwrap();
 
@@ -1851,7 +1860,7 @@ mod tests {
     fn the_legacy_files_are_imported_once_and_kept_under_a_new_name() {
         let dir = tempfile::tempdir().unwrap();
         let legacy = dir.path().join("sessions");
-        std::fs::create_dir_all(&legacy).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
         let id = "000000000001-1";
         let mut text = String::new();
         text.push_str(
@@ -1870,7 +1879,7 @@ mod tests {
         text.push('\n');
         // A torn last line, as an old crash left it.
         text.push_str("{\"type\":\"item\",\"item\":{\"us");
-        std::fs::write(legacy.join(format!("{id}.jsonl")), text).unwrap();
+        fs::write(legacy.join(format!("{id}.jsonl")), text).unwrap();
 
         let db = dir.path().join("sessions.db");
         let s = Store::open(&db, PathBuf::from("/ws")).unwrap();

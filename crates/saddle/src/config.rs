@@ -22,7 +22,18 @@
 //! # api-key-env = "LOCAL_KEY"          # omit when the server takes no key
 //! ```
 
+use crate::defaults;
+use crate::mcp;
+use crate::paths;
+use crate::tools;
+use crate::tui::theme::ThemeTables;
+use saddle_cap::sandbox;
+use saddle_cap::sandbox::Include;
 use std::collections::BTreeMap;
+use std::env;
+use std::fs;
+use std::io::ErrorKind;
+use std::iter;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -70,7 +81,7 @@ pub struct UserConfig {
     pub skills: SkillsConfig,
     /// Named colour roles, `[themes.<name>]`, and `[ui] theme` selects one (D71).
     #[serde(default)]
-    pub themes: crate::tui::theme::ThemeTables,
+    pub themes: ThemeTables,
     #[serde(default)]
     pub compaction: CompactionConfig,
     #[serde(default)]
@@ -383,9 +394,9 @@ pub fn edit(
     path: &Path,
     change: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
 ) -> Result<()> {
-    let text = match std::fs::read_to_string(path) {
+    let text = match fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
     };
     let mut doc: toml_edit::DocumentMut = text
@@ -396,10 +407,10 @@ pub fn edit(
     toml::from_str::<UserConfig>(&out)
         .with_context(|| format!("the change would leave {} invalid", path.display()))?;
     let dir = path.parent().context("config path has no parent")?;
-    std::fs::create_dir_all(dir)?;
+    fs::create_dir_all(dir)?;
     let tmp = dir.join(".config.toml.tmp");
-    std::fs::write(&tmp, out)?;
-    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+    fs::write(&tmp, out)?;
+    fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
 }
 
 /// A top-level `[name]` table, created if missing.
@@ -433,17 +444,17 @@ pub fn provider_table<'a>(
 
 impl UserConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let config: Self = match std::fs::read_to_string(path) {
+        let config: Self = match fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text).with_context(|| format!("{}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) if e.kind() == ErrorKind::NotFound => Self::default(),
             Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
         };
-        crate::mcp::validate(&config.mcp).with_context(|| format!("{}", path.display()))?;
+        mcp::validate(&config.mcp).with_context(|| format!("{}", path.display()))?;
         Ok(config)
     }
 
     pub fn root_entries(&self) -> Result<Vec<(RootName, PathBuf)>> {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = env::var_os("HOME").map(PathBuf::from);
         self.roots
             .iter()
             .map(|(name, path)| {
@@ -469,7 +480,7 @@ impl UserConfig {
         // table that is present and empty is a decision, and is taken as written (D63).
         let agent = match self.agent.clone() {
             Some(agent) => Some(agent),
-            None => toml::from_str::<toml::Value>(crate::defaults::DEFAULT_AGENT)
+            None => toml::from_str::<toml::Value>(defaults::DEFAULT_AGENT)
                 .ok()
                 .map(|v| toml::Value::Table(v.as_table().cloned().unwrap_or_default())),
         };
@@ -484,7 +495,7 @@ impl UserConfig {
         roots: &Roots,
         protected: &[PathBuf],
     ) -> Result<(SandboxExtras, Vec<ToolPath>)> {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = env::var_os("HOME").map(PathBuf::from);
         let expand = |path: &str| -> Result<PathBuf> {
             // `~` is home itself, and `~/x` is a path in it; anything else is taken as written.
             if path == "~" {
@@ -575,12 +586,12 @@ impl UserConfig {
                 continue;
             }
             for tool in tools {
-                if !crate::tools::NAMES.contains(&tool.as_str()) {
+                if !tools::NAMES.contains(&tool.as_str()) {
                     bail!(
                         "config.toml: [sandbox] entry `{}` lists unknown tool `{tool}`; the \
                          tools are {}",
                         entry.path(),
-                        crate::tools::NAMES.join(", ")
+                        tools::NAMES.join(", ")
                     );
                 }
             }
@@ -614,7 +625,7 @@ impl UserConfig {
         // The built-in rule first, so a machine with nothing configured still works (D62).
         let built_in = default_include();
         let rules: Vec<&IncludeConfig> = if self.sandbox.include_defaults {
-            std::iter::once(&built_in)
+            iter::once(&built_in)
                 .chain(self.sandbox.include.iter())
                 .collect()
         } else {
@@ -624,8 +635,7 @@ impl UserConfig {
         // are merged. Two rules over the same base would otherwise *union*: the broader one grants
         // a directory the narrower one excluded, so a person's extra pattern would do nothing.
         // Adding an exclusion has to narrow (D62).
-        let mut by_base: std::collections::BTreeMap<PathBuf, (usize, Vec<regex::Regex>)> =
-            std::collections::BTreeMap::new();
+        let mut by_base: BTreeMap<PathBuf, (usize, Vec<regex::Regex>)> = BTreeMap::new();
         for rule in rules {
             // A root name is accepted so a rule can follow the same names as everything else.
             let base = match RootName::new(&rule.base) {
@@ -657,8 +667,8 @@ impl UserConfig {
         }
         let mut include = Vec::new();
         for (base, (depth, except)) in by_base {
-            include.extend(saddle_cap::sandbox::enumerate(
-                &saddle_cap::sandbox::Include {
+            include.extend(sandbox::enumerate(
+                &Include {
                     base,
                     depth,
                     except,
@@ -682,6 +692,7 @@ impl UserConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn an_old_percent_grants_file_is_renamed_and_stamped_in_one_pass() {
@@ -690,23 +701,23 @@ mod tests {
         // arrived only on the next run.
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
-        std::fs::write(&config, "provider = \"synthetic\"\n").unwrap();
+        fs::write(&config, "provider = \"synthetic\"\n").unwrap();
         let policies = dir.path().join("policies");
-        std::fs::create_dir_all(&policies).unwrap();
+        fs::create_dir_all(&policies).unwrap();
         let old = policies.join("home%me%my-proj.toml");
-        std::fs::write(&old, "version = 1\n[agent]\nexec = { why = \"x\" }\n").unwrap();
+        fs::write(&old, "version = 1\n[agent]\nexec = { why = \"x\" }\n").unwrap();
 
         let touched = migrate(&config, &policies).unwrap();
         assert_eq!(touched.len(), 1, "{touched:?}");
         assert!(!old.exists(), "the old name is gone on this run");
         let new = policies.join("--home-me-my-proj--.toml");
-        let text = std::fs::read_to_string(&new).unwrap();
+        let text = fs::read_to_string(&new).unwrap();
         assert!(text.contains("workspace = \"/home/me/my-proj\""), "{text}");
         assert!(text.contains("exec"), "the grants survive: {text}");
 
         // Running again changes nothing.
         assert!(migrate(&config, &policies).unwrap().is_empty());
-        assert_eq!(std::fs::read_to_string(&new).unwrap(), text);
+        assert_eq!(fs::read_to_string(&new).unwrap(), text);
     }
 
     #[test]
@@ -721,7 +732,7 @@ mod tests {
     fn edits_keep_comments_and_refuse_invalid_results() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(
+        fs::write(
             &path,
             "# top comment\nprovider = \"anthropic\"\n\n[sandbox]\nread = [] # inline\n",
         )
@@ -735,7 +746,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
         assert!(
             text.contains("# top comment") && text.contains("# inline"),
             "{text}"
@@ -753,7 +764,7 @@ mod tests {
             Ok(())
         });
         assert!(bad.is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
     }
 }
 
@@ -869,12 +880,12 @@ pub fn migrate(path: &Path, policies: &Path) -> Result<Vec<PathBuf>> {
     let mut touched = Vec::new();
     // 1. The base grants, if they are still in `policy.toml`.
     let global = path.with_file_name("policy.toml");
-    let text = match std::fs::read_to_string(path) {
+    let text = match fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
     };
-    if let Ok(policy) = std::fs::read_to_string(&global) {
+    if let Ok(policy) = fs::read_to_string(&global) {
         let mut doc: toml_edit::DocumentMut = text
             .parse()
             .with_context(|| format!("{}", path.display()))?;
@@ -889,18 +900,18 @@ pub fn migrate(path: &Path, policies: &Path) -> Result<Vec<PathBuf>> {
             toml::from_str::<UserConfig>(&out)
                 .with_context(|| format!("the migration would leave {} invalid", path.display()))?;
             if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
+                fs::create_dir_all(dir)?;
             }
-            std::fs::write(path, &out).with_context(|| format!("{}", path.display()))?;
+            fs::write(path, &out).with_context(|| format!("{}", path.display()))?;
             // Kept under a name nothing reads, so a second run is a no-op.
-            let _ = std::fs::rename(&global, global.with_extension("toml.imported"));
+            let _ = fs::rename(&global, global.with_extension("toml.imported"));
             touched.push(global);
         }
     }
     // 2. Workspace grants files named with the old `%` separator: renamed, and the `workspace`
     // line stamped in the same step. The `%` form is the only name that decodes exactly, and doing
     // the two as separate passes is what made the line arrive one run late (D63).
-    if let Ok(entries) = std::fs::read_dir(policies) {
+    if let Ok(entries) = fs::read_dir(policies) {
         let mut found: Vec<PathBuf> = entries
             .flatten()
             .map(|e| e.path())
@@ -917,12 +928,12 @@ pub fn migrate(path: &Path, policies: &Path) -> Result<Vec<PathBuf>> {
             let claimed = format!("/{}", stem.trim_start_matches('%').replace('%', "/"));
             let target = policies.join(format!(
                 "{}.toml",
-                crate::paths::workspace_key(Path::new(&claimed))
+                paths::workspace_key(Path::new(&claimed))
             ));
             if target.exists() {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&file) else {
+            let Ok(text) = fs::read_to_string(&file) else {
                 continue;
             };
             let Ok(mut own) = text.parse::<toml_edit::DocumentMut>() else {
@@ -931,9 +942,8 @@ pub fn migrate(path: &Path, policies: &Path) -> Result<Vec<PathBuf>> {
             if own.get("workspace").is_none() {
                 own.insert("workspace", toml_edit::value(claimed));
             }
-            std::fs::write(&target, own.to_string())
-                .with_context(|| format!("{}", target.display()))?;
-            std::fs::remove_file(&file).with_context(|| format!("{}", file.display()))?;
+            fs::write(&target, own.to_string()).with_context(|| format!("{}", target.display()))?;
+            fs::remove_file(&file).with_context(|| format!("{}", file.display()))?;
             touched.push(target);
         }
     }

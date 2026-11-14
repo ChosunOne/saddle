@@ -1,5 +1,6 @@
 //! The third lowering (plan §5): a principal's grants to the sandbox a child process runs in (D19).
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -189,7 +190,7 @@ fn walk(dir: &Path, base: &Path, depth: usize, out: &mut Vec<Entry>) {
         rel,
         is_dir: true,
     });
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     let mut dirs: Vec<PathBuf> = Vec::new();
@@ -334,13 +335,15 @@ mod tests {
     use super::*;
     use crate::policy::{Policy, Principal};
     use crate::roots::RelPath;
+    use std::fs;
+    use std::slice;
 
     fn tree(dirs: &[&str]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         for d in dirs {
-            std::fs::create_dir_all(dir.path().join(d)).unwrap();
+            fs::create_dir_all(dir.path().join(d)).unwrap();
         }
-        std::fs::write(dir.path().join("README"), "x").unwrap();
+        fs::write(dir.path().join("README"), "x").unwrap();
         dir
     }
 
@@ -406,8 +409,8 @@ mod tests {
         // file inside a granted directory was silently undone — a crates.io token in ~/.cargo,
         // which is granted for the toolchain, stayed readable (D62).
         let dir = tree(&["cargo/registry"]);
-        std::fs::write(dir.path().join("cargo/credentials.toml"), "token\n").unwrap();
-        std::fs::write(dir.path().join("cargo/config.toml"), "[net]\n").unwrap();
+        fs::write(dir.path().join("cargo/credentials.toml"), "token\n").unwrap();
+        fs::write(dir.path().join("cargo/config.toml"), "[net]\n").unwrap();
         let got = rel(
             dir.path(),
             &enumerate(&rule(dir.path(), 2, &[r"^cargo/credentials\.toml$"]), &[]),
@@ -427,7 +430,7 @@ mod tests {
         let state = dir.path().join("state/saddle");
         let got = rel(
             dir.path(),
-            &enumerate(&rule(dir.path(), 2, &[]), std::slice::from_ref(&state)),
+            &enumerate(&rule(dir.path(), 2, &[]), slice::from_ref(&state)),
         );
         assert_eq!(got, ["README", "cargo", "config"], "{got:?}");
     }

@@ -13,6 +13,7 @@
 //! for values several roles share.
 
 use std::collections::BTreeMap;
+use std::env;
 
 use anyhow::{Context, Result, bail};
 use ratatui::style::Color;
@@ -259,7 +260,7 @@ fn resolve(
         Some(base) => resolve(base, tables, seen)?,
         None if name == "system" => {
             // Derived from the terminal, so it depends on an answer that may never come (D73).
-            let terminal = crate::tui::palette::Palette::from_terminal();
+            let terminal = Palette::from_terminal();
             (terminal.palette, terminal.appearance)
         }
         None => match builtin_palette(name) {
@@ -319,7 +320,7 @@ pub fn terminal_appearance() -> Appearance {
             Appearance::Dark
         };
     }
-    if let Ok(value) = std::env::var("COLORFGBG") {
+    if let Ok(value) = env::var("COLORFGBG") {
         // `fg;bg`, where either may be a 0–15 index. A white or bright background is light.
         if let Some(bg) = value.rsplit(';').next()
             && let Ok(index) = bg.trim().parse::<u8>()
@@ -548,6 +549,8 @@ fn srgb_colour(linear: [f64; 3]) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::catppuccin;
+    use std::collections::BTreeSet;
 
     fn tables(text: &str) -> ThemeTables {
         toml::from_str(text).unwrap()
@@ -727,11 +730,11 @@ mod tests {
         assert_eq!(latte.text, Color::Rgb(0x4c, 0x4f, 0x69), "Latte's own text");
         assert_eq!(latte.appearance, Appearance::Light);
         // Four flavours, four different themes: not the same palette under four names.
-        let accents: Vec<String> = crate::tui::catppuccin::NAMES
+        let accents: Vec<String> = catppuccin::NAMES
             .iter()
             .map(|n| format!("{:?}", build(n, &ThemeTables::new()).unwrap().accent))
             .collect();
-        let distinct: std::collections::BTreeSet<&String> = accents.iter().collect();
+        let distinct: BTreeSet<&String> = accents.iter().collect();
         assert_eq!(distinct.len(), 4, "{accents:?}");
     }
 

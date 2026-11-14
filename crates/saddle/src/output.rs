@@ -7,6 +7,10 @@
 //! go to stderr with the `saddle:` prefix, so a consumer can read stdout as a stream of events and
 //! treat a non-zero exit as a host failure.
 
+use crate::cancel;
+use crate::provider::Image;
+use crate::term;
+use std::io;
 use std::io::Write;
 
 use serde_json::{Value, json};
@@ -98,7 +102,7 @@ pub struct Json {
 impl Json {
     pub fn stdout() -> Self {
         Self {
-            out: Box::new(std::io::stdout()),
+            out: Box::new(io::stdout()),
         }
     }
 
@@ -119,7 +123,7 @@ impl Sink for Output {
     }
 
     fn note(&mut self, s: &str) {
-        self.info(&crate::term::clean(s));
+        self.info(&term::clean(s));
     }
 
     fn reasoning(&mut self, s: &str) {
@@ -149,7 +153,7 @@ impl Sink for Output {
     fn cancelled(&self) -> bool {
         match self {
             Output::Human(t) => Sink::cancelled(t),
-            Output::Json(_) => crate::cancel::requested(),
+            Output::Json(_) => cancel::requested(),
         }
     }
 }
@@ -159,7 +163,7 @@ impl Ui for Output {
         match self {
             Output::Human(t) => t.call(call),
             Output::Json(j) => {
-                let name = crate::term::clean(&call.name);
+                let name = term::clean(&call.name);
                 j.emit(json!({
                     "type": "call",
                     "name": name,
@@ -176,7 +180,7 @@ impl Ui for Output {
         }
     }
 
-    fn attached(&mut self, images: &[crate::provider::Image]) {
+    fn attached(&mut self, images: &[Image]) {
         match self {
             Output::Human(t) => t.attached(images),
             Output::Json(j) => {
@@ -268,27 +272,30 @@ impl Ui for Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Result;
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     /// A JSON sink into a buffer, so the stream can be read back.
-    fn captured() -> (Json, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    fn captured() -> (Json, Arc<Mutex<Vec<u8>>>) {
+        struct Shared(Arc<Mutex<Vec<u8>>>);
         impl Write for Shared {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            fn write(&mut self, b: &[u8]) -> Result<usize> {
                 self.0.lock().unwrap().extend_from_slice(b);
                 Ok(b.len())
             }
-            fn flush(&mut self) -> std::io::Result<()> {
+            fn flush(&mut self) -> Result<()> {
                 Ok(())
             }
         }
+        let buf = Arc::new(Mutex::new(Vec::new()));
         let sink = Json {
             out: Box::new(Shared(buf.clone())),
         };
         (sink, buf)
     }
 
-    fn events(buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<Value> {
+    fn events(buf: &Arc<Mutex<Vec<u8>>>) -> Vec<Value> {
         let raw = buf.lock().unwrap().clone();
         String::from_utf8(raw)
             .unwrap()

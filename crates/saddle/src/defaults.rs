@@ -1,6 +1,7 @@
 //! Files saddle writes on first run so it works without setup (D30): a user config with the
 //! toolchains it finds (D30). The grants live in the same file, under `[agent]` (D63).
 
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -209,7 +210,7 @@ write = [{write}]
 /// The policy text a workspace's file is seeded with when it has none: the global policy, or this
 /// built-in one when the global file is missing or unreadable (D42).
 pub fn ensure(paths: &Paths) -> Result<Vec<PathBuf>> {
-    let home = std::env::var_os("HOME")
+    let home = env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from);
     let mut created = Vec::new();
@@ -238,10 +239,15 @@ fn create_new(path: &Path, text: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config;
     use crate::config::SandboxEntry;
     use crate::config::UserConfig;
     use saddle_cap::policy::Policy;
+    use saddle_cap::sandbox;
+    use saddle_cap::sandbox::Include;
     use saddle_cap::{RootName, Roots};
+    use std::fs;
+    use std::path::Path;
 
     #[test]
     fn config_lists_only_toolchains_that_exist() {
@@ -286,8 +292,8 @@ mod tests {
         // keyrings` is three levels down, was never enumerated, and its pattern matched nothing —
         // so the keyring was readable (D62).
         let home = tempfile::tempdir().unwrap();
-        let rule = crate::config::default_include();
-        let include = saddle_cap::sandbox::Include {
+        let rule = config::default_include();
+        let include = Include {
             base: home.path().to_path_buf(),
             depth: rule.depth,
             except: rule
@@ -360,8 +366,8 @@ mod tests {
         ];
         for rel in withheld {
             let path = home.path().join(rel);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, "secret\n").unwrap();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "secret\n").unwrap();
         }
         let granted = [
             ".cargo/registry/index",
@@ -376,11 +382,11 @@ mod tests {
         ];
         for rel in granted {
             let path = home.path().join(rel);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, "fine\n").unwrap();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "fine\n").unwrap();
         }
-        let out = saddle_cap::sandbox::enumerate(&include, &[]);
-        let got: Vec<&std::path::Path> = out.iter().map(|p| p.as_path()).collect();
+        let out = sandbox::enumerate(&include, &[]);
+        let got: Vec<&Path> = out.iter().map(|p| p.as_path()).collect();
         for rel in withheld {
             let path = home.path().join(rel);
             // A rule on the file, or on a directory above it, would both reach it.
@@ -400,7 +406,7 @@ mod tests {
     fn every_default_except_pattern_matches_the_store_it_names() {
         // A pattern that never matches is silent: the directory is simply granted. So each one is
         // pinned to the path it is meant to withhold (D62).
-        let rule = crate::config::default_include();
+        let rule = config::default_include();
         let patterns: Vec<regex::Regex> = rule
             .except
             .iter()

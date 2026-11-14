@@ -1,6 +1,8 @@
 //! Cancelling a turn. There is one flag per process. The TUI sets it on Esc or Ctrl-C, and in line
 //! mode a SIGINT handler sets it. The model stream, the loop and a running command all check it.
 
+use std::mem;
+use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub static FLAG: AtomicBool = AtomicBool::new(false);
@@ -33,11 +35,11 @@ impl SigintGuard {
     pub fn install() -> Self {
         // SAFETY: a zeroed sigaction is valid; the handler only touches an atomic and calls _exit.
         unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
+            let mut action: libc::sigaction = mem::zeroed();
             action.sa_sigaction = on_sigint as *const () as libc::sighandler_t;
             action.sa_flags = libc::SA_RESTART;
             libc::sigemptyset(&mut action.sa_mask);
-            let mut previous: libc::sigaction = std::mem::zeroed();
+            let mut previous: libc::sigaction = mem::zeroed();
             libc::sigaction(libc::SIGINT, &action, &mut previous);
             Self { previous }
         }
@@ -48,7 +50,7 @@ impl Drop for SigintGuard {
     fn drop(&mut self) {
         // SAFETY: restores the handler saved in install.
         unsafe {
-            libc::sigaction(libc::SIGINT, &self.previous, std::ptr::null_mut());
+            libc::sigaction(libc::SIGINT, &self.previous, ptr::null_mut());
         }
     }
 }

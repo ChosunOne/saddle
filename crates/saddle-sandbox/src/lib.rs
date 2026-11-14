@@ -6,9 +6,16 @@
 //! landlock and seccomp, and execs the target, which inherits the confinement.
 
 use std::convert::Infallible;
+use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::mem::ManuallyDrop;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
+use std::process;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -92,13 +99,13 @@ pub fn network_availability() -> Result<String, String> {
     if !cfg!(target_os = "linux") {
         return Err("a command's network is Linux-only in v1".into());
     }
-    if let Ok(value) = std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
+    if let Ok(value) = fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
         && value.trim() == "0"
     {
         return Err("unprivileged user namespaces are disabled".into());
     }
-    let resolvers = std::fs::read_to_string("/etc/resolv.conf")
-        .map(|text| crate::namespaces::resolvers(&text))
+    let resolvers = fs::read_to_string("/etc/resolv.conf")
+        .map(|text| namespaces::resolvers(&text))
         .unwrap_or_default();
     if resolvers.is_empty() {
         // The proxy still works, because it is reached by an address rather than a name.
@@ -120,7 +127,7 @@ pub fn helper_main() -> ! {
         Err(err) => err,
     };
     eprintln!("saddle-sandbox: {err}");
-    std::process::exit(err.exit_code())
+    process::exit(err.exit_code())
 }
 
 /// The descriptor a long-lived command's spec arrives on, so fd 0 stays the command's (D106).
@@ -149,10 +156,9 @@ fn parse_spec(bytes: Vec<u8>) -> Result<SandboxSpec, SandboxError> {
 /// The spec on fd 3, when the host put one there (D106). A helper started by `run` has no fd 3:
 /// Rust closes every descriptor it opens, so the read fails and the spec comes from stdin.
 fn spec_from_fd3() -> Option<Vec<u8>> {
-    use std::os::fd::FromRawFd;
     // SAFETY: fd 3 is either the socket the host made or not open at all. The File is forgotten
     // rather than dropped, so a closed descriptor is never closed a second time.
-    let mut file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(SPEC_FD) });
+    let mut file = ManuallyDrop::new(unsafe { File::from_raw_fd(SPEC_FD) });
     let mut buf = Vec::new();
     match file.read_to_end(&mut buf) {
         Ok(_) if !buf.is_empty() => Some(buf),
@@ -167,10 +173,6 @@ fn spec_from_fd3() -> Option<Vec<u8>> {
 /// The caller owns the pipes: it must read stdout, drain stderr, and wait or kill the child. It
 /// also owns servicing the network relay while it waits, which is why this does not do it.
 pub fn spawn(helper: &Path, helper_args: &[&str], spec: &SandboxSpec) -> io::Result<Child> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::net::UnixStream;
-    use std::os::unix::process::CommandExt;
-
     let payload = serde_json::to_vec(spec).map_err(io::Error::other)?;
     // A socket pair, so both ends are owned: the child's end becomes fd 3, and closing ours is
     // what tells the helper the spec is complete.
@@ -201,8 +203,7 @@ pub fn spawn(helper: &Path, helper_args: &[&str], spec: &SandboxSpec) -> io::Res
 }
 
 fn reopen_stdin_null() -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let null = std::fs::File::open("/dev/null")?;
+    let null = File::open("/dev/null")?;
     // SAFETY: dup2 on two valid descriptors; fd 0 is replaced atomically.
     if unsafe { libc::dup2(null.as_raw_fd(), 0) } < 0 {
         return Err(io::Error::last_os_error());
@@ -247,7 +248,6 @@ fn resolve_program(program: &str, env: &[(String, String)]) -> Result<PathBuf, S
 }
 
 fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
     path.metadata()
         .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
@@ -281,8 +281,6 @@ pub fn run(
     cancel: &AtomicBool,
     service: &mut dyn FnMut(),
 ) -> io::Result<Output> {
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
-
     let mut child = Command::new(helper)
         .args(helper_args)
         .env_clear()

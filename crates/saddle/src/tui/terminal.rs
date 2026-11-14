@@ -15,10 +15,15 @@
 //! itself. Asking from there turned raw mode off and left every keystroke echoed onto the screen
 //! and the interface deaf to all of them.
 
+use ratatui::crossterm::terminal;
+use std::io;
 use std::io::IsTerminal as _;
 use std::io::Read as _;
+use std::io::Stdin;
 use std::io::Write as _;
+use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd as _;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ratatui::style::Color;
@@ -39,7 +44,7 @@ pub fn query_sequence() -> String {
 }
 
 /// The answer this process has, so a theme rebuilt mid-session does not ask again (D73).
-static REPORT: std::sync::Mutex<Option<Reported>> = std::sync::Mutex::new(None);
+static REPORT: Mutex<Option<Reported>> = Mutex::new(None);
 
 /// Asks the terminal once, before the interface starts, and keeps the answer (D73, D75).
 ///
@@ -77,24 +82,24 @@ fn may_ask(stdin_is_tty: bool, stdout_is_tty: bool, raw_mode: bool) -> bool {
 }
 
 fn ask() -> Reported {
-    let raw_mode = ratatui::crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+    let raw_mode = terminal::is_raw_mode_enabled().unwrap_or(false);
     if !may_ask(
-        std::io::stdin().is_terminal(),
-        std::io::stdout().is_terminal(),
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
         raw_mode,
     ) {
         return Reported::nothing();
     }
     // `enable_raw_mode` says whether it *was* already on; it is not, from the check above, so this
     // always puts cooked mode back.
-    let raw = ratatui::crossterm::terminal::enable_raw_mode().is_ok();
+    let raw = terminal::enable_raw_mode().is_ok();
     let report = query();
     if raw {
         // Anything still in the queue would be read as keystrokes by the interface that is about to
         // start, and typed into the prompt (D75). Discarding it costs at most one keystroke pressed
         // in the first 100 ms of a session.
         discard_pending_input();
-        let _ = ratatui::crossterm::terminal::disable_raw_mode();
+        let _ = terminal::disable_raw_mode();
     }
     report
 }
@@ -118,11 +123,10 @@ fn discard_pending_input() {
 /// Only called for the `system` theme, and only when stdin is a terminal: a pipe has nobody to answer
 /// and the read would sit until the deadline for nothing.
 pub fn query() -> Reported {
-    use std::io::IsTerminal as _;
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Reported::nothing();
     }
-    let mut out = std::io::stdout();
+    let mut out = io::stdout();
     if out.write_all(query_sequence().as_bytes()).is_err() || out.flush().is_err() {
         return Reported::nothing();
     }
@@ -130,7 +134,7 @@ pub fn query() -> Reported {
     // has already put the terminal in raw mode, so a byte at a time arrives without a line.
     let mut bytes = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
-    let mut stdin = std::io::stdin();
+    let mut stdin = io::stdin();
     loop {
         let now = Instant::now();
         if now >= deadline {
@@ -156,8 +160,8 @@ pub fn query() -> Reported {
 }
 
 /// Whether a byte is waiting within `limit`. `poll(2)` on stdin, so nothing is consumed by asking.
-fn poll(stdin: &std::io::Stdin, limit: Duration) -> bool {
-    let mut fd = std::mem::MaybeUninit::<libc_pollfd>::zeroed();
+fn poll(stdin: &Stdin, limit: Duration) -> bool {
+    let mut fd = MaybeUninit::<libc_pollfd>::zeroed();
     // SAFETY: `fd` is a plain struct of integers, and the descriptor is borrowed for the call.
     unsafe {
         let p = fd.as_mut_ptr();

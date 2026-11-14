@@ -7,7 +7,10 @@
 //! is sitting at, and it is removed when the session it names ends — so it is a permission for one
 //! session, not a property of the workspace.
 
+use std::cmp::Reverse;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -62,7 +65,7 @@ impl Allowance {
     pub fn request(&self, id: &str, workspace: &Path) -> Result<()> {
         let entry = Entry {
             workspace: workspace.to_path_buf(),
-            pid: std::process::id(),
+            pid: process::id(),
             when: now(),
         };
         write(&self.pending_path(id), &entry)
@@ -84,7 +87,7 @@ impl Allowance {
     pub fn allow(&self, id: &str, workspace: &Path) -> Result<()> {
         let entry = Entry {
             workspace: workspace.to_path_buf(),
-            pid: std::process::id(),
+            pid: process::id(),
             when: now(),
         };
         write(&self.allow_path(id), &entry)
@@ -93,7 +96,7 @@ impl Allowance {
     /// Every allowance, most recently made first, so a person can pick one instead of remembering
     /// an id (D61).
     pub fn allowed(&self) -> Vec<(String, Entry)> {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
             return Vec::new();
         };
         let mut out: Vec<(String, Entry)> = entries
@@ -108,7 +111,7 @@ impl Allowance {
                 }
             })
             .collect();
-        out.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.when));
+        out.sort_by_key(|(_, entry)| Reverse(entry.when));
         out
     }
 
@@ -120,7 +123,7 @@ impl Allowance {
             .into_iter()
             .filter(|(_, entry)| entry.covers(workspace))
             .collect();
-        out.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.when));
+        out.sort_by_key(|(_, entry)| Reverse(entry.when));
         out
     }
 
@@ -163,13 +166,13 @@ impl Allowance {
     /// Forgets everything about `id`: its allowance and its pending request, so an allowance is
     /// gone when a person says so rather than when a process exits (D61).
     pub fn revoke(&self, id: &str) {
-        let _ = std::fs::remove_file(self.allow_path(id));
-        let _ = std::fs::remove_file(self.pending_path(id));
+        let _ = fs::remove_file(self.allow_path(id));
+        let _ = fs::remove_file(self.pending_path(id));
     }
 
     /// The sessions waiting for an allowance, oldest first.
     pub fn waiting(&self) -> Vec<(String, Entry)> {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
             return Vec::new();
         };
         let mut out: Vec<(String, Entry)> = entries
@@ -209,14 +212,14 @@ fn now() -> u64 {
 
 fn write(path: &Path, entry: &Entry) -> Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("{}", dir.display()))?;
+        fs::create_dir_all(dir).with_context(|| format!("{}", dir.display()))?;
     }
     let text = toml::to_string(entry).context("writing an allowance")?;
-    std::fs::write(path, text).with_context(|| format!("{}", path.display()))
+    fs::write(path, text).with_context(|| format!("{}", path.display()))
 }
 
 fn read(path: &Path) -> Option<Entry> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = fs::read_to_string(path).ok()?;
     toml::from_str(&text).ok()
 }
 
@@ -236,6 +239,7 @@ pub fn check_id(id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process;
 
     fn temp() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -286,7 +290,7 @@ mod tests {
         let (id, entry) = &waiting[0];
         assert_eq!(id, "19c4f3a2-3f9b");
         assert_eq!(entry.workspace, ws.path());
-        assert_eq!(entry.pid, std::process::id());
+        assert_eq!(entry.pid, process::id());
     }
 
     #[test]

@@ -148,9 +148,11 @@ mod tests {
     use super::*;
     use crate::policy::Policy;
     use crate::roots::Roots;
+    use std::fs;
+    use std::path::Path;
 
-    fn roots(dir: &std::path::Path) -> Roots {
-        std::fs::create_dir_all(dir.join("tmp")).unwrap();
+    fn roots(dir: &Path) -> Roots {
+        fs::create_dir_all(dir.join("tmp")).unwrap();
         Roots::resolve(
             [
                 (RootName::workspace(), dir.to_path_buf()),

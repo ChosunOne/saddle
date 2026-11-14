@@ -330,6 +330,7 @@ impl SettingsDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::status;
 
     fn values() -> Values {
         Values {
@@ -339,7 +340,7 @@ mod tests {
             max_tokens: None,
             context_window: None,
             window: 262_144,
-            status: crate::tui::status::DEFAULT_STATUS.into(),
+            status: status::DEFAULT_STATUS.into(),
             max_steps: None,
             auto_compact: true,
             idle_compact: true,

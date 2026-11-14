@@ -1,5 +1,28 @@
 //! A session: resolved roots, the policy for this workspace, the engine, and an open audit log.
 
+use crate::config;
+use crate::config::ContextConfig;
+use crate::config::Overrides;
+use crate::config::SkillsConfig;
+use crate::config::ToolPath;
+use crate::mcp::Exposure;
+use crate::mcp::registry::Registry;
+use crate::paths;
+use crate::provider;
+use crate::provider::SearchTarget;
+use crate::skills;
+use crate::skills::Skill;
+use crate::tools::websearch::LastSearch;
+use saddle_cap::policy;
+use saddle_cap::roots;
+use std::env;
+use std::fs;
+use std::fs::DirBuilder;
+use std::fs::File;
+use std::io::Read;
+use std::io::Result as IoResult;
+use std::io::{Error, ErrorKind};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -45,11 +68,11 @@ pub const WORKSPACE_POLICY_HEADER: &str = r#"# This workspace's own grants, laid
 pub fn roots_for_validation() -> Result<Roots> {
     let paths = Paths::from_env()?;
     let user = UserConfig::load(&paths.user_config())?;
-    let cwd = std::env::current_dir().context("reading the working directory")?;
+    let cwd = env::current_dir().context("reading the working directory")?;
     let workspace = find_workspace(&cwd);
     let mut entries = vec![
         (RootName::workspace(), workspace),
-        (RootName::tmp(), std::env::temp_dir()),
+        (RootName::tmp(), env::temp_dir()),
     ];
     entries.extend(user.root_entries()?);
     Ok(Roots::resolve(entries, &paths.protected())?)
@@ -79,15 +102,15 @@ pub struct Setup {
     /// Notes for the session intro, such as a workspace `saddle.toml` that is no longer read.
     pub notes: Vec<String>,
     /// This run's grant overrides, kept so a policy reload does not silently drop them (D63).
-    pub overrides: crate::config::Overrides,
+    pub overrides: Overrides,
     /// Directories the file tools may reach outside every root, and the tools allowed on each
     /// (D66). From `[sandbox]` in the user's config only, so no workspace policy can add one.
-    pub tool_paths: Vec<crate::config::ToolPath>,
+    pub tool_paths: Vec<ToolPath>,
     /// Whether and how many skills to look for (D64), read with the rest of the config.
-    pub skills: crate::config::SkillsConfig,
+    pub skills: SkillsConfig,
     /// The instruction-file settings, kept so `/reload` re-reads them with the ones that were used
     /// at open (D70).
-    pub context: crate::config::ContextConfig,
+    pub context: ContextConfig,
     /// The sensitive directories this workspace puts in reach, which is what the person is asked
     /// about before the session opens (D60). Empty for an ordinary project.
     pub exposed: Vec<String>,
@@ -100,7 +123,7 @@ pub struct Setup {
 impl Setup {
     /// `tmp` is the directory to use as the `tmp` root. `overrides` are this run's `--grant` and
     /// `--revoke`, which are not stored (D63).
-    pub fn load(start: &Path, tmp: &Path, overrides: &crate::config::Overrides) -> Result<Self> {
+    pub fn load(start: &Path, tmp: &Path, overrides: &Overrides) -> Result<Self> {
         let paths = Paths::from_env()?;
         let start = start
             .canonicalize()
@@ -108,7 +131,7 @@ impl Setup {
         let workspace = find_workspace(&start);
         let user = UserConfig::load(&paths.user_config())?;
         // Reported before a root is resolved: this is a warning, not a rule about workspaces (D60).
-        let exposed = crate::paths::exposed(&workspace, &crate::paths::sensitive_dirs());
+        let exposed = paths::exposed(&workspace, &paths::sensitive_dirs());
 
         let mut entries = vec![
             (RootName::workspace(), workspace.clone()),
@@ -130,14 +153,14 @@ impl Setup {
         // This workspace's own grants are their own file (D63), so a directory's authority is
         // named after the directory and the global file does not grow a key per workspace.
         let own_path = paths.workspace_policy(&workspace);
-        let own_text = match std::fs::read_to_string(&own_path) {
+        let own_text = match fs::read_to_string(&own_path) {
             Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if e.kind() == ErrorKind::NotFound => {
                 if let Some(dir) = own_path.parent() {
-                    std::fs::create_dir_all(dir)
+                    fs::create_dir_all(dir)
                         .with_context(|| format!("creating {}", dir.display()))?;
                 }
-                std::fs::write(&own_path, workspace_header(&workspace))
+                fs::write(&own_path, workspace_header(&workspace))
                     .with_context(|| format!("creating {}", own_path.display()))?;
                 notes.push(format!(
                     "created {} for this workspace's own grants; it adds to {}",
@@ -179,9 +202,9 @@ impl Setup {
             // Applied to the *merged* grants, not to the workspace's own: `--revoke exec` has to
             // remove a grant that came from the base, and a workspace-level edit could only
             // shadow it (D63).
-            let merged_doc = saddle_cap::policy::merge(
+            let merged_doc = policy::merge(
                 global.clone(),
-                own.unwrap_or_else(|| crate::config::policy_document_pub(None)),
+                own.unwrap_or_else(|| config::policy_document_pub(None)),
             );
             let mut agent = match merged_doc.get("agent") {
                 Some(toml::Value::Table(t)) => t.clone(),
@@ -255,9 +278,9 @@ impl Setup {
                 format!(" · {} tool override(s)", entry.tool_exposure.len())
             };
             let exposure = match entry.exposure() {
-                crate::mcp::Exposure::Deferred => "searched for",
-                crate::mcp::Exposure::Direct => "in the prompt",
-                crate::mcp::Exposure::Hidden => "off",
+                Exposure::Deferred => "searched for",
+                Exposure::Direct => "in the prompt",
+                Exposure::Hidden => "off",
             };
             mcp.push(format!(
                 "{name} · {what} · {access} · {exposure}{per_tool} · {deadline}s per call"
@@ -308,12 +331,12 @@ impl Setup {
 ///
 /// A provider that cannot be resolved simply has no search, because a broken provider table is
 /// reported by `check` and by the model loop, not by a tool that was asked a different question.
-fn configured_search(setup: &Setup) -> Option<crate::provider::SearchTarget> {
+fn configured_search(setup: &Setup) -> Option<SearchTarget> {
     let user = UserConfig::load(&setup.paths.user_config()).ok()?;
     let name = user.provider?;
-    let config = crate::provider::endpoint(&name, &user.providers).ok()?;
+    let config = provider::endpoint(&name, &user.providers).ok()?;
     let url = config.search_url?;
-    Some(crate::provider::SearchTarget {
+    Some(SearchTarget {
         provider: name,
         url,
         key_env: config.api_key_env,
@@ -325,9 +348,8 @@ pub struct PrivateTmp(PathBuf);
 
 impl PrivateTmp {
     pub fn create(id: &str) -> Result<Self> {
-        use std::os::unix::fs::DirBuilderExt;
-        let path = std::env::temp_dir().join(format!("saddle-{id}"));
-        std::fs::DirBuilder::new()
+        let path = env::temp_dir().join(format!("saddle-{id}"));
+        DirBuilder::new()
             .mode(0o700)
             .create(&path)
             .with_context(|| format!("creating {}", path.display()))?;
@@ -341,7 +363,7 @@ impl PrivateTmp {
 
 impl Drop for PrivateTmp {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -363,20 +385,20 @@ pub struct Session {
     pub host_env: Vec<(String, String)>,
     /// Skills advertised to the model and loaded on demand (D64), read once at open like the
     /// instruction files.
-    pub skills: Vec<crate::skills::Skill>,
+    pub skills: Vec<Skill>,
     /// Notes for the person about a skill that was refused, shadowed or ignored.
     pub skill_notes: Vec<String>,
     /// The `[sandbox]` directories the file tools may reach (D66).
     pub tool_roots: Vec<ToolRoot>,
     /// Where the configured provider answers a web search, when it serves one (D82). Set again
     /// whenever the provider changes, so the tool follows the model.
-    pub search: Option<crate::provider::SearchTarget>,
+    pub search: Option<SearchTarget>,
     /// The results of the last search, so `{"result": n}` can show one in full without asking
     /// again. Held here rather than in the tool because a result's number only means the page the
     /// model was shown, and that is a property of the session (D82).
-    pub last_search: Option<crate::tools::websearch::LastSearch>,
+    pub last_search: Option<LastSearch>,
     /// The MCP servers this policy grants, and the tools of theirs the model has declared (D108).
-    pub mcp: crate::mcp::registry::Registry,
+    pub mcp: Registry,
     /// A host-built, branch-only snapshot, supplied by the agent for one query (D92, D94).
     pub query_snapshot: Option<Snapshot>,
     pub query_conversation: Option<String>,
@@ -391,11 +413,7 @@ impl Session {
     /// token of their own: two processes sharing one id must not fight over one file, and a reused
     /// id must not append to a chain that a previous process already closed.
     /// Opens a session with this run's grant overrides applied (D63).
-    pub fn open_with(
-        start: &Path,
-        id: Option<&str>,
-        overrides: &crate::config::Overrides,
-    ) -> Result<Self> {
+    pub fn open_with(start: &Path, id: Option<&str>, overrides: &Overrides) -> Result<Self> {
         let id = id.map(str::to_owned).unwrap_or_else(session_id);
         let run = format!("{id}-{}", session_id());
         let tmp = PrivateTmp::create(&run)?;
@@ -427,7 +445,7 @@ impl Session {
         )?;
 
         let search = configured_search(&setup);
-        let host_env: Vec<(String, String)> = std::env::vars().collect();
+        let host_env: Vec<(String, String)> = env::vars().collect();
         // D108: the servers this policy grants, and the tables that declare how to start them. A
         // granted server with no table is not an error here: `saddle check` says so, and the first
         // search reports it once.
@@ -438,7 +456,7 @@ impl Session {
                 .map(|g| g.mcp.clone())
                 .unwrap_or_default();
             let tmp = setup.roots.get(&RootName::tmp()).map(Path::to_path_buf);
-            crate::mcp::registry::Registry::new(grants, user.mcp, host_env.clone(), tmp)
+            Registry::new(grants, user.mcp, host_env.clone(), tmp)
         };
         let mut session = Self {
             setup,
@@ -488,7 +506,7 @@ impl Session {
         // skill is read at startup as an instruction file is, so a grants reload does not change
         // what the conversation was built from.
         let cfg = session.setup.skills.clone();
-        let (found, notes) = crate::skills::discover(&mut session, &cfg)?;
+        let (found, notes) = skills::discover(&mut session, &cfg)?;
         session.skills = found;
         session.skill_notes = notes;
         Ok(session)
@@ -647,7 +665,7 @@ impl Session {
 
     /// The tool-visible directory containing `abs`, innermost first (D66).
     fn tool_root_for(&self, abs: &Path) -> Option<&ToolRoot> {
-        let abs = saddle_cap::roots::normalize(abs);
+        let abs = roots::normalize(abs);
         self.tool_roots
             .iter()
             .filter(|r| abs.starts_with(&r.dir))
@@ -661,8 +679,7 @@ impl Session {
     /// which keeps the rule honest: a link may point at another directory the user listed, and
     /// never at something undeclared — otherwise `~/.agents/x -> ~/.config/saddle/config.toml`
     /// would hand the tools the policy that governs them (D16).
-    pub fn resolve_tool(&self, loc: &Location) -> std::io::Result<Location> {
-        use std::io::{Error, ErrorKind};
+    pub fn resolve_tool(&self, loc: &Location) -> IoResult<Location> {
         let base = self
             .base_of(&loc.root)
             .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no root `{}`", loc.root)))?;
@@ -722,7 +739,7 @@ impl Session {
     /// loaded stays where it was put, which is why the note says so.
     pub fn reload_skills(&mut self) -> Result<()> {
         let cfg = self.setup.skills.clone();
-        let (found, notes) = crate::skills::discover(self, &cfg)?;
+        let (found, notes) = skills::discover(self, &cfg)?;
         self.skills = found;
         self.skill_notes = notes;
         Ok(())
@@ -773,8 +790,8 @@ impl Session {
 /// time-and-pid id can be narrowed to a few thousand candidates from the clock alone.
 pub fn session_id() -> String {
     let mut bytes = [0u8; 8];
-    let ok = std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
+    let ok = File::open("/dev/urandom")
+        .and_then(|mut f| Read::read_exact(&mut f, &mut bytes))
         .is_ok();
     if !ok {
         // No random source: fall back to the clock rather than refusing to start, and say so in

@@ -17,6 +17,7 @@
 //! A `CONNECT` tunnel is decided once, on its own line, and then carried unchanged. The handshake
 //! inside it is not read a second time, because it can only reach the host that was allowed.
 
+use crate::net;
 use std::io::{self, Read, Write};
 use std::thread;
 
@@ -167,7 +168,7 @@ fn decide_tls(buf: &[u8], peer: &mut dyn Peer) -> io::Result<Step> {
         Peek::Name(name) => {
             let target = Target {
                 scheme: "https".to_owned(),
-                host: crate::net::normalise_host(name),
+                host: net::normalise_host(name),
                 port: 443,
                 path: "/".to_owned(),
             };

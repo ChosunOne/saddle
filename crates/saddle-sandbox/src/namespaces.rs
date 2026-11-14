@@ -12,8 +12,11 @@
 //! before D79, with no network at all. The fallback is strictly narrower, so an environment where
 //! this does not work is less capable, never less confined.
 
+use std::fs;
 use std::io;
+use std::mem;
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
 
 /// Enters a private network namespace, raises its loopback, and makes the resolver addresses the
 /// guest will ask into addresses of that loopback.
@@ -58,14 +61,14 @@ fn user_namespace(ids: Ids) -> Result<(), String> {
         return Err(format!("CLONE_NEWUSER: {}", io::Error::last_os_error()));
     }
     // An unprivileged user may not map a group before giving up setgroups(2).
-    let _ = std::fs::write("/proc/self/setgroups", "deny");
+    let _ = fs::write("/proc/self/setgroups", "deny");
     // One id, mapped to the same user: the command is root inside the namespace, which is what lets
     // it bind the ports a name resolves to, while every file it touches is still theirs on disk.
     for (file, line) in [
         ("/proc/self/uid_map", format!("0 {} 1\n", ids.uid)),
         ("/proc/self/gid_map", format!("0 {} 1\n", ids.gid)),
     ] {
-        std::fs::write(file, line).map_err(|e| format!("{file}: {e}"))?;
+        fs::write(file, line).map_err(|e| format!("{file}: {e}"))?;
     }
     // A namespace entered without a map cannot be left again, so it is checked rather than assumed:
     // an unmapped id would leave every file looking as if it belonged to nobody.
@@ -102,7 +105,7 @@ fn raise_loopback() -> Result<(), String> {
 
 fn loopback_ioctl(fd: libc::c_int) -> Result<(), String> {
     // SAFETY: the request fills an ifreq, which is all zeroes first so no field is uninitialised.
-    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    let mut req: libc::ifreq = unsafe { mem::zeroed() };
     for (i, byte) in b"lo".iter().enumerate() {
         req.ifr_name[i] = *byte as libc::c_char;
     }
@@ -122,7 +125,7 @@ fn loopback_ioctl(fd: libc::c_int) -> Result<(), String> {
 }
 
 /// Adds `ip` to the loopback interface, so a query sent to it arrives in this namespace.
-fn add_loopback_address(ip: std::net::Ipv4Addr) -> Result<(), String> {
+fn add_loopback_address(ip: Ipv4Addr) -> Result<(), String> {
     // SAFETY: the name is a NUL-terminated literal.
     let index = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
     if index == 0 {
@@ -148,7 +151,7 @@ fn add_loopback_address(ip: std::net::Ipv4Addr) -> Result<(), String> {
 
 /// An `RTM_NEWADDR` for `ip` as a host address of interface `index`, built as bytes because the
 /// netlink header and its attributes have no alignment guarantees worth relying on.
-fn new_address_message(index: u32, ip: std::net::Ipv4Addr) -> Vec<u8> {
+fn new_address_message(index: u32, ip: Ipv4Addr) -> Vec<u8> {
     const RTM_NEWADDR: u16 = 20;
     const NLM_F_REQUEST: u16 = 1;
     const NLM_F_ACK: u16 = 4;
@@ -186,7 +189,7 @@ fn new_address_message(index: u32, ip: std::net::Ipv4Addr) -> Vec<u8> {
 
 fn send_new_address(fd: libc::c_int, message: &[u8]) -> Result<(), String> {
     // SAFETY: a sockaddr_nl of the kernel's address, zeroed first so no field is uninitialised.
-    let mut to: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    let mut to: libc::sockaddr_nl = unsafe { mem::zeroed() };
     to.nl_family = libc::AF_NETLINK as libc::sa_family_t;
     // SAFETY: sendto with a valid buffer and length, and a sockaddr of the stated size.
     let sent = unsafe {
@@ -196,7 +199,7 @@ fn send_new_address(fd: libc::c_int, message: &[u8]) -> Result<(), String> {
             message.len(),
             0,
             (&raw const to).cast(),
-            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
         )
     };
     if sent < 0 {
@@ -266,10 +269,11 @@ fn is_loopback(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn a_new_address_message_is_one_the_kernel_can_read() {
-        let message = new_address_message(1, std::net::Ipv4Addr::new(192, 168, 1, 1));
+        let message = new_address_message(1, Ipv4Addr::new(192, 168, 1, 1));
         // The header says how long the whole message is, and the type says what it is.
         assert_eq!(
             u32::from_ne_bytes(message[0..4].try_into().unwrap()) as usize,

@@ -319,6 +319,7 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::Image;
     use crate::provider::{Api, Auth, CacheRetention, ToolResult};
 
     fn config(base_url: &str) -> ProviderConfig {
@@ -395,7 +396,7 @@ mod tests {
 
     #[test]
     fn an_attached_image_is_sent_as_a_data_url_beside_its_text() {
-        let image = crate::provider::Image {
+        let image = Image {
             media_type: "image/jpeg".into(),
             data: "BBBB".into(),
             name: "cat.jpg".into(),
@@ -426,7 +427,7 @@ mod tests {
     fn a_tool_result_image_travels_in_the_user_message_after_it() {
         // A Chat Completions tool message has no image field, so the picture follows it as a user
         // message, which is what the API accepts (D58).
-        let image = crate::provider::Image {
+        let image = Image {
             media_type: "image/png".into(),
             data: "AAAA".into(),
             name: "shot.png".into(),
@@ -453,7 +454,7 @@ mod tests {
 
     #[test]
     fn a_picture_with_no_words_still_gets_a_tool_message() {
-        let image = crate::provider::Image {
+        let image = Image {
             media_type: "image/png".into(),
             data: "AAAA".into(),
             name: "shot.png".into(),

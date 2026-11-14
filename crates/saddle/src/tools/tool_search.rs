@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use serde_json::Value;
+use std::mem;
 
 use crate::session::Session;
 use crate::tools::ToolOutput;
@@ -18,7 +19,7 @@ pub fn search(session: &mut Session, input: &Value) -> Result<ToolOutput> {
     // The registry lives on the session it has to ask, so it is taken out for the call and put
     // back afterwards: starting a server needs the engine and the audit log, which are the
     // session's too.
-    let mut registry = std::mem::take(&mut session.mcp);
+    let mut registry = mem::take(&mut session.mcp);
     let failing = registry.discover(session);
     let declared = registry.search(&query);
     // Named rather than listed: a tool the grant does not name is not the model's to reach, but

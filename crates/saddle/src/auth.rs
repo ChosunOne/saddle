@@ -99,6 +99,7 @@ impl AuthStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -128,7 +129,7 @@ mod tests {
         // working. `api-key` alone is a complete credential.
         let dir = tempdir();
         let path = dir.path().join("auth.json");
-        std::fs::write(&path, r#"{"openai":{"api-key":"sk-old"}}"#).unwrap();
+        fs::write(&path, r#"{"openai":{"api-key":"sk-old"}}"#).unwrap();
         let store = AuthStore::load(&path).unwrap();
         assert_eq!(store.key("openai"), Some("sk-old"));
         assert!(store.oauth("openai").is_none());
@@ -156,7 +157,7 @@ mod tests {
         // other's shape into the file.
         store.set("openai", "sk-1".to_owned());
         store.save(&path).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
         let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(saved["openai"]["api-key"], "sk-1");
         assert!(
@@ -169,7 +170,7 @@ mod tests {
             "the oauth entry grew a key field: {text}"
         );
         // The file stays private.
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "{mode:o}");
         // Logging out forgets it.
         assert!(store.remove("openai-chatgpt"));

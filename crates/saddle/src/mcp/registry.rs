@@ -4,11 +4,18 @@
 //! (D103), so a tool the grant does not name is never declared and never callable, however loudly
 //! the server advertises it.
 
+use crate::mcp::Exposure;
+use crate::mcp::host;
+use crate::mcp::http::Client as HttpClient;
+use crate::mcp::http::Outcome;
+use crate::mcp::lower;
+use saddle_policy::audit;
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::mcp::stdio::{Client, Tool};
 use crate::mcp::{McpEntry, first_line};
@@ -22,9 +29,9 @@ use crate::tools::ToolOutput;
 /// way — a length and a hash (D24, D112).
 pub fn arguments_record(input: &Value) -> Value {
     let text = input.to_string();
-    serde_json::json!({
+    json!({
         "bytes": text.len(),
-        "sha256": saddle_policy::audit::sha256_hex(text.as_bytes()),
+        "sha256": audit::sha256_hex(text.as_bytes()),
     })
 }
 
@@ -39,7 +46,7 @@ pub fn record_call(
     allow: Option<bool>,
     explanation: &str,
 ) -> Result<()> {
-    let args = serde_json::json!({
+    let args = json!({
         "via": "mcp",
         "server": server,
         "tool": tool,
@@ -76,7 +83,7 @@ fn parse(key: &str) -> Option<(&str, &str)> {
 /// How one running server is spoken to: a child's pipes, or the host's own requests (D107, D110).
 pub enum Connection {
     Stdio(Client),
-    Http(crate::mcp::http::Client),
+    Http(HttpClient),
 }
 
 /// One running server and its relay.
@@ -118,7 +125,7 @@ impl Registry {
             entries,
             host_env,
             tmp,
-            helper: std::env::current_exe().ok(),
+            helper: env::current_exe().ok(),
             ..Self::default()
         }
     }
@@ -202,19 +209,12 @@ impl Registry {
         match entry.transport()? {
             crate::mcp::Transport::Stdio { command, args } => {
                 let helper = self.helper.clone().context("locating the saddle binary")?;
-                let mut spec = crate::mcp::lower::spec(
-                    session,
-                    &grant,
-                    &entry,
-                    command,
-                    args,
-                    &self.host_env,
-                )?;
+                let mut spec = lower::spec(session, &grant, &entry, command, args, &self.host_env)?;
                 let mut bridge = self.tmp.as_deref().and_then(|dir| Bridge::start(dir).ok());
                 if let Some(bridge) = &bridge {
                     spec.net = Some(bridge.spec());
                 }
-                let roots = crate::mcp::host::roots(session);
+                let roots = host::roots(session);
                 let mut client = Client::start(server, &helper, &spec, entry.timeout(), roots)?;
                 let tools = {
                     let mut service = || {
@@ -237,9 +237,8 @@ impl Registry {
             crate::mcp::Transport::Http { url } => {
                 // A server with no child still has a reach: its net grants, narrowed from the
                 // agent's, are what every request of its own is decided against (D105, D110).
-                let reach = crate::mcp::lower::net_reach(session, &grant)?;
-                let mut client =
-                    crate::mcp::http::Client::start(server, url, reach, entry.timeout())?;
+                let reach = lower::net_reach(session, &grant)?;
+                let mut client = HttpClient::start(server, url, reach, entry.timeout())?;
                 client.initialize(session)?;
                 let tools = client.tools(session)?;
                 self.record(server, tools);
@@ -265,12 +264,10 @@ impl Registry {
 
     /// What one tool's exposure is, from its table: the tool's own word, the server's, or `hidden`
     /// when there is no table to ask (D117, D122).
-    fn exposure(&self, server: &str, tool: &str) -> crate::mcp::Exposure {
+    fn exposure(&self, server: &str, tool: &str) -> Exposure {
         self.entries
             .get(server)
-            .map_or(crate::mcp::Exposure::Deferred, |entry| {
-                entry.exposure_of(tool)
-            })
+            .map_or(Exposure::Deferred, |entry| entry.exposure_of(tool))
     }
 
     /// Whether a server is off: `hidden` in its table, or turned off for this session (D117, D123).
@@ -305,7 +302,7 @@ impl Registry {
     fn is_hidden(&self, server: &str) -> bool {
         self.entries
             .get(server)
-            .is_some_and(|entry| entry.exposure() == crate::mcp::Exposure::Hidden)
+            .is_some_and(|entry| entry.exposure() == Exposure::Hidden)
     }
 
     /// The servers whose table says `direct`, which are started when the session opens because
@@ -314,7 +311,7 @@ impl Registry {
         self.entries
             .iter()
             .filter(|(name, entry)| {
-                entry.exposure() == crate::mcp::Exposure::Direct
+                entry.exposure() == Exposure::Direct
                     && self.grants.iter().any(|g| &g.server == *name)
             })
             .map(|(name, _)| name.clone())
@@ -352,14 +349,12 @@ impl Registry {
                 ));
                 continue;
             };
-            if entry.exposure() == crate::mcp::Exposure::Hidden {
+            if entry.exposure() == Exposure::Hidden {
                 continue;
             }
             let how = match entry.exposure() {
-                crate::mcp::Exposure::Direct => "direct: its tools are in your list already",
-                crate::mcp::Exposure::Deferred | crate::mcp::Exposure::Hidden => {
-                    "deferred: search for one to declare it"
-                }
+                Exposure::Direct => "direct: its tools are in your list already",
+                Exposure::Deferred | Exposure::Hidden => "deferred: search for one to declare it",
             };
             let description = entry
                 .description
@@ -384,9 +379,9 @@ impl Registry {
         for grant in &self.grants {
             let entry = self.entries.get(&grant.server);
             let exposure = match entry.map(McpEntry::exposure) {
-                Some(crate::mcp::Exposure::Direct) => "direct",
-                Some(crate::mcp::Exposure::Hidden) => "hidden",
-                Some(crate::mcp::Exposure::Deferred) | None => "deferred",
+                Some(Exposure::Direct) => "direct",
+                Some(Exposure::Hidden) => "hidden",
+                Some(Exposure::Deferred) | None => "deferred",
             };
             let state = if self.servers.contains_key(&grant.server) {
                 "running".to_owned()
@@ -396,7 +391,7 @@ impl Registry {
                 "no [mcp.{}] table".to_owned().replace("{}", &grant.server)
             } else if self.suspended.contains(&grant.server) {
                 "off (this session)".to_owned()
-            } else if entry.is_some_and(|e| e.exposure() == crate::mcp::Exposure::Hidden) {
+            } else if entry.is_some_and(|e| e.exposure() == Exposure::Hidden) {
                 "off".to_owned()
             } else {
                 "not started".to_owned()
@@ -481,7 +476,7 @@ impl Registry {
             // table, and a catalogue that somehow holds the tool must not be a way past it
             // (D117, D122).
             if self.is_off(server)
-                || self.exposure(server, &tool.name) == crate::mcp::Exposure::Hidden
+                || self.exposure(server, &tool.name) == Exposure::Hidden
                 || !self.granted(server, &tool.name)
             {
                 continue;
@@ -528,7 +523,7 @@ impl Registry {
             if self.is_off(server) {
                 continue;
             }
-            let direct = self.exposure(server, &tool.name) == crate::mcp::Exposure::Direct;
+            let direct = self.exposure(server, &tool.name) == Exposure::Direct;
             if direct && self.granted(server, &tool.name) {
                 keys.insert(key.clone());
             }
@@ -589,7 +584,7 @@ impl Registry {
             Some(format!(
                 "`{server}` is off for this session: `/mcp enable {server}`"
             ))
-        } else if self.exposure(&server, &tool.name) == crate::mcp::Exposure::Hidden {
+        } else if self.exposure(&server, &tool.name) == Exposure::Hidden {
             Some(format!(
                 "`{server}` is turned off in config.toml (`exposure = \"hidden\"`)"
             ))
@@ -652,9 +647,9 @@ impl Registry {
                 }
             }
             Connection::Http(client) => match client.call(session, &tool.name, input)? {
-                crate::mcp::http::Outcome::Answered(text) => ToolOutput::ok(text),
-                crate::mcp::http::Outcome::Failed(text) => ToolOutput::err(text),
-                crate::mcp::http::Outcome::Denied(why) => ToolOutput::denied(&why),
+                Outcome::Answered(text) => ToolOutput::ok(text),
+                Outcome::Failed(text) => ToolOutput::err(text),
+                Outcome::Denied(why) => ToolOutput::denied(&why),
             },
         };
         let mut out = outcome;
@@ -681,11 +676,10 @@ impl Registry {
 
     #[cfg(test)]
     fn tool(name: &str) -> Tool {
-        use serde_json::json as object;
         Tool {
             name: name.to_owned(),
             description: format!("{name} does things"),
-            schema: object!({ "type": "object" }),
+            schema: json!({ "type": "object" }),
         }
     }
 
@@ -699,6 +693,7 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::Exposure;
     use serde_json::json;
 
     #[test]
@@ -709,7 +704,7 @@ mod tests {
         entries.insert(
             "scout".to_owned(),
             McpEntry {
-                exposure: crate::mcp::Exposure::Direct,
+                exposure: Exposure::Direct,
                 ..McpEntry::default()
             },
         );
@@ -750,10 +745,10 @@ mod tests {
         entries.insert(
             "scout".to_owned(),
             McpEntry {
-                exposure: crate::mcp::Exposure::Deferred,
+                exposure: Exposure::Deferred,
                 tool_exposure: BTreeMap::from([
-                    ("search".to_owned(), crate::mcp::Exposure::Direct),
-                    ("rm_rf".to_owned(), crate::mcp::Exposure::Hidden),
+                    ("search".to_owned(), Exposure::Direct),
+                    ("rm_rf".to_owned(), Exposure::Hidden),
                 ]),
                 ..McpEntry::default()
             },
@@ -792,14 +787,14 @@ mod tests {
         entries.insert(
             "front".to_owned(),
             McpEntry {
-                exposure: crate::mcp::Exposure::Direct,
+                exposure: Exposure::Direct,
                 ..McpEntry::default()
             },
         );
         entries.insert(
             "off".to_owned(),
             McpEntry {
-                exposure: crate::mcp::Exposure::Hidden,
+                exposure: Exposure::Hidden,
                 ..McpEntry::default()
             },
         );
@@ -854,14 +849,14 @@ mod tests {
         entries.insert(
             "front".to_owned(),
             McpEntry {
-                exposure: crate::mcp::Exposure::Direct,
+                exposure: Exposure::Direct,
                 ..McpEntry::default()
             },
         );
         entries.insert(
             "off".to_owned(),
             McpEntry {
-                exposure: crate::mcp::Exposure::Hidden,
+                exposure: Exposure::Hidden,
                 ..McpEntry::default()
             },
         );

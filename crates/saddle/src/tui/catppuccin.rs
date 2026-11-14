@@ -68,12 +68,6 @@ pub struct Flavour {
 
 /// `#rrggbb` as a colour, at compile time, so the table below can be the published one verbatim.
 const fn hex(value: &str) -> Color {
-    let bytes = value.as_bytes();
-    let at = if bytes.len() == 7 && bytes[0] == b'#' {
-        1
-    } else {
-        0
-    };
     // A closure cannot be called from a constant function, so this is a nested function.
     const fn digit(c: u8) -> u8 {
         match c {
@@ -86,6 +80,12 @@ const fn hex(value: &str) -> Color {
     const fn byte(hi: u8, lo: u8) -> u8 {
         digit(hi) * 16 + digit(lo)
     }
+    let bytes = value.as_bytes();
+    let at = if bytes.len() == 7 && bytes[0] == b'#' {
+        1
+    } else {
+        0
+    };
     Color::Rgb(
         byte(bytes[at], bytes[at + 1]),
         byte(bytes[at + 2], bytes[at + 3]),

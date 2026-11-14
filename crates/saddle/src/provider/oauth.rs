@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
+use std::str;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -562,7 +563,7 @@ fn decode(s: &str) -> String {
     while i < bytes.len() {
         match bytes[i] {
             b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or_default();
+                let hex = str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or_default();
                 match u8::from_str_radix(hex, 16) {
                     Ok(b) => {
                         out.push(b);
@@ -856,6 +857,7 @@ mod tests {
     use super::super::{Api, Auth, Provider, Reported, endpoint};
     use super::*;
     use crate::auth::AuthStore;
+    use std::path::PathBuf;
 
     fn flow() -> Settings {
         Flow {
@@ -1154,7 +1156,7 @@ mod tests {
         p.with_oauth(
             Flow::default(),
             tokens,
-            std::path::PathBuf::from("/nonexistent/auth.json"),
+            PathBuf::from("/nonexistent/auth.json"),
         );
         // The flow is empty here, so the refresh reports the incomplete endpoints rather than
         // pretending the token was renewed.

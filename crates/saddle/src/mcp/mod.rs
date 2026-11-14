@@ -3,6 +3,7 @@
 //! tools may be called; this module only reads what was declared and refuses a table that does not
 //! describe exactly one server.
 
+use serde::de::Error;
 pub mod host;
 pub mod http;
 pub mod lower;
@@ -101,7 +102,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let text = String::deserialize(deserializer)?;
-    Exposure::parse(&text).map_err(serde::de::Error::custom)
+    Exposure::parse(&text).map_err(Error::custom)
 }
 
 /// The per-tool map (D122): every value is an exposure, and every key is an exact tool name.
@@ -113,14 +114,11 @@ where
     let mut out = BTreeMap::new();
     for (name, text) in raw {
         if name.contains('*') {
-            return Err(serde::de::Error::custom(format!(
+            return Err(Error::custom(format!(
                 "`{name}` is a pattern: tool-exposure names tools exactly, the way the grant does"
             )));
         }
-        out.insert(
-            name,
-            Exposure::parse(&text).map_err(serde::de::Error::custom)?,
-        );
+        out.insert(name, Exposure::parse(&text).map_err(Error::custom)?);
     }
     Ok(out)
 }

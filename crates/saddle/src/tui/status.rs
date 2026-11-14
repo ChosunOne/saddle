@@ -4,7 +4,11 @@
 //! as nothing, and takes the separator in front of it along, so leaving out a `[ui] status` field
 //! never leaves a dangling `· ` in the line.
 
+use crate::provider;
+use crate::provider::Quota;
 use std::fmt;
+use std::mem;
+use std::time::SystemTime;
 
 use crate::provider::Usage;
 
@@ -150,7 +154,7 @@ impl Template {
                         ));
                     };
                     if !run.is_empty() {
-                        pieces.push(Piece::Text(std::mem::take(&mut run)));
+                        pieces.push(Piece::Text(mem::take(&mut run)));
                     }
                     pieces.push(Piece::Field(field));
                 }
@@ -218,13 +222,13 @@ pub struct StatusData<'a> {
     /// Whether a price is known at all, so `$0.00` (nothing spent yet) can be told apart from no
     /// price (D36).
     pub priced: bool,
-    pub quota: Option<&'a crate::provider::Quota>,
+    pub quota: Option<&'a Quota>,
     pub context: u64,
     pub window: u64,
     pub workspace: &'a str,
     /// The clock a refill is counted down against, passed in rather than read, so the line renders
     /// the same way twice (D49).
-    pub now: std::time::SystemTime,
+    pub now: SystemTime,
 }
 
 impl StatusData<'_> {
@@ -307,10 +311,7 @@ impl StatusData<'_> {
         for window in &q.windows {
             let mut text = format!("{} {:.0}%", window.label, window.percent);
             if let Some(reset) = &window.reset {
-                text.push_str(&format!(
-                    " ↺{}",
-                    crate::provider::reset_left(reset, self.now)
-                ));
+                text.push_str(&format!(" ↺{}", provider::reset_left(reset, self.now)));
             }
             parts.push(text);
         }
@@ -319,10 +320,10 @@ impl StatusData<'_> {
         // fact, and `↺` says "until" without a word (D49).
         match (&q.reset, text.is_empty()) {
             (Some(reset), false) => {
-                format!("{text} ↺{}", crate::provider::reset_left(reset, self.now))
+                format!("{text} ↺{}", provider::reset_left(reset, self.now))
             }
             (Some(reset), true) => {
-                format!("↺{}", crate::provider::reset_left(reset, self.now))
+                format!("↺{}", provider::reset_left(reset, self.now))
             }
             (None, _) => text,
         }
@@ -353,6 +354,9 @@ mod tests {
     use super::*;
     use crate::provider::{Price, Quota, quota_from_page};
     use serde_json::json;
+    use std::time;
+    use std::time::Duration;
+    use std::time::SystemTime;
 
     fn data<'a>(usage: Usage, cost: f64, quota: Option<&'a Quota>) -> StatusData<'a> {
         StatusData {
@@ -365,7 +369,7 @@ mod tests {
             context: 1_300,
             window: 128_000,
             // A fixed clock, so the line renders the same way twice (D49).
-            now: std::time::UNIX_EPOCH,
+            now: time::UNIX_EPOCH,
             workspace: "/ws",
         }
     }
@@ -508,7 +512,7 @@ mod tests {
             reset: Some("2026-11-12T08:26:09.000Z".into()),
             ..Quota::default()
         };
-        let render = |now: std::time::SystemTime| {
+        let render = |now: SystemTime| {
             let mut d = data(Usage::default(), 0.0, Some(&quota));
             d.now = now;
             Template::parse("{quota}").unwrap().render(&d)
@@ -552,7 +556,7 @@ mod tests {
             "secondary_window": {"used_percent": 100, "limit_window_seconds": 604800, "reset_at": 1800600000}
         }})).0;
         let mut d = data(Usage::default(), 0.0, Some(&q));
-        d.now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1799996400);
+        d.now = time::UNIX_EPOCH + Duration::from_secs(1799996400);
         let rendered = Template::parse("{quota}").unwrap().render(&d);
         assert_eq!(rendered, "5h 75% ↺1h, weekly 0% ↺7d");
     }

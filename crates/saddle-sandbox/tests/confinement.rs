@@ -1,11 +1,22 @@
 //! Runs probes inside the real sandbox. The probe is this test binary itself, re-run with
 //! `PROBE` set, so the tests depend on nothing but the kernel.
 
+use std::env;
+use std::fs;
+use std::fs::OpenOptions;
+use std::io;
+use std::io::Read;
+use std::io::Result;
 use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 use saddle_cap::sandbox::{SYSTEM_READ, SYSTEM_WRITE};
 use saddle_sandbox::{SandboxSpec, availability, run, spawn};
@@ -17,34 +28,31 @@ static NEVER: AtomicBool = AtomicBool::new(false);
 /// The probe side. Does nothing unless started by one of the tests below.
 #[test]
 fn probe() {
-    let Ok(action) = std::env::var(PROBE) else {
+    let Ok(action) = env::var(PROBE) else {
         return;
     };
     let (verb, arg) = action.split_once(':').unwrap_or((action.as_str(), ""));
     // A command the host holds a conversation with answers every line it is given, which is what
     // proves a spawned child kept its own stdin and stdout (D106).
     if verb == "chat" {
-        let mut out = std::io::stdout();
-        for line in std::io::stdin().lines() {
+        let mut out = io::stdout();
+        for line in io::stdin().lines() {
             writeln!(out, "{MARK}echo {}", line.unwrap()).unwrap();
             out.flush().unwrap();
         }
-        std::process::exit(0);
+        process::exit(0);
     }
-    let result: std::io::Result<String> = match verb {
-        "read" => std::fs::read(arg).map(|b| format!("{} bytes", b.len())),
-        "write" => std::fs::write(arg, b"x").map(|_| "written".into()),
-        "truncate" => std::fs::OpenOptions::new()
+    let result: Result<String> = match verb {
+        "read" => fs::read(arg).map(|b| format!("{} bytes", b.len())),
+        "write" => fs::write(arg, b"x").map(|_| "written".into()),
+        "truncate" => OpenOptions::new()
             .write(true)
             .open(arg)
             .and_then(|f| f.set_len(0))
             .map(|_| "truncated".into()),
-        "tcp" => std::net::TcpStream::connect(arg).map(|_| "connected".into()),
-        "unix" => std::os::unix::net::UnixStream::connect(arg).map(|_| "connected".into()),
-        "env" => Ok(std::env::vars()
-            .map(|(k, _)| k)
-            .collect::<Vec<_>>()
-            .join(",")),
+        "tcp" => TcpStream::connect(arg).map(|_| "connected".into()),
+        "unix" => UnixStream::connect(arg).map(|_| "connected".into()),
+        "env" => Ok(env::vars().map(|(k, _)| k).collect::<Vec<_>>().join(",")),
         _ => panic!("unknown probe {verb}"),
     };
     let line = match result {
@@ -52,8 +60,8 @@ fn probe() {
         Err(e) => format!("{MARK}err {}", e.raw_os_error().unwrap_or(-1)),
     };
     println!("{line}");
-    std::io::stdout().flush().unwrap();
-    std::process::exit(0);
+    io::stdout().flush().unwrap();
+    process::exit(0);
 }
 
 struct Fixture {
@@ -69,13 +77,13 @@ impl Fixture {
             writable: tempfile::tempdir().unwrap(),
             secret: tempfile::tempdir().unwrap(),
         };
-        std::fs::write(f.granted.path().join("file"), b"granted").unwrap();
-        std::fs::write(f.secret.path().join("file"), b"secret").unwrap();
+        fs::write(f.granted.path().join("file"), b"granted").unwrap();
+        fs::write(f.secret.path().join("file"), b"secret").unwrap();
         f
     }
 
     fn spec(&self, action: &str) -> SandboxSpec {
-        let exe = std::env::current_exe().unwrap();
+        let exe = env::current_exe().unwrap();
         let mut read: Vec<PathBuf> = SYSTEM_READ.iter().map(PathBuf::from).collect();
         read.push(exe.parent().unwrap().to_path_buf());
         read.push(self.granted.path().to_path_buf());
@@ -153,7 +161,7 @@ fn a_spawned_command_keeps_its_own_stdin_and_stdout() {
         }
         let Some(answer) = answer else {
             let mut why = String::new();
-            std::io::Read::read_to_string(&mut stderr, &mut why).unwrap();
+            Read::read_to_string(&mut stderr, &mut why).unwrap();
             panic!("no answer to {word}: {why}");
         };
         assert_eq!(answer, format!("echo {word}"));
@@ -212,10 +220,7 @@ fn writes_only_writable_paths() {
         )),
         EACCES
     );
-    assert_eq!(
-        std::fs::read(f.granted.path().join("file")).unwrap(),
-        b"granted"
-    );
+    assert_eq!(fs::read(f.granted.path().join("file")).unwrap(), b"granted");
 }
 
 #[test]
@@ -245,7 +250,7 @@ fn environment_is_exactly_the_spec() {
         return;
     }
     // SAFETY: tests in this binary do not read this variable concurrently.
-    unsafe { std::env::set_var("SADDLE_TEST_SECRET", "hunter2") };
+    unsafe { env::set_var("SADDLE_TEST_SECRET", "hunter2") };
     let f = Fixture::new();
     let mut names: Vec<String> = f
         .probe("env")
@@ -268,7 +273,7 @@ fn timeout_kills_the_command() {
     let mut spec = f.spec("unused");
     spec.argv = vec!["sh".into(), "-c".into(), "sleep 30".into()];
     let helper = Path::new(env!("CARGO_BIN_EXE_saddle-sandbox"));
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let out = run(
         helper,
         &[],
@@ -313,6 +318,8 @@ fn missing_program_exits_127() {
 
 #[test]
 fn cancel_kills_the_command_and_its_children() {
+    static CANCEL: AtomicBool = AtomicBool::new(false);
+
     if !sandbox_available() {
         return;
     }
@@ -320,12 +327,11 @@ fn cancel_kills_the_command_and_its_children() {
     let mut spec = f.spec("unused");
     spec.argv = vec!["sh".into(), "-c".into(), "sleep 30 & sleep 30".into()];
     let helper = Path::new(env!("CARGO_BIN_EXE_saddle-sandbox"));
-    static CANCEL: AtomicBool = AtomicBool::new(false);
-    let setter = std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_millis(200));
+    let setter = thread::spawn(|| {
+        thread::sleep(Duration::from_millis(200));
         CANCEL.store(true, Ordering::SeqCst);
     });
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let out = run(
         helper,
         &[],

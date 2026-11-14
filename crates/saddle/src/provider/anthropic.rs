@@ -412,10 +412,13 @@ fn drop_before_fallback(parts: &mut Vec<Part>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::Auth;
+    use crate::provider::Image;
+    use crate::provider::ToolDef;
     use crate::provider::ToolResult;
 
-    fn image(name: &str) -> crate::provider::Image {
-        crate::provider::Image {
+    fn image(name: &str) -> Image {
+        Image {
             media_type: "image/png".into(),
             data: "AAAA".into(),
             name: name.into(),
@@ -486,7 +489,7 @@ mod tests {
 
     #[test]
     fn an_attached_image_is_sent_as_an_image_block_beside_its_text() {
-        let image = crate::provider::Image {
+        let image = Image {
             media_type: "image/png".into(),
             data: "AAAA".into(),
             name: "shot.png".into(),
@@ -718,10 +721,10 @@ mod tests {
             key_header: None,
             cache_retention: Default::default(),
             cache_affinity: false,
-            auth: crate::provider::Auth::ApiKey,
+            auth: Auth::ApiKey,
             oauth: None,
         };
-        let tools = [crate::provider::ToolDef {
+        let tools = [ToolDef {
             name: "read".into(),
             description: "d".into(),
             schema: json!({"type":"object"}),

@@ -3,8 +3,15 @@
 //! is drained into a bounded tail, never mixed into the protocol, and quoted only when something
 //! failed: "exited with status 1" without the reason is the message that costs an hour.
 
+use crate::mcp::host;
+use crate::tools;
+use saddle_cap::sandbox::SandboxSpec;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+#[cfg(test)]
+use std::process::Command;
+#[cfg(test)]
+use std::process::Stdio;
 use std::process::{Child, ChildStdin};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
@@ -55,13 +62,13 @@ impl Client {
     pub fn start(
         name: &str,
         helper: &Path,
-        spec: &saddle_cap::sandbox::SandboxSpec,
+        spec: &SandboxSpec,
         timeout: Duration,
         roots: Vec<Value>,
     ) -> Result<Self> {
         // The helper is this binary, re-executed: without its argument it would run the CLI
         // instead of applying the sandbox.
-        let child = saddle_sandbox::spawn(helper, &[crate::tools::HELPER_ARG], spec)
+        let child = saddle_sandbox::spawn(helper, &[tools::HELPER_ARG], spec)
             .with_context(|| format!("starting the `{name}` server"))?;
         let mut client = Self::from_child(name, child)?;
         client.timeout = timeout;
@@ -221,7 +228,7 @@ impl Client {
                 // holding the pipe it must go back down (D114). The session is out of reach in a
                 // `service` closure, so the answer comes from what the client was given.
                 Ok(Message::Request { id, method, .. }) => {
-                    let reply = crate::mcp::host::answer(&self.roots, &method);
+                    let reply = host::answer(&self.roots, &method);
                     self.send(&protocol::response(id, reply))?;
                     continue;
                 }
@@ -339,11 +346,11 @@ fn content_text(result: &Value) -> String {
 
 /// A command with the pipes a client needs, for a caller that is not using the sandbox (tests).
 #[cfg(test)]
-fn piped(mut command: std::process::Command) -> Result<Child> {
+fn piped(mut command: Command) -> Result<Child> {
     command
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .context("starting the fake server")
 }
@@ -351,6 +358,7 @@ fn piped(mut command: std::process::Command) -> Result<Child> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     /// A server that answers the two methods a session needs, in the order they are asked, so the
     /// transport is checked without a sandbox or a real MCP implementation.
@@ -370,7 +378,7 @@ done
 "#;
 
     fn fake() -> Client {
-        let mut command = std::process::Command::new("/bin/sh");
+        let mut command = Command::new("/bin/sh");
         command.arg("-c").arg(FAKE);
         Client::from_child("fake", piped(command).unwrap()).unwrap()
     }
@@ -394,7 +402,7 @@ done
 
     #[test]
     fn a_server_that_dies_is_reported_with_what_it_said() {
-        let mut command = std::process::Command::new("/bin/sh");
+        let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
             .arg("echo 'no database for you' >&2; exit 3");

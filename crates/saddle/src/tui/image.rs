@@ -9,6 +9,7 @@
 //! the image's pixels — the terminal scales it — so saddle needs no image decoder.
 
 use std::fmt::Write as _;
+use std::str;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -189,7 +190,7 @@ fn kitty(png: &[u8], pixels: (u32, u32), window: &Window, id: u32) -> String {
     let chunks: Vec<&str> = b64
         .as_bytes()
         .chunks(4096)
-        .map(|c| std::str::from_utf8(c).unwrap_or_default())
+        .map(|c| str::from_utf8(c).unwrap_or_default())
         .collect();
     let n = chunks.len();
     let mut out = String::new();

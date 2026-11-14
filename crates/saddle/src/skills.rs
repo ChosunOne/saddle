@@ -17,7 +17,10 @@
 //! as with instruction files: a project skill of the same name replaces a user one, and the note
 //! says which it replaced.
 
+use crate::ignore;
 use std::collections::BTreeMap;
+use std::fmt::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -137,8 +140,8 @@ fn skip_name(name: &str) -> bool {
 
 /// Adds the rules of every ignore file in `dir`, which sits at `rel` below the scan root.
 fn load_ignores(dir: &Path, rel: &str, rules: &mut Rules) {
-    for name in crate::ignore::FILES {
-        if let Ok(text) = std::fs::read_to_string(dir.join(name)) {
+    for name in ignore::FILES {
+        if let Ok(text) = fs::read_to_string(dir.join(name)) {
             rules.add(&text, rel);
         }
     }
@@ -177,7 +180,7 @@ fn load_dir(
         }
         return Ok(());
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = fs::read_dir(dir) else {
         return Ok(());
     };
     let mut names: Vec<String> = entries
@@ -196,7 +199,7 @@ fn load_dir(
             format!("{rel}/{name}")
         };
         // `metadata` follows a link, so a linked directory is searched and a linked file read.
-        let Ok(meta) = std::fs::metadata(&child) else {
+        let Ok(meta) = fs::metadata(&child) else {
             continue;
         };
         if meta.is_dir() {
@@ -437,7 +440,7 @@ pub fn listing(skills: &[Skill]) -> String {
     );
     for skill in shown {
         let file = skill.dir.join(FILE);
-        let _ = std::fmt::Write::write_fmt(
+        let _ = Write::write_fmt(
             &mut s,
             format_args!(
                 "<skill name=\"{}\" file=\"{}\">\n{}\n</skill>\n",
@@ -506,6 +509,8 @@ fn escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs as unix_fs;
 
     fn fields(text: &str) -> BTreeMap<String, String> {
         frontmatter(text).expect("frontmatter")
@@ -617,7 +622,7 @@ mod tests {
         let ws = dir.path();
         assert_eq!(project_base(ws), ws.join(".agents/skills"));
         // A skill directory somewhere else is not the project's.
-        std::fs::create_dir_all(ws.join("crates/sub/.agents/skills/x")).unwrap();
+        fs::create_dir_all(ws.join("crates/sub/.agents/skills/x")).unwrap();
         assert_ne!(project_base(ws), ws.join("crates/sub/.agents/skills"));
     }
 
@@ -760,19 +765,19 @@ mod tests {
         // target of the link rather than the link.
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("elsewhere/x");
-        std::fs::create_dir_all(&real).unwrap();
-        std::fs::write(real.join(FILE), "---\nname: x\ndescription: d\n---\nbody\n").unwrap();
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join(FILE), "---\nname: x\ndescription: d\n---\nbody\n").unwrap();
         let mut skills = Vec::new();
         let mut notes = Vec::new();
         let link = dir.path().join("skills/x");
-        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        unix_fs::symlink(&real, &link).unwrap();
         add(
             &mut skills,
             &mut notes,
             &link.join(FILE),
             "~/skills/x/SKILL.md".into(),
-            std::fs::read_to_string(link.join(FILE)).unwrap(),
+            fs::read_to_string(link.join(FILE)).unwrap(),
             32,
         );
         assert_eq!(skills.len(), 1, "{notes:?}");

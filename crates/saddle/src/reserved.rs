@@ -167,31 +167,33 @@ fn put(ws: &Dir, path: &Path, entry: &Entry) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs as unix_fs;
 
     #[test]
     fn hooks_and_config_are_put_back() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
-        std::fs::create_dir_all(root.join(".git/modules/vendor/lib/hooks")).unwrap();
-        std::fs::write(root.join(".git/config"), "[core]\n").unwrap();
-        std::fs::write(root.join(".git/hooks/pre-commit.sample"), "sample").unwrap();
-        std::fs::write(root.join(".git/modules/vendor/lib/config"), "[core]\n").unwrap();
+        fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        fs::create_dir_all(root.join(".git/modules/vendor/lib/hooks")).unwrap();
+        fs::write(root.join(".git/config"), "[core]\n").unwrap();
+        fs::write(root.join(".git/hooks/pre-commit.sample"), "sample").unwrap();
+        fs::write(root.join(".git/modules/vendor/lib/config"), "[core]\n").unwrap();
         let ws = Dir::open_ambient_dir(root, cap_std::ambient_authority()).unwrap();
         let before = take(&ws).unwrap();
 
-        std::fs::write(root.join(".git/config"), "[core]\nfsmonitor = evil\n").unwrap();
-        std::fs::write(root.join(".git/hooks/pre-commit"), "#!/bin/sh\nevil").unwrap();
-        std::fs::remove_file(root.join(".git/hooks/pre-commit.sample")).unwrap();
-        std::fs::write(
+        fs::write(root.join(".git/config"), "[core]\nfsmonitor = evil\n").unwrap();
+        fs::write(root.join(".git/hooks/pre-commit"), "#!/bin/sh\nevil").unwrap();
+        fs::remove_file(root.join(".git/hooks/pre-commit.sample")).unwrap();
+        fs::write(
             root.join(".git/modules/vendor/lib/hooks/post-checkout"),
             "evil",
         )
         .unwrap();
         // An ordinary file is not restored: only the reserved paths are (D42 no longer reserves a
         // workspace policy, because it is not read from the tree).
-        std::fs::remove_file(root.join(".git/modules/vendor/lib/config")).unwrap();
-        std::fs::write(root.join("src.rs"), "ordinary edit").unwrap();
+        fs::remove_file(root.join(".git/modules/vendor/lib/config")).unwrap();
+        fs::write(root.join("src.rs"), "ordinary edit").unwrap();
 
         let changes = restore(&ws, &before).unwrap();
         let paths: Vec<String> = changes
@@ -210,7 +212,7 @@ mod tests {
         );
         assert_eq!(take(&ws).unwrap(), before);
         assert_eq!(
-            std::fs::read_to_string(root.join("src.rs")).unwrap(),
+            fs::read_to_string(root.join("src.rs")).unwrap(),
             "ordinary edit"
         );
     }
@@ -220,14 +222,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        fs::create_dir_all(root.join(".git/hooks")).unwrap();
         let ws = Dir::open_ambient_dir(root, cap_std::ambient_authority()).unwrap();
         let before = take(&ws).unwrap();
 
-        std::fs::remove_dir(root.join(".git/hooks")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.join(".git/hooks")).unwrap();
+        fs::remove_dir(root.join(".git/hooks")).unwrap();
+        unix_fs::symlink(outside.path(), root.join(".git/hooks")).unwrap();
         restore(&ws, &before).unwrap();
         assert!(root.join(".git/hooks").symlink_metadata().unwrap().is_dir());
-        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 }

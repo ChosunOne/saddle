@@ -3,6 +3,7 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::config::CompactionConfig;
 use crate::provider::{Item, Part};
@@ -31,7 +32,7 @@ pub struct Settings {
     pub keep_recent: u64,
     pub idle: bool,
     pub idle_fraction: f64,
-    pub idle_after: std::time::Duration,
+    pub idle_after: Duration,
     pub background: bool,
     pub background_fraction: f64,
 }
@@ -55,9 +56,7 @@ impl Settings {
             keep_recent: c.keep_recent_tokens.unwrap_or(DEFAULT_KEEP_RECENT),
             idle: c.idle.unwrap_or(true),
             idle_fraction: fraction(c.idle_fraction, DEFAULT_IDLE_FRACTION),
-            idle_after: std::time::Duration::from_secs(
-                c.idle_seconds.unwrap_or(DEFAULT_IDLE_SECONDS),
-            ),
+            idle_after: Duration::from_secs(c.idle_seconds.unwrap_or(DEFAULT_IDLE_SECONDS)),
             background: c.background.unwrap_or(true),
             background_fraction: fraction(c.background_fraction, DEFAULT_BACKGROUND_FRACTION),
         }

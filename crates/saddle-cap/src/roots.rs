@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Error;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -171,7 +172,7 @@ pub enum RootError {
     Unresolvable {
         name: RootName,
         path: PathBuf,
-        source: std::io::Error,
+        source: Error,
     },
     #[error("root `{name}` at {path} is not a directory")]
     NotDir { name: RootName, path: PathBuf },
@@ -292,6 +293,7 @@ pub fn normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn rel_paths_cannot_escape() {
@@ -306,7 +308,7 @@ mod tests {
     #[test]
     fn locate_picks_innermost_root() {
         let ws = tempfile::tempdir().unwrap();
-        std::fs::create_dir(ws.path().join("vendor")).unwrap();
+        fs::create_dir(ws.path().join("vendor")).unwrap();
         let roots = Roots::resolve(
             [
                 (RootName::workspace(), ws.path().to_path_buf()),

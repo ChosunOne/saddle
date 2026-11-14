@@ -5,6 +5,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use self::Direction::{Export, Import};
 use crate::scope::Scope;
 
 pub const HOST_PACKAGE: &str = "saddle:host";
@@ -85,7 +86,6 @@ pub fn classify(direction: Direction, name: &str) -> Requirement {
         None => return Requirement::Refused(format!("unversioned; this host supports {line}x")),
     }
 
-    use Direction::*;
     let scope = |s| Requirement::Scope(s);
     match (direction, n.namespace, n.package, n.interface) {
         (Import, "saddle", "host", i) => match i {

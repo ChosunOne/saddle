@@ -36,10 +36,15 @@
 //! `api.synthetic.new`, `api.exa.ai` and `mcp.exa.ai` are the hosts that have to be granted, and the
 //! same audit log records each one.
 
+use crate::agent;
+use crate::auth::AuthStore;
+use crate::provider::SearchTarget;
 use anyhow::Result;
 use saddle_cap::{Principal, Scope};
 use saddle_policy::{Kind, Request};
 use serde_json::{Value, json};
+use std::env;
+use std::result::Result as StdResult;
 
 use super::{ToolOutput, fetch, num_field};
 use crate::session::Session;
@@ -52,7 +57,7 @@ const MAX_RESULTS: u64 = 100;
 const MAX_BYTES: usize = 64 * 1024;
 /// What one expanded result may carry. This is the agent's own result limit, so a page that fits
 /// here is not cut a second time on the way into the context (D82).
-const MAX_FULL: usize = crate::agent::RESULT_LIMIT;
+const MAX_FULL: usize = agent::RESULT_LIMIT;
 /// How much of one quoted passage the model is shown. Exa's own highlights are short excerpts, but
 /// Synthetic's search returns whole page texts under that key, so without a ceiling one result fills
 /// the entire answer and the other four are lost.
@@ -67,7 +72,7 @@ const MAX_REPLY: u64 = 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Backend {
     /// The provider in use searches on its own, and its own key pays for it (D82).
-    Provider(crate::provider::SearchTarget),
+    Provider(SearchTarget),
     /// Exa's REST search, with a key.
     ExaRest,
     /// Exa's hosted MCP server, which answers without a key.
@@ -296,7 +301,7 @@ fn choose(session: &mut Session) -> Result<Backend, ToolOutput> {
 /// absence of a documented schema is survivable.
 fn provider_search(
     session: &mut Session,
-    target: &crate::provider::SearchTarget,
+    target: &SearchTarget,
     query: &str,
     count: u64,
 ) -> Result<ToolOutput> {
@@ -354,14 +359,14 @@ fn provider_search(
 }
 
 /// The provider key: the variable it names, then the store `/login` writes.
-fn provider_key(session: &Session, target: &crate::provider::SearchTarget) -> Option<String> {
+fn provider_key(session: &Session, target: &SearchTarget) -> Option<String> {
     if let Some(var) = &target.key_env
-        && let Ok(key) = std::env::var(var)
+        && let Ok(key) = env::var(var)
         && !key.trim().is_empty()
     {
         return Some(key);
     }
-    let store = crate::auth::AuthStore::load(&session.setup.paths.auth_store()).ok()?;
+    let store = AuthStore::load(&session.setup.paths.auth_store()).ok()?;
     store
         .key(&target.provider)
         .filter(|k| !k.trim().is_empty())
@@ -391,12 +396,12 @@ fn provider_explain(status: u16, body: &str, provider: &str) -> String {
 /// The Exa key: the environment first, so a session can be given one for a single run, then the
 /// store `/login` writes.
 pub(crate) fn exa_key(session: &Session) -> Option<String> {
-    if let Ok(key) = std::env::var("EXA_API_KEY")
+    if let Ok(key) = env::var("EXA_API_KEY")
         && !key.trim().is_empty()
     {
         return Some(key);
     }
-    let store = crate::auth::AuthStore::load(&session.setup.paths.auth_store()).ok()?;
+    let store = AuthStore::load(&session.setup.paths.auth_store()).ok()?;
     store.key("exa").map(str::to_owned)
 }
 
@@ -531,7 +536,7 @@ fn permit(
     method: &str,
     target: &fetch::Target,
     headers: &[&str],
-) -> Result<std::result::Result<(), ToolOutput>> {
+) -> Result<StdResult<(), ToolOutput>> {
     let names: Vec<String> = headers.iter().map(|h| (*h).to_owned()).collect();
     let d = session.decide(
         &Principal::Agent,
@@ -773,6 +778,7 @@ fn parse_mcp(body: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str;
 
     #[test]
     fn a_rest_answer_becomes_numbered_results() {
@@ -922,7 +928,7 @@ mod tests {
         assert_eq!(whole_text("short", "https://x/"), "short");
         // A cut never splits a character.
         let multibyte = "é".repeat(MAX_FULL);
-        assert!(std::str::from_utf8(whole_text(&multibyte, "https://x/").as_bytes()).is_ok());
+        assert!(str::from_utf8(whole_text(&multibyte, "https://x/").as_bytes()).is_ok());
     }
 
     #[test]
@@ -1081,6 +1087,6 @@ mod tests {
         assert_eq!(cut("short"), "short");
         // A cut never splits a character.
         let multibyte = "é".repeat(MAX_BYTES);
-        assert!(std::str::from_utf8(cut(&multibyte).as_bytes()).is_ok());
+        assert!(str::from_utf8(cut(&multibyte).as_bytes()).is_ok());
     }
 }

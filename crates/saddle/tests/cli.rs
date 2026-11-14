@@ -1,12 +1,28 @@
 //! End to end through the binary: the policy in force, decisions, reserved paths, the exec sandbox,
 //! network grants and the audit log, in a throwaway workspace with its own XDG directories.
 
+use std::fs;
+use std::fs::Permissions;
 use std::io::BufRead as _;
+use std::io::BufReader;
+use std::io::Read;
+use std::io::Write;
+use std::net::TcpListener;
+use std::net::TcpStream;
+use std::os::unix::fs as unix_fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::process::{Command, Output};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::thread::JoinHandle;
+use std::time::Duration;
+use std::time::Instant;
 
 const POLICY: &str = r#"
 version = 1
@@ -35,12 +51,12 @@ impl Env {
             home: tempfile::tempdir().unwrap(),
         };
         let ws = env.ws.path();
-        std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
-        std::fs::write(ws.join(".git/config"), "[core]\n").unwrap();
+        fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+        fs::write(ws.join(".git/config"), "[core]\n").unwrap();
         env.write_policy(POLICY);
-        std::fs::write(ws.join("README"), "hello\n").unwrap();
-        std::fs::write(ws.join(".env"), "TOKEN=1\n").unwrap();
-        std::fs::write(env.outside.path().join("secret"), "secret\n").unwrap();
+        fs::write(ws.join("README"), "hello\n").unwrap();
+        fs::write(ws.join(".env"), "TOKEN=1\n").unwrap();
+        fs::write(env.outside.path().join("secret"), "secret\n").unwrap();
         env
     }
 
@@ -61,9 +77,9 @@ impl Env {
     /// what the file is checked against, so it is written here (D63).
     fn write_override(&self, text: &str) {
         let path = self.override_path();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         let ws = self.ws.path().canonicalize().unwrap();
-        std::fs::write(
+        fs::write(
             &path,
             format!("workspace = {:?}\n{text}", ws.display().to_string()),
         )
@@ -74,33 +90,33 @@ impl Env {
     /// which provider it is talking to (D82).
     fn write_config(&self, text: &str) {
         let path = self.policy_path();
-        let base = std::fs::read_to_string(&path).unwrap_or_default();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, format!("{text}{base}")).unwrap();
+        let base = fs::read_to_string(&path).unwrap_or_default();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("{text}{base}")).unwrap();
     }
 
     /// The base grants: `[agent]` in `config.toml` (D63).
     fn write_policy(&self, text: impl AsRef<str>) {
         let agent = agent_of(text.as_ref());
         let path = self.policy_path();
-        let base = std::fs::read_to_string(&path).unwrap_or_default();
+        let base = fs::read_to_string(&path).unwrap_or_default();
         let mut doc: toml::Table = base.parse().unwrap_or_default();
         doc.insert("agent".into(), agent);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
     }
 
     /// Changes the base grants in place, so a test does not have to spell the serialised TOML.
     fn edit_agent(&self, change: impl FnOnce(&mut toml::Table)) {
         let path = self.policy_path();
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let text = fs::read_to_string(&path).unwrap_or_default();
         let mut doc: toml::Table = text.parse().unwrap_or_default();
         let agent = doc
             .entry("agent")
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
         change(agent.as_table_mut().unwrap());
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
     }
 
     fn workspace_key(&self) -> String {
@@ -114,7 +130,7 @@ impl Env {
     }
 
     fn policy(&self) -> String {
-        std::fs::read_to_string(self.policy_path()).unwrap()
+        fs::read_to_string(self.policy_path()).unwrap()
     }
 
     fn saddle(&self, args: &[&str]) -> Output {
@@ -147,7 +163,7 @@ impl Env {
 
     /// The skills a run advertised: discovery writes one `skill` record, which is what the prompt
     /// listing is built from, so this is the observable form of "the model was told about it".
-    fn advertised(&self, home: &std::path::Path) -> Vec<String> {
+    fn advertised(&self, home: &Path) -> Vec<String> {
         let out = saddle_in(self, home, &["tool", "ls", r#"{"path":"."}"#]);
         assert!(out.status.success(), "{}", stderr(&out));
         let log = self
@@ -155,7 +171,7 @@ impl Env {
             .last()
             .cloned()
             .expect("a log was written");
-        std::fs::read_to_string(log)
+        fs::read_to_string(log)
             .unwrap()
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -178,7 +194,7 @@ impl Env {
     fn audit(&self) -> String {
         self.audit_logs()
             .iter()
-            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .filter_map(|p| fs::read_to_string(p).ok())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -186,7 +202,7 @@ impl Env {
     fn audit_logs(&self) -> Vec<PathBuf> {
         let dir = self.xdg.path().join("state/saddle/audit");
         // No run yet means no audit directory, which is not a failure.
-        let Ok(entries) = std::fs::read_dir(dir) else {
+        let Ok(entries) = fs::read_dir(dir) else {
             return Vec::new();
         };
         let mut logs: Vec<PathBuf> = entries.map(|e| e.unwrap().path()).collect();
@@ -263,7 +279,7 @@ fn a_workspace_layers_its_own_file_on_the_base() {
 
     // A tree-level file is reported and not read.
     env.write_override("version = 1\n");
-    std::fs::write(
+    fs::write(
         env.path("saddle.toml"),
         "version = 1\n\n[agent]\nnet = [{ host = \"*\" }]\n",
     )
@@ -318,7 +334,7 @@ fn file_tools_follow_the_policy() {
     );
     assert!(ok, "{text}");
     assert_eq!(
-        std::fs::read_to_string(env.path("src/new.rs")).unwrap(),
+        fs::read_to_string(env.path("src/new.rs")).unwrap(),
         "fn main() {}"
     );
 
@@ -327,10 +343,7 @@ fn file_tools_follow_the_policy() {
         serde_json::json!({"path": "README", "old": "hello", "new": "goodbye"}),
     );
     assert!(ok, "{text}");
-    assert_eq!(
-        std::fs::read_to_string(env.path("README")).unwrap(),
-        "goodbye\n"
-    );
+    assert_eq!(fs::read_to_string(env.path("README")).unwrap(), "goodbye\n");
 
     let denied = |name: &str, input: serde_json::Value, expect: &str| {
         let (ok, text) = env.tool(name, input);
@@ -367,7 +380,7 @@ fn file_tools_follow_the_policy() {
     );
 
     // A symlink inside the workspace that points at a reserved path is decided on its target.
-    std::os::unix::fs::symlink(".git/hooks/pre-commit", env.path("innocent")).unwrap();
+    unix_fs::symlink(".git/hooks/pre-commit", env.path("innocent")).unwrap();
     denied(
         "write",
         serde_json::json!({"path": "innocent", "content": "x"}),
@@ -389,10 +402,7 @@ fn bash_runs_sandboxed_and_reserved_paths_are_restored() {
     );
     assert!(ok, "{text}");
     assert!(text.contains("hello"));
-    assert_eq!(
-        std::fs::read_to_string(env.path("out.txt")).unwrap(),
-        "built\n"
-    );
+    assert_eq!(fs::read_to_string(env.path("out.txt")).unwrap(), "built\n");
 
     let secret = env.outside.path().join("secret");
     let (ok, text) = env.tool(
@@ -412,7 +422,7 @@ fn bash_runs_sandboxed_and_reserved_paths_are_restored() {
     );
     assert!(!env.path(".git/hooks/pre-commit").exists());
     assert_eq!(
-        std::fs::read_to_string(env.path(".git/config")).unwrap(),
+        fs::read_to_string(env.path(".git/config")).unwrap(),
         "[core]\n"
     );
 
@@ -431,7 +441,7 @@ fn every_decision_is_logged_and_the_chain_verifies() {
     let logs = env.audit_logs();
     assert_eq!(logs.len(), 2);
 
-    let records: Vec<serde_json::Value> = std::fs::read_to_string(&logs[1])
+    let records: Vec<serde_json::Value> = fs::read_to_string(&logs[1])
         .unwrap()
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
@@ -461,9 +471,9 @@ fn every_decision_is_logged_and_the_chain_verifies() {
     );
 
     // Dropping the last line is caught by the index even though the remaining chain is intact.
-    let text = std::fs::read_to_string(&logs[1]).unwrap();
+    let text = fs::read_to_string(&logs[1]).unwrap();
     let kept: Vec<&str> = text.lines().take(2).collect();
-    std::fs::write(&logs[1], kept.join("\n") + "\n").unwrap();
+    fs::write(&logs[1], kept.join("\n") + "\n").unwrap();
     let out = env.saddle(&["audit", "verify", logs[1].to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(1));
 }
@@ -484,7 +494,7 @@ fn fetch_needs_a_net_grant_and_says_which_one() {
     );
     // Nothing was sent: the decision is the whole answer, and the query is in the record.
     let logs = env.audit_logs();
-    let record = std::fs::read_to_string(logs.last().unwrap()).unwrap();
+    let record = fs::read_to_string(logs.last().unwrap()).unwrap();
     assert!(
         record.contains("https://api.example.com:443/v1/models"),
         "{record}"
@@ -539,7 +549,7 @@ fn a_private_fetch_refusal_is_audited_without_header_values_or_query_secrets() {
     assert!(!ok, "{text}");
     assert!(text.starts_with("denied:"), "{text}");
     let logs = env.audit_logs();
-    let log = std::fs::read_to_string(logs.last().unwrap()).unwrap();
+    let log = fs::read_to_string(logs.last().unwrap()).unwrap();
     let decisions: Vec<serde_json::Value> = log
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
@@ -784,13 +794,8 @@ mcp     = [{ server = "scout", tools = ["search"] }, { server = "ghost", tools =
 /// A loopback streamable-HTTP MCP server: JSON for `initialize`, an event stream for `tools/list`,
 /// so both framings a server may answer with are exercised (D110). It stops when the test says so,
 /// because a refused request never reaches it and would otherwise leave a thread waiting forever.
-fn mock_http_mcp() -> (
-    String,
-    Arc<AtomicUsize>,
-    Arc<AtomicBool>,
-    std::thread::JoinHandle<()>,
-) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+fn mock_http_mcp() -> (String, Arc<AtomicUsize>, Arc<AtomicBool>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let port = listener.local_addr().expect("the bound address").port();
     listener
         .set_nonblocking(true)
@@ -799,12 +804,12 @@ fn mock_http_mcp() -> (
     let stop = Arc::new(AtomicBool::new(false));
     let count = Arc::clone(&seen);
     let done = Arc::clone(&stop);
-    let handle = std::thread::spawn(move || {
+    let handle = thread::spawn(move || {
         while !done.load(Ordering::SeqCst) {
             let stream = match listener.accept() {
                 Ok((stream, _)) => stream,
                 Err(_) => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(5));
                     continue;
                 }
             };
@@ -814,7 +819,7 @@ fn mock_http_mcp() -> (
             let mut buf = [0u8; 4096];
             // Headers first, then exactly as many bytes of body as they announced.
             loop {
-                match std::io::Read::read(&mut stream, &mut buf) {
+                match Read::read(&mut stream, &mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => raw.extend_from_slice(&buf[..n]),
                 }
@@ -859,7 +864,7 @@ fn mock_http_mcp() -> (
                     reply.len()
                 )
             };
-            let _ = std::io::Write::write_all(&mut stream, answer.as_bytes());
+            let _ = Write::write_all(&mut stream, answer.as_bytes());
         }
     });
     (format!("http://127.0.0.1:{port}/mcp"), seen, stop, handle)
@@ -872,7 +877,7 @@ fn a_request_from_the_server_is_answered_so_the_listing_can_finish() {
     // back down the pipe — and that it carried the workspace root rather than an empty list.
     let env = Env::new();
     let script = env.ws.path().join("asking-mcp.sh");
-    std::fs::write(
+    fs::write(
         &script,
         r#"#!/bin/sh
 asked=0
@@ -897,7 +902,7 @@ done
 "#,
     )
     .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&script, Permissions::from_mode(0o755)).unwrap();
     env.write_config(&format!(
         "\n[mcp.fake]\ncommand = {:?}\n",
         script.display().to_string()
@@ -926,7 +931,7 @@ fn a_server_that_never_answers_is_cut_off_at_the_deadline_its_table_names() {
     // enforced rather than a constant. Two seconds, and the message says which deadline it was.
     let env = Env::new();
     let script = env.ws.path().join("mute-mcp.sh");
-    std::fs::write(
+    fs::write(
         &script,
         r#"#!/bin/sh
 while IFS= read -r line; do
@@ -940,7 +945,7 @@ done
 "#,
     )
     .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&script, Permissions::from_mode(0o755)).unwrap();
     env.write_config(&format!(
         "\n[mcp.fake]\ncommand = {:?}\ntimeout = 2\n",
         script.display().to_string()
@@ -955,7 +960,7 @@ exec    = { timeout-secs = 20 }
 mcp     = [{ server = "fake", tools = ["search"] }]
 "#,
     );
-    let began = std::time::Instant::now();
+    let began = Instant::now();
     let out = env.saddle(&["mcp", "call", "fake", "search", "{}"]);
     let took = began.elapsed();
     let text = String::from_utf8_lossy(&out.stdout);
@@ -965,28 +970,28 @@ mcp     = [{ server = "fake", tools = ["search"] }]
         "the refusal does not name the deadline: {text}"
     );
     assert!(
-        took < std::time::Duration::from_secs(20),
+        took < Duration::from_secs(20),
         "it waited past the deadline its table names: {took:?}"
     );
 }
 
 /// A loopback authorization server: metadata, registration and a token endpoint, each echoing the
 /// `client_id` it was given so the exchange can be checked end to end.
-fn mock_auth_server() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+fn mock_auth_server() -> (String, Arc<AtomicBool>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let port = listener.local_addr().expect("the bound address").port();
     listener
         .set_nonblocking(true)
         .expect("a non-blocking listener");
     let stop = Arc::new(AtomicBool::new(false));
     let done = Arc::clone(&stop);
-    let handle = std::thread::spawn(move || {
+    let handle = thread::spawn(move || {
         let base = format!("http://127.0.0.1:{port}");
         while !done.load(Ordering::SeqCst) {
             let stream = match listener.accept() {
                 Ok((stream, _)) => stream,
                 Err(_) => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(5));
                     continue;
                 }
             };
@@ -994,7 +999,7 @@ fn mock_auth_server() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) 
             let mut raw = Vec::new();
             let mut buf = [0u8; 4096];
             loop {
-                match std::io::Read::read(&mut stream, &mut buf) {
+                match Read::read(&mut stream, &mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => raw.extend_from_slice(&buf[..n]),
                 }
@@ -1048,39 +1053,34 @@ fn mock_auth_server() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) 
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 answer.len()
             );
-            let _ = std::io::Write::write_all(&mut stream, header.as_bytes());
-            let _ = std::io::Write::write_all(&mut stream, answer.as_bytes());
+            let _ = Write::write_all(&mut stream, header.as_bytes());
+            let _ = Write::write_all(&mut stream, answer.as_bytes());
         }
     });
     (format!("http://127.0.0.1:{port}/mcp"), stop, handle)
 }
 
 /// The headers a mock server was sent, kept for the assertion.
-type SeenHeaders = Arc<std::sync::Mutex<Vec<String>>>;
+type SeenHeaders = Arc<Mutex<Vec<String>>>;
 
 /// An MCP server that wants a bearer token: 401 without one, and the value it saw kept for the
 /// assertion (D116).
-fn mock_token_mcp() -> (
-    String,
-    SeenHeaders,
-    Arc<AtomicBool>,
-    std::thread::JoinHandle<()>,
-) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+fn mock_token_mcp() -> (String, SeenHeaders, Arc<AtomicBool>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let port = listener.local_addr().expect("the bound address").port();
     listener
         .set_nonblocking(true)
         .expect("a non-blocking listener");
-    let seen: SeenHeaders = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen: SeenHeaders = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let record = Arc::clone(&seen);
     let done = Arc::clone(&stop);
-    let handle = std::thread::spawn(move || {
+    let handle = thread::spawn(move || {
         while !done.load(Ordering::SeqCst) {
             let stream = match listener.accept() {
                 Ok((stream, _)) => stream,
                 Err(_) => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(5));
                     continue;
                 }
             };
@@ -1088,7 +1088,7 @@ fn mock_token_mcp() -> (
             let mut raw = Vec::new();
             let mut buf = [0u8; 4096];
             loop {
-                match std::io::Read::read(&mut stream, &mut buf) {
+                match Read::read(&mut stream, &mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => raw.extend_from_slice(&buf[..n]),
                 }
@@ -1146,8 +1146,8 @@ fn mock_token_mcp() -> (
                 "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 answer.len()
             );
-            let _ = std::io::Write::write_all(&mut stream, head.as_bytes());
-            let _ = std::io::Write::write_all(&mut stream, answer.as_bytes());
+            let _ = Write::write_all(&mut stream, head.as_bytes());
+            let _ = Write::write_all(&mut stream, answer.as_bytes());
         }
     });
     (format!("http://127.0.0.1:{port}/mcp"), seen, stop, handle)
@@ -1159,8 +1159,8 @@ fn mcp_logout_forgets_the_token_so_the_next_call_says_how_to_sign_in() {
     // with the command that fixes it, rather than retried without a token.
     let env = Env::new();
     let auth_path = env.xdg.path().join("state/saddle/auth.json");
-    std::fs::create_dir_all(auth_path.parent().expect("the state directory")).unwrap();
-    std::fs::write(
+    fs::create_dir_all(auth_path.parent().expect("the state directory")).unwrap();
+    fs::write(
         &auth_path,
         r#"{"mcp:remote":{"oauth":{"access":"a-token","refresh":"r","expires-at":0}},"openai":{"api-key":"sk-keep"}}"#,
     )
@@ -1171,7 +1171,7 @@ fn mcp_logout_forgets_the_token_so_the_next_call_says_how_to_sign_in() {
     assert!(out.status.success(), "{text}");
     assert!(text.contains("signed out"), "{text}");
 
-    let stored = std::fs::read_to_string(&auth_path).unwrap();
+    let stored = fs::read_to_string(&auth_path).unwrap();
     assert!(!stored.contains("mcp:remote"), "{stored}");
     assert!(
         stored.contains("sk-keep"),
@@ -1220,8 +1220,8 @@ mcp     = [{{ server = "remote", tools = ["echo"], net = [{{ host = "127.0.0.1",
 
     // The token the person stored is sent, and the call completes.
     let auth_path = env.xdg.path().join("state/saddle/auth.json");
-    std::fs::create_dir_all(auth_path.parent().expect("the state directory")).unwrap();
-    std::fs::write(
+    fs::create_dir_all(auth_path.parent().expect("the state directory")).unwrap();
+    fs::write(
         &auth_path,
         // `AuthStore` is transparent over its map, so the key is the top level.
         r#"{"mcp:remote":{"oauth":{"access":"planted-token","refresh":"","expires-at":0}}}"#,
@@ -1265,20 +1265,20 @@ mcp     = [{{ server = "remote", tools = ["echo"], net = [{{ host = "127.0.0.1",
 "#
     ));
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_saddle"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_saddle"))
         .args(["mcp", "auth", "remote"])
         .current_dir(env.ws.path())
         .env("XDG_CONFIG_HOME", env.xdg.path().join("config"))
         .env("XDG_STATE_HOME", env.xdg.path().join("state"))
         .env("HOME", env.home.path())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawning saddle mcp auth");
 
     // Read until the URL, then behave like the browser: a GET on the redirect the URL names.
     let stdout = child.stdout.take().expect("piped stdout");
-    let mut lines = std::io::BufReader::new(stdout).lines();
+    let mut lines = BufReader::new(stdout).lines();
     let mut printed = String::new();
     let mut authorize = String::new();
     while let Some(Ok(line)) = lines.next() {
@@ -1310,8 +1310,8 @@ mcp     = [{{ server = "remote", tools = ["echo"], net = [{{ host = "127.0.0.1",
         .split('/')
         .next()
         .expect("a host in the redirect");
-    let mut browser = std::net::TcpStream::connect(authority).expect("reaching the callback");
-    std::io::Write::write_all(
+    let mut browser = TcpStream::connect(authority).expect("reaching the callback");
+    Write::write_all(
         &mut browser,
         format!("GET /callback?code=the-code&state={state} HTTP/1.1\r\nhost: {authority}\r\n\r\n")
             .as_bytes(),
@@ -1321,7 +1321,7 @@ mcp     = [{{ server = "remote", tools = ["echo"], net = [{{ host = "127.0.0.1",
     let rest: String = lines.map_while(Result::ok).collect();
     assert!(status.success(), "the sign-in failed: {printed}{rest}");
 
-    let stored = std::fs::read_to_string(env.xdg.path().join("state/saddle/auth.json"))
+    let stored = fs::read_to_string(env.xdg.path().join("state/saddle/auth.json"))
         .expect("auth.json was not written");
     assert!(
         stored.contains("access-the-code"),
@@ -1344,7 +1344,7 @@ fn a_table_says_how_its_tools_reach_the_model_and_codemode_is_refused() {
     // does not do.
     let env = Env::new();
     let script = env.ws.path().join("fake-mcp.sh");
-    std::fs::write(
+    fs::write(
         &script,
         r#"#!/bin/sh
 while IFS= read -r line; do
@@ -1358,7 +1358,7 @@ done
 "#,
     )
     .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&script, Permissions::from_mode(0o755)).unwrap();
     let table = format!(
         "\n[mcp.fake]\ncommand = {:?}\nexposure = \"direct\"\n",
         script.display().to_string()
@@ -1391,8 +1391,8 @@ mcp     = [{ server = "fake", tools = ["search"] }]
     // `[mcp.fake]` table in the same file.
     let env = Env::new();
     let script = env.ws.path().join("fake-mcp.sh");
-    std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&script, Permissions::from_mode(0o755)).unwrap();
     env.write_config(&format!(
         "\n[mcp.fake]\ncommand = {:?}\nexposure = \"codemode\"\n",
         script.display().to_string()
@@ -1417,7 +1417,7 @@ fn mcp_call_runs_one_tool_as_the_model_would_and_refuses_an_ungranted_one() {
     // one before a search has declared anything.
     let env = Env::new();
     let script = env.ws.path().join("fake-mcp.sh");
-    std::fs::write(
+    fs::write(
         &script,
         r#"#!/bin/sh
 while IFS= read -r line; do
@@ -1433,7 +1433,7 @@ done
 "#,
     )
     .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&script, Permissions::from_mode(0o755)).unwrap();
     env.write_config(&format!(
         "\n[mcp.fake]\ncommand = {:?}\n",
         script.display().to_string()
@@ -1564,7 +1564,7 @@ fn mcp_list_starts_a_server_and_says_what_the_grant_allows() {
     // sandbox, spoken to over its own stdin and stdout, and its tools compared with the grant.
     let env = Env::new();
     let script = env.ws.path().join("fake-mcp.sh");
-    std::fs::write(
+    fs::write(
         &script,
         r#"#!/bin/sh
 while IFS= read -r line; do
@@ -1578,7 +1578,7 @@ done
 "#,
     )
     .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&script, Permissions::from_mode(0o755)).unwrap();
     env.write_config(&format!(
         "\n[mcp.fake]\ncommand = {:?}\n",
         script.display().to_string()
@@ -1615,7 +1615,7 @@ fn tool_search_declares_what_the_grant_allows_and_nothing_else() {
     // can only ever declare what the grant names.
     let env = Env::new();
     let script = env.ws.path().join("fake-mcp.sh");
-    std::fs::write(
+    fs::write(
         &script,
         r#"#!/bin/sh
 while IFS= read -r line; do
@@ -1629,7 +1629,7 @@ done
 "#,
     )
     .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&script, Permissions::from_mode(0o755)).unwrap();
     env.write_config(&format!(
         "\n[mcp.fake]\ncommand = {:?}\n",
         script.display().to_string()
@@ -1693,10 +1693,10 @@ fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() 
     // command a person runs in their own terminal, and the allowance is written outside every root.
     let home = tempfile::tempdir().unwrap();
     let xdg = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
+    fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
     let sub = home.path().join("src/proj");
-    std::fs::create_dir_all(sub.join(".git")).unwrap();
-    let saddle = |dir: &std::path::Path, args: &[&str]| {
+    fs::create_dir_all(sub.join(".git")).unwrap();
+    let saddle = |dir: &Path, args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_saddle"))
             .arg("-C")
             .arg(dir)
@@ -1704,7 +1704,7 @@ fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() 
             .env("HOME", home.path())
             .env("XDG_STATE_HOME", xdg.path().join("state"))
             .env("XDG_CONFIG_HOME", xdg.path().join("config"))
-            .stdin(std::process::Stdio::null())
+            .stdin(Stdio::null())
             .output()
             .unwrap()
     };
@@ -1777,7 +1777,7 @@ fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() 
     // Allowing this workspace for this id lets that session, and only that session, in.
     let allow = saddle(home.path(), &["session", "allow", &id]);
     assert!(allow.status.success(), "{}", stderr(&allow));
-    std::fs::write(home.path().join("README"), "hello\n").unwrap();
+    fs::write(home.path().join("README"), "hello\n").unwrap();
     let other_id = "0123456789abcdef";
     let wrong_session = saddle(
         home.path(),
@@ -1841,8 +1841,8 @@ fn allow_sensitive_in_the_users_config_skips_the_question() {
     // every root, so nothing the agent runs can set it (D42, D60).
     let home = tempfile::tempdir().unwrap();
     let xdg = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
-    std::fs::write(home.path().join("README"), "hello\n").unwrap();
+    fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
+    fs::write(home.path().join("README"), "hello\n").unwrap();
     let run = || {
         Command::new(env!("CARGO_BIN_EXE_saddle"))
             .arg("-C")
@@ -1851,7 +1851,7 @@ fn allow_sensitive_in_the_users_config_skips_the_question() {
             .env("HOME", home.path())
             .env("XDG_STATE_HOME", xdg.path().join("state"))
             .env("XDG_CONFIG_HOME", xdg.path().join("config"))
-            .stdin(std::process::Stdio::null())
+            .stdin(Stdio::null())
             .output()
             .unwrap()
     };
@@ -1860,7 +1860,7 @@ fn allow_sensitive_in_the_users_config_skips_the_question() {
         Some(2),
         "refused while the flag is off"
     );
-    std::fs::write(
+    fs::write(
         xdg.path().join("config/saddle/config.toml"),
         "allow-sensitive = true\n",
     )
@@ -1875,9 +1875,9 @@ fn the_directory_above_home_is_reported_too() {
     // path looks different (D60).
     let above = tempfile::tempdir().unwrap();
     let home = above.path().join("me");
-    std::fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&home).unwrap();
     let xdg = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
+    fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_saddle"))
         .arg("-C")
         .arg(above.path())
@@ -1902,18 +1902,18 @@ fn the_default_include_rule_gives_a_child_what_it_needs_and_withholds_credential
     // saddle has never seen, while the credentials beside it stay out of reach.
     let home = tempfile::tempdir().unwrap();
     let xdg = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
+    fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
     let h = home.path();
-    std::fs::create_dir_all(h.join(".cargo/registry")).unwrap();
-    std::fs::create_dir_all(h.join(".config/git")).unwrap();
-    std::fs::create_dir_all(h.join(".ssh")).unwrap();
-    std::fs::create_dir_all(h.join("proj/.git")).unwrap();
-    std::fs::write(h.join(".config/git/config"), "gitconfig\n").unwrap();
-    std::fs::write(h.join(".ssh/id_rsa"), "sk-live-private\n").unwrap();
+    fs::create_dir_all(h.join(".cargo/registry")).unwrap();
+    fs::create_dir_all(h.join(".config/git")).unwrap();
+    fs::create_dir_all(h.join(".ssh")).unwrap();
+    fs::create_dir_all(h.join("proj/.git")).unwrap();
+    fs::write(h.join(".config/git/config"), "gitconfig\n").unwrap();
+    fs::write(h.join(".ssh/id_rsa"), "sk-live-private\n").unwrap();
     let auth = xdg.path().join("state/saddle/auth.json");
-    std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
+    fs::create_dir_all(auth.parent().unwrap()).unwrap();
     // The shape `AuthStore` reads, so the file is a real store rather than a parse error.
-    std::fs::write(&auth, r#"{"synthetic":{"api-key":"sk-live-api"}}"#).unwrap();
+    fs::write(&auth, r#"{"synthetic":{"api-key":"sk-live-api"}}"#).unwrap();
     let saddle = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_saddle"))
             .arg("-C")
@@ -1936,7 +1936,7 @@ fn the_default_include_rule_gives_a_child_what_it_needs_and_withholds_credential
         "the exclusion is not in the list: {text}"
     );
 
-    let read = |path: &std::path::Path| -> bool {
+    let read = |path: &Path| -> bool {
         let out = saddle(&[
             "tool",
             "bash",
@@ -1962,13 +1962,13 @@ fn an_extra_except_line_takes_one_more_directory_out_of_reach() {
     let home = tempfile::tempdir().unwrap();
     let xdg = tempfile::tempdir().unwrap();
     let h = home.path();
-    std::fs::create_dir_all(h.join("proj/.git")).unwrap();
-    std::fs::create_dir_all(h.join(".config/git")).unwrap();
-    std::fs::create_dir_all(h.join("notes/private")).unwrap();
-    std::fs::write(h.join("notes/private/a.txt"), "secret\n").unwrap();
-    std::fs::write(h.join("notes/public.txt"), "fine\n").unwrap();
-    std::fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
-    std::fs::write(
+    fs::create_dir_all(h.join("proj/.git")).unwrap();
+    fs::create_dir_all(h.join(".config/git")).unwrap();
+    fs::create_dir_all(h.join("notes/private")).unwrap();
+    fs::write(h.join("notes/private/a.txt"), "secret\n").unwrap();
+    fs::write(h.join("notes/public.txt"), "fine\n").unwrap();
+    fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
+    fs::write(
         xdg.path().join("config/saddle/config.toml"),
         r#"
 [[sandbox.include]]
@@ -1978,7 +1978,7 @@ except = ["^notes/private$"]
 "#,
     )
     .unwrap();
-    let read = |path: &std::path::Path| -> bool {
+    let read = |path: &Path| -> bool {
         let out = Command::new(env!("CARGO_BIN_EXE_saddle"))
             .arg("-C")
             .arg(h.join("proj"))
@@ -2063,9 +2063,9 @@ fn the_old_policy_file_is_migrated_once() {
     let env = Env::new();
     let config = env.policy_path();
     // The old layout: a config with machine settings only, and a `policy.toml` beside it.
-    std::fs::write(&config, "provider = \"synthetic\"\n").unwrap();
+    fs::write(&config, "provider = \"synthetic\"\n").unwrap();
     let dir = config.parent().unwrap();
-    std::fs::write(
+    fs::write(
         dir.join("policy.toml"),
         "version = 1\n[agent]\nexec = { why = \"old base\", timeout-secs = 42 }\n",
     )
@@ -2102,9 +2102,9 @@ fn a_grants_file_that_names_another_directory_is_refused() {
     let env = Env::new();
     let key = env.workspace_key();
     let dir = env.policy_path().parent().unwrap().join("policies");
-    std::fs::create_dir_all(&dir).unwrap();
+    fs::create_dir_all(&dir).unwrap();
     let file = dir.join(format!("{key}.toml"));
-    std::fs::write(
+    fs::write(
         &file,
         "workspace = \"/somewhere/else\"\nversion = 1\n[agent]\nnet = [{ host = \"*\" }]\n",
     )
@@ -2117,7 +2117,7 @@ fn a_grants_file_that_names_another_directory_is_refused() {
 
     // The same file naming this directory is used, which is the ordinary case.
     let ws = env.ws.path().canonicalize().unwrap();
-    std::fs::write(
+    fs::write(
         &file,
         format!(
             "workspace = {:?}\nversion = 1\n[agent]\nnet = [{{ host = \"*\" }}]\n",
@@ -2138,9 +2138,9 @@ fn a_skill_is_loaded_with_the_read_tool() {
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let dir = env.path(".agents/skills/house");
-    std::fs::create_dir_all(&dir).unwrap();
+    fs::create_dir_all(&dir).unwrap();
     let file = dir.join("SKILL.md");
-    std::fs::write(
+    fs::write(
         &file,
         "---\nname: house\ndescription: House style. Use when editing Rust here.\n---\n\n\
          lowercase doc comments.\n",
@@ -2183,8 +2183,8 @@ fn a_skill_the_policy_refuses_is_not_advertised() {
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let dir = env.path(".agents/skills/house");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
         dir.join("SKILL.md"),
         "---\nname: house\ndescription: House style.\n---\nlowercase doc comments.\n",
     )
@@ -2223,9 +2223,9 @@ fn a_skill_under_the_config_directory_is_not_advertised() {
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let dir = env.xdg.path().join("config/saddle/skills/pdf-tools");
-    std::fs::create_dir_all(&dir).unwrap();
+    fs::create_dir_all(&dir).unwrap();
     let file = dir.join("SKILL.md");
-    std::fs::write(
+    fs::write(
         &file,
         "---\nname: pdf-tools\ndescription: Extract text.\n---\nbody\n",
     )
@@ -2262,12 +2262,12 @@ fn a_sandbox_path_reaches_commands_and_not_the_file_tools() {
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let notes = home.path().join("notes");
-    std::fs::create_dir_all(&notes).unwrap();
-    std::fs::write(notes.join("a.md"), "hi\n").unwrap();
+    fs::create_dir_all(&notes).unwrap();
+    fs::write(notes.join("a.md"), "hi\n").unwrap();
 
     // A path in [sandbox] read, not a root and not a grant.
     let config = env.policy_path();
-    let mut doc: toml::Table = std::fs::read_to_string(&config).unwrap().parse().unwrap();
+    let mut doc: toml::Table = fs::read_to_string(&config).unwrap().parse().unwrap();
     let sandbox = doc
         .entry("sandbox")
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
@@ -2278,7 +2278,7 @@ fn a_sandbox_path_reaches_commands_and_not_the_file_tools() {
 
     let run = |args: &[&str]| {
         let text = toml::to_string(&doc).unwrap();
-        std::fs::write(&config, &text).unwrap();
+        fs::write(&config, &text).unwrap();
         Command::new(env!("CARGO_BIN_EXE_saddle"))
             .arg("-C")
             .arg(env.ws.path())
@@ -2323,7 +2323,7 @@ fn a_sandbox_path_reaches_commands_and_not_the_file_tools() {
 
 /// Runs the binary with `HOME` pointed at a throwaway directory, so a `[sandbox]` entry can name
 /// something under it.
-fn saddle_in(env: &Env, home: &std::path::Path, args: &[&str]) -> Output {
+fn saddle_in(env: &Env, home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_saddle"))
         .arg("-C")
         .arg(env.ws.path())
@@ -2338,7 +2338,7 @@ fn saddle_in(env: &Env, home: &std::path::Path, args: &[&str]) -> Output {
 /// Writes `[sandbox] read` as the given TOML value, keeping the rest of the config.
 fn set_sandbox_read(env: &Env, value: toml::Value) {
     let path = env.policy_path();
-    let mut doc: toml::Table = std::fs::read_to_string(&path)
+    let mut doc: toml::Table = fs::read_to_string(&path)
         .unwrap_or_default()
         .parse()
         .unwrap();
@@ -2346,7 +2346,7 @@ fn set_sandbox_read(env: &Env, value: toml::Value) {
         .entry("sandbox")
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
     sandbox.as_table_mut().unwrap().insert("read".into(), value);
-    std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+    fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
 }
 
 #[test]
@@ -2356,11 +2356,11 @@ fn a_sandbox_entry_naming_tools_lets_those_tools_reach_it() {
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let agents = home.path().join(".agents");
-    std::fs::create_dir_all(agents.join("skills/a")).unwrap();
-    std::fs::write(agents.join("skills/a/SKILL.md"), "---\nname: a\n---\nx\n").unwrap();
+    fs::create_dir_all(agents.join("skills/a")).unwrap();
+    fs::write(agents.join("skills/a/SKILL.md"), "---\nname: a\n---\nx\n").unwrap();
     let notes = home.path().join("notes");
-    std::fs::create_dir_all(&notes).unwrap();
-    std::fs::write(notes.join("n.md"), "notes\n").unwrap();
+    fs::create_dir_all(&notes).unwrap();
+    fs::write(notes.join("n.md"), "notes\n").unwrap();
 
     let entry = |path: &str, tools: &[&str]| {
         let mut table = toml::Table::new();
@@ -2445,7 +2445,7 @@ fn a_sandbox_entry_naming_tools_can_write_but_never_a_reserved_path() {
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let scratch = home.path().join("scratch");
-    std::fs::create_dir_all(scratch.join(".git/hooks")).unwrap();
+    fs::create_dir_all(scratch.join(".git/hooks")).unwrap();
     let mut table = toml::Table::new();
     table.insert("path".into(), "~/scratch".into());
     table.insert(
@@ -2539,7 +2539,7 @@ fn one_access_records_one_decision() {
         env.tool(name, serde_json::from_str(input).unwrap());
         let logs = env.audit_logs();
         assert!(logs.len() > before, "{name} wrote no log");
-        std::fs::read_to_string(logs.last().unwrap())
+        fs::read_to_string(logs.last().unwrap())
             .unwrap()
             .lines()
             .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
@@ -2569,13 +2569,13 @@ fn the_shared_skills_directory_is_readable_by_default() {
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let skill = home.path().join(".agents/skills/s");
-    std::fs::create_dir_all(skill.join("references")).unwrap();
-    std::fs::write(
+    fs::create_dir_all(skill.join("references")).unwrap();
+    fs::write(
         skill.join("SKILL.md"),
         "---\nname: s\ndescription: d\n---\nRead references/r.md.\n",
     )
     .unwrap();
-    std::fs::write(skill.join("references/r.md"), "the reference\n").unwrap();
+    fs::write(skill.join("references/r.md"), "the reference\n").unwrap();
 
     let out = saddle_in(
         &env,
@@ -2631,13 +2631,13 @@ fn the_shared_skills_directory_is_readable_by_default() {
 
     // `tools-defaults = false` turns it off.
     let path = env.policy_path();
-    let mut doc: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    let mut doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
     doc.entry("sandbox")
         .or_insert_with(|| toml::Value::Table(toml::Table::new()))
         .as_table_mut()
         .unwrap()
         .insert("tools-defaults".into(), toml::Value::Boolean(false));
-    std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+    fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
     let out = saddle_in(
         &env,
         home.path(),
@@ -2661,8 +2661,8 @@ fn an_entry_for_a_default_path_adds_to_it_rather_than_replacing_it() {
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let agents = home.path().join(".agents");
-    std::fs::create_dir_all(&agents).unwrap();
-    std::fs::write(agents.join("a.txt"), "text\n").unwrap();
+    fs::create_dir_all(&agents).unwrap();
+    fs::write(agents.join("a.txt"), "text\n").unwrap();
     set_sandbox_read(
         &env,
         toml::Value::Array(vec![toml::Value::Table({
@@ -2708,8 +2708,8 @@ fn a_config_with_no_sandbox_table_keeps_the_built_in_defaults() {
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let skill = home.path().join(".agents/skills/s");
-    std::fs::create_dir_all(&skill).unwrap();
-    std::fs::write(
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(
         skill.join("SKILL.md"),
         "---\nname: s\ndescription: d\n---\nx\n",
     )
@@ -2717,9 +2717,9 @@ fn a_config_with_no_sandbox_table_keeps_the_built_in_defaults() {
 
     // Env::new wrote a config with `[agent]` and nothing else; make sure there is no [sandbox].
     let path = env.policy_path();
-    let mut doc: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    let mut doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
     doc.remove("sandbox");
-    std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+    fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
 
     let out = saddle_in(&env, home.path(), &["check"]);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -2742,12 +2742,12 @@ fn a_tool_path_may_follow_a_link_to_another_declared_path() {
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let real = home.path().join("elsewhere/skills/prose-lint");
-    std::fs::create_dir_all(real.join("references")).unwrap();
-    std::fs::write(real.join("SKILL.md"), "---\nname: prose-lint\n---\nbody\n").unwrap();
-    std::fs::write(real.join("references/tells.md"), "# Tells\n").unwrap();
+    fs::create_dir_all(real.join("references")).unwrap();
+    fs::write(real.join("SKILL.md"), "---\nname: prose-lint\n---\nbody\n").unwrap();
+    fs::write(real.join("references/tells.md"), "# Tells\n").unwrap();
     let agents = home.path().join(".agents/skills");
-    std::fs::create_dir_all(&agents).unwrap();
-    std::os::unix::fs::symlink(&real, agents.join("prose-lint")).unwrap();
+    fs::create_dir_all(&agents).unwrap();
+    unix_fs::symlink(&real, agents.join("prose-lint")).unwrap();
 
     // Undeclared: refused, and the message says what to do about it.
     let out = saddle_in(
@@ -2817,7 +2817,7 @@ fn a_tool_path_may_follow_a_link_to_another_declared_path() {
     // A link may not reach the policy: the config directory is protected for every entry (D16).
     let policy = env.policy_path();
     let escape = agents.join("escape.md");
-    std::os::unix::fs::symlink(&policy, &escape).unwrap();
+    unix_fs::symlink(&policy, &escape).unwrap();
     let out = saddle_in(
         &env,
         home.path(),
@@ -2838,9 +2838,9 @@ fn the_projects_skills_are_in_one_directory_at_the_root() {
     let home = tempfile::tempdir().unwrap();
     for rel in [".agents/skills/at-root", "crates/sub/.agents/skills/nested"] {
         let dir = env.path(rel);
-        std::fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir).unwrap();
         let name = rel.rsplit('/').next().unwrap();
-        std::fs::write(
+        fs::write(
             dir.join("SKILL.md"),
             format!("---\nname: {name}\ndescription: d\n---\nbody\n"),
         )
@@ -2857,14 +2857,14 @@ fn skill_discovery_honours_ignore_files_and_skips_node_modules() {
     let home = tempfile::tempdir().unwrap();
     for dir in ["keep", "ignored", "node_modules/pkg", ".hidden"] {
         let skills = env.path(&format!(".agents/skills/{dir}/s"));
-        std::fs::create_dir_all(&skills).unwrap();
-        std::fs::write(
+        fs::create_dir_all(&skills).unwrap();
+        fs::write(
             skills.join("SKILL.md"),
             format!("---\nname: s-{dir}\ndescription: d\n---\n"),
         )
         .unwrap();
     }
-    std::fs::write(env.path(".agents/skills/.ignore"), "ignored\n").unwrap();
+    fs::write(env.path(".agents/skills/.ignore"), "ignored\n").unwrap();
     assert_eq!(env.advertised(home.path()), ["s-keep"]);
 }
 
@@ -2876,24 +2876,24 @@ fn a_directory_holding_a_skill_yields_one_skill_and_a_bare_markdown_file_is_one(
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let dir = env.path(".agents/skills/a");
-    std::fs::create_dir_all(dir.join("references/inner")).unwrap();
-    std::fs::write(
+    fs::create_dir_all(dir.join("references/inner")).unwrap();
+    fs::write(
         dir.join("SKILL.md"),
         "---\nname: a\ndescription: d\n---\nbody\n",
     )
     .unwrap();
-    std::fs::write(
+    fs::write(
         dir.join("references/inner/SKILL.md"),
         "---\nname: inner\ndescription: d\n---\n",
     )
     .unwrap();
-    std::fs::create_dir_all(env.path(".agents/skills/a/deep")).unwrap();
-    std::fs::write(
+    fs::create_dir_all(env.path(".agents/skills/a/deep")).unwrap();
+    fs::write(
         env.path(".agents/skills/a/deep/lonely.md"),
         "---\nname: lonely\ndescription: d\n---\n",
     )
     .unwrap();
-    std::fs::write(
+    fs::write(
         env.path(".agents/skills/standalone.md"),
         "---\nname: standalone\ndescription: d\n---\n",
     )
@@ -2915,8 +2915,8 @@ fn a_refusal_is_said_out_loud_and_the_first_skill_of_a_name_wins() {
         ("refused", "refused"),
     ] {
         let path = env.path(&format!(".agents/skills/{dir}"));
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::write(
+        fs::create_dir_all(&path).unwrap();
+        fs::write(
             path.join("SKILL.md"),
             format!("---\nname: {declared}\ndescription: d\n---\nbody of {dir}\n"),
         )
@@ -2957,8 +2957,8 @@ fn the_session_offers_its_skills_and_records_a_load() {
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let dir = env.path(".agents/skills/manim");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
         dir.join("SKILL.md"),
         "---\nname: manim\ndescription: Animate a proof.\ndisable-model-invocation: true\n---\nRender with Scene.\n",
     )
@@ -2969,7 +2969,7 @@ fn the_session_offers_its_skills_and_records_a_load() {
     let out = saddle_in(&env, home.path(), &["tool", "ls", r#"{"path":"."}"#]);
     assert!(out.status.success(), "{}", stderr(&out));
     let log = env.audit_logs().last().cloned().unwrap();
-    let records: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+    let records: Vec<serde_json::Value> = fs::read_to_string(&log)
         .unwrap()
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
@@ -2989,8 +2989,8 @@ fn reload_reads_instruction_files_and_skills_again() {
     // second is a real mid-session change.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(env.path(".agents/skills/first")).unwrap();
-    std::fs::write(
+    fs::create_dir_all(env.path(".agents/skills/first")).unwrap();
+    fs::write(
         env.path(".agents/skills/first/SKILL.md"),
         "---\nname: first\ndescription: d\n---\nbody\n",
     )
@@ -3007,18 +3007,17 @@ fn reload_reads_instruction_files_and_skills_again() {
         .env("SYNTHETIC_API_KEY", "x")
         .env("XDG_STATE_HOME", env.xdg.path().join("state"))
         .env("XDG_CONFIG_HOME", env.xdg.path().join("config"))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     // Read as it is written, so a full pipe cannot stop the child before its session opens.
-    let stdout = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (ready, opened) = std::sync::mpsc::channel();
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    let (ready, opened) = mpsc::channel();
     let out = stdout.clone();
     let mut piped = child.stdout.take().unwrap();
-    let drain = std::thread::spawn(move || {
-        use std::io::Read as _;
+    let drain = thread::spawn(move || {
         let mut buf = [0u8; 8192];
         while let Ok(n) = piped.read(&mut buf) {
             if n == 0 {
@@ -3032,15 +3031,11 @@ fn reload_reads_instruction_files_and_skills_again() {
     // fixed sleep would be a race on a loaded machine, so the banner line mode prints once its
     // session is up is waited for instead.
     let stderr = child.stderr.take().unwrap();
-    let errors = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let errors = Arc::new(Mutex::new(String::new()));
     let seen = errors.clone();
-    let reader = std::thread::spawn(move || {
-        use std::io::BufRead as _;
+    let reader = thread::spawn(move || {
         let mut told = false;
-        for line in std::io::BufReader::new(stderr)
-            .lines()
-            .map_while(Result::ok)
-        {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             // The first line names the provider, the model and the audit log, and it is written
             // once the session is open and about to read stdin.
             if !told && line.contains(" \u{b7} audit ") {
@@ -3051,18 +3046,17 @@ fn reload_reads_instruction_files_and_skills_again() {
         }
     });
     opened
-        .recv_timeout(std::time::Duration::from_secs(30))
+        .recv_timeout(Duration::from_secs(30))
         .expect("the session never started");
 
-    std::fs::write(env.path("AGENTS.md"), "a rule added mid-session\n").unwrap();
-    std::fs::create_dir_all(env.path(".agents/skills/second")).unwrap();
-    std::fs::write(
+    fs::write(env.path("AGENTS.md"), "a rule added mid-session\n").unwrap();
+    fs::create_dir_all(env.path(".agents/skills/second")).unwrap();
+    fs::write(
         env.path(".agents/skills/second/SKILL.md"),
         "---\nname: second\ndescription: d\n---\nbody\n",
     )
     .unwrap();
     {
-        use std::io::Write as _;
         let stdin = child.stdin.as_mut().unwrap();
         stdin.write_all(b"/reload\n/quit\n").unwrap();
     }
@@ -3089,7 +3083,7 @@ fn a_custom_theme_is_read_from_the_users_config() {
     // cannot build is reported rather than silently replaced by the default.
     let env = Env::new();
     let path = env.policy_path();
-    std::fs::write(
+    fs::write(
         &path,
         r##"[ui]
 theme = "mine"
@@ -3108,7 +3102,7 @@ fs-read = [{ root = "workspace" }]
     assert!(out.status.success(), "{}", stderr(&out));
 
     // A theme naming an unknown base is an error the person sees, not a fallback.
-    std::fs::write(
+    fs::write(
         &path,
         "[ui]\ntheme = \"nope\"\n\n[agent]\nfs-read = [{ root = \"workspace\" }]\n",
     )

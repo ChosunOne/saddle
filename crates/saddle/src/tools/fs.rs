@@ -2,6 +2,7 @@
 //! lead out of the root. A symlink can still lead to another path inside the root, so every access
 //! is decided on the requested path and, when it differs, on the path the symlinks resolve to.
 
+use crate::provider::Image;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -56,7 +57,7 @@ pub fn read(session: &mut Session, input: &Value) -> Result<ToolOutput> {
     // A picture is handed to the model as a picture rather than refused as "not UTF-8": reading
     // a screenshot is the point of asking for one (D58).
     if looks_like_image(&bytes) {
-        return Ok(match crate::provider::Image::read(Path::new(path), bytes) {
+        return Ok(match Image::read(Path::new(path), bytes) {
             Ok(image) => ToolOutput {
                 images: vec![image.clone()],
                 ..ToolOutput::ok(format!(

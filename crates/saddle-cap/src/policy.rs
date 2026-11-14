@@ -1,9 +1,12 @@
 //! The policy file (D22): grants only, every grant explained, everything resolved at load.
 
+use serde::de::Error;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
 use std::time::Duration;
+use toml::de::Error as DeError;
+use toml::ser::Error as SerError;
 
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
@@ -38,7 +41,7 @@ impl<'de> Deserialize<'de> for PluginId {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         PluginId::new(&s).ok_or_else(|| {
-            serde::de::Error::custom(format!("`{s}` is not a valid plugin id ([a-z][a-z0-9-]*)"))
+            Error::custom(format!("`{s}` is not a valid plugin id ([a-z][a-z0-9-]*)"))
         })
     }
 }
@@ -342,9 +345,9 @@ pub struct Policy {
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
     #[error(transparent)]
-    Toml(#[from] toml::de::Error),
+    Toml(#[from] DeError),
     #[error("could not combine the policies: {0}")]
-    Combine(#[from] toml::ser::Error),
+    Combine(#[from] SerError),
     #[error("unsupported policy version {0}; this build reads version {POLICY_VERSION}")]
     Version(u32),
     #[error("{at}: {msg}")]

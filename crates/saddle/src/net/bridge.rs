@@ -10,10 +10,13 @@
 //! address that was checked rather than to the name again, so a name cannot be swapped underneath
 //! the decision (D28).
 
+use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -145,9 +148,9 @@ impl Bridge {
     pub fn start(dir: &Path) -> io::Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!("net-{}-{n}.sock", std::process::id()));
+        let path = dir.join(format!("net-{}-{n}.sock", process::id()));
         // A socket left behind by a process that died is not a listener.
-        let _ = std::fs::remove_file(&path);
+        let _ = fs::remove_file(&path);
         let listener = UnixListener::bind(&path)?;
         listener.set_nonblocking(true)?;
 
@@ -175,7 +178,7 @@ impl Bridge {
                     Err(_) => break,
                 }
             }
-            let _ = std::fs::remove_file(&thread_path);
+            let _ = fs::remove_file(&thread_path);
         });
 
         Ok(Self {
@@ -236,7 +239,7 @@ impl Bridge {
 }
 
 /// Reads the relay's dialect line, carries the connection, and reports what was refused.
-fn answer(stream: std::os::unix::net::UnixStream, asks: Sender<Ask>) -> Vec<String> {
+fn answer(stream: UnixStream, asks: Sender<Ask>) -> Vec<String> {
     let Ok(mut reader) = stream.try_clone().map(BufReader::new) else {
         return Vec::new();
     };

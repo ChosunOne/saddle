@@ -8,6 +8,12 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.88"
 
+[workspace.lints.clippy]
+# Import names at module scope instead of qualifying them at the point of use.
+absolute_paths = "deny"
+# Also reject local items (including imports) appearing after executable statements.
+items_after_statements = "deny"
+
 [workspace.dependencies]
 saddle-cap = { path = "crates/saddle-cap" }
 saddle-policy = { path = "crates/saddle-policy" }

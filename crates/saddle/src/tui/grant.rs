@@ -6,6 +6,8 @@
 //! table is the base, and a change made while working in a project is a change to that project
 //! (D63).
 
+use saddle_cap::policy::HostPattern;
+use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -21,8 +23,7 @@ pub fn edit(
     change: &Change,
     roots: &saddle_cap::Roots,
 ) -> Result<()> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut doc: DocumentMut = text
         .parse()
         .with_context(|| format!("{}", path.display()))?;
@@ -37,7 +38,7 @@ pub fn edit(
     let out = doc.to_string();
     validate(&out, key, roots)
         .with_context(|| format!("the change would leave {} unloadable", path.display()))?;
-    std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
+    fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -153,8 +154,7 @@ pub fn add(
     what: &str,
     roots: &saddle_cap::Roots,
 ) -> Result<String> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut doc: DocumentMut = text
         .parse()
         .with_context(|| format!("{}", path.display()))?;
@@ -167,7 +167,7 @@ pub fn add(
     let out = doc.to_string();
     validate(&out, key, roots)
         .with_context(|| format!("the change would leave {} unloadable", path.display()))?;
-    std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
+    fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
     Ok(summary)
 }
 
@@ -202,7 +202,7 @@ fn append(
             }
             // Checked here so the message names the mistake rather than the parser rejecting it.
             let host = base_host(&argument);
-            saddle_cap::policy::HostPattern::parse(&host).map_err(|e| anyhow::anyhow!("{e}"))?;
+            HostPattern::parse(&host).map_err(|e| anyhow::anyhow!("{e}"))?;
             let port = port_argument(&argument);
             push_table(
                 table,
@@ -384,11 +384,13 @@ fn toggle(doc: &mut DocumentMut, key: Option<&str>, rule: &str, on: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
 
-    fn temp(text: &str) -> (tempfile::TempDir, std::path::PathBuf, saddle_cap::Roots) {
+    fn temp(text: &str) -> (tempfile::TempDir, PathBuf, saddle_cap::Roots) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.toml");
-        std::fs::write(&path, text).unwrap();
+        fs::write(&path, text).unwrap();
         let roots = saddle_cap::Roots::resolve(
             [(saddle_cap::RootName::workspace(), dir.path().to_path_buf())],
             &[],
@@ -412,7 +414,7 @@ mod tests {
             &roots,
         )
         .unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
         assert!(
             text.contains(r#"exclude = [".env*", "/secrets"]"#),
             "{text}"
@@ -434,7 +436,7 @@ mod tests {
             &roots,
         )
         .unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains("exclude"), "{text}");
     }
 
@@ -456,7 +458,7 @@ mod tests {
         assert!(e.contains("past the end"), "{e}");
         // Nothing was written.
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
+            fs::read_to_string(&path).unwrap(),
             "version = 1\n\n[agent]\nfs-read = [{ root = \"workspace\" }]\n"
         );
     }
@@ -472,7 +474,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(added, "net grant for api.example.com");
-        let text = std::fs::read_to_string(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
         // The version line a policy needs is added, since the file had none.
         assert!(text.contains("version = 1"), "{text}");
         assert!(text.contains("[[agent.net]]"), "{text}");
@@ -484,7 +486,7 @@ mod tests {
 
         // A second host appends rather than replacing.
         add(&path, None, "net *.other.test", &roots).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
         assert_eq!(text.matches("[[agent.net]]").count(), 2, "{text}");
         assert!(!text.contains("port = 8443\nport"), "{text}");
     }
@@ -500,7 +502,7 @@ mod tests {
 
         // A root the session does have is written as a grant.
         add(&path, None, "write workspace # scratch space", &roots).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("[[agent.fs-write]]"), "{text}");
         assert!(text.contains(r#"root = "workspace""#), "{text}");
     }
@@ -510,7 +512,7 @@ mod tests {
         let (_d, path, roots) = temp("version = 1\n");
         add(&path, None, "exec", &roots).unwrap();
         add(&path, None, "tokens 250000", &roots).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("[agent.exec]"), "{text}");
         assert!(text.contains("tokens-per-session = 250000"), "{text}");
         // Both would be a second grant of the same scope.
@@ -555,7 +557,7 @@ mod tests {
         // The exclusion is malformed as a glob once written, and a session could not read it.
         let (_d, path, roots) =
             temp("version = 1\n\n[agent]\nfs-read = [{ root = \"workspace\" }]\n");
-        let before = std::fs::read_to_string(&path).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
         let e = edit(
             &path,
             None,
@@ -568,6 +570,6 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("unloadable"), "{e}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
     }
 }
