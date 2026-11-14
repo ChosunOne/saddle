@@ -90,7 +90,7 @@ pub fn classify(direction: Direction, name: &str) -> Requirement {
     match (direction, n.namespace, n.package, n.interface) {
         (Import, "saddle", "host", i) => match i {
             "exec" => scope(Scope::Exec),
-            "fs-read" => scope(Scope::FsRead),
+            "fs-read" | "fs-read-range" => scope(Scope::FsRead),
             "fs-write" => scope(Scope::FsWrite),
             "transcript-read" => scope(Scope::TranscriptRead),
             "context-contribute" => scope(Scope::ContextContribute),

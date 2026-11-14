@@ -8,3 +8,4 @@ wit_bindgen::generate!({
 
 pub use exports::saddle::plugin::tool::{Definition, Guest as Tool, Output};
 pub use saddle::host::fs_read::{Failure, Path as FilePath, read_file};
+pub use saddle::host::fs_read_range::{Chunk, read_range};

@@ -80,6 +80,60 @@ set its entry's `enabled = false` and reload. Installation never replaces an exi
 updating requires explicitly removing the old installation, reinstalling, and reviewing the new pin.
 There is no downloader, signing service, registry or automatic update mechanism.
 
+## Standard text-read plugin
+
+`saddle-tools` is the home for tool implementations rather than host services. Its first component
+is `files`, exporting `plugin__files__read`. Unlike the minimal SDK reader above, it handles source
+files larger than 64 KiB by requesting bounded byte ranges, selects line pages in guest code, and
+keeps the host independent of line formatting:
+
+```sh
+cargo build -p saddle-tools --example read --target wasm32-unknown-unknown --release
+mkdir -p target/read-plugin
+cargo run -p saddle-loader --example componentize -- \
+  target/wasm32-unknown-unknown/release/examples/read.wasm target/read-plugin/read.component.wasm
+cp crates/saddle-tools/plugins/read/plugin.toml target/read-plugin/plugin.toml
+saddle plugin install target/read-plugin/plugin.toml
+```
+
+The opt-in production-host test uses that built artifact:
+
+```sh
+cargo nextest run --test plugins --run-ignored only \
+  -E 'test(standard_read_component_paginates_large_files_through_the_production_host)'
+```
+
+Enable the printed `[plugins.files]` block and grant `[plugin.files]` the same `tool`/`fs-read`
+permissions shown for the reader example. Then:
+
+```sh
+saddle plugin call files '{"path":"src/lib.rs","offset":100,"limit":40}'
+saddle tool plugin__files__read '{"root":"workspace","path":"src/lib.rs"}'
+```
+
+`path` is relative to `root` (default `workspace`); `offset` is a positive 1-based line number.
+Pages have at most 2,000 lines and 50 KiB of text plus a bounded continuation/truncation note. Plain
+text, CRLF and trailing newlines are preserved, without line-number prefixes that could interfere
+with exact edits. Oversized lines may be truncated; continuation advances past the truncated line.
+Only selected page bytes are UTF-8 validated. Binary/NUL-containing pages are refused.
+
+Each invocation scans at most 1 MiB from the beginning, using 8 KiB ranges and bounded guest memory.
+The normal fuel/deadline still applies and may stop it earlier. Release builds are recommended;
+debug guest code can consume substantially more fuel. A very distant line offset is refused rather
+than reading indefinitely. Ranges are individually authorized, reopened and audited with offset,
+limit and call identity; they are not a snapshot if the file changes concurrently.
+
+The original `read-file` interface and its 64 KiB limit remain unchanged. The new additive
+`saddle:host/fs-read-range@0.1.0` uses the same `fs-read` grant and returns bytes plus an observed EOF
+flag. Each range is limited to 1–65,536 bytes; the host may read one extra byte to establish EOF.
+SDK hosts other than Saddle must implement `HostServices::read_range` to support it; its default
+returns an unsupported-operation error. Existing compiled reader components remain compatible.
+
+This is an incremental migration, not a replacement of built-in `read` yet. Images, absolute/home
+path resolution, shared tool-visible directories and a person-controlled tool-selection/default
+grant story still need parity work. Standard plugins are not silently enabled or given the agent's
+authority merely because their source ships in the repository.
+
 ## Authority and provenance
 
 Operational authority is bounded by the agent, then the manifest's scope ceiling, then the plugin's

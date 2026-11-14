@@ -1,0 +1,4 @@
+id = "files"
+version = "0.1.0"
+component = "read.component.wasm"
+scopes = ["tool", "fs-read"]

@@ -2549,6 +2549,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "saddle-tools"
+version = "0.0.1"
+dependencies = [
+ "saddle-sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "saddle-wit"
 version = "0.0.1"
 dependencies = [

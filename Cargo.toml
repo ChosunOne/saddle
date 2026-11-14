@@ -20,6 +20,7 @@ saddle-policy = { path = "crates/saddle-policy" }
 saddle-sandbox = { path = "crates/saddle-sandbox" }
 saddle-wit = { path = "crates/saddle-wit" }
 saddle-loader = { path = "crates/saddle-loader" }
+saddle-sdk = { path = "crates/saddle-sdk" }
 
 # D14, D127: one deliberately pinned runtime line; 36 supports the workspace's Rust 1.88 MSRV.
 # The future wasmtime-wasi-http adapter must use the same exact version.

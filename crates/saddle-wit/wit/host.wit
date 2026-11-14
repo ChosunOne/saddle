@@ -15,3 +15,13 @@ interface fs-read {
 
     read-file: func(path: path) -> result<list<u8>, failure>;
 }
+
+// An additive interface keeps existing read-file components binary-compatible.
+interface fs-read-range {
+    use fs-read.{path, failure};
+    record chunk {
+        bytes: list<u8>,
+        eof: bool,
+    }
+    read-range: func(path: path, offset: u64, limit: u32) -> result<chunk, failure>;
+}

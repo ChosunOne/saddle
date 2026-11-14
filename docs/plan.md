@@ -2936,6 +2936,21 @@ A real upgrade test checks this separation, rather than only testing framed mess
 uninspected handshake. A generic recovery notice is not evidence of one particular underlying
 failure; transport failures must not be diagnosed solely from the fact that HTTP recovery worked.
 
+**D131.** Standard tool implementations move into guest components incrementally; the core retains
+permission enforcement, root resolution, audit, sandboxing and provider/session services. Bundling
+must not implicitly grant a component the agent's reach or make it privileged. Native tools remain
+until replacement covers their documented surfaces and a person-controlled selection/default-grant
+story is in place; there is no silent alias or replacement in this step.
+
+The additive `saddle:host/fs-read-range@0.1.0` interface requires the existing `fs-read` scope and
+returns a bounded byte chunk and an observed EOF flag for a root-relative path, byte offset and
+positive limit of at most 64 KiB. It does not change the original `fs-read` interface or whole-file
+limit. Each request independently passes D129's requested/resolved checks and logs offset/limit
+with the path and call id. The host may read one look-ahead byte to establish EOF. Guest code owns
+line selection, UTF-8 handling and presentation, not the host. Ranges reopen and recheck the file:
+they are not a snapshot, and concurrent file changes may affect a multi-chunk read. No file handles
+or unbounded reads are exposed. Invocation fuel/deadlines still bound aggregate work.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

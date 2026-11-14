@@ -1,8 +1,8 @@
-//! a component's host calls are serviced by the session's one engine and audit log (D129).
+//! component host calls use the session's one engine and audit log (D129, D131).
 
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
@@ -16,6 +16,7 @@ use saddle_policy::audit::sha256_hex;
 use saddle_policy::{Kind, Request};
 use saddle_wit::exports::saddle::plugin::tool::{Definition, Output};
 use saddle_wit::saddle::host::fs_read::{Failure, Path};
+use saddle_wit::saddle::host::fs_read_range::Chunk;
 use serde_json::json;
 
 use crate::session::Session;
@@ -45,12 +46,13 @@ impl StdError for Fatal {
     }
 }
 
-type FileReply = Result<Result<Vec<u8>, Failure>, String>;
+type FileReply = Result<Result<Chunk, Failure>, String>;
 enum Event {
     Read {
         who: Principal,
         deadline: Instant,
         path: Path,
+        range: Option<(u64, u32)>,
         answer: SyncSender<FileReply>,
     },
     Finished(Result<Reply, String>),
@@ -61,12 +63,33 @@ pub struct Host {
 }
 impl HostServices for Host {
     fn read_file(&mut self, call: &Invocation, path: Path) -> Result<Result<Vec<u8>, Failure>> {
+        Ok(self.request(call, path, None)?.map(|chunk| chunk.bytes))
+    }
+
+    fn read_range(
+        &mut self,
+        call: &Invocation,
+        path: Path,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Result<Chunk, Failure>> {
+        self.request(call, path, Some((offset, limit)))
+    }
+}
+impl Host {
+    fn request(
+        &mut self,
+        call: &Invocation,
+        path: Path,
+        range: Option<(u64, u32)>,
+    ) -> Result<Result<Chunk, Failure>> {
         let (answer, result) = mpsc::sync_channel(1);
         self.events
             .send(Event::Read {
                 who: call.principal().clone(),
                 deadline: call.deadline(),
                 path,
+                range,
                 answer,
             })
             .map_err(|_| anyhow!("plugin session ended"))?;
@@ -113,10 +136,10 @@ pub fn execute(
                 who,
                 deadline,
                 path,
+                range,
                 answer,
             }) => {
-                let result = read_file(session, &who, call, deadline, path);
-                let response = match result {
+                let response = match read_file(session, &who, call, deadline, path, range) {
                     Ok(value) => Ok(value),
                     Err(error) => {
                         let why = format!("{error:#}");
@@ -149,10 +172,44 @@ fn denied(
     who: &Principal,
     call: &str,
     path: &Path,
+    range: Option<(u64, u32)>,
     why: String,
-) -> Result<Result<Vec<u8>, Failure>> {
-    session.audit.event(Kind::Decision, Some(who), Some(Scope::FsRead), Some(false), json!({"call_id":call, "root_sha256":sha256_hex(path.root.as_bytes()), "relative_sha256":sha256_hex(path.relative.as_bytes())}), &why)?;
+) -> Result<Result<Chunk, Failure>> {
+    let mut args = json!({"call_id":call, "root_sha256":sha256_hex(path.root.as_bytes()), "relative_sha256":sha256_hex(path.relative.as_bytes())});
+    if let Some((offset, limit)) = range {
+        args["offset"] = offset.into();
+        args["limit"] = limit.into();
+    }
+    session.audit.event(
+        Kind::Decision,
+        Some(who),
+        Some(Scope::FsRead),
+        Some(false),
+        args,
+        &why,
+    )?;
     Ok(Err(Failure::Denied(why)))
+}
+
+fn gate(
+    session: &mut Session,
+    who: &Principal,
+    call: &str,
+    loc: &Location,
+    range: Option<(u64, u32)>,
+) -> Result<Option<Failure>> {
+    let request = Request::FsRead { loc };
+    let decision = session.engine.decide(who, &request);
+    if let Some(range) = range {
+        session
+            .audit
+            .decision_for_read_range(who, &request, &decision, call, range)?;
+    } else {
+        session
+            .audit
+            .decision_for_call(who, &request, &decision, call)?;
+    }
+    Ok((!decision.allow).then_some(Failure::Denied(decision.explanation)))
 }
 
 fn read_file(
@@ -161,9 +218,27 @@ fn read_file(
     call: &str,
     deadline: Instant,
     path: Path,
-) -> Result<Result<Vec<u8>, Failure>> {
+    range: Option<(u64, u32)>,
+) -> Result<Result<Chunk, Failure>> {
+    if range.is_some_and(|(_, limit)| limit == 0 || u64::from(limit) > MAX_FILE_BYTES as u64) {
+        return denied(
+            session,
+            who,
+            call,
+            &path,
+            range,
+            "read range limit must be between 1 and 65536 bytes".into(),
+        );
+    }
     if path.root.len() > 64 || path.relative.len() > 4096 {
-        return denied(session, who, call, &path, "plugin path is too long".into());
+        return denied(
+            session,
+            who,
+            call,
+            &path,
+            range,
+            "plugin path is too long".into(),
+        );
     }
     let (root, rel) = match (RootName::new(&path.root), RelPath::new(&path.relative)) {
         (Ok(root), Ok(rel)) => (root, rel),
@@ -173,6 +248,7 @@ fn read_file(
                 who,
                 call,
                 &path,
+                range,
                 "invalid root-relative plugin path".into(),
             );
         }
@@ -183,17 +259,13 @@ fn read_file(
             who,
             call,
             &path,
+            range,
             "plugin read cancelled or timed out".into(),
         );
     }
     let loc = Location::new(root, rel);
-    let request = Request::FsRead { loc: &loc };
-    let decision = session.engine.decide(who, &request);
-    session
-        .audit
-        .decision_for_call(who, &request, &decision, call)?;
-    if !decision.allow {
-        return Ok(Err(Failure::Denied(decision.explanation)));
+    if let Some(failure) = gate(session, who, call, &loc, range)? {
+        return Ok(Err(failure));
     }
     let dir = session
         .file_roots
@@ -202,20 +274,19 @@ fn read_file(
         .try_clone()?;
     let real = match resolve_beneath(&dir, &loc.rel) {
         Ok(rel) => Location::new(loc.root.clone(), rel),
-        Err(error) => return denied(session, who, call, &path, error.to_string()),
+        Err(error) => return denied(session, who, call, &path, range, error.to_string()),
     };
-    if real != loc {
-        let request = Request::FsRead { loc: &real };
-        let decision = session.engine.decide(who, &request);
-        session
-            .audit
-            .decision_for_call(who, &request, &decision, call)?;
-        if !decision.allow {
-            return Ok(Err(Failure::Denied(decision.explanation)));
-        }
+    if real != loc
+        && let Some(failure) = gate(session, who, call, &real, range)?
+    {
+        return Ok(Err(failure));
     }
-    let bytes = (|| -> Result<Result<Vec<u8>, Failure>> {
+    let bytes = (|| -> Result<Result<Chunk, Failure>> {
         let mut file = fs_access::file(&dir, &real.rel)?;
+        if let Some((offset, _)) = range {
+            file.seek(SeekFrom::Start(offset))?;
+        }
+        let max = range.map_or(MAX_FILE_BYTES, |(_, limit)| limit as usize);
         let mut bytes = Vec::new();
         let mut chunk = [0; 8192];
         loop {
@@ -224,15 +295,19 @@ fn read_file(
                     "plugin read cancelled or timed out".into(),
                 )));
             }
-            let want = (MAX_FILE_BYTES + 1 - bytes.len()).min(chunk.len());
+            let want = (max + 1 - bytes.len()).min(chunk.len());
             let n = file.read(&mut chunk[..want])?;
             if n == 0 {
-                return Ok(Ok(bytes));
+                return Ok(Ok(Chunk { bytes, eof: true }));
             }
-            if bytes.len() + n > MAX_FILE_BYTES {
+            if bytes.len() + n > max && range.is_none() {
                 return Ok(Err(Failure::TooLarge));
             }
             bytes.extend_from_slice(&chunk[..n]);
+            if bytes.len() > max {
+                bytes.truncate(max);
+                return Ok(Ok(Chunk { bytes, eof: false }));
+            }
         }
     })();
     Ok(match bytes {

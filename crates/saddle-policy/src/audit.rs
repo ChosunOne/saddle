@@ -101,7 +101,7 @@ impl AuditLog {
     }
 
     pub fn decision(&mut self, who: &Principal, req: &Request<'_>, d: &Decision) -> io::Result<()> {
-        self.call_decision(who, req, d, None)
+        self.call_decision(who, req, d, None, None)
     }
 
     /// correlates a plugin host operation without replacing its resolved arguments (D129).
@@ -112,7 +112,19 @@ impl AuditLog {
         d: &Decision,
         call: &str,
     ) -> io::Result<()> {
-        self.call_decision(who, req, d, Some(call))
+        self.call_decision(who, req, d, Some(call), None)
+    }
+
+    /// records a bounded byte read with its resolved path and host-assigned call identity (D131).
+    pub fn decision_for_read_range(
+        &mut self,
+        who: &Principal,
+        req: &Request<'_>,
+        d: &Decision,
+        call: &str,
+        range: (u64, u32),
+    ) -> io::Result<()> {
+        self.call_decision(who, req, d, Some(call), Some(range))
     }
 
     fn call_decision(
@@ -121,10 +133,15 @@ impl AuditLog {
         req: &Request<'_>,
         d: &Decision,
         call: Option<&str>,
+        range: Option<(u64, u32)>,
     ) -> io::Result<()> {
         let mut args = req.args();
         if let Some(call) = call {
             args["call_id"] = Value::String(call.to_owned());
+        }
+        if let Some((offset, limit)) = range {
+            args["offset"] = offset.into();
+            args["limit"] = limit.into();
         }
         self.write(Record {
             kind: Kind::Decision,

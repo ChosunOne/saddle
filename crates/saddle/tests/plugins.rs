@@ -302,6 +302,97 @@ fn special_and_oversized_files_fail_without_unbounded_reads() {
 }
 
 #[test]
+fn ranged_reads_are_bounded_audited_and_cannot_bypass_existing_read_policy() {
+    let env = Env::new(&fixture::range_reader("file", 70000, 4), fixture::GRANTS);
+    let mut data = vec![b'x'; 70000];
+    data.extend_from_slice(b"tail-more");
+    fs::write(env.ws().join("file"), data).unwrap();
+    let out = call(&env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("tail"));
+    assert!(!text(&out).contains("tail-more"));
+    let rows = env.records();
+    let row = rows.iter().find(|r| r["scope"] == "fs-read").unwrap();
+    assert_eq!(row["args"]["offset"], 70000);
+    assert_eq!(row["args"]["limit"], 4);
+    for limit in [0, 65537, u32::MAX] {
+        let env = Env::new(&fixture::range_reader("file", 0, limit), fixture::GRANTS);
+        fs::write(env.ws().join("file"), "secret").unwrap();
+        let out = call(&env);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert!(!text(&out).contains("secret"));
+        assert!(
+            env.records()
+                .iter()
+                .any(|r| r["scope"] == "fs-read" && r["allow"] == false)
+        );
+    }
+    for path in ["private", "alias", ".env"] {
+        let env = Env::new(&fixture::range_reader(path, 0, 4), fixture::GRANTS);
+        fs::write(env.ws().join("private"), "secret").unwrap();
+        fs::write(env.ws().join(".env"), "secret").unwrap();
+        symlink("private", env.ws().join("alias")).unwrap();
+        let out = call(&env);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert!(!text(&out).contains("secret"));
+    }
+    let env = Env::new(&fixture::range_reader("file", 0, 4), "tool={}");
+    assert_eq!(call(&env).status.code(), Some(1));
+    no_file_reads(&env);
+}
+
+#[test]
+#[ignore = "build the standard read component first; see docs/plugins.md"]
+fn standard_read_component_paginates_large_files_through_the_production_host() {
+    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/read-plugin/read.component.wasm");
+    let bytes =
+        fs::read(component).expect("build the standard read component first; see docs/plugins.md");
+    let env = Env::new(&bytes, fixture::GRANTS);
+    fs::write(env.ws().join("file"), "hello\n".repeat(20_000)).unwrap();
+    let out = env.run(&[
+        "plugin",
+        "call",
+        "reader",
+        r#"{"path":"file","offset":15000,"limit":2}"#,
+    ]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("hello\nhello\n"));
+    assert!(text(&out).contains("offset=15002"));
+    let rows = env.records();
+    let reads: Vec<_> = rows
+        .iter()
+        .filter(|row| row["scope"] == "fs-read")
+        .collect();
+    assert!(reads.len() > 1);
+    assert!(
+        reads
+            .iter()
+            .all(|row| row["principal"] == "plugin.reader" && row["args"]["limit"] == 8192)
+    );
+    assert!(
+        reads
+            .iter()
+            .any(|row| row["args"]["offset"].as_u64().unwrap() > 65536)
+    );
+    let log = env.log();
+    assert!(
+        env.run(&["audit", "verify", log.to_str().unwrap()])
+            .status
+            .success()
+    );
+    fs::write(env.ws().join("private"), "secret").unwrap();
+    symlink("private", env.ws().join("alias")).unwrap();
+    for path in [".env", "private", "alias"] {
+        fs::write(env.ws().join(".env"), "secret").unwrap();
+        let arguments = format!(r#"{{"path":{path:?}}}"#);
+        let out = env.run(&["plugin", "call", "reader", &arguments]);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert!(!text(&out).contains("secret"));
+    }
+}
+
+#[test]
 fn workspace_plugin_grants_are_layered_and_one_run_revocation_keeps_them_bounded() {
     let env = Env::new(&fixture::reader("file"), "");
     fs::write(env.ws().join("file"), "workspace-scoped plugin").unwrap();

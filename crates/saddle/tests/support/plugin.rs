@@ -12,9 +12,13 @@ pub fn reader(path: &str) -> Vec<u8> {
 }
 
 pub fn reader_on_root(root: &str, path: &str) -> Vec<u8> {
+    wat::parse_str(reader_source(root, path)).unwrap()
+}
+
+fn reader_source(root: &str, path: &str) -> String {
     assert!(root.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
     assert!(path.is_ascii() && !path.contains(['"', '\\']));
-    let source = READER
+    READER
         .replace(
             "(data (i32.const 256) \"workspace\")",
             &format!("(data (i32.const 256) {root:?})"),
@@ -33,7 +37,18 @@ pub fn reader_on_root(root: &str, path: &str) -> Vec<u8> {
                 "i32.const 300 i32.const {} i32.const 32 call $read",
                 path.len()
             ),
-        );
+        )
+}
+
+#[allow(dead_code)] // shared with the model suite, which does not need this fixture.
+pub fn range_reader(path: &str, offset: u64, limit: u32) -> Vec<u8> {
+    let source = reader_source("workspace", path)
+        .replace("fs-read@0.1.0", "fs-read-range@0.1.0")
+        .replace("\"read-file\"", "\"read-range\"")
+        .replace("(type $result (result (list u8) (error $failure)))", "(type $chunk-record (record (field \"bytes\" (list u8)) (field \"eof\" bool))) (export \"chunk\" (type $chunk (eq $chunk-record))) (type $result (result $chunk (error $failure)))")
+        .replace("(func (param \"path\" $path) (result $result))", "(func (param \"path\" $path) (param \"offset\" u64) (param \"limit\" u32) (result $result))")
+        .replace("(param i32 i32 i32 i32 i32)", "(param i32 i32 i32 i32 i64 i32 i32)")
+        .replace("i32.const 32 call $read", &format!("i64.const {offset} i32.const {limit} i32.const 32 call $read"));
     wat::parse_str(source).unwrap()
 }
 

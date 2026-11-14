@@ -15,6 +15,7 @@ use saddle_cap::{Grants, Principal, Scope};
 use saddle_wit::ReadToolPre;
 use saddle_wit::exports::saddle::plugin::tool::{Definition, Output};
 use saddle_wit::saddle::host::fs_read::{self, Failure, Host, Path};
+use saddle_wit::saddle::host::fs_read_range::{self, Chunk, Host as RangeHost};
 use sha2::{Digest, Sha256};
 use wasmtime::component::types::{Component as ComponentType, ComponentItem};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
@@ -109,6 +110,19 @@ pub trait HostServices: Send + 'static {
         call: &Invocation,
         path: Path,
     ) -> anyhow::Result<Result<Vec<u8>, Failure>>;
+
+    /// serves a bounded range under the same grants; hosts without this service fail closed.
+    fn read_range(
+        &mut self,
+        _call: &Invocation,
+        _path: Path,
+        _offset: u64,
+        _limit: u32,
+    ) -> anyhow::Result<Result<Chunk, Failure>> {
+        Ok(Err(Failure::Io(
+            "host does not implement ranged reads".into(),
+        )))
+    }
 }
 
 struct State<H> {
@@ -135,6 +149,25 @@ impl<H: HostServices> Host for State<H> {
         }
         let result = self.host.read_file(&self.call, path)?;
         if matches!(&result, Ok(bytes) if bytes.len() > MAX_FILE_BYTES) {
+            return Ok(Err(Failure::TooLarge));
+        }
+        Ok(result)
+    }
+}
+
+impl<H: HostServices> RangeHost for State<H> {
+    fn read_range(
+        &mut self,
+        path: Path,
+        offset: u64,
+        limit: u32,
+    ) -> anyhow::Result<Result<Chunk, Failure>> {
+        if self.call.cancelled() || Instant::now() >= self.call.deadline {
+            return Err(anyhow!("plugin call cancelled or timed out"));
+        }
+        let result = self.host.read_range(&self.call, path, offset, limit)?;
+        if matches!(&result, Ok(chunk) if chunk.bytes.len() > MAX_FILE_BYTES || chunk.bytes.len() as u64 > u64::from(limit))
+        {
             return Ok(Err(Failure::TooLarge));
         }
         Ok(result)
@@ -237,7 +270,11 @@ impl Loader {
         // Even an empty, unused import must be refused if its adapter is not implemented;
         // Wasmtime can otherwise elide it during pre-linking.
         for name in &imports {
-            if name != "saddle:host/fs-read@0.1.0" && !ambient::supports(name) {
+            if !matches!(
+                name.as_str(),
+                "saddle:host/fs-read@0.1.0" | "saddle:host/fs-read-range@0.1.0"
+            ) && !ambient::supports(name)
+            {
                 return Err(Error::Refused(format!(
                     "import `{name}` is not implemented by the initial runtime"
                 )));
@@ -248,6 +285,8 @@ impl Loader {
         if scopes.contains(&Scope::FsRead) {
             fs_read::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
                 .map_err(runtime("linking fs-read"))?;
+            fs_read_range::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+                .map_err(runtime("linking fs-read-range"))?;
         }
         check_tool_types(engine, &ty)?;
         let pre = linker
