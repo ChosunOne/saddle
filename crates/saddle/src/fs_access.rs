@@ -88,6 +88,17 @@ pub fn file(root: &Dir, rel: &RelPath) -> io::Result<File> {
     ))
 }
 
+/// pins a previously resolved directory without following any replaced path component (D132).
+pub fn directory(root: &Dir, rel: &RelPath) -> io::Result<Dir> {
+    let mut dir = root.try_clone()?;
+    for part in rel.to_path().components() {
+        if let Component::Normal(part) = part {
+            dir = Dir::from_std_file(dir.open_with(part, &options(true))?.into_std());
+        }
+    }
+    Ok(dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +117,10 @@ mod tests {
         assert!(file(&dir, &RelPath::new("link").unwrap()).is_err());
         assert!(file(&dir, &RelPath::new("alias/file").unwrap()).is_err());
         assert!(file(&dir, &RelPath::new("dir/file").unwrap()).is_ok());
+        assert!(directory(&dir, &RelPath::new("alias").unwrap()).is_err());
+        assert!(directory(&dir, &RelPath::new("dir/file").unwrap()).is_err());
+        let child = directory(&dir, &RelPath::new("dir").unwrap()).unwrap();
+        assert_eq!(child.entries().unwrap().count(), 1);
     }
 
     #[test]

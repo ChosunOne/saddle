@@ -2951,6 +2951,29 @@ line selection, UTF-8 handling and presentation, not the host. Ranges reopen and
 they are not a snapshot, and concurrent file changes may affect a multi-chunk read. No file handles
 or unbounded reads are exposed. Invocation fuel/deadlines still bound aggregate work.
 
+**D132.** Filesystem tool migration uses small, bounded metadata services rather than host-side
+tool implementations. Additive `saddle:host/fs-paths@0.1.0` and `fs-list@0.1.0` imports require the
+existing `fs-read` grant. Resolution maps relative (workspace-based), absolute and home-relative
+paths to true roots and checks the plugin's effective read policy. It does not turn D66's
+tool-visible directories into roots or let a guest choose a native tool name to borrow their access.
+Actual operations still recheck paths and resolved symlink targets independently.
+
+Directory pages contain at most 128 named entries with file/directory/symlink/other kinds, sorted
+lexically after a caller cursor, plus counts and a more flag. The core pins the directory with
+no-follow descriptors and filters every entry against both requested and resolved locations without
+per-child audit records, like D10's native search filter. Only the starting access is audited with
+operation, cursor, limit, path and call id. No symlink target is followed or disclosed by listing.
+Non-UTF-8 names are skipped; a scan exceeding 100,000 entries fails rather than silently returning
+an incomplete page. Cancellation/deadline checks run during enumeration. Pages are not snapshots;
+concurrent directory changes may affect later pages. Guests own listing presentation and recursive
+walks; neither interface exposes arbitrary host paths or native directory handles.
+
+Native tool replacements remain incremental under D131. Read still needs image result support,
+deep-offset/cursor work and explicit standard-tool selection; shared tool-path delegation needs its
+own design without weakening D65/D66. Search tools build on metadata/range services. Mutating tools,
+exec/network tools and transcript SQL require their own bounded adapters and delegation tests before
+migration; they must not call a built-in as the agent to bypass their plugin principal.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

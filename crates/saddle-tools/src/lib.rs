@@ -1,11 +1,13 @@
 //! standard tool implementations; the core owns effects, guests own presentation (D131).
 
+pub mod listing;
+
 use serde::Deserialize;
 
 #[cfg(target_arch = "wasm32")]
-use saddle_sdk::{Definition, FilePath, Output, Tool, read_range};
+use saddle_sdk::{Definition, FilePath, Output, Tool, read_range, resolve_path};
 #[cfg(target_arch = "wasm32")]
-use serde_json::json;
+use serde_json::{Value, json};
 
 const CHUNK_BYTES: u32 = 8192;
 const PAGE_BYTES: usize = 50 * 1024;
@@ -42,7 +44,7 @@ impl Tool for Read {
     fn describe() -> Definition {
         Definition {
             name: "read".into(),
-            description: "read a UTF-8 text page beneath a granted root; path is root-relative, root defaults to workspace, offset is a 1-based line. At most 2000 lines and 50 KiB per page; scans at most 1 MiB. No images or absolute paths.".into(),
+            description: "read a UTF-8 text page beneath a granted root; path is workspace-relative or absolute unless root is provided, offset is a 1-based line. At most 2000 lines and 50 KiB per page; scans at most 1 MiB. No images.".into(),
             input_schema: json!({
                 "type":"object", "properties": {
                     "root":{"type":"string"}, "path":{"type":"string"},
@@ -54,6 +56,15 @@ impl Tool for Read {
     }
 
     fn invoke(arguments: String) -> Output {
+        let arguments = match normalize_path(&arguments, None) {
+            Ok(arguments) => arguments,
+            Err(text) => {
+                return Output {
+                    text,
+                    is_error: true,
+                };
+            }
+        };
         let result = read_with(&arguments, |root, path, offset, limit| {
             read_range(
                 &FilePath {
@@ -77,6 +88,26 @@ impl Tool for Read {
             },
         }
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn normalize_path(arguments: &str, default: Option<&str>) -> Result<String, String> {
+    let mut arguments: Value =
+        serde_json::from_str(arguments).map_err(|error| format!("invalid arguments: {error}"))?;
+    let object = arguments
+        .as_object_mut()
+        .ok_or("arguments must be an object")?;
+    if !object.contains_key("root") {
+        let path = object
+            .get("path")
+            .and_then(Value::as_str)
+            .or(default)
+            .ok_or("missing string field `path`")?;
+        let path = resolve_path(path).map_err(|error| format!("resolve failed: {error:?}"))?;
+        object.insert("root".into(), json!(path.root));
+        object.insert("path".into(), json!(path.relative));
+    }
+    Ok(arguments.to_string())
 }
 
 /// runs the tool against a bounded range service; native tests use an in-memory service.

@@ -14,6 +14,8 @@ use saddle_cap::manifest::{Manifest, above_ceiling};
 use saddle_cap::{Grants, Principal, Scope};
 use saddle_wit::ReadToolPre;
 use saddle_wit::exports::saddle::plugin::tool::{Definition, Output};
+use saddle_wit::saddle::host::fs_list::{self, Host as ListHost, Page as DirectoryPage};
+use saddle_wit::saddle::host::fs_paths::{self, Host as PathsHost};
 use saddle_wit::saddle::host::fs_read::{self, Failure, Host, Path};
 use saddle_wit::saddle::host::fs_read_range::{self, Chunk, Host as RangeHost};
 use sha2::{Digest, Sha256};
@@ -24,6 +26,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 /// native I/O must enforce this cap before allocating or reading the entire source.
 pub const MAX_FILE_BYTES: usize = 64 * 1024;
+pub const MAX_DIRECTORY_ENTRIES: usize = 128;
 const MAX_COMPONENT_BYTES: usize = 4 * 1024 * 1024;
 const TICK: Duration = Duration::from_millis(10);
 
@@ -111,6 +114,28 @@ pub trait HostServices: Send + 'static {
         path: Path,
     ) -> anyhow::Result<Result<Vec<u8>, Failure>>;
 
+    fn resolve_path(
+        &mut self,
+        _call: &Invocation,
+        _value: String,
+    ) -> anyhow::Result<Result<Path, Failure>> {
+        Ok(Err(Failure::Io(
+            "host does not implement path resolution".into(),
+        )))
+    }
+
+    fn read_directory(
+        &mut self,
+        _call: &Invocation,
+        _path: Path,
+        _after: String,
+        _limit: u32,
+    ) -> anyhow::Result<Result<DirectoryPage, Failure>> {
+        Ok(Err(Failure::Io(
+            "host does not implement directory reads".into(),
+        )))
+    }
+
     /// serves a bounded range under the same grants; hosts without this service fail closed.
     fn read_range(
         &mut self,
@@ -167,6 +192,38 @@ impl<H: HostServices> RangeHost for State<H> {
         }
         let result = self.host.read_range(&self.call, path, offset, limit)?;
         if matches!(&result, Ok(chunk) if chunk.bytes.len() > MAX_FILE_BYTES || chunk.bytes.len() as u64 > u64::from(limit))
+        {
+            return Ok(Err(Failure::TooLarge));
+        }
+        Ok(result)
+    }
+}
+
+impl<H: HostServices> PathsHost for State<H> {
+    fn resolve_path(&mut self, value: String) -> anyhow::Result<Result<Path, Failure>> {
+        if self.call.cancelled() || Instant::now() >= self.call.deadline {
+            return Err(anyhow!("plugin call cancelled or timed out"));
+        }
+        let result = self.host.resolve_path(&self.call, value)?;
+        if matches!(&result, Ok(path) if path.root.len() > 64 || path.relative.len() > 4096) {
+            return Ok(Err(Failure::TooLarge));
+        }
+        Ok(result)
+    }
+}
+
+impl<H: HostServices> ListHost for State<H> {
+    fn read_directory(
+        &mut self,
+        path: Path,
+        after: String,
+        limit: u32,
+    ) -> anyhow::Result<Result<DirectoryPage, Failure>> {
+        if self.call.cancelled() || Instant::now() >= self.call.deadline {
+            return Err(anyhow!("plugin call cancelled or timed out"));
+        }
+        let result = self.host.read_directory(&self.call, path, after, limit)?;
+        if matches!(&result, Ok(page) if page.entries.len() > MAX_DIRECTORY_ENTRIES || page.entries.len() as u64 > u64::from(limit) || page.entries.iter().map(|entry| entry.name.len()).sum::<usize>() > MAX_FILE_BYTES)
         {
             return Ok(Err(Failure::TooLarge));
         }
@@ -272,7 +329,10 @@ impl Loader {
         for name in &imports {
             if !matches!(
                 name.as_str(),
-                "saddle:host/fs-read@0.1.0" | "saddle:host/fs-read-range@0.1.0"
+                "saddle:host/fs-read@0.1.0"
+                    | "saddle:host/fs-read-range@0.1.0"
+                    | "saddle:host/fs-paths@0.1.0"
+                    | "saddle:host/fs-list@0.1.0"
             ) && !ambient::supports(name)
             {
                 return Err(Error::Refused(format!(
@@ -287,6 +347,10 @@ impl Loader {
                 .map_err(runtime("linking fs-read"))?;
             fs_read_range::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
                 .map_err(runtime("linking fs-read-range"))?;
+            fs_paths::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+                .map_err(runtime("linking fs-paths"))?;
+            fs_list::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+                .map_err(runtime("linking fs-list"))?;
         }
         check_tool_types(engine, &ty)?;
         let pre = linker

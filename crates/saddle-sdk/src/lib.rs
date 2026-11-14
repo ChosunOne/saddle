@@ -7,5 +7,9 @@ wit_bindgen::generate!({
 });
 
 pub use exports::saddle::plugin::tool::{Definition, Guest as Tool, Output};
+pub use saddle::host::fs_list::{
+    Entry as DirectoryEntry, EntryKind, Page as DirectoryPage, read_directory,
+};
+pub use saddle::host::fs_paths::resolve_path;
 pub use saddle::host::fs_read::{Failure, Path as FilePath, read_file};
 pub use saddle::host::fs_read_range::{Chunk, read_range};

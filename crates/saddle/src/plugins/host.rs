@@ -9,16 +9,18 @@ use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Error as HostError, Result, anyhow};
 use saddle_cap::{Location, Principal, RelPath, RootName, Scope};
 use saddle_loader::{HostServices, Invocation, MAX_FILE_BYTES, Prepared};
 use saddle_policy::audit::sha256_hex;
 use saddle_policy::{Kind, Request};
 use saddle_wit::exports::saddle::plugin::tool::{Definition, Output};
+use saddle_wit::saddle::host::fs_list::Page as DirectoryPage;
 use saddle_wit::saddle::host::fs_read::{Failure, Path};
 use saddle_wit::saddle::host::fs_read_range::Chunk;
 use serde_json::json;
 
+use super::filesystem;
 use crate::session::Session;
 use crate::tools::fs::resolve_beneath;
 use crate::{cancel, fs_access};
@@ -46,7 +48,8 @@ impl StdError for Fatal {
     }
 }
 
-type FileReply = Result<Result<Chunk, Failure>, String>;
+type HostReply<T> = Result<Result<T, Failure>, String>;
+type FileReply = HostReply<Chunk>;
 enum Event {
     Read {
         who: Principal,
@@ -55,6 +58,20 @@ enum Event {
         range: Option<(u64, u32)>,
         answer: SyncSender<FileReply>,
     },
+    Resolve {
+        who: Principal,
+        deadline: Instant,
+        value: String,
+        answer: SyncSender<HostReply<Path>>,
+    },
+    List {
+        who: Principal,
+        deadline: Instant,
+        path: Path,
+        after: String,
+        limit: u32,
+        answer: SyncSender<HostReply<DirectoryPage>>,
+    },
     Finished(Result<Reply, String>),
 }
 
@@ -62,6 +79,46 @@ pub struct Host {
     events: SyncSender<Event>,
 }
 impl HostServices for Host {
+    fn resolve_path(&mut self, call: &Invocation, value: String) -> Result<Result<Path, Failure>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        self.events
+            .send(Event::Resolve {
+                who: call.principal().clone(),
+                deadline: call.deadline(),
+                value,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        result
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(|_| anyhow!("plugin path request timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
+
+    fn read_directory(
+        &mut self,
+        call: &Invocation,
+        path: Path,
+        after: String,
+        limit: u32,
+    ) -> Result<Result<DirectoryPage, Failure>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        self.events
+            .send(Event::List {
+                who: call.principal().clone(),
+                deadline: call.deadline(),
+                path,
+                after,
+                limit,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        result
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(|_| anyhow!("plugin directory request timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
+
     fn read_file(&mut self, call: &Invocation, path: Path) -> Result<Result<Vec<u8>, Failure>> {
         Ok(self.request(call, path, None)?.map(|chunk| chunk.bytes))
     }
@@ -139,16 +196,40 @@ pub fn execute(
                 range,
                 answer,
             }) => {
-                let response = match read_file(session, &who, call, deadline, path, range) {
-                    Ok(value) => Ok(value),
-                    Err(error) => {
-                        let why = format!("{error:#}");
-                        fatal = Some(error);
-                        cancelled.store(true, Ordering::Relaxed);
-                        Err(why)
-                    }
-                };
-                let _ = answer.send(response);
+                respond(
+                    read_file(session, &who, call, deadline, path, range),
+                    answer,
+                    &mut fatal,
+                    &cancelled,
+                );
+            }
+            Ok(Event::Resolve {
+                who,
+                deadline,
+                value,
+                answer,
+            }) => {
+                respond(
+                    filesystem::resolve_path(session, &who, call, deadline, value),
+                    answer,
+                    &mut fatal,
+                    &cancelled,
+                );
+            }
+            Ok(Event::List {
+                who,
+                deadline,
+                path,
+                after,
+                limit,
+                answer,
+            }) => {
+                respond(
+                    filesystem::read_directory(session, &who, call, deadline, path, after, limit),
+                    answer,
+                    &mut fatal,
+                    &cancelled,
+                );
             }
             Ok(Event::Finished(result)) => break result,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -165,6 +246,24 @@ pub fn execute(
         return Err(Fatal(error).into());
     }
     Ok(result)
+}
+
+fn respond<T>(
+    result: Result<Result<T, Failure>>,
+    answer: SyncSender<HostReply<T>>,
+    fatal: &mut Option<HostError>,
+    cancelled: &AtomicBool,
+) {
+    let response = match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let why = format!("{error:#}");
+            *fatal = Some(error);
+            cancelled.store(true, Ordering::Relaxed);
+            Err(why)
+        }
+    };
+    let _ = answer.send(response);
 }
 
 fn denied(

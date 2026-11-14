@@ -52,6 +52,42 @@ pub fn range_reader(path: &str, offset: u64, limit: u32) -> Vec<u8> {
     wat::parse_str(source).unwrap()
 }
 
+#[allow(dead_code)] // shared with model tests that do not need metadata fixtures.
+pub fn directory_reader(path: &str, after: &str, limit: u32) -> Vec<u8> {
+    assert!(after.is_ascii() && !after.contains(['"', '\\']));
+    let source = reader_source("workspace", path)
+        .replace("fs-read@0.1.0", "fs-list@0.1.0")
+        .replace("\"read-file\"", "\"read-directory\"")
+        .replace("(type $result (result (list u8) (error $failure)))", "(type $kind-type (enum \"file\" \"directory\" \"symlink\" \"other\")) (export \"entry-kind\" (type $kind (eq $kind-type))) (type $entry-type (record (field \"name\" string) (field \"kind\" $kind))) (export \"entry\" (type $entry (eq $entry-type))) (type $page-type (record (field \"entries\" (list $entry)) (field \"total\" u32) (field \"skipped\" u32) (field \"more\" bool))) (export \"page\" (type $page (eq $page-type))) (type $result (result $page (error $failure)))")
+        .replace("(func (param \"path\" $path) (result $result))", "(func (param \"path\" $path) (param \"after\" string) (param \"limit\" u32) (result $result))")
+        .replace("(param i32 i32 i32 i32 i32)", "(param i32 i32 i32 i32 i32 i32 i32 i32)")
+        .replace("(data (i32.const 272) \"denied\")", &format!("(data (i32.const 272) \"denied\") (data (i32.const 512) {after:?})"))
+        .replace("i32.const 32 call $read", &format!("i32.const 512 i32.const {} i32.const {limit} i32.const 32 call $read", after.len()))
+        .replace("i32.const 64 i32.const 36 i32.load i32.store", "i32.const 64 i32.const 36 i32.load i32.load i32.store")
+        .replace("i32.const 68 i32.const 40 i32.load i32.store", "i32.const 68 i32.const 36 i32.load i32.const 4 i32.add i32.load i32.store");
+    wat::parse_str(source).unwrap()
+}
+
+#[allow(dead_code)] // shared with model tests that do not need metadata fixtures.
+pub fn path_resolver(path: &str) -> Vec<u8> {
+    let source = reader_source("workspace", path)
+        .replace("fs-read@0.1.0", "fs-paths@0.1.0")
+        .replace("\"read-file\"", "\"resolve-path\"")
+        .replace(
+            "(result (list u8) (error $failure))",
+            "(result $path (error $failure))",
+        )
+        .replace(
+            "(func (param \"path\" $path) (result $result))",
+            "(func (param \"value\" string) (result $result))",
+        )
+        .replace("(param i32 i32 i32 i32 i32)", "(param i32 i32 i32)")
+        .replace("i32.const 256 i32.const 9 ", "")
+        .replace("i32.const 36 i32.load", "i32.const 44 i32.load")
+        .replace("i32.const 40 i32.load", "i32.const 48 i32.load");
+    wat::parse_str(source).unwrap()
+}
+
 pub fn forbidden() -> Vec<u8> {
     wat::parse_str(
         READER

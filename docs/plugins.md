@@ -111,7 +111,8 @@ saddle plugin call files '{"path":"src/lib.rs","offset":100,"limit":40}'
 saddle tool plugin__files__read '{"root":"workspace","path":"src/lib.rs"}'
 ```
 
-`path` is relative to `root` (default `workspace`); `offset` is a positive 1-based line number.
+Without `root`, `path` may be workspace-relative, absolute or home-relative, but must map to an
+explicitly granted true root. With `root`, `path` is root-relative. `offset` is a positive 1-based line number.
 Pages have at most 2,000 lines and 50 KiB of text plus a bounded continuation/truncation note. Plain
 text, CRLF and trailing newlines are preserved, without line-number prefixes that could interfere
 with exact edits. Oversized lines may be truncated; continuation advances past the truncated line.
@@ -129,10 +130,45 @@ flag. Each range is limited to 1–65,536 bytes; the host may read one extra byt
 SDK hosts other than Saddle must implement `HostServices::read_range` to support it; its default
 returns an unsupported-operation error. Existing compiled reader components remain compatible.
 
-This is an incremental migration, not a replacement of built-in `read` yet. Images, absolute/home
-path resolution, shared tool-visible directories and a person-controlled tool-selection/default
+This is an incremental migration, not a replacement of built-in `read` yet. Images,
+shared tool-visible directories and a person-controlled tool-selection/default
 grant story still need parity work. Standard plugins are not silently enabled or given the agent's
 authority merely because their source ships in the repository.
+
+## Standard directory listing plugin
+
+`listing` exports `plugin__listing__ls`, implemented in `saddle-tools`:
+
+```sh
+cargo build -p saddle-tools --example ls --target wasm32-unknown-unknown --release
+mkdir -p target/ls-plugin
+cargo run -p saddle-loader --example componentize -- \
+  target/wasm32-unknown-unknown/release/examples/ls.wasm target/ls-plugin/ls.component.wasm
+cp crates/saddle-tools/plugins/ls/plugin.toml target/ls-plugin/plugin.toml
+saddle plugin install target/ls-plugin/plugin.toml
+```
+
+Enable the printed `[plugins.listing]` entry and separately grant `[plugin.listing]` `tool` and the
+needed `fs-read` roots. `saddle plugin call listing '{"path":"src"}'` lists a directory; omitting
+`path` lists the workspace. Path resolution follows the read plugin's rules. Results are sorted,
+with `/` for directories and `@` for symlinks, at most 500 entries/50 KiB plus summary notes.
+
+The guest requests lexical pages of at most 128 entries via `fs-list`. The core checks and audits
+the start directory and filters both agent/plugin exclusions on every child before returning names.
+Symlinks are identified but not followed; a subsequent call targeting an escaping link is refused.
+Each page scans at most 100,000 entries; larger directories fail rather than silently missing names.
+Non-UTF-8 names are skipped, not converted to potentially ambiguous paths. Names in concurrently
+modified directories are not a snapshot. The guest owns suffixes, sorting and output truncation.
+
+The additive `fs-paths` service maps paths to real roots under the same `fs-read` permission. It
+never lets a guest select a native tool identity or access D66 tool-visible directories merely
+because native `read` can. Those directories need a separate bounded delegation design, not an
+automatic exception or a new grantable root.
+
+```sh
+cargo nextest run --test plugins --run-ignored only \
+  -E 'test(standard_ls_component_lists_filtered_pages_and_never_follows_entry_links)'
+```
 
 ## Authority and provenance
 

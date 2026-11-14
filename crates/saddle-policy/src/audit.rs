@@ -101,7 +101,7 @@ impl AuditLog {
     }
 
     pub fn decision(&mut self, who: &Principal, req: &Request<'_>, d: &Decision) -> io::Result<()> {
-        self.call_decision(who, req, d, None, None)
+        self.call_decision(who, req, d, None, None, None)
     }
 
     /// correlates a plugin host operation without replacing its resolved arguments (D129).
@@ -112,7 +112,7 @@ impl AuditLog {
         d: &Decision,
         call: &str,
     ) -> io::Result<()> {
-        self.call_decision(who, req, d, Some(call), None)
+        self.call_decision(who, req, d, Some(call), None, None)
     }
 
     /// records a bounded byte read with its resolved path and host-assigned call identity (D131).
@@ -124,7 +124,19 @@ impl AuditLog {
         call: &str,
         range: (u64, u32),
     ) -> io::Result<()> {
-        self.call_decision(who, req, d, Some(call), Some(range))
+        self.call_decision(who, req, d, Some(call), Some(range), None)
+    }
+
+    /// supplements resolved arguments without allowing details to replace them (D132).
+    pub fn decision_for_call_details(
+        &mut self,
+        who: &Principal,
+        req: &Request<'_>,
+        d: &Decision,
+        call: &str,
+        details: Value,
+    ) -> io::Result<()> {
+        self.call_decision(who, req, d, Some(call), None, Some(details))
     }
 
     fn call_decision(
@@ -134,6 +146,7 @@ impl AuditLog {
         d: &Decision,
         call: Option<&str>,
         range: Option<(u64, u32)>,
+        details: Option<Value>,
     ) -> io::Result<()> {
         let mut args = req.args();
         if let Some(call) = call {
@@ -142,6 +155,11 @@ impl AuditLog {
         if let Some((offset, limit)) = range {
             args["offset"] = offset.into();
             args["limit"] = limit.into();
+        }
+        if let (Some(args), Some(Value::Object(details))) = (args.as_object_mut(), details) {
+            for (key, value) in details {
+                args.entry(key).or_insert(value);
+            }
         }
         self.write(Record {
             kind: Kind::Decision,
@@ -307,6 +325,34 @@ pub fn verify(path: &Path) -> Result<Verified, VerifyError> {
 mod tests {
     use super::*;
     use saddle_cap::{Location, RelPath, RootName};
+    use serde_json::json;
+
+    #[test]
+    fn operation_details_cannot_replace_resolved_paths_or_call_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = AuditLog::create(dir.path(), "details").unwrap();
+        let loc = Location::new(RootName::workspace(), RelPath::new("file").unwrap());
+        let decision = Decision {
+            allow: true,
+            scope: Scope::FsRead,
+            rule: None,
+            explanation: "allowed".into(),
+        };
+        log.decision_for_call_details(
+            &Principal::Agent,
+            &Request::FsRead { loc: &loc },
+            &decision,
+            "host-call",
+            json!({"path":"spoofed","call_id":"spoofed","operation":"read-directory"}),
+        )
+        .unwrap();
+        let record: Record =
+            serde_json::from_str(fs::read_to_string(log.path()).unwrap().trim()).unwrap();
+        assert_eq!(record.args["path"], "workspace:file");
+        assert_eq!(record.args["call_id"], "host-call");
+        assert_eq!(record.args["operation"], "read-directory");
+        verify(log.path()).unwrap();
+    }
 
     fn sample(dir: &Path) -> (PathBuf, String) {
         let mut log = AuditLog::create(dir, "s1").unwrap();

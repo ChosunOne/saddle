@@ -25,3 +25,21 @@ interface fs-read-range {
     }
     read-range: func(path: path, offset: u64, limit: u32) -> result<chunk, failure>;
 }
+
+interface fs-paths {
+    use fs-read.{path, failure};
+    resolve-path: func(value: string) -> result<path, failure>;
+}
+
+interface fs-list {
+    use fs-read.{path, failure};
+    enum entry-kind { file, directory, symlink, other }
+    record entry { name: string, kind: entry-kind }
+    record page {
+        entries: list<entry>,
+        total: u32,
+        skipped: u32,
+        more: bool,
+    }
+    read-directory: func(path: path, after: string, limit: u32) -> result<page, failure>;
+}

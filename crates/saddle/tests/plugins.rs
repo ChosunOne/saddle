@@ -302,6 +302,55 @@ fn special_and_oversized_files_fail_without_unbounded_reads() {
 }
 
 #[test]
+fn metadata_services_use_plugin_grants_and_do_not_borrow_native_tool_path_authority() {
+    let env = Env::new(&fixture::directory_reader(".", "", 1), fixture::GRANTS);
+    fs::write(env.ws().join(".env"), "parent secret").unwrap();
+    fs::write(env.ws().join("private"), "plugin secret").unwrap();
+    fs::write(env.ws().join("visible"), "ok").unwrap();
+    let out = call(&env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("visible"));
+    assert!(!text(&out).contains(".env"));
+    assert!(!text(&out).contains("private"));
+    assert!(
+        env.records()
+            .iter()
+            .any(|r| r["args"]["operation"] == "read-directory"
+                && r["principal"] == "plugin.reader"
+                && r["args"]["limit"] == 1)
+    );
+    for limit in [0, 129] {
+        let env = Env::new(&fixture::directory_reader(".", "", limit), fixture::GRANTS);
+        assert_eq!(call(&env).status.code(), Some(1));
+    }
+    for path in ["private", ".env", "../outside", "~/.agents/secret"] {
+        let env = Env::new(&fixture::path_resolver(path), fixture::GRANTS);
+        assert_eq!(call(&env).status.code(), Some(1), "{path}");
+    }
+    let env = Env::new(&fixture::path_resolver("sub/file"), fixture::GRANTS);
+    let out = call(&env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("sub/file"));
+    let env = Env::new(&fixture::path_resolver("~/.agents/secret"), fixture::GRANTS);
+    let shared = env.0.path().join("home/.agents");
+    fs::create_dir_all(&shared).unwrap();
+    fs::write(shared.join("secret"), "managed-native-content").unwrap();
+    let arguments = format!(
+        r#"{{"path":{:?}}}"#,
+        shared.join("secret").to_str().unwrap()
+    );
+    let native = env.run(&["tool", "read", &arguments]);
+    assert!(native.status.success(), "{}", text(&native));
+    assert!(text(&native).contains("managed-native-content"));
+    let out = call(&env);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!text(&out).contains("managed-native-content"));
+    let env = Env::new(&fixture::directory_reader(".", "", 1), "tool={}");
+    assert_eq!(call(&env).status.code(), Some(1));
+    no_file_reads(&env);
+}
+
+#[test]
 fn ranged_reads_are_bounded_audited_and_cannot_bypass_existing_read_policy() {
     let env = Env::new(&fixture::range_reader("file", 70000, 4), fixture::GRANTS);
     let mut data = vec![b'x'; 70000];
@@ -362,7 +411,7 @@ fn standard_read_component_paginates_large_files_through_the_production_host() {
     let rows = env.records();
     let reads: Vec<_> = rows
         .iter()
-        .filter(|row| row["scope"] == "fs-read")
+        .filter(|row| row["scope"] == "fs-read" && row["args"]["offset"].is_u64())
         .collect();
     assert!(reads.len() > 1);
     assert!(
@@ -390,6 +439,57 @@ fn standard_read_component_paginates_large_files_through_the_production_host() {
         assert_eq!(out.status.code(), Some(1), "{}", text(&out));
         assert!(!text(&out).contains("secret"));
     }
+    let absolute = format!(
+        r#"{{"path":{:?},"offset":2,"limit":1}}"#,
+        env.ws().join("file").to_str().unwrap()
+    );
+    let out = env.run(&["plugin", "call", "reader", &absolute]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("offset=3"));
+}
+
+#[test]
+#[ignore = "build the standard ls component first; see docs/plugins.md"]
+fn standard_ls_component_lists_filtered_pages_and_never_follows_entry_links() {
+    let component =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/ls-plugin/ls.component.wasm");
+    let bytes =
+        fs::read(component).expect("build the standard ls component first; see docs/plugins.md");
+    let env = Env::new(&bytes, fixture::GRANTS);
+    fs::create_dir(env.ws().join("dir")).unwrap();
+    for n in 0..600 {
+        fs::write(env.ws().join("dir").join(format!("file{n:04}")), "ok").unwrap();
+    }
+    fs::write(env.ws().join("dir/private"), "secret").unwrap();
+    fs::write(env.ws().join("dir/.env"), "secret").unwrap();
+    let args = format!(r#"{{"path":{:?}}}"#, env.ws().join("dir").to_str().unwrap());
+    let out = env.run(&["plugin", "call", "reader", &args]);
+    assert!(out.status.success(), "{}", text(&out));
+    let output = text(&out);
+    assert!(output.contains("first 500 of 600 entries"));
+    assert!(output.contains("2 paths skipped"));
+    assert!(!output.contains("private"));
+    assert!(!output.contains("file0500"));
+    assert_eq!(
+        env.records()
+            .iter()
+            .filter(|row| row["args"]["operation"] == "read-directory")
+            .count(),
+        4
+    );
+    fs::create_dir(env.ws().join("empty")).unwrap();
+    let out = env.run(&["plugin", "call", "reader", r#"{"path":"empty"}"#]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("(empty)"));
+    fs::create_dir(env.ws().join("links")).unwrap();
+    fs::create_dir(env.ws().join("links/subdir")).unwrap();
+    symlink("/etc", env.ws().join("links/outside")).unwrap();
+    let out = env.run(&["plugin", "call", "reader", r#"{"path":"links"}"#]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("outside@"));
+    assert!(text(&out).contains("subdir/"));
+    let out = env.run(&["plugin", "call", "reader", r#"{"path":"links/outside"}"#]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
 }
 
 #[test]

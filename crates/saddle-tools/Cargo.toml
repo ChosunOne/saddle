@@ -6,14 +6,16 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+saddle-sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-saddle-sdk.workspace = true
-
 [[example]]
 name = "read"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "ls"
 crate-type = ["cdylib"]
 
 [lints]

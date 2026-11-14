@@ -4,5 +4,7 @@ package saddle:host@0.1.0;
 world read-tool {
     import fs-read;
     import fs-read-range;
+    import fs-paths;
+    import fs-list;
     export saddle:plugin/tool@0.1.0;
 }

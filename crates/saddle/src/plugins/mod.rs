@@ -1,5 +1,6 @@
 //! explicit, protected, digest-pinned read-tool plugins (D25, D26, D128, D129).
 
+mod filesystem;
 mod host;
 
 use std::collections::BTreeMap;

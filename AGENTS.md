@@ -22,7 +22,7 @@ because it is followed.
 | `crates/saddle-wit` | canonical read-tool WIT and generated host bindings (D127) |
 | `crates/saddle-loader` | actual component inspection, bounded delegation, grant-shaped pre-linking, fresh bounded instances and a narrow host-services trait, without a dependency on the binary's session (D126, D127) |
 | `crates/saddle-sdk` | guest bindings from the same WIT and a read-only example; no `std::fs` authority (D12, D127) |
-| `crates/saddle-tools` | standard guest tool implementations; the text-read component owns pagination/presentation and uses bounded host byte ranges, not native filesystem access (D131) |
+| `crates/saddle-tools` | standard guest tool implementations; text reading and directory listing own pagination/presentation and use bounded host byte ranges/filtered metadata, not native filesystem access (D131, D132) |
 | `crates/saddle-sandbox` | applies a sandbox spec to the current process and execs the target, including the command's own network namespace and the relay in it (D79); starts a long-lived child whose stdin and stdout belong to the caller, with the spec on fd 3 (D106); also builds the `saddle-sandbox` helper binary used by its own tests |
 | `crates/saddle` | the binary: built-in tools, model providers, the model loop, the TUI |
 
@@ -295,7 +295,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D131 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D132 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
