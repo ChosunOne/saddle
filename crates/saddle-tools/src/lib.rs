@@ -1,7 +1,9 @@
 //! standard tool implementations; the core owns effects, guests own presentation (D131).
 
 pub mod listing;
+pub mod mutation;
 mod pagination;
+mod patch;
 pub mod search;
 pub mod transcript;
 pub use pagination::read_with;

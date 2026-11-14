@@ -1262,6 +1262,148 @@ fn one_compiled_reader_changes_directory_permissions_at_runtime_without_repinnin
 }
 
 #[test]
+#[ignore = "build the standard write component first; see docs/plugins.md"]
+fn one_compiled_writer_changes_write_permissions_at_runtime_without_repinning() {
+    let tool = "plugin__reader__write";
+    let mut responses = Vec::new();
+    for turn in 0..3 {
+        let id = format!("write-{turn}");
+        responses.push(sse_response(&openai_sse(
+            "",
+            &[(
+                &id,
+                tool,
+                json!({"path":"file","content":format!("turn {turn}")}),
+            )],
+        )));
+        responses.push(sse_response(&openai_sse("done", &[])));
+    }
+    let (base, seen) = serve(responses);
+    let env = Env::new(Api::Openai, &base);
+    let config = env.xdg.path().join("config/saddle/config.toml");
+    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/write-plugin/write.component.wasm");
+    let bytes = fs::read(component).expect("build the standard write component first");
+    plugin_fixture::configure(&config, &bytes, "tool={}\nfs-read=[{root='workspace'}]");
+    fs::write(config.parent().unwrap().join("plugins/reader/plugin.toml"), "id='reader'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes=['tool','fs-read','fs-write']\n").unwrap();
+    let initial: toml::Table = fs::read_to_string(&config).unwrap().parse().unwrap();
+    let pin = initial["plugins"]["reader"]["sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fs::write(env.ws.path().join("file"), "original").unwrap();
+    let mut child = env
+        .command(&["run", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let wait_for = |count| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while seen.lock().unwrap().len() < count {
+            assert!(Instant::now() < deadline, "turn did not finish");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    child.stdin.as_mut().unwrap().write_all(b"first\n").unwrap();
+    wait_for(2);
+    assert_eq!(
+        fs::read_to_string(env.ws.path().join("file")).unwrap(),
+        "original"
+    );
+    let grant = "fs-write=[{root='workspace'}]\n";
+    let settings = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        settings.replace("[plugin.reader]\n", &format!("[plugin.reader]\n{grant}")),
+    )
+    .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"/reload\nsecond\n")
+        .unwrap();
+    wait_for(4);
+    assert_eq!(
+        fs::read_to_string(env.ws.path().join("file")).unwrap(),
+        "turn 1"
+    );
+    let settings = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        settings.replace(&format!("[plugin.reader]\n{grant}"), "[plugin.reader]\n"),
+    )
+    .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/reload\nthird\n/quit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        fs::read_to_string(env.ws.path().join("file")).unwrap(),
+        "turn 1"
+    );
+    assert_eq!(
+        fs::read(
+            config
+                .parent()
+                .unwrap()
+                .join("plugins/reader/component.wasm")
+        )
+        .unwrap(),
+        bytes
+    );
+    let final_config: toml::Table = fs::read_to_string(&config).unwrap().parse().unwrap();
+    assert_eq!(
+        final_config["plugins"]["reader"]["sha256"]
+            .as_str()
+            .unwrap(),
+        pin
+    );
+    let seen = seen.lock().unwrap();
+    for turn in 0..3 {
+        assert!(
+            seen[turn * 2].body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["function"]["name"] == tool)
+        );
+        let result = seen[turn * 2 + 1].body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| {
+                message["role"] == "tool" && message["tool_call_id"] == format!("write-{turn}")
+            })
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(result.contains("wrote file"), turn == 1, "{result}");
+        if turn != 1 {
+            assert!(result.contains("denied:"), "{result}");
+        }
+    }
+    let audit = records(&env.audit_log());
+    assert!(
+        audit
+            .iter()
+            .filter(|row| row["args"]["operation"] == "load" && row["allow"] == true)
+            .all(|row| row["args"]["sha256"] == pin)
+    );
+    assert!(
+        env.saddle(&["audit", "verify", env.audit_log().to_str().unwrap()])
+            .status
+            .success()
+    );
+}
+
+#[test]
 fn reloading_managed_paths_revokes_targets_even_when_the_plugin_stays_loaded() {
     let (base, seen) = serve(vec![
         sse_response(&openai_sse(

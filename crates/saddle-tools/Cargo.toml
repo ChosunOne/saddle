@@ -13,6 +13,7 @@ memchr.workspace = true
 saddle-sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [[example]]
 name = "read"
@@ -32,6 +33,18 @@ crate-type = ["cdylib"]
 
 [[example]]
 name = "session_query"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "write"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "edit"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "patch"
 crate-type = ["cdylib"]
 
 [lints]

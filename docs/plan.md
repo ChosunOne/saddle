@@ -3118,6 +3118,50 @@ well, so a root grant is not an accidental prerequisite. Tests of a build-varian
 substitute for this user-visible runtime contract. Standard plugins still replace, not coexist as
 permanent selectable alternatives to, the native tools (D137).
 
+**D140.** Mutable tools use the additive `saddle:host/fs-write@0.1.0` service. A batch contains
+at most 32 path/content pairs (absent content means remove), 1 MiB of aggregate bytes, and explicit
+`any`, `missing` or SHA-256 preconditions. The core receives plans, not patch/edit workflows. Guests
+own schemas, exact edit/hunk matching and presentation. Paths are workspace-relative, absolute or
+home-relative and are resolved by the core; writers do not need a read grant merely to locate or
+replace a file. Mutation of D66 external directories remains unsupported in this slice, not a
+compile-time feature or alternate SDK; the API can retain its shape when runtime write delegation
+for those directories is added.
+
+Filesystem imports are service eligibility under any bounded filesystem capability (`fs-read`,
+`fs-write`, `tool-read`), extending D139. Read-only plugins can link mutation services but calls are
+denied without write authority; write-only plugins can link read services but cannot read contents
+without read authority. Root write grants are bounded by the parent's corresponding write grants,
+including both sets of exclusions. No omitted grant is inherited. Reserved paths and requested and
+resolved path checks apply to every target, including rename sources/destinations. All target
+permissions, path conflicts and preconditions are checked before target publication. One denial
+refuses the whole batch before parent creation or staging. Duplicate/ancestor target conflicts are
+refused. Core precondition checks return neither existing contents nor actual hashes to a blind
+writer. SHA-256 expectations require independently decided/audited read authority on both requested
+and resolved paths; write authority alone cannot probe hashes. Conditional target reads are bounded
+to 1 MiB and cancellation/deadlines are checked.
+
+Parents are pinned/created without following replaced links. Host-owned, exclusively created staging files in
+the checked target directories are a write implementation detail, never guest-chosen resources;
+they contain only supplied bytes, use exclusive no-follow creation and are cleaned on failure.
+Existing executable permission bits are preserved, set-id bits are not; new files are private.
+Each replacement publishes by rename, so it never truncates a symlink or a multiply-linked inode
+into another location. This is preflight-all and per-entry atomic publication, not a filesystem-wide
+transaction, crash durability guarantee or race-free compare-and-swap against independent writers.
+Preconditions are rechecked before publication; a concurrent change after that check is still a
+known race. An I/O failure during publication reports partial application explicitly. Empty parent
+directories can remain after preparation failure. Cancellation/traps after committed effects do not
+roll them back; guest traps report that effects were committed. Description-time mutations are
+refused. Every target decision includes principal, call id, path, operation, byte count and payload
+hash, never payload bytes; commit/failure is also recorded, and audit failures are fatal.
+
+Standard `write`, `edit` and `patch` guests use this one service. Edit/update requires a real read
+grant and hashes the read preimage; no native tool is called under the agent's identity. Add and
+move destinations must be absent, deletes are idempotent, pure moves preserve source bytes, and a
+patch submits one batch only after all new contents are computed. Whole-file mutation inputs and
+resulting batches are bounded to 1 MiB in addition to normal argument/fuel/deadline limits. Native
+entry points stay temporary until delivery and documented parity gaps, including human diff
+presentation and external-directory writes, are closed.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

@@ -36,6 +36,17 @@ interface fs-read {
     read-file: func(path: path) -> result<list<u8>, failure>;
 }
 
+// Mutations carry bytes and explicit optimistic preconditions, not tool workflows (D140).
+interface fs-write {
+    variant expectation { any, missing, sha256(string) }
+    record change {
+        path: string,
+        content: option<list<u8>>,
+        expected: expectation,
+    }
+    apply: func(changes: list<change>) -> result<_, string>;
+}
+
 // An additive interface keeps existing read-file components binary-compatible.
 interface fs-read-range {
     use fs-read.{path, failure};

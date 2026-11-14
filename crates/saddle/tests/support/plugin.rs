@@ -9,6 +9,66 @@ use base64::engine::general_purpose::STANDARD;
 use saddle_policy::audit::sha256_hex;
 
 const READER: &str = include_str!("../../../saddle-loader/src/fixtures/read-tool.wat");
+const MUTATOR: &str = include_str!("../../../saddle-loader/src/fixtures/mutation-tool.wat");
+
+#[allow(dead_code)] // mutation fixtures are used by the CLI suite.
+pub fn mutator(changes: &[(&str, Option<&str>, &str)], describe: bool, trap: bool) -> Vec<u8> {
+    let mut records = vec![0u8; changes.len() * 32];
+    let mut payload = Vec::new();
+    for (index, (path, content, expected)) in changes.iter().enumerate() {
+        let base = index * 32;
+        let mut string = |text: &str| {
+            let at = 4096 + payload.len() as u32;
+            payload.extend_from_slice(text.as_bytes());
+            (at, text.len() as u32)
+        };
+        let (ptr, len) = string(path);
+        records[base..base + 4].copy_from_slice(&ptr.to_le_bytes());
+        records[base + 4..base + 8].copy_from_slice(&len.to_le_bytes());
+        if let Some(content) = content {
+            let (ptr, len) = string(content);
+            records[base + 8] = 1;
+            records[base + 12..base + 16].copy_from_slice(&ptr.to_le_bytes());
+            records[base + 16..base + 20].copy_from_slice(&len.to_le_bytes());
+        }
+        records[base + 20] = match *expected {
+            "any" => 0,
+            "missing" => 1,
+            hash => {
+                let (ptr, len) = string(hash);
+                records[base + 24..base + 28].copy_from_slice(&ptr.to_le_bytes());
+                records[base + 28..base + 32].copy_from_slice(&len.to_le_bytes());
+                2
+            }
+        };
+    }
+    let escape =
+        |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("\\{byte:02x}")).collect() };
+    let mut source = MUTATOR
+        .replace(
+            ";; mutation-data",
+            &format!(
+                "(data (i32.const 256) \"{}\") (data (i32.const 4096) \"{}\")",
+                escape(&records),
+                escape(&payload)
+            ),
+        )
+        .replace(
+            "i32.const 256 i32.const 1 i32.const 32 call $apply",
+            &format!(
+                "i32.const 256 i32.const {} i32.const 32 call $apply",
+                changes.len()
+            ),
+        );
+    if describe {
+        source = source.replace(";; describe-probe", "call $mutate");
+    }
+    if trap {
+        source = source.replace(";; after-mutation", "unreachable");
+    }
+    wat::parse_str(source).unwrap()
+}
+
 const TRANSCRIPT: &str = include_str!("../../../saddle-loader/src/fixtures/transcript-tool.wat");
 
 pub fn transcript_query(sql: &str) -> Vec<u8> {

@@ -20,10 +20,11 @@ use saddle_wit::exports::saddle::plugin::tool::{Definition, Output};
 use saddle_wit::saddle::host::fs_list::Page as DirectoryPage;
 use saddle_wit::saddle::host::fs_read::{Failure, Path};
 use saddle_wit::saddle::host::fs_read_range::Chunk;
+use saddle_wit::saddle::host::fs_write::Change;
 use saddle_wit::saddle::host::tool_result::ImageInfo;
 use serde_json::json;
 
-use super::filesystem;
+use super::{filesystem, mutations};
 use crate::provider::Image;
 use crate::session::Session;
 use crate::{cancel, fs_access, transcript};
@@ -54,6 +55,12 @@ impl StdError for Fatal {
 type HostReply<T, E = Failure> = Result<Result<T, E>, String>;
 type FileReply = HostReply<Chunk>;
 enum Event {
+    Mutate {
+        who: Principal,
+        deadline: Instant,
+        changes: Vec<Change>,
+        answer: SyncSender<HostReply<(), String>>,
+    },
     Query {
         who: Principal,
         deadline: Instant,
@@ -98,6 +105,25 @@ pub struct Host {
     events: SyncSender<Event>,
 }
 impl HostServices for Host {
+    fn apply_changes(
+        &mut self,
+        call: &Invocation,
+        changes: Vec<Change>,
+    ) -> Result<Result<(), String>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        self.events
+            .send(Event::Mutate {
+                who: call.principal().clone(),
+                deadline: call.deadline(),
+                changes,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        result
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(|_| anyhow!("plugin mutation request timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
     fn resolve_tool_path(
         &mut self,
         call: &Invocation,
@@ -283,6 +309,7 @@ pub fn execute(
     call: &str,
 ) -> Result<Result<Reply, String>> {
     let invoking = matches!(job, Job::Invoke(_));
+    let mut filesystem_effects = false;
     let mut images = Vec::new();
     let (events, pending) = mpsc::sync_channel(1);
     let host = Host {
@@ -314,6 +341,37 @@ pub fn execute(
             cancelled.store(true, Ordering::Relaxed);
         }
         match pending.recv_timeout(Duration::from_millis(10)) {
+            Ok(Event::Mutate {
+                who,
+                deadline,
+                changes,
+                answer,
+            }) => {
+                let result = if invoking {
+                    mutations::apply(
+                        session,
+                        &who,
+                        call,
+                        deadline,
+                        changes,
+                        &mut filesystem_effects,
+                    )
+                } else {
+                    session
+                        .audit
+                        .event(
+                            Kind::Decision,
+                            Some(&who),
+                            Some(Scope::FsWrite),
+                            Some(false),
+                            json!({"call_id":call,"operation":"apply"}),
+                            "filesystem mutations are refused during describe",
+                        )
+                        .map(|_| Err("filesystem mutations are refused during describe".into()))
+                        .map_err(HostError::from)
+                };
+                respond(result, answer, &mut fatal, &cancelled);
+            }
             Ok(Event::Query {
                 who,
                 deadline,
@@ -404,6 +462,9 @@ pub fn execute(
                 );
             }
             Ok(Event::Finished(result)) => {
+                let result = result.map_err(|why| {
+                    if filesystem_effects { format!("{why}; filesystem changes were committed before failure; inspect paths before retrying") } else { why }
+                });
                 break result.map(|reply| match reply {
                     Reply::Output { output, .. } if !output.is_error => Reply::Output {
                         output,

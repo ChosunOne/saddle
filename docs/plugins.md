@@ -1,7 +1,7 @@
-# WASI read-tool plugins
+# WASI tool plugins
 
 Saddle loads explicitly installed, digest-pinned WASI components as model-callable tools
-(D126–D129). The initial runtime supports **read-only tools**, not arbitrary extensions. A manifest
+(D126–D140). The runtime supports bounded filesystem and transcript services, not arbitrary extensions. A manifest
 in a repository never executes automatically. Installation, enablement and grants are separate steps
 performed by a person; an agent cannot write its own protected configuration.
 
@@ -263,9 +263,9 @@ Adding the `tool-read` grant and reloading enables that existing configured reac
 artifact. Removing it and reloading denies external reads again while workspace reads still work.
 A custom external-only reader can omit `fs-read` entirely and use the same SDK calls.
 
-The ordinary read interfaces are linked with either read capability; interface availability never
-supplies permission for a path. With neither read capability, filesystem imports are refused before
-initialization. Other SDK services keep their own capability requirements. Manifest ceilings and
+The filesystem interfaces are linked with any filesystem capability; interface availability never
+supplies permission for a path or operation (D140). With no filesystem capability, filesystem imports
+are refused before initialization. Other SDK services keep their own capability requirements. Manifest ceilings and
 agent reach still bound every plugin grant. Standard manifests allow the optional runtime scope but
 never grant it.
 
@@ -322,9 +322,80 @@ with `columns`, `rows` and `truncated` fields. Only `messages`, `requests` and `
 the active branch are queryable. Saved-database tables, other sessions, writes and file functions
 remain inaccessible. With no active conversation, it returns an error instead of choosing one.
 
-Services are independently linked by each plugin's bounded grants. Enabling transcript access does
-not enable filesystem access or vice versa; an omitted service is unavailable even when the agent
-or a sibling plugin holds it. Compiling against SDK bindings does not grant their authority.
+Unrelated services are independently linked by each plugin's bounded grants. Enabling transcript
+access does not enable filesystem access or vice versa. The filesystem family is available under
+any filesystem capability, but each operation/path still needs its own grant; one plugin's grants
+never supply another's. Compiling against SDK bindings does not grant their authority.
+
+## Standard mutable filesystem components
+
+The `writer`, `editor` and `patcher` components implement `write`, `edit` and `patch` in guest code
+(D140). Their SDK primitive is `apply_changes(&[Change])`, a bounded batch of writes/removals with
+`Any`, `Missing` or SHA-256 preconditions. The core does not parse patches or choose text matches.
+
+```sh
+cargo build -p saddle-tools --examples --target wasm32-unknown-unknown --release
+for name in write edit patch; do
+  mkdir -p target/$name-plugin
+  cargo run -p saddle-loader --example componentize -- \
+    target/wasm32-unknown-unknown/release/examples/$name.wasm \
+    target/$name-plugin/$name.component.wasm
+  cp crates/saddle-tools/plugins/$name/plugin.toml target/$name-plugin/plugin.toml
+done
+saddle plugin install target/write-plugin/plugin.toml
+# Likewise install edit-plugin/patch-plugin, then enable and pin each printed entry.
+```
+
+Permissions are runtime configuration of those same artifacts:
+
+```toml
+[plugin.writer]
+tool = {}
+fs-write = [{ root = "workspace", exclude = [".env*", "private/**"] }]
+
+[plugin.editor]
+tool = {}
+fs-read = [{ root = "workspace" }]
+fs-write = [{ root = "workspace" }]
+
+[plugin.patcher]
+tool = {}
+fs-read = [{ root = "workspace" }]
+fs-write = [{ root = "workspace" }]
+```
+
+The agent must hold the corresponding grants too; both principals' exclusions apply. The tools
+are `plugin__writer__write`, `plugin__editor__edit` and `plugin__patcher__patch`. Arguments match
+native `write` (`path`, `content`), `edit` (`path`, `old`, `new`) and `patch` (`patch`). Writers do
+not need read authority. A write-only patcher can add/delete; updating/moving requires actual read
+permission. SDK service availability is not permission to read or write a path: the filesystem
+service family can link under any filesystem capability, while each operation checks its own grant.
+Adding/removing write permission and reloading does not rebuild or repin the plugin.
+
+The core preflights every requested/resolved target and precondition before publication, rejects
+reserved paths and overlapping/aliased targets, stages only supplied bytes through pinned parent
+handles, and replaces entries by rename rather than truncating an existing inode. File payloads
+are not logged: audit records paths, operation, size, hash, principal and call id. Mutations during
+`describe` are refused. A guest trap after committed effects does not roll them back and is reported
+as such. Staging files use exclusive creation and are cleaned after failure; empty created parents can remain.
+SHA-256 preconditions independently require read authority on both requested and resolved paths;
+write-only callers cannot probe existing hashes.
+
+Bounds are 32 paths and 1 MiB of aggregate resulting content per batch, 1 MiB per conditional input
+file, plus the normal 64 KiB tool-argument and fuel/deadline limits. Add/move destinations must be
+absent; deletes are idempotent. Edits/hunks must match exactly once. Source hashes detect stale
+preimages before publication, but are not an OS-level atomic compare-and-swap against independent
+writers. Publication is atomic per entry, **not** a multi-file transaction or crash-durability
+promise: I/O errors during publication may partially apply and are explicitly reported.
+
+This first mutation adapter covers true policy roots only. D66 external-directory writes and
+native human-facing diff presentation remain parity work; no build variant is needed or planned
+for them. Native tools have not been removed yet.
+
+```sh
+cargo nextest run --test plugins --run-ignored all -E 'test(mutation)'
+cargo nextest run --test agent --run-ignored all -E 'test(one_compiled_writer)'
+```
 
 ## Built-in migration tracking
 
@@ -335,7 +406,7 @@ No standard component is silently aliased over a built-in or given implicit gran
 | `read` | native-style text pagination/totals, deep offsets, bounded range reads, explicit image mode and optional managed paths | scans beyond resource bounds, standard-component delivery |
 | `ls` | filtered directory pages, suffixes, sorted output, optional managed paths | bounded/non-UTF-8 listing differences |
 | `find`, `grep` | guest traversal, shared ignore syntax, glob/regex matching | large-tree/performance edges, host-path display and unreadable-file metadata |
-| `write`, `edit`, `patch` | not migrated | scoped mutation/atomic transaction services, reserved paths, preflight all patch paths |
+| `write`, `edit`, `patch` | guest workflows over bounded, preflight-all mutation batches and optimistic preconditions | external-directory writes, human diff presentation, standard delivery; documented size/atomicity limits |
 | `bash` | not migrated | delegated exec sandbox, bounded streaming, cancellation, environment filtering and reservation restore |
 | `fetch`, `websearch` | not migrated | bounded attributed network/search adapters, redirects, protected credentials and grant narrowing |
 | `session_query` | guest schema/presentation over branch-only, bounded transcript SQL under delegated `transcript-read` | standard-component delivery and native-entry-point removal |
@@ -379,7 +450,7 @@ These labels are provenance, not permission to follow instructions found in a pl
   filesystem adapter. Its worker asks the session thread over a bounded channel; the loader does
   not own a second policy engine or depend on `Session`.
 
-Only `fs-read`, `tool-read`, `transcript-read` and `tool` grants are supported by this runtime. Other scopes fail closed. The
+Only `fs-read`, `fs-write`, `tool-read`, `transcript-read` and `tool` grants are supported by this runtime. Other scopes fail closed. The
 component classifier describes a wider planned ABI; that does not make its adapters available.
 Descriptions are capped at 1,000 characters, schemas at 16 KiB and configured plugins at 16.
 Schemas must parse as JSON objects with an object input type; the provider may enforce further

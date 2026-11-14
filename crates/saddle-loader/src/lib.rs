@@ -19,6 +19,7 @@ use saddle_wit::saddle::host::fs_list::{self, Host as ListHost, Page as Director
 use saddle_wit::saddle::host::fs_paths::{self, Host as PathsHost};
 use saddle_wit::saddle::host::fs_read::{self, Failure, Host, Path};
 use saddle_wit::saddle::host::fs_read_range::{self, Chunk, Host as RangeHost};
+use saddle_wit::saddle::host::fs_write::{self, Change, Expectation, Host as WriteHost};
 use saddle_wit::saddle::host::tool_paths::{
     self, Chunk as ToolChunk, Entry as ToolEntry, EntryKind as ToolEntryKind,
     Failure as ToolFailure, Host as ToolPathsHost, Page as ToolPage, Path as ToolPath,
@@ -33,6 +34,8 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 /// native I/O must enforce this cap before allocating or reading the entire source.
 pub const MAX_FILE_BYTES: usize = 64 * 1024;
+pub const MAX_MUTATION_BYTES: usize = 1024 * 1024;
+pub const MAX_MUTATIONS: usize = 32;
 pub const MAX_DIRECTORY_ENTRIES: usize = 128;
 pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 pub const MAX_QUERY_BYTES: usize = 16 * 1024;
@@ -117,9 +120,16 @@ impl Invocation {
 /// Implementations must decide and audit using `call.principal()` and `call.grants()`, validate
 /// root-relative paths and symlinks, and bound/cancel I/O independently of Wasm's epoch deadline.
 /// `Err` is a host failure (including audit failure), not a guest-visible policy denial.
-/// read callbacks may hold either read capability; determine authority per path, never from the
-/// existence of a linked interface (D139).
+/// filesystem callbacks may hold any filesystem capability; determine authority per operation/path,
+/// never from the existence of a linked interface (D139, D140).
 pub trait HostServices: Send + 'static {
+    fn apply_changes(
+        &mut self,
+        _call: &Invocation,
+        _changes: Vec<Change>,
+    ) -> anyhow::Result<Result<(), String>> {
+        Ok(Err("host does not implement filesystem mutations".into()))
+    }
     fn resolve_tool_path(
         &mut self,
         _call: &Invocation,
@@ -250,6 +260,24 @@ impl<H: HostServices> TranscriptHost for State<H> {
         let result = self.host.query_transcript(&self.call, sql)?;
         if matches!(&result, Ok(value) | Err(value) if value.len() > MAX_QUERY_RESULT_BYTES) {
             return Ok(Err("transcript result exceeds 50 KiB".into()));
+        }
+        Ok(result)
+    }
+}
+
+impl<H: HostServices> WriteHost for State<H> {
+    fn apply(&mut self, changes: Vec<Change>) -> anyhow::Result<Result<(), String>> {
+        if self.call.cancelled() || Instant::now() >= self.call.deadline {
+            return Err(anyhow!("plugin call cancelled or timed out"));
+        }
+        if changes.is_empty() || changes.len() > MAX_MUTATIONS
+            || changes.iter().any(|change| change.path.len() > 4096 || matches!(&change.expected, Expectation::Sha256(hash) if hash.len() != 64 || !hash.bytes().all(|c| c.is_ascii_hexdigit())))
+            || changes.iter().map(|change| change.content.as_ref().map_or(0, Vec::len)).sum::<usize>() > MAX_MUTATION_BYTES {
+            return Ok(Err("invalid mutation batch or exceeds 32 paths/1 MiB".into()));
+        }
+        let result = self.host.apply_changes(&self.call, changes)?;
+        if matches!(&result, Err(why) if why.len() > MAX_FILE_BYTES) {
+            return Ok(Err("mutation error exceeds host result limit".into()));
         }
         Ok(result)
     }
@@ -557,6 +585,7 @@ impl Loader {
                 name.as_str(),
                 "saddle:host/fs-read@0.1.0"
                     | "saddle:host/fs-read-range@0.1.0"
+                    | "saddle:host/fs-write@0.1.0"
                     | "saddle:host/fs-paths@0.1.0"
                     | "saddle:host/fs-list@0.1.0"
                     | "saddle:host/tool-result@0.1.0"
@@ -572,7 +601,12 @@ impl Loader {
         let mut linker = Linker::<State<H>>::new(engine);
         ambient::add(&mut linker).map_err(runtime("linking ambient WASI"))?;
         // D139: one filesystem SDK, with actual root/external access decided per request.
-        if scopes.contains(&Scope::FsRead) || scopes.contains(&Scope::ToolRead) {
+        if scopes.contains(&Scope::FsRead)
+            || scopes.contains(&Scope::ToolRead)
+            || scopes.contains(&Scope::FsWrite)
+        {
+            fs_write::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+                .map_err(runtime("linking fs-write"))?;
             fs_read::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
                 .map_err(runtime("linking fs-read"))?;
             fs_read_range::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
@@ -967,6 +1001,77 @@ mod tests {
             "{why}"
         );
         assert!(!why.contains("unreachable"), "{why}");
+    }
+
+    struct MutationHost(Arc<AtomicUsize>);
+    impl HostServices for MutationHost {
+        fn read_file(
+            &mut self,
+            _: &Invocation,
+            _: Path,
+        ) -> anyhow::Result<Result<Vec<u8>, Failure>> {
+            panic!("writer must not read");
+        }
+        fn apply_changes(
+            &mut self,
+            call: &Invocation,
+            _: Vec<Change>,
+        ) -> anyhow::Result<Result<(), String>> {
+            assert!(call.grants().fs_read.is_empty());
+            assert_eq!(call.grants().fs_write.len(), 1);
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Ok(()))
+        }
+    }
+
+    #[test]
+    fn mutation_adapter_bounds_batches_before_host_dispatch() {
+        let (_dir, agent, plugin) = grants(
+            "[agent]\nfs-write=[{root='workspace'}]\n[plugin.reader]\ntool={}\nfs-write=[{root='workspace'}]\n",
+        );
+        let manifest = Manifest::parse(
+            "id='reader'\nversion='0.1.0'\ncomponent='mutator.wasm'\nscopes=['tool','fs-write']",
+        )
+        .unwrap();
+        let bytes = wat::parse_str(include_str!("fixtures/mutation-tool.wat")).unwrap();
+        let prepared = Loader::new()
+            .unwrap()
+            .prepare::<MutationHost>(&manifest, &agent, &plugin, &bytes, Limits::default())
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut store = prepared
+            .store(MutationHost(calls.clone()), cancelled())
+            .unwrap();
+        let change = || Change {
+            path: "file".into(),
+            content: Some(b"content".to_vec()),
+            expected: Expectation::Any,
+        };
+        for changes in [
+            Vec::new(),
+            (0..33).map(|_| change()).collect(),
+            vec![Change {
+                content: Some(vec![0; MAX_MUTATION_BYTES + 1]),
+                ..change()
+            }],
+            vec![Change {
+                expected: Expectation::Sha256("invalid".into()),
+                ..change()
+            }],
+        ] {
+            assert!(
+                WriteHost::apply(store.data_mut(), changes)
+                    .unwrap()
+                    .is_err()
+            );
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(
+            WriteHost::apply(store.data_mut(), vec![change()])
+                .unwrap()
+                .is_ok()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     struct NoHost;

@@ -1,4 +1,4 @@
-//! guest bindings for a read-only tool (D12, D127), generated from the host's canonical WIT.
+//! guest tool bindings, generated from the host's canonical WIT (D12, D127, D140).
 
 wit_bindgen::generate!({
     path: "../saddle-wit/wit",
@@ -14,5 +14,6 @@ pub use saddle::host::fs_read::read_file;
 pub use saddle::host::fs_read::{Failure, Path as FilePath};
 pub use saddle::host::fs_read_range::Chunk;
 pub use saddle::host::fs_read_range::read_range;
+pub use saddle::host::fs_write::{Change, Expectation, apply as apply_changes};
 pub use saddle::host::tool_result::{ImageInfo, emit_image};
 pub use saddle::host::transcript_read::query as query_transcript;

@@ -60,7 +60,7 @@ impl fmt::Display for Direction {
 }
 
 /// What an interface needs before a component may use it.
-/// read-service eligibility never substitutes for its per-resource decisions (D139).
+/// filesystem-service eligibility never substitutes for its per-resource decisions (D139, D140).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Requirement {
     Scope(Scope),
@@ -92,11 +92,10 @@ pub fn classify(direction: Direction, name: &str) -> Requirement {
     match (direction, n.namespace, n.package, n.interface) {
         (Import, "saddle", "host", i) => match i {
             "exec" => scope(Scope::Exec),
-            "fs-read" | "fs-read-range" | "fs-paths" | "fs-list" | "tool-paths" => {
-                Requirement::AnyScope(&[Scope::FsRead, Scope::ToolRead])
+            "fs-read" | "fs-read-range" | "fs-paths" | "fs-list" | "tool-paths" | "fs-write" => {
+                Requirement::AnyScope(&[Scope::FsRead, Scope::ToolRead, Scope::FsWrite])
             }
             "tool-result" => scope(Scope::Tool),
-            "fs-write" => scope(Scope::FsWrite),
             "transcript-read" => scope(Scope::TranscriptRead),
             "context-contribute" => scope(Scope::ContextContribute),
             "model-invoke" => scope(Scope::ModelInvoke),
@@ -193,7 +192,7 @@ pub fn host_interfaces(granted: &BTreeSet<Scope>) -> Vec<&'static str> {
     for scope in granted {
         let interface = match scope {
             Scope::Exec => "saddle:host/exec",
-            Scope::FsRead | Scope::ToolRead => {
+            Scope::FsRead | Scope::ToolRead | Scope::FsWrite => {
                 if !out.contains(&"saddle:host/fs-read") {
                     out.extend([
                         "saddle:host/fs-read",
@@ -201,11 +200,11 @@ pub fn host_interfaces(granted: &BTreeSet<Scope>) -> Vec<&'static str> {
                         "saddle:host/fs-paths",
                         "saddle:host/fs-list",
                         "saddle:host/tool-paths",
+                        "saddle:host/fs-write",
                     ]);
                 }
                 continue;
             }
-            Scope::FsWrite => "saddle:host/fs-write",
             Scope::TranscriptRead => "saddle:host/transcript-read",
             Scope::ContextContribute => "saddle:host/context-contribute",
             Scope::ModelInvoke => "saddle:host/model-invoke",
@@ -306,6 +305,7 @@ mod tests {
                 "saddle:host/fs-paths",
                 "saddle:host/fs-list",
                 "saddle:host/tool-paths",
+                "saddle:host/fs-write",
                 "wasi:http/outgoing-handler"
             ]
         );
@@ -320,7 +320,7 @@ mod tests {
             "saddle:host/fs-list@0.1.0",
             "saddle:host/tool-paths@0.1.0",
         ];
-        for scope in [Scope::FsRead, Scope::ToolRead] {
+        for scope in [Scope::FsRead, Scope::ToolRead, Scope::FsWrite] {
             check_component(&BTreeSet::from([scope]), imports, []).unwrap();
         }
         assert!(check_component(&BTreeSet::from([Scope::Tool]), imports, []).is_err());

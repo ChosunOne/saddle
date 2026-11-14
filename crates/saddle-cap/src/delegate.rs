@@ -4,19 +4,19 @@ use crate::{Grants, RootName, Scope};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DelegationError {
-    #[error("scope `{0}` is not implemented by the read-only plugin runtime")]
+    #[error("scope `{0}` is not implemented by the plugin runtime")]
     Unsupported(Scope),
     #[error("plugin asks for scope `{0}`, which the agent does not hold")]
     Scope(Scope),
     #[error("plugin asks for tool-path role `{0}`, which the agent does not hold")]
     ToolRole(String),
-    #[error("plugin asks to read root `{0}`, which the agent does not hold")]
+    #[error("plugin asks for a filesystem root `{0}`, which the agent does not hold")]
     Root(RootName),
     #[error("could not combine grant exclusions: {0}")]
     Exclusions(String),
 }
 
-/// bounds an explicitly granted read-only tool without inheriting omitted grants.
+/// bounds an explicitly granted tool without inheriting omitted grants.
 ///
 /// `tool` registers an export, not operational authority. Additional adapters must extend this
 /// check before their scopes can be linked; unsupported grants are never silently ignored.
@@ -24,7 +24,7 @@ pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationEr
     for scope in plugin.scopes() {
         if !matches!(
             scope,
-            Scope::FsRead | Scope::ToolRead | Scope::Tool | Scope::TranscriptRead
+            Scope::FsRead | Scope::FsWrite | Scope::ToolRead | Scope::Tool | Scope::TranscriptRead
         ) {
             return Err(DelegationError::Unsupported(scope));
         }
@@ -48,28 +48,29 @@ pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationEr
             }
         }
     }
-    for want in &plugin.fs_read {
-        let held: Vec<_> = agent
-            .fs_read
-            .iter()
-            .filter(|g| g.root == want.root)
-            .collect();
-        if held.is_empty() {
-            return Err(DelegationError::Root(want.root.clone()));
-        }
-        // Grants are unions. Pairwise intersections preserve an agent's multiple entries for a
-        // root rather than accidentally making one entry's exclusions bind an unrelated entry.
-        for grant in held {
-            let mut exclude = want.exclude.clone();
-            for pattern in &grant.exclude {
-                if !exclude.contains(pattern) {
-                    exclude.push(pattern.clone());
-                }
+    for (wants, parent, output) in [
+        (&plugin.fs_read, &agent.fs_read, &mut out.fs_read),
+        (&plugin.fs_write, &agent.fs_write, &mut out.fs_write),
+    ] {
+        for want in wants {
+            let held: Vec<_> = parent.iter().filter(|g| g.root == want.root).collect();
+            if held.is_empty() {
+                return Err(DelegationError::Root(want.root.clone()));
             }
-            out.fs_read.push(
-                want.with_exclusions(exclude)
-                    .map_err(DelegationError::Exclusions)?,
-            );
+            // Grants are unions. Pairwise intersections preserve an agent's multiple entries for a
+            // root rather than accidentally making one entry's exclusions bind an unrelated entry.
+            for grant in held {
+                let mut exclude = want.exclude.clone();
+                for pattern in &grant.exclude {
+                    if !exclude.contains(pattern) {
+                        exclude.push(pattern.clone());
+                    }
+                }
+                output.push(
+                    want.with_exclusions(exclude)
+                        .map_err(DelegationError::Exclusions)?,
+                );
+            }
         }
     }
     Ok(out)
@@ -157,6 +158,29 @@ mod tests {
             read_tool(&agent, &plugin),
             Err(DelegationError::Unsupported(Scope::Exec))
         ));
+    }
+
+    #[test]
+    fn writes_are_bounded_by_parent_write_grants_not_read_or_sibling_grants() {
+        let (agent, plugin) = grants(
+            "[agent]\nfs-write=[{root='workspace',exclude=['.env*']}]\n[plugin.reader]\ntool={}\nfs-write=[{root='workspace',exclude=['private']}]\n",
+        );
+        let bounded = read_tool(&agent, &plugin).unwrap();
+        assert!(bounded.fs_read.is_empty());
+        for value in [".env", "private/key"] {
+            assert!(bounded.fs_write[0].excludes(&RelPath::new(value).unwrap()));
+        }
+        assert!(!bounded.fs_write[0].excludes(&RelPath::new("file").unwrap()));
+        let (agent, plugin) = grants(
+            "[agent]\nfs-read=[{root='workspace'}]\n[plugin.sibling]\nfs-write=[{root='workspace'}]\n[plugin.reader]\ntool={}\nfs-write=[{root='workspace'}]\n",
+        );
+        assert!(matches!(
+            read_tool(&agent, &plugin),
+            Err(DelegationError::Root(_))
+        ));
+        let (agent, plugin) =
+            grants("[agent]\nfs-write=[{root='workspace'}]\n[plugin.reader]\ntool={}\n");
+        assert!(read_tool(&agent, &plugin).unwrap().fs_write.is_empty());
     }
 
     #[test]

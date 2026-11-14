@@ -2,6 +2,7 @@
 
 mod filesystem;
 mod host;
+mod mutations;
 
 use std::collections::BTreeMap;
 use std::fs;

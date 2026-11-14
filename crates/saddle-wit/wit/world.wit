@@ -1,8 +1,9 @@
 package saddle:host@0.1.0;
 
-// This is a read-only tool world, not a world that imports every possible capability.
+// A filesystem/transcript tool world; the historical name is retained for SDK compatibility.
 world read-tool {
     import fs-read;
+    import fs-write;
     import fs-read-range;
     import fs-paths;
     import fs-list;

@@ -3,8 +3,8 @@
 #[path = "support/plugin.rs"]
 mod fixture;
 
-use std::fs;
-use std::os::unix::fs::symlink;
+use std::fs::{self, Permissions};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -121,6 +121,362 @@ fn generic_filesystem_imports_never_substitute_for_per_path_permissions() {
                 .success()
         );
     }
+}
+
+#[test]
+#[ignore = "build standard write/edit/patch components first; see docs/plugins.md"]
+fn standard_mutation_components_write_edit_and_patch_through_the_production_host() {
+    for (name, grants, arguments) in [
+        (
+            "write",
+            WRITE_GRANTS,
+            r#"{"path":"newdir/file","content":"created\n"}"#,
+        ),
+        (
+            "edit",
+            "tool={}\nfs-read=[{root='workspace'}]\nfs-write=[{root='workspace'}]",
+            r#"{"path":"file","old":"old","new":"new"}"#,
+        ),
+        (
+            "patch",
+            "tool={}\nfs-read=[{root='workspace'}]\nfs-write=[{root='workspace'}]",
+            r#"{"patch":"*** Begin Patch\n*** Update File: file\n*** Move to: moved\n@@\n-old\n+new\n*** Add File: added\n+created\n*** Delete File: gone\n*** End Patch"}"#,
+        ),
+    ] {
+        let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../target/{name}-plugin/{name}.component.wasm"));
+        let bytes = fs::read(component).expect("build standard mutation components first");
+        let env = Env::new(&bytes, grants);
+        managed_manifest(&env, "['tool','fs-read','fs-write']");
+        fs::write(env.ws().join("file"), "old\n").unwrap();
+        fs::write(env.ws().join("gone"), "remove me").unwrap();
+        let out = env.run(&["plugin", "call", "reader", arguments]);
+        assert!(out.status.success(), "{name}: {}", text(&out));
+        match name {
+            "write" => assert_eq!(
+                fs::read_to_string(env.ws().join("newdir/file")).unwrap(),
+                "created\n"
+            ),
+            "edit" => assert_eq!(fs::read_to_string(env.ws().join("file")).unwrap(), "new\n"),
+            "patch" => {
+                assert!(!env.ws().join("file").exists());
+                assert!(!env.ws().join("gone").exists());
+                assert_eq!(fs::read_to_string(env.ws().join("moved")).unwrap(), "new\n");
+                assert_eq!(
+                    fs::read_to_string(env.ws().join("added")).unwrap(),
+                    "created\n"
+                );
+                let out = env.run(&["plugin", "call", "reader", r#"{"patch":"*** Add File: first\n+ok\n*** Add File: .git/config\n+blocked\n"}"#]);
+                assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+                assert!(!env.ws().join("first").exists());
+                // The same compiled patcher supports blind additions/deletions without read authority.
+                env.edit(
+                    "[plugin.reader]\ntool={}\nfs-read=[{root='workspace'}]\n",
+                    "[plugin.reader]\ntool={}\nfs-read=[]\n",
+                );
+                let out = env.run(&[
+                    "plugin",
+                    "call",
+                    "reader",
+                    r#"{"patch":"*** Add File: blind\n+ok\n*** Delete File: added\n"}"#,
+                ]);
+                assert!(out.status.success(), "{}", text(&out));
+                assert_eq!(fs::read_to_string(env.ws().join("blind")).unwrap(), "ok\n");
+                assert!(!env.ws().join("added").exists());
+                let out = env.run(&[
+                    "plugin",
+                    "call",
+                    "reader",
+                    r#"{"patch":"*** Update File: moved\n@@\n-new\n+denied\n"}"#,
+                ]);
+                assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+                assert_eq!(fs::read_to_string(env.ws().join("moved")).unwrap(), "new\n");
+            }
+            _ => unreachable!(),
+        }
+        let log = env.log();
+        assert!(
+            env.run(&["audit", "verify", log.to_str().unwrap()])
+                .status
+                .success()
+        );
+    }
+}
+
+const WRITE_GRANTS: &str = "tool={}\nfs-write=[{root='workspace',exclude=['private']}]";
+
+fn mutation_env(changes: &[(&str, Option<&str>, &str)], grants: &str) -> Env {
+    let env = Env::new(&fixture::mutator(changes, false, false), grants);
+    managed_manifest(&env, "['tool','fs-read','fs-write']");
+    env
+}
+
+#[test]
+fn mutation_service_writes_without_read_authority_and_never_truncates_hardlink_targets() {
+    let env = mutation_env(
+        &[("nested/file", Some("DO_NOT_LOG_PAYLOAD_345"), "any")],
+        WRITE_GRANTS,
+    );
+    let out = call(&env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        fs::read_to_string(env.ws().join("nested/file")).unwrap(),
+        "DO_NOT_LOG_PAYLOAD_345"
+    );
+    let rows = env.records();
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row["principal"] == "plugin.reader" && row["scope"] == "fs-read")
+    );
+    assert!(rows.iter().any(|row| row["scope"] == "fs-write"
+        && row["principal"] == "plugin.reader"
+        && row["args"]["bytes"] == "DO_NOT_LOG_PAYLOAD_345".len()
+        && row["args"]["sha256"].is_string()
+        && row["args"]["call_id"].is_string()));
+    assert!(
+        !fs::read_to_string(env.log())
+            .unwrap()
+            .contains("DO_NOT_LOG_PAYLOAD_345")
+    );
+    assert!(
+        !fs::read_dir(env.ws().join("nested"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".saddle-stage-"))
+    );
+    let log = env.log();
+    assert!(
+        env.run(&["audit", "verify", log.to_str().unwrap()])
+            .status
+            .success()
+    );
+
+    let env = mutation_env(&[("alias", Some("replaced"), "any")], WRITE_GRANTS);
+    let outside = env.0.path().join("outside");
+    fs::write(&outside, "outside original").unwrap();
+    fs::hard_link(&outside, env.ws().join("alias")).unwrap();
+    let out = call(&env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "outside original");
+    assert_eq!(
+        fs::read_to_string(env.ws().join("alias")).unwrap(),
+        "replaced"
+    );
+}
+
+#[test]
+fn mutation_write_only_parents_and_replacement_permissions_need_no_directory_read() {
+    let env = mutation_env(&[("nested/created/file", Some("new"), "any")], WRITE_GRANTS);
+    let parent = env.ws().join("nested");
+    fs::create_dir(&parent).unwrap();
+    fs::set_permissions(&parent, Permissions::from_mode(0o300)).unwrap();
+    let out = call(&env);
+    fs::set_permissions(&parent, Permissions::from_mode(0o700)).unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let target = parent.join("created/file");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+    fs::set_permissions(&target, Permissions::from_mode(0o4751)).unwrap();
+    let out = call(&env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+        0o751
+    );
+}
+
+#[test]
+fn mutation_batches_preflight_all_permissions_including_exclusions_and_reserved_paths() {
+    for denied in [
+        "private",
+        ".env",
+        ".git/config",
+        ".git/hooks/post-checkout",
+        ".git/modules/sub/hooks/pre-commit",
+    ] {
+        let env = mutation_env(
+            &[
+                ("newdir/first", Some("first"), "missing"),
+                (denied, Some("blocked"), "any"),
+            ],
+            WRITE_GRANTS,
+        );
+        env.edit(
+            "fs-write=[{root='workspace'}]",
+            "fs-write=[{root='workspace',exclude=['.env*']}]",
+        );
+        let out = call(&env);
+        assert_eq!(out.status.code(), Some(1), "{denied}: {}", text(&out));
+        assert!(!env.ws().join("newdir").exists(), "{denied}");
+        assert!(!env.ws().join(denied).exists(), "{denied}");
+    }
+    let env = mutation_env(&[("alias", Some("changed"), "any")], WRITE_GRANTS);
+    fs::write(env.ws().join("private"), "original").unwrap();
+    symlink("private", env.ws().join("alias")).unwrap();
+    let out = call(&env);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert_eq!(
+        fs::read_to_string(env.ws().join("private")).unwrap(),
+        "original"
+    );
+}
+
+#[test]
+fn mutation_preconditions_alias_conflicts_and_missing_deletes_are_checked_before_publication() {
+    let before = sha256_hex(b"before");
+    let env = mutation_env(
+        &[
+            ("newdir/first", Some("first"), "missing"),
+            ("file", Some("changed"), &before),
+        ],
+        "tool={}\nfs-write=[{root='workspace'}]\nfs-read=[{root='workspace'}]",
+    );
+    fs::write(env.ws().join("file"), "concurrently changed").unwrap();
+    let out = call(&env);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("precondition failed"));
+    assert!(!env.ws().join("newdir").exists());
+    assert_eq!(
+        fs::read_to_string(env.ws().join("file")).unwrap(),
+        "concurrently changed"
+    );
+    let env = mutation_env(
+        &[("file", Some("one"), "any"), ("alias", Some("two"), "any")],
+        WRITE_GRANTS,
+    );
+    fs::write(env.ws().join("file"), "original").unwrap();
+    symlink("file", env.ws().join("alias")).unwrap();
+    assert_eq!(call(&env).status.code(), Some(1));
+    assert_eq!(
+        fs::read_to_string(env.ws().join("file")).unwrap(),
+        "original"
+    );
+    let env = mutation_env(&[("missing/absent", None, "any")], WRITE_GRANTS);
+    let out = call(&env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!env.ws().join("missing").exists());
+}
+
+#[test]
+fn mutation_hash_preconditions_require_independent_read_authority() {
+    let hash = sha256_hex(b"before");
+    for (read, path) in [
+        ("", "file"),
+        ("fs-read=[{root='workspace',exclude=['file']}]\n", "file"),
+        ("fs-read=[{root='workspace',exclude=['alias']}]\n", "alias"),
+        ("fs-read=[{root='workspace',exclude=['file']}]\n", "alias"),
+    ] {
+        let env = mutation_env(
+            &[("new", Some("new"), "any"), (path, Some("after"), &hash)],
+            &format!("{read}{WRITE_GRANTS}"),
+        );
+        fs::write(env.ws().join("file"), "before").unwrap();
+        symlink("file", env.ws().join("alias")).unwrap();
+        let out = call(&env);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert!(text(&out).contains("denied:"), "{}", text(&out));
+        assert!(!env.ws().join("new").exists());
+        assert_eq!(fs::read_to_string(env.ws().join("file")).unwrap(), "before");
+        assert!(
+            env.records()
+                .iter()
+                .any(|row| row["principal"] == "plugin.reader"
+                    && row["scope"] == "fs-read"
+                    && row["allow"] == false)
+        );
+    }
+    let env = mutation_env(
+        &[("file", Some("after"), &hash)],
+        "tool={}\nfs-read=[{root='workspace'}]\nfs-write=[{root='workspace'}]",
+    );
+    fs::write(env.ws().join("file"), "before").unwrap();
+    let out = call(&env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(env.ws().join("file")).unwrap(), "after");
+}
+
+#[test]
+fn mutation_permissions_are_runtime_configuration_not_import_authority() {
+    let env = mutation_env(
+        &[("file", Some("written"), "any")],
+        "tool={}\nfs-read=[{root='workspace'}]",
+    );
+    let listing = env.run(&["plugin", "list"]);
+    assert!(text(&listing).contains("ready:"), "{}", text(&listing));
+    assert_eq!(call(&env).status.code(), Some(1));
+    assert!(!env.ws().join("file").exists());
+    let before = fs::read(
+        env.config()
+            .parent()
+            .unwrap()
+            .join("plugins/reader/component.wasm"),
+    )
+    .unwrap();
+    env.edit(
+        "[plugin.reader]\n",
+        "[plugin.reader]\nfs-write=[{root='workspace'}]\n",
+    );
+    let out = call(&env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        fs::read_to_string(env.ws().join("file")).unwrap(),
+        "written"
+    );
+    assert_eq!(
+        fs::read(
+            env.config()
+                .parent()
+                .unwrap()
+                .join("plugins/reader/component.wasm")
+        )
+        .unwrap(),
+        before
+    );
+    env.edit(
+        "[plugin.reader]\nfs-write=[{root='workspace'}]\n",
+        "[plugin.reader]\n",
+    );
+    fs::write(env.ws().join("file"), "after revocation").unwrap();
+    assert_eq!(call(&env).status.code(), Some(1));
+    assert_eq!(
+        fs::read_to_string(env.ws().join("file")).unwrap(),
+        "after revocation"
+    );
+}
+
+#[test]
+fn mutations_are_refused_during_describe_and_committed_effects_survive_guest_traps() {
+    let env = Env::new(
+        &fixture::mutator(&[("file", Some("changed"), "any")], true, false),
+        WRITE_GRANTS,
+    );
+    managed_manifest(&env, "['tool','fs-read','fs-write']");
+    let listing = env.run(&["plugin", "list"]);
+    assert!(text(&listing).contains("ready:"), "{}", text(&listing));
+    assert!(!env.ws().join("file").exists());
+    let env = Env::new(
+        &fixture::mutator(&[("file", Some("changed"), "any")], false, true),
+        WRITE_GRANTS,
+    );
+    managed_manifest(&env, "['tool','fs-read','fs-write']");
+    let out = call(&env);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert_eq!(
+        fs::read_to_string(env.ws().join("file")).unwrap(),
+        "changed"
+    );
+    assert!(text(&out).contains("filesystem changes were committed"));
+    let env = mutation_env(&[("file", Some("too many"), "any"); 33], WRITE_GRANTS);
+    let out = call(&env);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(!env.ws().join("file").exists());
 }
 
 fn managed_manifest(env: &Env, scopes: &str) {
