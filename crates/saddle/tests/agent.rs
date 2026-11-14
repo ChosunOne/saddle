@@ -2,6 +2,8 @@
 //! asks for tool calls, and the test checks what the policy let through, what went back to the
 //! model, and what reached the audit log.
 
+#[path = "support/http.rs"]
+mod http_fixture;
 #[path = "support/plugin.rs"]
 mod plugin_fixture;
 
@@ -19,7 +21,9 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use http_fixture::{Server as HttpServer, reply as http_reply};
 use rusqlite::Connection;
+use saddle_policy::audit::sha256_hex;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -1255,6 +1259,174 @@ fn one_compiled_reader_changes_directory_permissions_at_runtime_without_repinnin
         .collect();
     assert_eq!(loads.len(), 3);
     assert!(loads.iter().all(|row| row["args"]["sha256"] == pin));
+    assert!(
+        env.saddle(&["audit", "verify", env.audit_log().to_str().unwrap()])
+            .status
+            .success()
+    );
+}
+
+#[test]
+#[ignore = "build the standard websearch component first; see docs/plugins.md"]
+fn standard_search_keeps_credentials_private_and_snapshots_principal_scoped_across_reload() {
+    let first = json!({"results":[{"title":"first","url":"https://example.test/first","text":format!("full first page {KEY}")},{"title":"unshown","url":"https://example.test/unshown","text":"must not acquire a number"}]}).to_string();
+    let second = json!({"results":[{"title":"second","url":"https://example.test/second","text":"full second page"}]}).to_string();
+    let search = HttpServer::new(vec![
+        http_reply(200, "Content-Type: application/json\r\n", &first),
+        http_reply(200, "Content-Type: application/json\r\n", &second),
+    ]);
+    let reader = "plugin__reader__websearch";
+    let sibling = "plugin__sibling__websearch";
+    let calls = [
+        ("query", reader, json!({"query":"first","num_results":1})),
+        ("unshown", reader, json!({"result":2})),
+        ("expand", reader, json!({"result":1})),
+        ("sibling", sibling, json!({"result":1})),
+        ("different", reader, json!({"query":"second","result":1})),
+        ("reuse", reader, json!({"result":1})),
+    ];
+    let mut responses: Vec<_> = calls
+        .iter()
+        .map(|(id, tool, args)| sse_response(&openai_sse("", &[(*id, *tool, args.clone())])))
+        .collect();
+    responses.push(sse_response(&openai_sse("phase one done", &[])));
+    responses.push(sse_response(&openai_sse(
+        "",
+        &[("revoked", reader, json!({"result":1}))],
+    )));
+    responses.push(sse_response(&openai_sse("done", &[])));
+    let (base, seen) = serve(responses);
+    let env = Env::new(Api::Openai, &base);
+    let config = env.xdg.path().join("config/saddle/config.toml");
+    let bytes = fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/websearch-plugin/websearch.component.wasm"),
+    )
+    .expect("build the standard websearch component first");
+    let grant = format!("{{host='127.0.0.1',scheme='http',port={}}}", search.port);
+    let model_port: u16 = base
+        .strip_prefix("http://127.0.0.1:")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let other = format!("{{host='127.0.0.1',scheme='http',port={model_port}}}");
+    let mut settings: toml::Table = fs::read_to_string(&config).unwrap().parse().unwrap();
+    let reach: toml::Table = format!("net=[{grant},{other}]").parse().unwrap();
+    settings["agent"]
+        .as_table_mut()
+        .unwrap()
+        .insert("net".into(), reach["net"].clone());
+    settings["providers"]["mock"]
+        .as_table_mut()
+        .unwrap()
+        .insert("search-url".into(), format!("{}/search", search.url).into());
+    fs::write(&config, toml::to_string(&settings).unwrap()).unwrap();
+    plugin_fixture::configure(&config, &bytes, &format!("tool={{}}\nnet=[{grant}]"));
+    let root = config.parent().unwrap().join("plugins");
+    fs::write(
+        root.join("reader/plugin.toml"),
+        "id='reader'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes=['tool','net']\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("sibling")).unwrap();
+    fs::write(root.join("sibling/component.wasm"), &bytes).unwrap();
+    fs::write(
+        root.join("sibling/plugin.toml"),
+        "id='sibling'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes=['tool','net']\n",
+    )
+    .unwrap();
+    let pin = sha256_hex(&bytes);
+    let settings = fs::read_to_string(&config).unwrap();
+    fs::write(&config,format!("{settings}\n[plugins.sibling]\nenabled=true\nmanifest='sibling/plugin.toml'\nsha256='{pin}'\n[plugin.sibling]\ntool={{}}\nnet=[{grant}]\n")).unwrap();
+    let listing = env.saddle(&["plugin", "list"]);
+    assert!(
+        text(&listing.stdout).matches("ready:").count() == 2,
+        "{} {}",
+        text(&listing.stdout),
+        text(&listing.stderr)
+    );
+    let mut child = env
+        .command(&["run", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"phase one\n")
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while seen.lock().unwrap().len() < 7 {
+        assert!(Instant::now() < deadline, "search turn did not finish");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let settings = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        settings.replace(
+            &format!("[plugin.reader]\ntool={{}}\nnet=[{grant}]"),
+            &format!("[plugin.reader]\ntool={{}}\nnet=[{other}]"),
+        ),
+    )
+    .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/reload\nphase two\n/quit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let seen = seen.lock().unwrap();
+    let content = |index: usize, id: &str| {
+        seen[index].body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["tool_call_id"] == id)
+            .unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(
+        content(1, "query").contains("1. first"),
+        "{}\nstderr: {}",
+        content(1, "query"),
+        text(&out.stderr)
+    );
+    assert!(content(2, "unshown").contains("returned 1"));
+    assert!(content(3, "expand").contains("full first page"));
+    assert!(content(4, "sibling").contains("no search to expand"));
+    assert!(content(5, "different").contains("full second page"));
+    assert!(content(6, "reuse").contains("full second page"));
+    assert!(content(8, "revoked").contains("denied:"));
+    for (index, (id, _, _)) in calls.iter().enumerate() {
+        assert!(!content(index + 1, id).contains(KEY));
+    }
+    let requests = search.seen.lock().unwrap();
+    assert_eq!(requests.len(), 2, "expansions must not make more requests");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.contains(&format!("Bearer {KEY}")))
+    );
+    let audit = fs::read_to_string(env.audit_log()).unwrap();
+    assert!(!audit.contains(KEY));
+    assert!(
+        records(&env.audit_log())
+            .iter()
+            .any(|row| row["principal"] == "plugin.reader"
+                && row["scope"] == "net"
+                && row["args"]["call_id"].is_string())
+    );
+    assert_eq!(fs::read(root.join("reader/component.wasm")).unwrap(), bytes);
     assert!(
         env.saddle(&["audit", "verify", env.audit_log().to_str().unwrap()])
             .status

@@ -2,7 +2,7 @@
 
 Saddle is a coding-agent harness in Rust. Its plugin boundary is WASI components whose
 authority is a *declared* scope set, checked before instantiation and bounded by the agent's reach.
-The binary supports explicitly installed, digest-pinned filesystem/transcript tool plugins (D126–D142), alongside
+The binary supports explicitly installed, digest-pinned capability-gated tool plugins (D126–D143), alongside
 built-in tools and MCP; the loader, canonical WIT and SDK are separate library crates.
 `docs/plan.md` is the specification; read it before changing behaviour in the policy, sandbox or tool
 layer.
@@ -22,7 +22,7 @@ because it is followed.
 | `crates/saddle-wit` | canonical read-tool WIT and generated host bindings (D127) |
 | `crates/saddle-loader` | actual component inspection, bounded delegation, grant-shaped pre-linking, fresh bounded instances and a narrow host-services trait, without a dependency on the binary's session (D126, D127) |
 | `crates/saddle-sdk` | guest bindings from the same WIT and a read-only example; no `std::fs` authority (D12, D127) |
-| `crates/saddle-tools` | standard guest tools: text/image reads, pagination, listing, traversal/search, transcript queries and write/edit/patch workflows; uses runtime-gated SDK services, not native filesystem/database access. Mutations and reads cover policy roots and delegated D66 directories; guests emit human-only diffs (D131–D141) |
+| `crates/saddle-tools` | standard guest tools: text/image reads, pagination, listing, traversal/search, transcript queries, write/edit/patch, shell and HTTP/search workflows; uses runtime-gated SDK services, not native filesystem/database access. Mutations and reads cover policy roots and delegated D66 directories; guests emit human-only diffs (D131–D141) |
 | `crates/saddle-ignore` | authority-free ignore-file parsing, shared by native search/skill discovery and guest search components (D68, D133) |
 | `crates/saddle-sandbox` | applies a sandbox spec to the current process and execs the target, including the command's own network namespace and the relay in it (D79); starts a long-lived child whose stdin and stdout belong to the caller, with the spec on fd 3 (D106); also builds the `saddle-sandbox` helper binary used by its own tests |
 | `crates/saddle` | the binary: built-in tools, model providers, the model loop, the TUI |
@@ -34,6 +34,7 @@ Inside `crates/saddle/src`:
 | `agent` | the model loop (no request limit unless one is set, D37; a turn stops on a repeated call and answer, D38), the system prompt (base plus grants, so a policy reload replaces only the grants, D47), tool dispatch, and compaction — synchronous at the hard threshold, started in the background at three quarters (D78), and run by the worker thread when the session is idle (D77) |
 | `session` | opening the workspace, resolving roots, the policy engine and audit log for a session |
 | `plugins` | protected/digest-pinned loading, tool registration, provenance and CLI installation (D128); worker-to-session host calls through the one engine/audit log, reload revocation and bounded reads (D129) |
+| `network`, `search_transport` | per-hop attributed HTTP and protected provider/Exa communication, bounded per-principal raw search snapshots; parsing/presentation is guest-owned (D143) |
 | `execution` | caller-attributed subprocess sandbox lowering, network bridge, bounded capture and reservation restore; native/guest shell workflows are adapters (D142) |
 | `plugins/mutations` | bounded write/remove batches with all-target permission/precondition preflight, pinned staging and per-entry atomic publication under the plugin principal; not a filesystem-wide transaction (D140) |
 | `fs_access` | pinned no-follow directory/file opens for session roots and plugin artifacts/reads (D129) |
@@ -320,7 +321,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D142 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D143 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

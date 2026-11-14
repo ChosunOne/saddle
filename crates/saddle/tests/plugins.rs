@@ -2,6 +2,8 @@
 
 #[path = "support/plugin.rs"]
 mod fixture;
+#[path = "support/http.rs"]
+mod http_fixture;
 
 use std::fs::{self, Permissions};
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -9,6 +11,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
+use http_fixture::{Server as HttpServer, reply as http_reply};
 use saddle_policy::audit::sha256_hex;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -488,6 +491,73 @@ fn managed_manifest(env: &Env, scopes: &str) {
         format!("id='reader'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes={scopes}\n"),
     )
     .unwrap();
+}
+
+#[test]
+#[ignore = "build the standard fetch component first; see docs/plugins.md"]
+fn standard_fetch_checks_redirect_grants_strips_cross_origin_headers_and_bounds_private_reach() {
+    let target = HttpServer::new(vec![http_reply(
+        200,
+        "Content-Type: text/plain\r\n",
+        "redirected",
+    )]);
+    let redirect = http_reply(302, &format!("Location: {}/page\r\n", target.url), "");
+    let source = HttpServer::new(vec![redirect.clone(), redirect]);
+    let bytes = fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/fetch-plugin/fetch.component.wasm"),
+    )
+    .expect("build the standard fetch component first");
+    let source_grant = format!("{{host='127.0.0.1',scheme='http',port={}}}", source.port);
+    let target_grant = format!("{{host='127.0.0.1',scheme='http',port={}}}", target.port);
+    let env = Env::new(&bytes, &format!("tool={{}}\nnet=[{source_grant}]"));
+    managed_manifest(&env, "['tool','net']");
+    env.edit(
+        "[agent]\n",
+        &format!("[agent]\nnet=[{source_grant},{target_grant}]\n"),
+    );
+    let arguments = serde_json::json!({"url":format!("{}/start?token=QUERY_SECRET_X",source.url),"headers":{"Authorization":"HEADER_SECRET_X"}}).to_string();
+    let out = env.run(&["plugin", "call", "reader", &arguments]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(target.seen.lock().unwrap().is_empty());
+    env.edit(
+        &format!("net=[{source_grant}]"),
+        &format!("net=[{source_grant},{target_grant}]"),
+    );
+    let out = env.run(&["plugin", "call", "reader", &arguments]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("redirected"));
+    assert!(source.seen.lock().unwrap()[0].contains("HEADER_SECRET_X"));
+    assert!(!target.seen.lock().unwrap()[0].contains("HEADER_SECRET_X"));
+    let audit = fs::read_to_string(env.log()).unwrap();
+    assert!(!audit.contains("HEADER_SECRET_X") && !audit.contains("QUERY_SECRET_X"));
+    assert!(env.records().iter().any(|row| row["scope"] == "net"
+        && row["principal"] == "plugin.reader"
+        && row["args"]["call_id"].is_string()));
+    assert!(
+        env.run(&["audit", "verify", env.log().to_str().unwrap()])
+            .status
+            .success()
+    );
+
+    let env = Env::new(&bytes, &format!("tool={{}}\nnet=[{source_grant}]"));
+    managed_manifest(&env, "['tool','net']");
+    env.edit(
+        "[agent]\n",
+        &format!(
+            "[agent]\nnet=[{{host='*',scheme='http',port={}}}]\n",
+            source.port
+        ),
+    );
+    let count = source.seen.lock().unwrap().len();
+    let out = env.run(&["plugin", "call", "reader", &arguments]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("loopback"), "{}", text(&out));
+    assert_eq!(
+        source.seen.lock().unwrap().len(),
+        count,
+        "narrowing a wildcard must not gain private reach"
+    );
 }
 
 #[test]

@@ -1,0 +1,4 @@
+id = "web"
+version = "0.1.0"
+component = "websearch.component.wasm"
+scopes = ["tool", "net"]

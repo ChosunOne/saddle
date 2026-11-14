@@ -1,7 +1,7 @@
 # WASI tool plugins
 
 Saddle loads explicitly installed, digest-pinned WASI components as model-callable tools
-(D126–D142). The runtime supports bounded filesystem and transcript services, not arbitrary extensions. A manifest
+(D126–D143). The runtime supports bounded filesystem and transcript services, not arbitrary extensions. A manifest
 in a repository never executes automatically. Installation, enablement and grants are separate steps
 performed by a person; an agent cannot write its own protected configuration.
 
@@ -441,6 +441,55 @@ a trap after execution warns that effects may already have happened.
 cargo nextest run --test plugins --run-ignored all -E 'test(standard_shell)'
 ```
 
+## Standard network/search components
+
+The `http` and `web` components export `plugin__http__fetch` and `plugin__web__websearch` (D143).
+Build/componentize the `fetch`/`websearch` examples using the filesystem workflow. Native entry points
+now use the same guest-owned parsing/presentation library through temporary adapters; they do not
+supply agent authority to plugin calls.
+
+```toml
+[plugin.http]
+tool = {}
+net = [{ host = "docs.rs" }, { host = "*.rust-lang.org" }]
+
+[plugin.web]
+tool = {}
+# Grant the configured provider's search host, or the selected Exa fallback:
+net = [{ host = "api.synthetic.new" }, { host = "api.exa.ai" }, { host = "mcp.exa.ai" }]
+```
+
+Parent grants must cover every requested scheme/host/port. Narrowing a wildcard to an exact name
+cannot acquire private-network exemptions the parent lacks. SDK filesystem authority is unrelated.
+The host canonicalizes HTTP(S) URLs, rejects userinfo and routing/framing override headers, checks
+DNS addresses through the shared resolver, independently gates each redirect (five maximum), and
+removes all caller headers on cross-origin redirects. Responses capture at most 100 KiB; the guest
+validates UTF-8 and presents about 60 KiB with truncation labelled. Header names are audited, values
+never are; query values are redacted. Headers must fit 64 entries/64 KiB.
+
+The search SDK accepts only query/count, not an endpoint or protected credential selector. The core
+uses the configured provider, keyed Exa REST or anonymous Exa MCP, and sends credentials only through
+those fixed protocol paths. Credential-bearing requests do not follow redirects. Protected search
+responses are capped at 1 MiB and cleartext key echoes are redacted. The guest parses backend results,
+selects excerpts, numbers the originally returned set, formats full pages and chooses whether a new
+query requires another search. Anonymous MCP text is not falsely presented as numbered full pages.
+
+The session retains at most 17 bounded response snapshots, keyed by principal. A sibling cannot
+expand another plugin's search. Expansions make no HTTP request, and plugin snapshot access rechecks
+the original endpoint's current reach, so revocation cannot leave a cache-reading bypass. Search
+queries are bounded to 16 KiB and results to 100. Raw responses remain core-managed data, not plugin
+persistent storage. Reload needs no rebuild or repinning.
+
+Network calls use the cumulative host-wait budget from D142, with 30 seconds per call. Cancellation
+is checked around I/O; it cannot immediately interrupt a blocked resolver/read. Description-time
+HTTP, search and cache access are refused; audit failures are fatal. Raw WASI outgoing HTTP, sockets
+and poll remain unavailable. Standard delivery and native-entry-point removal are still separate.
+
+```sh
+cargo nextest run --test plugins --run-ignored all -E 'test(standard_fetch)'
+cargo nextest run --test agent --run-ignored all -E 'test(standard_search)'
+```
+
 ## Built-in migration tracking
 
 No standard component is silently aliased over a built-in or given implicit grants.
@@ -452,7 +501,7 @@ No standard component is silently aliased over a built-in or given implicit gran
 | `find`, `grep` | guest traversal, shared ignore syntax, glob/regex matching | large-tree/performance edges, host-path display and unreadable-file metadata |
 | `write`, `edit`, `patch` | guest workflows over bounded, preflight-all mutation batches and optimistic preconditions | standard delivery; documented size/atomicity and bounded diff presentation differences |
 | `bash` | guest shell workflow over delegated sandbox execution, bounded capture, timeout/cancellation and reservation restore | standard delivery; documented capture/presentation and process-group limitations |
-| `fetch`, `websearch` | not migrated | bounded attributed network/search adapters, redirects, protected credentials and grant narrowing |
+| `fetch`, `websearch` | guest schemas/workflows/parsing/presentation over attributed HTTP and protected search services | standard delivery; bounded presentation and blocking-I/O cancellation limits |
 | `session_query` | guest schema/presentation over branch-only, bounded transcript SQL under delegated `transcript-read` | standard-component delivery and native-entry-point removal |
 
 The target is replacement, not parallel selectable implementations: native entry points go away as
@@ -488,8 +537,8 @@ These labels are provenance, not permission to follow instructions found in a pl
 - `saddle-loader` hashes and compiles the supplied binary bytes, checks actual imports, export
   signatures and capabilities before initialization, and creates a fresh bounded instance for each
   `describe` or `invoke`. Native serialized Wasmtime code is not accepted.
-- `saddle-sdk` provides guest bindings, exports and the read-only Rust example. It calls the typed
-  host `read-file` function, never `std::fs`.
+- `saddle-sdk` provides bindings/exports and typed filesystem, execution, HTTP and transcript/search
+  services; guests receive no ambient `std::fs`, subprocess or socket authority.
 - `saddle::plugins` owns protected artifact loading, registration, provenance and the production
   filesystem adapter. Its worker asks the session thread over a bounded channel; the loader does
   not own a second policy engine or depend on `Session`.

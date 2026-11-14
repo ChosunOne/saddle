@@ -1,0 +1,4 @@
+id = "http"
+version = "0.1.0"
+component = "fetch.component.wasm"
+scopes = ["tool", "net"]

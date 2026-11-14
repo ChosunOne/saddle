@@ -1,7 +1,9 @@
 package saddle:host@0.1.0;
 
-// A filesystem/transcript tool world; the historical name is retained for SDK compatibility.
+// A standard tool world; the historical name is retained for SDK compatibility.
 world read-tool {
+    import http;
+    import web-search;
     import exec;
     import fs-read;
     import fs-write;

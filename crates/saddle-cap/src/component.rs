@@ -92,6 +92,7 @@ pub fn classify(direction: Direction, name: &str) -> Requirement {
     match (direction, n.namespace, n.package, n.interface) {
         (Import, "saddle", "host", i) => match i {
             "exec" => scope(Scope::Exec),
+            "http" | "web-search" => scope(Scope::Net),
             "fs-read" | "fs-read-range" | "fs-paths" | "fs-list" | "tool-paths" | "fs-write" => {
                 Requirement::AnyScope(&[
                     Scope::FsRead,
@@ -214,7 +215,10 @@ pub fn host_interfaces(granted: &BTreeSet<Scope>) -> Vec<&'static str> {
             Scope::ContextContribute => "saddle:host/context-contribute",
             Scope::ModelInvoke => "saddle:host/model-invoke",
             Scope::Persist => "saddle:host/persist",
-            Scope::Net => "wasi:http/outgoing-handler",
+            Scope::Net => {
+                out.extend(["saddle:host/http", "saddle:host/web-search"]);
+                continue;
+            }
             // An MCP grant declares no component import: the client is host-side and reached
             // through built-in tools (D103). A plugin calling one needs `saddle:host/mcp`.
             Scope::Tool | Scope::Veto | Scope::Ui | Scope::Mcp => continue,
@@ -311,7 +315,8 @@ mod tests {
                 "saddle:host/fs-list",
                 "saddle:host/tool-paths",
                 "saddle:host/fs-write",
-                "wasi:http/outgoing-handler"
+                "saddle:host/http",
+                "saddle:host/web-search"
             ]
         );
     }

@@ -2,12 +2,14 @@
 
 pub mod bash;
 mod diff;
+pub mod fetch;
 pub mod listing;
 pub mod mutation;
 mod pagination;
 mod patch;
 pub mod search;
 pub mod transcript;
+pub mod websearch;
 pub use pagination::read_with;
 
 use saddle_sdk::ImageInfo;

@@ -16,8 +16,7 @@ use std::time::Duration;
 use ureq::config::Config;
 
 use anyhow::Result;
-use saddle_cap::{Principal, Scope};
-use saddle_policy::{Kind, Request};
+use saddle_cap::Principal;
 use serde_json::Value;
 
 #[cfg(test)]
@@ -26,12 +25,13 @@ use ureq::http::Uri;
 use ureq::unversioned::resolver::{ArrayVec, DefaultResolver, ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 
-use super::{ToolOutput, str_field};
+use super::ToolOutput;
+use crate::network::{self, Operation};
 use crate::session::Session;
-
-/// A reply larger than this is cut rather than buffered without bound. It is the same ceiling the
-/// agent puts on a tool result (D17), since anything longer cannot enter the context anyway.
-pub const MAX_BYTES: u64 = 100 * 1024;
+use saddle_sdk::{Header as SdkHeader, HttpResponse};
+use saddle_tools::fetch::fetch_with;
+use saddle_wit::saddle::host::http::Header as HttpHeader;
+use std::time::Instant;
 
 /// A URL as the policy and the request need it: the parts are separate because a grant matches on
 /// scheme, host and port rather than on the whole string.
@@ -101,57 +101,63 @@ impl Target {
 }
 
 pub fn fetch(session: &mut Session, input: &Value) -> Result<ToolOutput> {
-    let raw = match str_field(input, "url") {
-        Ok(url) => url,
-        Err(out) => return Ok(out),
-    };
-    let headers = match headers_field(input) {
-        Ok(headers) => headers,
-        Err(out) => return Ok(out),
-    };
-    let target = match Target::parse(raw) {
-        Ok(t) => t,
-        Err(why) => return Ok(ToolOutput::err(why)),
-    };
-    let who = Principal::Agent;
-    let names: Vec<String> = headers.iter().map(|(name, _)| name.clone()).collect();
-    let req = Request::Net {
-        method: "GET",
-        scheme: &target.scheme,
-        host: &target.host,
-        port: target.port,
-        path: target.request_path(),
-        headers: &names,
-    };
-    // A private address is reachable only when a grant spells it out. The check is on the grant
-    // rather than on the form of the URL, so a wildcard grant cannot open loopback (D28, D40).
-    let named = session.net_names_host(&who, &target.host);
-    // A local server is the case people get stuck on, and the ordinary denial for one is
-    // unhelpful: a wildcard grant can cover the scheme and the port, so nothing in "no net grant
-    // covering http://127.0.0.1:8080" says what is actually missing. It is refused here with the
-    // grant to write.
-    if !named && let Some(why) = local(&target) {
-        session.audit.event(
-            Kind::Decision,
-            Some(&who),
-            Some(Scope::Net),
-            Some(false),
-            req.args(),
-            &why,
-        )?;
-        return Ok(ToolOutput::denied(&why));
+    let mut fatal = None;
+    let result = fetch_with(&input.to_string(), |request| {
+        let headers = request
+            .headers
+            .into_iter()
+            .map(|header| HttpHeader {
+                name: header.name,
+                value: header.value,
+            })
+            .collect();
+        match network::request(
+            session,
+            &Principal::Agent,
+            "native-fetch",
+            Operation {
+                method: "GET",
+                url: &request.url,
+                headers,
+                body: "",
+                limit: network::MAX_RESPONSE,
+                deadline: Instant::now() + Duration::from_secs(30),
+                redirects: true,
+            },
+        ) {
+            Ok(result) => result.map(|response| HttpResponse {
+                status: response.status,
+                headers: response
+                    .headers
+                    .into_iter()
+                    .map(|header| SdkHeader {
+                        name: header.name,
+                        value: header.value,
+                    })
+                    .collect(),
+                body: response.body,
+                truncated: response.truncated,
+            }),
+            Err(error) => {
+                fatal = Some(error);
+                Err("network host failure".into())
+            }
+        }
+    });
+    if let Some(error) = fatal {
+        return Err(error);
     }
-    let decision = session.decide(&who, &req)?;
-    if !decision.allow {
-        return Ok(ToolOutput::denied(&decision.explanation));
-    }
-    Ok(get(&target, named, &headers))
+    Ok(match result {
+        Ok(text) => ToolOutput::ok(text),
+        Err(why) => ToolOutput::err(why),
+    })
 }
 
 /// The `headers` object, checked: a name is a token, and a value is opaque but bounded. A header
 /// that would let the request reach somewhere else (`host`, and the proxy headers) is refused,
 /// since a grant is checked against the URL and a header must not be able to change what that URL
 /// means (D48).
+#[cfg(test)]
 fn headers_field(input: &Value) -> Result<Vec<(String, String)>, ToolOutput> {
     let Some(value) = input.get("headers") else {
         return Ok(Vec::new());
@@ -246,20 +252,30 @@ pub(crate) fn local(target: &Target) -> Option<String> {
 
 /// The client every host-side request is made with: a resolver that pins the addresses that were
 /// checked, so a name cannot be swapped between the decision and the connection (D28).
-pub(crate) fn agent(named: bool) -> ureq::Agent {
-    agent_for(named, Duration::from_secs(30))
-}
-
 /// The same agent with a deadline of the caller's choosing, which is what an MCP server's
 /// `[mcp.<name>] timeout` is (D113).
 pub(crate) fn agent_for(named: bool, timeout: Duration) -> ureq::Agent {
+    agent_configured(named, timeout, false)
+}
+
+/// manual redirect handling permits the caller to decide every hop (D143).
+pub(crate) fn agent_no_redirect(named: bool, timeout: Duration) -> ureq::Agent {
+    agent_configured(named, timeout, true)
+}
+
+fn agent_configured(named: bool, timeout: Duration, no_redirect: bool) -> ureq::Agent {
     // `with_parts` is the only way to install a resolver. The connector is the default one, so TLS
     // and pools are unchanged.
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(timeout))
-        .user_agent(concat!("saddle/", env!("CARGO_PKG_VERSION")))
-        .build();
+        .user_agent(concat!("saddle/", env!("CARGO_PKG_VERSION")));
+    let config = if no_redirect {
+        config.max_redirects(0)
+    } else {
+        config
+    }
+    .build();
     ureq::Agent::with_parts(
         config,
         DefaultConnector::new(),
@@ -270,92 +286,6 @@ pub(crate) fn agent_for(named: bool, timeout: Duration) -> ureq::Agent {
             named,
         },
     )
-}
-
-/// A request whose body is JSON, answered as text. The same rules as [`get`]: the addresses are
-/// pinned, and a status is a result rather than an error, so the caller can report what the server
-/// said.
-/// A POST, for a host call whose body is not a page: the reply is read up to `limit` bytes rather
-/// than `fetch`'s own cap, because a search answer carries whole passages and would otherwise be
-/// refused for being a large success (D82).
-pub(crate) fn post(
-    target: &Target,
-    named: bool,
-    headers: &[(String, String)],
-    body: &str,
-    limit: u64,
-) -> Result<(u16, String), String> {
-    if !named && let Err(why) = resolve_public(&target.host, target.port) {
-        return Err(why);
-    }
-    let url = format!(
-        "{}://{}{}",
-        target.scheme,
-        authority(&target.host, target.port, target.scheme == "https"),
-        target.path
-    );
-    let mut request = agent(named).post(&url);
-    for (name, value) in headers {
-        request = request.header(name.as_str(), value.as_str());
-    }
-    let mut resp = request.send(body).map_err(|e| format!("{url}: {e}"))?;
-    let status = resp.status().as_u16();
-    let text = resp
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_string()
-        .map_err(|e| format!("{url} answered {status} but the body is not UTF-8 text: {e}"))?;
-    Ok((status, text))
-}
-
-fn get(target: &Target, named: bool, headers: &[(String, String)]) -> ToolOutput {
-    let agent = agent(named);
-    // Resolved once here for the explanation, and again by the resolver that pins the addresses.
-    // The second resolution is the one that matters: it is what ureq dials.
-    if !named && let Err(why) = resolve_public(&target.host, target.port) {
-        return ToolOutput::err(why);
-    }
-    let url = format!(
-        "{}://{}{}",
-        target.scheme,
-        authority(&target.host, target.port, target.scheme == "https"),
-        target.path
-    );
-    let mut request = agent.get(&url);
-    for (name, value) in headers {
-        request = request.header(name.as_str(), value.as_str());
-    }
-    let mut resp = match request.call() {
-        Ok(resp) => resp,
-        Err(e) => return ToolOutput::err(format!("{url}: {e}")),
-    };
-    let status = resp.status().as_u16();
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_owned();
-    let body = match resp
-        .body_mut()
-        .with_config()
-        .limit(MAX_BYTES)
-        .read_to_string()
-    {
-        Ok(text) => text,
-        Err(e) => {
-            return ToolOutput::err(format!(
-                "{url} answered {status} but the body is not UTF-8 text: {e}"
-            ));
-        }
-    };
-    let head = if content_type.is_empty() {
-        format!("{status}")
-    } else {
-        format!("{status} {content_type}")
-    };
-    ToolOutput::ok(format!("{head}\n\n{body}"))
 }
 
 /// The authority for the request line: the default port is left out, and an IPv6 literal is

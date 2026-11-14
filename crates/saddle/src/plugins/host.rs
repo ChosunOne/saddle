@@ -26,10 +26,14 @@ use serde_json::json;
 
 use super::{filesystem, mutations};
 use crate::execution;
+use crate::network::Operation;
 use crate::provider::Image;
 use crate::session::Session;
 use crate::{cancel, fs_access, transcript};
+use crate::{network, search_transport};
 use saddle_wit::saddle::host::exec::{Command, Reply as ExecReply};
+use saddle_wit::saddle::host::http::{Request as HttpRequest, Response as HttpResponse};
+use saddle_wit::saddle::host::web_search::Snapshot as SearchSnapshot;
 
 pub enum Job {
     Describe,
@@ -61,6 +65,18 @@ impl StdError for Fatal {
 type HostReply<T, E = Failure> = Result<Result<T, E>, String>;
 type FileReply = HostReply<Chunk>;
 enum Event {
+    Http {
+        who: Principal,
+        deadline: Instant,
+        request: HttpRequest,
+        answer: SyncSender<HostReply<HttpResponse, String>>,
+    },
+    Search {
+        who: Principal,
+        deadline: Instant,
+        query: Option<(String, u32)>,
+        answer: SyncSender<HostReply<Option<SearchSnapshot>, String>>,
+    },
     Execute {
         who: Principal,
         request: Command,
@@ -120,7 +136,66 @@ enum Event {
 pub struct Host {
     events: SyncSender<Event>,
 }
+impl Host {
+    fn request_search(
+        &mut self,
+        call: &Invocation,
+        query: Option<(String, u32)>,
+    ) -> Result<Result<Option<SearchSnapshot>, String>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        self.events
+            .send(Event::Search {
+                who: call.principal().clone(),
+                deadline: call
+                    .deadline()
+                    .min(Instant::now() + Duration::from_secs(30)),
+                query,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        result
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(|_| anyhow!("plugin search request timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
+}
 impl HostServices for Host {
+    fn http_get(
+        &mut self,
+        call: &Invocation,
+        request: HttpRequest,
+    ) -> Result<Result<HttpResponse, String>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        self.events
+            .send(Event::Http {
+                who: call.principal().clone(),
+                deadline: call
+                    .deadline()
+                    .min(Instant::now() + Duration::from_secs(30)),
+                request,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        result
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(|_| anyhow!("plugin HTTP request timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
+    fn search_web(
+        &mut self,
+        call: &Invocation,
+        query: String,
+        count: u32,
+    ) -> Result<Result<SearchSnapshot, String>> {
+        Ok(self
+            .request_search(call, Some((query, count)))?
+            .and_then(|snapshot| {
+                snapshot.ok_or_else(|| "search transport returned no snapshot".into())
+            }))
+    }
+    fn last_search(&mut self, call: &Invocation) -> Result<Result<Option<SearchSnapshot>, String>> {
+        self.request_search(call, None)
+    }
     fn execute(
         &mut self,
         call: &Invocation,
@@ -359,6 +434,7 @@ pub fn execute(
     let invoking = matches!(job, Job::Invoke(_));
     let mut filesystem_effects = false;
     let mut execution_effects = false;
+    let mut network_effects = false;
     let mut diff = None;
     let mut images = Vec::new();
     let (events, pending) = mpsc::sync_channel(1);
@@ -392,6 +468,75 @@ pub fn execute(
             cancelled.store(true, Ordering::Relaxed);
         }
         match pending.recv_timeout(Duration::from_millis(10)) {
+            Ok(Event::Http {
+                who,
+                deadline,
+                request,
+                answer,
+            }) => {
+                let result = if invoking {
+                    network_effects = true;
+                    network::request(
+                        session,
+                        &who,
+                        call,
+                        Operation {
+                            method: "GET",
+                            url: &request.url,
+                            headers: request.headers,
+                            body: "",
+                            limit: network::MAX_RESPONSE,
+                            deadline,
+                            redirects: true,
+                        },
+                    )
+                } else {
+                    session
+                        .audit
+                        .event(
+                            Kind::Decision,
+                            Some(&who),
+                            Some(Scope::Net),
+                            Some(false),
+                            json!({"call_id":call,"operation":"http"}),
+                            "HTTP is refused during describe",
+                        )
+                        .map(|_| Err("HTTP is refused during describe".into()))
+                        .map_err(Into::into)
+                };
+                respond(result, answer, &mut fatal, &cancelled);
+            }
+            Ok(Event::Search {
+                who,
+                deadline,
+                query,
+                answer,
+            }) => {
+                let result = if invoking {
+                    match query {
+                        Some((query, count)) => {
+                            network_effects = true;
+                            search_transport::search(session, &who, call, query, count, deadline)
+                                .map(|result| result.map(Some))
+                        }
+                        None => search_transport::last(session, &who, call),
+                    }
+                } else {
+                    session
+                        .audit
+                        .event(
+                            Kind::Decision,
+                            Some(&who),
+                            Some(Scope::Net),
+                            Some(false),
+                            json!({"call_id":call,"operation":"search"}),
+                            "search is refused during describe",
+                        )
+                        .map(|_| Err("search is refused during describe".into()))
+                        .map_err(Into::into)
+                };
+                respond(result, answer, &mut fatal, &cancelled);
+            }
             Ok(Event::Execute {
                 who,
                 request,
@@ -557,7 +702,7 @@ pub fn execute(
             }
             Ok(Event::Finished(result)) => {
                 let result = result.map_err(|why| {
-                    if filesystem_effects { format!("{why}; filesystem changes were committed before failure; inspect paths before retrying") } else if execution_effects { format!("{why}; execution may have produced effects before failure; inspect results before retrying") } else { why }
+                    if filesystem_effects { format!("{why}; filesystem changes were committed before failure; inspect paths before retrying") } else if execution_effects { format!("{why}; execution may have produced effects before failure; inspect results before retrying") } else if network_effects { format!("{why}; network requests may have completed before failure") } else { why }
                 });
                 break result.map(|reply| match reply {
                     Reply::Output { output, .. } if !output.is_error => Reply::Output {

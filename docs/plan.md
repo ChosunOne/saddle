@@ -3200,6 +3200,35 @@ Guest computation retains its original two-second budget and fuel. Captured stre
 256 KiB each, the guest's final presentation to its ordinary output limit. No interactive terminal,
 ambient guest subprocess access or unbounded streaming/storage is introduced.
 
+**D143.** Standard `fetch` and `websearch` guests own schemas, argument/workflow decisions,
+response parsing, excerpt selection and text presentation. Native entry points are temporary thin
+adapters to those same guest-owned libraries. `saddle:host/http` offers bounded HTTP GET effects;
+`saddle:host/web-search` offers fixed, protected provider/Exa communication and per-principal response
+snapshots, not arbitrary credential-bearing requests. Both require delegated `net`; raw sockets,
+ambient outgoing HTTP and WASI poll remain unavailable. The core canonicalizes URLs, refuses
+userinfo and routing/framing override headers, decides/audits every redirect independently, pins
+checked DNS addresses through the shared resolver, and strips caller headers across origins. Every
+private-space exemption is bounded by both parent and child (D142). Search credentials never become
+guest parameters or returned headers; only the configured provider/fixed Exa endpoints can receive
+them, and credential-bearing POSTs do not follow redirects. Cleartext credential echoes are redacted.
+
+HTTP captures 100 KiB, protected search responses 1 MiB, headers 64 entries/64 KiB, queries 16 KiB,
+and redirects at most five. Long host waits use D142's cumulative accounting with at most 30 seconds
+per network call; cancellation is checked around I/O, but cannot immediately preempt a blocking
+resolver/read (the HTTP deadline still bounds the request). Description-time HTTP/search/cache
+access is refused and fatal audit errors remain fatal. Query terms, method, redacted URL, header
+names and caller/call id are audited, never credential/header values. A guest trap does not undo a
+network request that already happened.
+
+Search snapshots retain raw bounded responses in the core, keyed by principal, with at most 17
+entries (16 plugins plus the native adapter; older entries may be evicted). Guests implement result
+numbering, full-page expansion and whether a different query requires another search. Snapshot count
+retains the originally numbered result set. A sibling cannot read another principal's snapshot and
+plugin cache access rechecks the original endpoint's current reach; it makes no HTTP request. The
+anonymous Exa MCP path retains unstructured result semantics rather than inventing numbered pages.
+Standard text presentation is bounded to about 60 KiB, explicitly labelled when cut; installation,
+standard delivery and native-entry-point removal remain separate follow-on work.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
@@ -3207,8 +3236,9 @@ ambient guest subprocess access or unbounded streaming/storage is introduced.
 | `exec` | running commands | `saddle:host/exec` import | sandbox helper (D18, D19); the network it reaches is `net` (D79) |
 | `fs-read` | reading files under granted roots | `saddle:host/fs-read` import | policy per call |
 | `tool-read` | bounded reads of existing D66 tool paths under explicitly delegated read-only roles | ordinary filesystem-read imports (D139); legacy `saddle:host/tool-paths` | policy per requested/resolved location and current configuration entry (D138) |
+| `tool-write` | mutations of existing D66 tool paths under explicitly delegated write roles | ordinary `saddle:host/fs-write` import (D141) | policy per requested/resolved location, absolute reserved paths and current configuration entry |
 | `fs-write` | writing files under granted roots | `saddle:host/fs-write` import | policy per call, reserved paths (D23) |
-| `net` | HTTP requests to granted hosts | `wasi:http/outgoing-handler` import, `fetch` and `websearch` tools, a command's proxy | host HTTP client, policy per request (D28, D39, D79, D82) |
+| `net` | HTTP requests to granted hosts | `saddle:host/http` and `saddle:host/web-search`, a command's proxy; raw WASI HTTP remains unlinked | host HTTP client, policy per hop under the calling principal (D28, D79, D143) |
 | `transcript-read` | reading session messages and their request usage, and observing them as they arrive | `saddle:host/transcript-read` import, `saddle:plugin/observer` export | policy per call |
 | `context-contribute` | adding notes and diagnostics to the context | `saddle:host/context-contribute` import | policy per call, slot schemas (D26) |
 | `tool` | registering tools the model can call | `saddle:plugin/tool` export | load-time check, catalogue rendering (D26) |
@@ -3227,11 +3257,12 @@ One capability representation, in `saddle-cap`, lowered three ways:
 3. to a sandbox spec for child processes, applied at `exec`.
 
 The WASI layer is closed the same way for every plugin: no preopens, empty environment, no sockets.
-Authority arrives only through `saddle:host` interfaces and `wasi:http`, and both reach the policy
-engine.
+Authority arrives through `saddle:host` services and the command proxy, which reach the policy
+engine. Ambient WASI outgoing HTTP is not linked in the current runtime (D143).
 
-- A component can reach only the scopes its imports and exports name. That set is a static property
-  of the component and is checked before any plugin bytecode runs.
+- Imports/exports define service eligibility, checked before any plugin bytecode runs. They are not
+  operational authority: shared filesystem bindings may link under any filesystem capability, and
+  each requested operation/path still requires its own runtime grant (D139–D141).
 - The policy engine decides each call with resolved arguments: which path under which root, which
   host, how many tokens, which storage namespace.
 - The sandbox spec gives child processes the same roots, because the policy engine cannot see inside a
@@ -3278,8 +3309,9 @@ host adapters and CLI/model tests for explicit installation, registration, prove
 provenance wrapper moves forward to the first model-visible plugin tool, before registration, not
 after unlabelled output has already reached a conversation.
 
-The v1 test is the whole thesis. If a plugin that imports `fs-read` without the grant still loads, the
-model is decorative.
+The v1 refusal remains the thesis: a component with no eligible filesystem capability must not
+initialize filesystem imports. D139–D141 distinguish bindings from per-operation authority: linking
+read bindings under a write capability must never let that principal read a file without read reach.
 
 ## 8. Deferred
 

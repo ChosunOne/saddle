@@ -21,12 +21,16 @@ use saddle_wit::saddle::host::fs_paths::{self, Host as PathsHost};
 use saddle_wit::saddle::host::fs_read::{self, Failure, Host, Path};
 use saddle_wit::saddle::host::fs_read_range::{self, Chunk, Host as RangeHost};
 use saddle_wit::saddle::host::fs_write::{self, Change, Expectation, Host as WriteHost};
+use saddle_wit::saddle::host::http::{
+    self, Host as HttpHost, Request as HttpRequest, Response as HttpResponse,
+};
 use saddle_wit::saddle::host::tool_paths::{
     self, Chunk as ToolChunk, Entry as ToolEntry, EntryKind as ToolEntryKind,
     Failure as ToolFailure, Host as ToolPathsHost, Page as ToolPage, Path as ToolPath,
 };
 use saddle_wit::saddle::host::tool_result::{self, Host as ResultHost, ImageInfo};
 use saddle_wit::saddle::host::transcript_read::{self, Host as TranscriptHost};
+use saddle_wit::saddle::host::web_search::{self, Host as SearchHost, Snapshot as SearchSnapshot};
 use sha2::{Digest, Sha256};
 use wasmtime::component::types::{Component as ComponentType, ComponentItem};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
@@ -124,6 +128,27 @@ impl Invocation {
 /// filesystem callbacks may hold any filesystem capability; determine authority per operation/path,
 /// never from the existence of a linked interface (D139, D140).
 pub trait HostServices: Send + 'static {
+    fn http_get(
+        &mut self,
+        _call: &Invocation,
+        _request: HttpRequest,
+    ) -> anyhow::Result<Result<HttpResponse, String>> {
+        Ok(Err("host does not implement HTTP".into()))
+    }
+    fn search_web(
+        &mut self,
+        _call: &Invocation,
+        _query: String,
+        _count: u32,
+    ) -> anyhow::Result<Result<SearchSnapshot, String>> {
+        Ok(Err("host does not implement web search".into()))
+    }
+    fn last_search(
+        &mut self,
+        _call: &Invocation,
+    ) -> anyhow::Result<Result<Option<SearchSnapshot>, String>> {
+        Ok(Err("host does not implement search snapshots".into()))
+    }
     fn execute(
         &mut self,
         _call: &Invocation,
@@ -298,6 +323,72 @@ impl<H: HostServices> ExecHost for State<H> {
         if matches!(&result, Ok(reply) if reply.stdout.len() > 256*1024 || reply.stderr.len() > 256*1024 || reply.denials.iter().chain(&reply.restored).map(String::len).sum::<usize>() > MAX_FILE_BYTES)
         {
             return Ok(Err("execution reply exceeds bounds".into()));
+        }
+        if matches!(&result, Err(why) if why.len() > MAX_FILE_BYTES) {
+            return Ok(Err("host error exceeds 64 KiB".into()));
+        }
+        Ok(result)
+    }
+}
+
+impl<H: HostServices> HttpHost for State<H> {
+    fn get(&mut self, request: HttpRequest) -> anyhow::Result<Result<HttpResponse, String>> {
+        if request.url.len() > 8192
+            || request.headers.len() > 64
+            || request
+                .headers
+                .iter()
+                .map(|h| h.name.len() + h.value.len())
+                .sum::<usize>()
+                > MAX_FILE_BYTES
+        {
+            return Ok(Err("HTTP request exceeds bounds".into()));
+        }
+        let result = self.host_wait(Duration::from_secs(30), |host, call, _| {
+            host.http_get(call, request)
+        })?;
+        if matches!(&result, Ok(reply) if reply.body.len() > 100*1024 || reply.headers.len() > 64 || reply.headers.iter().map(|h|h.name.len()+h.value.len()).sum::<usize>() > MAX_FILE_BYTES)
+        {
+            return Ok(Err("HTTP response exceeds bounds".into()));
+        }
+        if matches!(&result, Err(why) if why.len() > MAX_FILE_BYTES) {
+            return Ok(Err("host error exceeds 64 KiB".into()));
+        }
+        Ok(result)
+    }
+}
+
+impl<H: HostServices> SearchHost for State<H> {
+    fn search(
+        &mut self,
+        query: String,
+        count: u32,
+    ) -> anyhow::Result<Result<SearchSnapshot, String>> {
+        if query.len() > 16384 || !(1..=100).contains(&count) {
+            return Ok(Err("invalid search query/count or exceeds 16 KiB".into()));
+        }
+        let result = self.host_wait(Duration::from_secs(30), |host, call, _| {
+            host.search_web(call, query, count)
+        })?;
+        if matches!(&result, Ok(snapshot) if snapshot.body.len() > 1024*1024 || snapshot.query.len() > 16384 || snapshot.provider.len() > 1024 || snapshot.via.len() > 64)
+        {
+            return Ok(Err("search response exceeds bounds".into()));
+        }
+        if matches!(&result, Err(why) if why.len() > MAX_FILE_BYTES) {
+            return Ok(Err("host error exceeds 64 KiB".into()));
+        }
+        Ok(result)
+    }
+    fn last(&mut self) -> anyhow::Result<Result<Option<SearchSnapshot>, String>> {
+        let result = self.host_wait(Duration::from_secs(1), |host, call, _| {
+            host.last_search(call)
+        })?;
+        if matches!(&result, Ok(Some(snapshot)) if snapshot.body.len() > 1024*1024 || snapshot.query.len() > 16384 || snapshot.provider.len() > 1024 || snapshot.via.len() > 64)
+        {
+            return Ok(Err("search snapshot exceeds bounds".into()));
+        }
+        if matches!(&result, Err(why) if why.len() > MAX_FILE_BYTES) {
+            return Ok(Err("host error exceeds 64 KiB".into()));
         }
         Ok(result)
     }
@@ -670,6 +761,8 @@ impl Loader {
                 name.as_str(),
                 "saddle:host/fs-read@0.1.0"
                     | "saddle:host/exec@0.1.0"
+                    | "saddle:host/http@0.1.0"
+                    | "saddle:host/web-search@0.1.0"
                     | "saddle:host/fs-read-range@0.1.0"
                     | "saddle:host/fs-write@0.1.0"
                     | "saddle:host/fs-paths@0.1.0"
@@ -686,6 +779,12 @@ impl Loader {
         }
         let mut linker = Linker::<State<H>>::new(engine);
         ambient::add(&mut linker).map_err(runtime("linking ambient WASI"))?;
+        if scopes.contains(&Scope::Net) {
+            http::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+                .map_err(runtime("linking HTTP"))?;
+            web_search::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+                .map_err(runtime("linking search"))?;
+        }
         if scopes.contains(&Scope::Exec) {
             exec::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
                 .map_err(runtime("linking exec"))?;
@@ -1094,6 +1193,114 @@ mod tests {
             "{why}"
         );
         assert!(!why.contains("unreachable"), "{why}");
+    }
+
+    struct NetworkHost(Arc<AtomicUsize>);
+    impl HostServices for NetworkHost {
+        fn read_file(
+            &mut self,
+            _: &Invocation,
+            _: Path,
+        ) -> anyhow::Result<Result<Vec<u8>, Failure>> {
+            panic!("network adapter must not read files");
+        }
+        fn http_get(
+            &mut self,
+            _: &Invocation,
+            _: HttpRequest,
+        ) -> anyhow::Result<Result<HttpResponse, String>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Ok(HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: vec![0; 100 * 1024 + 1],
+                truncated: false,
+            }))
+        }
+        fn search_web(
+            &mut self,
+            _: &Invocation,
+            query: String,
+            count: u32,
+        ) -> anyhow::Result<Result<SearchSnapshot, String>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Ok(SearchSnapshot {
+                query,
+                count,
+                via: "provider".into(),
+                provider: "test".into(),
+                status: 200,
+                body: "x".repeat(1024 * 1024 + 1),
+            }))
+        }
+    }
+
+    #[test]
+    fn network_adapters_bound_arguments_before_dispatch_and_replies_before_guest_return() {
+        let (_dir, agent, plugin) = grants(
+            "[agent]\nfs-read=[{root='workspace'}]\n[plugin.reader]\ntool={}\nfs-read=[{root='workspace'}]\n",
+        );
+        let bytes = wat::parse_str(include_str!("fixtures/read-tool.wat")).unwrap();
+        let prepared = Loader::new()
+            .unwrap()
+            .prepare::<NetworkHost>(&manifest(), &agent, &plugin, &bytes, Limits::default())
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut store = prepared
+            .store(NetworkHost(calls.clone()), cancelled())
+            .unwrap();
+        assert!(
+            HttpHost::get(
+                store.data_mut(),
+                HttpRequest {
+                    url: "x".repeat(8193),
+                    headers: vec![]
+                }
+            )
+            .unwrap()
+            .is_err()
+        );
+        assert!(
+            SearchHost::search(store.data_mut(), "x".repeat(16385), 1)
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            SearchHost::search(store.data_mut(), "query".into(), 101)
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(
+            HttpHost::get(
+                store.data_mut(),
+                HttpRequest {
+                    url: "https://example.test/".into(),
+                    headers: vec![]
+                }
+            )
+            .unwrap()
+            .is_err()
+        );
+        assert!(
+            SearchHost::search(store.data_mut(), "query".into(), 1)
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let state = store.data_mut();
+        state.host_time_left = Duration::ZERO;
+        assert!(
+            HttpHost::get(
+                state,
+                HttpRequest {
+                    url: "https://example.test/".into(),
+                    headers: vec![]
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     struct MutationHost(Arc<AtomicUsize>);

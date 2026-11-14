@@ -56,6 +56,7 @@ syntect = { version = "5.3", default-features = false, features = [
 ] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 ureq = "3.5"
+url = "2"
 # The ChatGPT backend's WebSocket transport (D101): tungstenite's client, over the rustls that
 # ureq already brings, so there is one TLS stack in the build.
 tungstenite = { version = "0.30", features = ["url", "rustls-tls-webpki-roots"] }

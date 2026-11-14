@@ -1,5 +1,18 @@
 package saddle:host@0.1.0;
 
+interface http {
+    record header { name: string, value: string }
+    record request { url: string, headers: list<header> }
+    record response { status: u16, headers: list<header>, body: list<u8>, truncated: bool }
+    get: func(request: request) -> result<response, string>;
+}
+
+interface web-search {
+    record snapshot { query: string, count: u32, via: string, provider: string, status: u16, body: string }
+    search: func(query: string, count: u32) -> result<snapshot, string>;
+    last: func() -> result<option<snapshot>, string>;
+}
+
 interface exec {
     record command { argv: list<string>, timeout-secs: u64 }
     record reply {

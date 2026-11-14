@@ -10,6 +10,9 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+saddle-tools.workspace = true
+saddle-sdk.workspace = true
+url.workspace = true
 saddle-ignore.workspace = true
 saddle-cap.workspace = true
 saddle-policy.workspace = true
@@ -42,7 +45,6 @@ syntect.workspace = true
 two-face.workspace = true
 
 [dev-dependencies]
-saddle-tools.workspace = true
 wat.workspace = true
 tempfile.workspace = true
 # The end-to-end tests read the session store directly to check what was saved (D53).

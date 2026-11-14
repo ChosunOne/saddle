@@ -2467,6 +2467,7 @@ dependencies = [
  "saddle-loader",
  "saddle-policy",
  "saddle-sandbox",
+ "saddle-sdk",
  "saddle-tools",
  "saddle-wit",
  "serde",
@@ -2481,6 +2482,7 @@ dependencies = [
  "two-face",
  "unicode-width",
  "ureq",
+ "url",
  "wat",
 ]
 

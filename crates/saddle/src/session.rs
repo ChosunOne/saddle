@@ -10,9 +10,9 @@ use crate::mcp::registry::Registry;
 use crate::paths;
 use crate::provider;
 use crate::provider::SearchTarget;
+use crate::search_transport::CachedSearch;
 use crate::skills;
 use crate::skills::Skill;
-use crate::tools::websearch::LastSearch;
 use saddle_cap::policy;
 use saddle_cap::roots;
 use std::collections::BTreeMap;
@@ -522,7 +522,7 @@ pub struct Session {
     /// The results of the last search, so `{"result": n}` can show one in full without asking
     /// again. Held here rather than in the tool because a result's number only means the page the
     /// model was shown, and that is a property of the session (D82).
-    pub last_search: Option<LastSearch>,
+    pub search_snapshots: BTreeMap<Principal, CachedSearch>,
     /// The MCP servers this policy grants, and the tools of theirs the model has declared (D108).
     pub mcp: Registry,
     /// A host-built, branch-only snapshot, supplied by the agent for one query (D92, D94).
@@ -604,7 +604,7 @@ impl Session {
             // The configured default provider, which is what `saddle tool` has. A run that resolved
             // a provider (`-p`, or one picked with /login) replaces this with that one's (D82).
             search,
-            last_search: None,
+            search_snapshots: BTreeMap::new(),
             mcp,
             query_snapshot: None,
             query_conversation: None,
