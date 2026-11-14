@@ -18,6 +18,7 @@ const DELAY: Duration = Duration::from_secs(1);
 #[derive(Debug)]
 pub struct Transient {
     message: String,
+    reason: &'static str,
     delay: Duration,
 }
 
@@ -25,8 +26,15 @@ impl Transient {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            reason: "transient provider error",
             delay: DELAY,
         }
+    }
+
+    /// identifies the failure using host-chosen labels, never backend text or request data (D130).
+    pub fn with_reason(mut self, reason: &'static str) -> Self {
+        self.reason = reason;
+        self
     }
 
     pub fn with_retry_after(mut self, seconds: Option<u64>) -> Self {
@@ -66,7 +74,7 @@ pub fn once(
                 return Err(error);
             };
             let delay = transient.delay;
-            tracked.note(&format!("response stream interrupted; retrying once over HTTP with the full conversation in {}s", delay.as_secs()));
+            tracked.note(&format!("response stream interrupted ({}); retrying once over HTTP with the full conversation in {}s", transient.reason, delay.as_secs()));
             pause(tracked.sink, delay)?;
             attempt(true, tracked.sink)
         }
@@ -167,6 +175,25 @@ mod tests {
         assert_eq!(attempts, [false, true]);
         assert_eq!(sink.notes.len(), 1);
         assert!(error.to_string().contains("connection closed"));
+    }
+
+    #[test]
+    fn recovery_reports_only_the_host_chosen_failure_category() {
+        let mut sink = Capture::default();
+        let _ = once(&mut sink, |_, _| {
+            Err(
+                Transient::new("private backend details and request text\x1b[2J")
+                    .with_reason("websocket read timed out")
+                    .with_retry_after(Some(0))
+                    .into(),
+            )
+        });
+        assert_eq!(
+            sink.notes,
+            [
+                "response stream interrupted (websocket read timed out); retrying once over HTTP with the full conversation in 0s"
+            ]
+        );
     }
 
     #[test]

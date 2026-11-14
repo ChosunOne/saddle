@@ -134,10 +134,10 @@ impl Request {
             return Ok(());
         };
         let mut events = sse::Reader::new(body);
-        while let Some(event) = events
-            .next_event()
-            .map_err(|error| Transient::new(format!("reading the response stream: {error}")))?
-        {
+        while let Some(event) = events.next_event().map_err(|error| {
+            Transient::new(format!("reading the response stream: {error}"))
+                .with_reason("HTTP response read failed")
+        })? {
             if self.stopped() || self.tx.send(Msg::Event(event)).is_err() {
                 break;
             }

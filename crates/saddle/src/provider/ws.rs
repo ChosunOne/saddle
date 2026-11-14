@@ -10,6 +10,7 @@
 //! there before any reply text or reasoning is shown. Partial replies are never silently replayed.
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
@@ -23,7 +24,7 @@ use sha2::{Digest, Sha256};
 use tungstenite::client::ClientRequestBuilder;
 use tungstenite::http::Uri;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{Message, WebSocket, connect};
+use tungstenite::{Error as WsError, Message, WebSocket, connect};
 
 use super::http::{self, Msg};
 use super::retry::Transient;
@@ -210,9 +211,15 @@ fn run(
 fn open(url: &str, headers: &[(String, String)]) -> Result<WebSocket<MaybeTlsStream<TcpStream>>> {
     let uri: Uri = url.parse().with_context(|| format!("not a URL: {url}"))?;
     let mut request = ClientRequestBuilder::new(uri);
-    for (name, value) in headers {
+    // D102: HTTP's responses=experimental is not the WebSocket v2 protocol. Replace it
+    // case-insensitively rather than appending a second, conflicting beta header.
+    for (name, value) in headers
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("openai-beta"))
+    {
         request = request.with_header(name.as_str(), value.as_str());
     }
+    request = request.with_header("OpenAI-Beta", "responses_websockets=2026-02-06");
     let (socket, _) = connect(request).context("opening the websocket")?;
     // Match the HTTP stream's idle-read bound; an unresponsive peer must eventually recover too.
     let tcp = match socket.get_ref() {
@@ -259,7 +266,9 @@ fn pump(
                     full["type"] = json!("response.create");
                     if let Err(error) = socket.send(Message::Text(full.to_string().into())) {
                         let _ = tx.send(Msg::Failed(
-                            Transient::new(format!("websocket resend: {error}")).into(),
+                            Transient::new(format!("websocket resend: {error}"))
+                                .with_reason("websocket resend failed")
+                                .into(),
                         ));
                         return;
                     }
@@ -310,7 +319,9 @@ fn pump(
             }
             Ok(Message::Close(_)) => {
                 let _ = tx.send(Msg::Failed(
-                    Transient::new("websocket closed before response.completed").into(),
+                    Transient::new("websocket closed before response.completed")
+                        .with_reason("websocket closed before completion")
+                        .into(),
                 ));
                 return;
             }
@@ -319,11 +330,28 @@ fn pump(
             Ok(_) => {}
             Err(error) => {
                 let _ = tx.send(Msg::Failed(
-                    Transient::new(format!("websocket: {error}")).into(),
+                    Transient::new(format!("websocket: {error}"))
+                        .with_reason(read_failure_reason(&error))
+                        .into(),
                 ));
                 return;
             }
         }
+    }
+}
+
+fn read_failure_reason(error: &WsError) -> &'static str {
+    match error {
+        WsError::Io(error)
+            if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
+        {
+            "websocket read timed out"
+        }
+        WsError::ConnectionClosed | WsError::AlreadyClosed => "websocket connection closed",
+        WsError::Protocol(_) => "websocket protocol read failed",
+        WsError::Io(_) => "websocket I/O read failed",
+        WsError::Tls(_) => "websocket TLS read failed",
+        _ => "websocket read failed",
     }
 }
 
@@ -381,11 +409,12 @@ fn stripped(body: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io::ErrorKind;
+    use std::io::{Error as IoError, ErrorKind};
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
 
-    use tungstenite::accept;
+    use tungstenite::handshake::server::{Request as UpgradeRequest, Response as UpgradeResponse};
+    use tungstenite::{accept, accept_hdr};
 
     use super::*;
     use crate::provider::sse::Events;
@@ -513,6 +542,64 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn read_diagnostics_distinguish_timeout_disconnect_and_io_without_echoing_errors() {
+        for kind in [ErrorKind::TimedOut, ErrorKind::WouldBlock] {
+            let error = WsError::Io(IoError::new(kind, "untrusted diagnostics"));
+            assert_eq!(read_failure_reason(&error), "websocket read timed out");
+        }
+        assert_eq!(
+            read_failure_reason(&WsError::ConnectionClosed),
+            "websocket connection closed"
+        );
+        let error = WsError::Io(IoError::new(ErrorKind::ConnectionReset, "private details"));
+        assert_eq!(read_failure_reason(&error), "websocket I/O read failed");
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // tungstenite fixes the handshake callback's error type.
+    fn the_upgrade_uses_v2_even_when_http_headers_supply_a_different_beta() {
+        for name in ["OpenAI-Beta", "openai-beta", "oPeNaI-bEtA"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("ws://{}/responses", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let mut socket = accept_hdr(
+                    accept_connection(&listener),
+                    |request: &UpgradeRequest, response: UpgradeResponse| {
+                        let values: Vec<_> =
+                            request.headers().get_all("openai-beta").iter().collect();
+                        assert_eq!(values.len(), 1);
+                        assert_eq!(values[0], "responses_websockets=2026-02-06");
+                        assert_eq!(request.headers()["authorization"], "Bearer test-only");
+                        assert_eq!(request.headers()["session_id"], "upgrade-test");
+                        Ok(response)
+                    },
+                )
+                .unwrap();
+                assert!(matches!(socket.read().unwrap(), Message::Text(_)));
+                for event in reply("resp_upgrade", "ok") {
+                    socket
+                        .send(Message::Text(event.to_string().into()))
+                        .unwrap();
+                }
+            });
+            let headers = vec![
+                (name.into(), "responses=experimental".into()),
+                ("authorization".into(), "Bearer test-only".into()),
+                ("session_id".into(), "upgrade-test".into()),
+            ];
+            let (events, _pending) =
+                stream("upgrade-test", &url, &headers, &body(json!([]))).unwrap();
+            assert_eq!(drain(events).len(), 2);
+            server.join().unwrap();
+            assert_eq!(
+                headers[0].1, "responses=experimental",
+                "HTTP headers are not mutated"
+            );
+        }
     }
 
     #[test]

@@ -360,7 +360,9 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
     }
     if !finished {
         return Err(
-            Transient::new("the reply stream ended before the response was completed").into(),
+            Transient::new("the reply stream ended before the response was completed")
+                .with_reason("stream ended before completion")
+                .into(),
         );
     }
 
@@ -506,7 +508,16 @@ fn stream_error(event: &Value) -> AnyError {
             .filter(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
             .filter_map(|(_, value)| value.as_str()?.trim().parse::<u64>().ok())
             .max();
-        Transient::new(message).with_retry_after(retry_after).into()
+        let reason = match code {
+            "websocket_connection_limit_reached" => "websocket connection age limit reached",
+            "rate_limit_exceeded" => "provider rate limit",
+            _ if status == Some(429) => "provider rate limit",
+            _ => "transient provider error",
+        };
+        Transient::new(message)
+            .with_reason(reason)
+            .with_retry_after(retry_after)
+            .into()
     } else {
         anyhow!(message)
     }

@@ -2923,6 +2923,19 @@ The next request gets the refreshed tool list; a stale or guessed tool name is d
 refreshes plugins too. Already saved plugin output retains its original metadata and delimiter;
 reloading is not permission to rewrite transcript history.
 
+**D130.** A Responses recovery notice identifies the failure stage with a bounded, host-chosen
+label: WebSocket close, timeout, I/O/protocol/TLS failure, resend failure, HTTP read failure,
+premature stream end, provider rate limit or connection-age limit. It never echoes raw backend
+messages, frames, request bodies, URLs or credentials into that notice. Diagnostics remain outside
+the model conversation. D125's one-retry and no-visible-replay rules are unchanged.
+
+The D102 WebSocket v2 handshake is enforced independently of HTTP headers: any case spelling of
+`OpenAI-Beta` in the HTTP header set is replaced with the single value
+`responses_websockets=2026-02-06` on the upgrade only. HTTP retains its configured beta header.
+A real upgrade test checks this separation, rather than only testing framed messages after an
+uninspected handshake. A generic recovery notice is not evidence of one particular underlying
+failure; transport failures must not be diagnosed solely from the fact that HTTP recovery worked.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
