@@ -365,6 +365,9 @@ pub(crate) fn gate(
 }
 
 pub(crate) fn open_root(session: &Session, loc: &Location) -> io::Result<Dir> {
+    if let Some(dir) = session.file_roots.get(&loc.root) {
+        return dir.try_clone();
+    }
     let path = session.base_of(&loc.root).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, format!("no root `{}`", loc.root))
     })?;
@@ -374,7 +377,7 @@ pub(crate) fn open_root(session: &Session, loc: &Location) -> io::Result<Dir> {
 /// The location `rel` refers to after following symlinks inside `dir`, one component at a time.
 /// Dangling links are followed too, since writing through one creates its target. A link to an
 /// absolute path or out of the root is an error, as it would be for cap-std.
-fn resolve_beneath(dir: &Dir, rel: &RelPath) -> io::Result<RelPath> {
+pub(crate) fn resolve_beneath(dir: &Dir, rel: &RelPath) -> io::Result<RelPath> {
     const MAX_HOPS: usize = 40;
     let mut pending: Vec<String> = Vec::new();
     push_components(&mut pending, &rel.to_path())?;

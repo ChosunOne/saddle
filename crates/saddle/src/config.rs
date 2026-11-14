@@ -25,6 +25,7 @@
 use crate::defaults;
 use crate::mcp;
 use crate::paths;
+use crate::plugins::Entry as PluginEntry;
 use crate::tools;
 use crate::tui::theme::ThemeTables;
 use saddle_cap::sandbox;
@@ -38,7 +39,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use saddle_cap::sandbox::SandboxExtras;
-use saddle_cap::{RootName, Roots};
+use saddle_cap::{PluginId, RootName, Roots};
 use serde::Deserialize;
 
 use crate::mcp::McpTable;
@@ -47,6 +48,11 @@ use crate::provider::ProviderEntry;
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {
+    /// explicit plugin grants, separate from installed/enabled artifact configuration (D128).
+    #[serde(default)]
+    pub plugin: BTreeMap<PluginId, toml::Value>,
+    #[serde(default)]
+    pub plugins: BTreeMap<PluginId, PluginEntry>,
     /// The grants every workspace inherits (D63). This was `policy.toml`; it is the same TOML,
     /// under `[agent]` here.
     #[serde(default)]
@@ -450,6 +456,9 @@ impl UserConfig {
             Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
         };
         mcp::validate(&config.mcp).with_context(|| format!("{}", path.display()))?;
+        if config.plugins.len() > 16 {
+            bail!("at most 16 plugins may be configured in one session");
+        }
         Ok(config)
     }
 
@@ -484,7 +493,19 @@ impl UserConfig {
                 .ok()
                 .map(|v| toml::Value::Table(v.as_table().cloned().unwrap_or_default())),
         };
-        policy_document(agent)
+        let mut document = policy_document(agent);
+        if let toml::Value::Table(table) = &mut document {
+            table.insert(
+                "plugin".into(),
+                toml::Value::Table(
+                    self.plugin
+                        .iter()
+                        .map(|(id, grants)| (id.to_string(), grants.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        document
     }
 
     /// The extras every child gets: named roots, plus the directories the include rules work out

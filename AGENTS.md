@@ -2,8 +2,8 @@
 
 Saddle is a coding-agent harness in Rust. Its plugin boundary is WASI components whose
 authority is a *declared* scope set, checked before instantiation and bounded by the agent's reach.
-The current v0 has built-in tools; the initial v1 loader, canonical WIT and read-only SDK are library
-crates, not yet wired into the binary's config, host services or model-visible tool registry.
+The binary supports explicitly installed, digest-pinned read-only tool plugins (D126–D129), alongside
+built-in tools and MCP; the loader, canonical WIT and SDK are separate library crates.
 `docs/plan.md` is the specification; read it before changing behaviour in the policy, sandbox or tool
 layer.
 
@@ -31,6 +31,8 @@ Inside `crates/saddle/src`:
 | --- | --- |
 | `agent` | the model loop (no request limit unless one is set, D37; a turn stops on a repeated call and answer, D38), the system prompt (base plus grants, so a policy reload replaces only the grants, D47), tool dispatch, and compaction — synchronous at the hard threshold, started in the background at three quarters (D78), and run by the worker thread when the session is idle (D77) |
 | `session` | opening the workspace, resolving roots, the policy engine and audit log for a session |
+| `plugins` | protected/digest-pinned loading, tool registration, provenance and CLI installation (D128); worker-to-session host calls through the one engine/audit log, reload revocation and bounded reads (D129) |
+| `fs_access` | pinned no-follow directory/file opens for session roots and plugin artifacts/reads (D129) |
 | `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch`, `tools/websearch`, `tools/session_query` | the eleven built-in tools (`fetch` is host-side network, D39; `patch` is D56; `websearch` asks the provider, or Exa, D82; `session_query` is branch-only read-only SQL over messages, request usage and reasoning, D92, D94, D98) |
 | `net` | the command network (D79): `hello` reads a hostname out of a TLS handshake, `head` out of a `CONNECT` line or a `Host` header, `proxy` decides and carries a connection, `bridge` joins the proxy's threads to the one engine and the one audit log |
 | `tools/diff` | line diffs of edited files, for the transcript only — the model never sees them |
@@ -66,9 +68,10 @@ adding a `net` grant to the policy, never widening the sandbox allowlist. A gran
 because that exemption needs a grant that names the address. `saddle tool <name> '<json>'` runs any one
 of them as the agent through the gate, which is the most direct way to check a policy change by hand.
 
-The initial WASI library surface and its development commands are in `docs/plugins.md`. Plugin
-installation/configuration, binary host adapters, a registry and model-visible provenance remain to
-be implemented; no repository auto-loading or plugin-to-MCP adapter exists. MCP
+`saddle plugin install/list/call` is the local read-tool workflow; `docs/plugins.md` documents its
+configuration, grants, SDK build and limits. Installation never enables a plugin or changes grants.
+Other plugin scopes/adapters, persistent instances and automatic updates remain deferred; no
+repository auto-loading or plugin-to-MCP adapter exists. MCP
 prompts, MCP resources, `codemode` and images in a tool result are refused rather than missing
 (D119) — a boundary that is written down, not an omission.
 
@@ -291,7 +294,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D127 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D129 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

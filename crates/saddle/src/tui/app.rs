@@ -2697,6 +2697,7 @@ mod tests {
                 }),
             ]),
             Item::ToolResults(vec![ToolResult {
+                provenance: None,
                 id: "c1".into(),
                 images: Vec::new(),
                 content: "fn x() {}".into(),

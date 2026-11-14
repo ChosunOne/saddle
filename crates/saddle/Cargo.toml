@@ -13,8 +13,11 @@ workspace = true
 saddle-cap.workspace = true
 saddle-policy.workspace = true
 saddle-sandbox.workspace = true
+saddle-loader.workspace = true
+saddle-wit.workspace = true
 anyhow.workspace = true
 cap-std.workspace = true
+cap-fs-ext.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -38,6 +41,7 @@ syntect.workspace = true
 two-face.workspace = true
 
 [dev-dependencies]
+wat.workspace = true
 tempfile.workspace = true
 # The end-to-end tests read the session store directly to check what was saved (D53).
 rusqlite.workspace = true

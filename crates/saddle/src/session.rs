@@ -15,6 +15,7 @@ use crate::skills::Skill;
 use crate::tools::websearch::LastSearch;
 use saddle_cap::policy;
 use saddle_cap::roots;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::fs::DirBuilder;
@@ -22,21 +23,26 @@ use std::fs::File;
 use std::io::Read;
 use std::io::Result as IoResult;
 use std::io::{Error, ErrorKind};
+use std::mem;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use cap_std::fs::Dir;
 use saddle_cap::policy::{NetGrant, POLICY_FILE};
 use saddle_cap::sandbox::SandboxExtras;
-use saddle_cap::{Location, Policy, Principal, RootName, Roots, Scope, names_host};
+use saddle_cap::{Location, PluginId, Policy, Principal, RootName, Roots, Scope, names_host};
 use saddle_policy::audit::sha256_hex;
 use saddle_policy::{AuditLog, Decision, Engine, Kind, Request, net_decision};
 use serde_json::json;
 
 use crate::config::UserConfig;
+use crate::fs_access;
 use crate::mcp::Transport;
 use crate::paths::{Paths, find_workspace};
+use crate::plugins::{Entry as PluginEntry, HostFailure, Registry as PluginRegistry};
+use crate::provider::ToolDef;
 use crate::store::Snapshot;
 
 /// The header a workspace's own grant file starts with. Empty of grants on purpose: its presence
@@ -81,6 +87,7 @@ pub fn roots_for_validation() -> Result<Roots> {
 /// Everything needed to parse the policy. `check` stops here; a session goes on to open the audit
 /// log.
 pub struct Setup {
+    pub plugins: BTreeMap<PluginId, PluginEntry>,
     pub paths: Paths,
     pub workspace: PathBuf,
     /// The directory saddle was started in, inside the workspace.
@@ -190,10 +197,14 @@ impl Setup {
                     workspace.display()
                 );
             }
-            doc.get("agent").cloned().map(|agent| {
+            (doc.contains_key("agent") || doc.contains_key("plugin")).then(|| {
                 let mut out = toml::Table::new();
                 out.insert("version".into(), toml::Value::Integer(1));
-                out.insert("agent".into(), agent);
+                for key in ["agent", "plugin"] {
+                    if let Some(value) = doc.get(key) {
+                        out.insert(key.into(), value.clone());
+                    }
+                }
                 toml::Value::Table(out)
             })
         };
@@ -211,10 +222,11 @@ impl Setup {
                 _ => toml::Table::new(),
             };
             overrides.apply(&mut agent)?;
-            let mut doc = toml::Table::new();
-            doc.insert("version".into(), toml::Value::Integer(1));
-            doc.insert("agent".into(), toml::Value::Table(agent));
-            own = Some(toml::Value::Table(doc));
+            let mut doc = merged_doc;
+            if let toml::Value::Table(table) = &mut doc {
+                table.insert("agent".into(), toml::Value::Table(agent));
+            }
+            own = Some(doc);
             notes.push(format!(
                 "grants changed for this session only: {}",
                 overrides.describe()
@@ -299,6 +311,7 @@ impl Setup {
         // The hash names the grants, not the file: a provider change is not a policy change.
         let policy_sha256 = sha256_hex(format!("{global_text}\n---\n{policy_text}").as_bytes());
         Ok(Self {
+            plugins: user.plugins,
             paths,
             start: start.clone(),
             workspace,
@@ -377,6 +390,8 @@ pub struct ToolRoot {
 }
 
 pub struct Session {
+    pub file_roots: BTreeMap<RootName, Dir>,
+    pub plugins: PluginRegistry,
     pub setup: Setup,
     pub engine: Engine,
     pub audit: AuditLog,
@@ -445,6 +460,12 @@ impl Session {
         )?;
 
         let search = configured_search(&setup);
+        let file_roots = setup
+            .roots
+            .iter()
+            .map(|(name, path)| Ok((name.clone(), fs_access::root(path)?)))
+            .collect::<Result<_>>()?;
+        let plugins = PluginRegistry::new(setup.plugins.clone());
         let host_env: Vec<(String, String)> = env::vars().collect();
         // D108: the servers this policy grants, and the tables that declare how to start them. A
         // granted server with no table is not an error here: `saddle check` says so, and the first
@@ -459,6 +480,8 @@ impl Session {
             Registry::new(grants, user.mcp, host_env.clone(), tmp)
         };
         let mut session = Self {
+            file_roots,
+            plugins,
             setup,
             engine: Engine::new(policy),
             audit,
@@ -509,6 +532,10 @@ impl Session {
         let (found, notes) = skills::discover(&mut session, &cfg)?;
         session.skills = found;
         session.skill_notes = notes;
+        let mut plugins = mem::take(&mut session.plugins);
+        let loaded = plugins.load(&mut session);
+        session.plugins = plugins;
+        loaded?;
         Ok(session)
     }
 
@@ -516,31 +543,53 @@ impl Session {
         &self.setup.roots
     }
 
-    /// Decides and logs. Logging failure is fatal: an unlogged decision breaks D10.
-    /// Reads this workspace's policy again and rebuilds the engine, for a grant changed mid-session
-    /// (D47). The new file is parsed and layered exactly as at open, so a change that would not load
-    /// stops the reload and leaves the session on the grants it had.
+    pub fn declared_tools(&self) -> Vec<ToolDef> {
+        let mut tools = self.mcp.declared();
+        tools.extend(self.plugins.definitions());
+        tools
+    }
+
+    pub fn reload_plugins(&mut self) -> Result<()> {
+        let entries = self.setup.plugins.clone();
+        let fresh = self.plugins.reconfigured(entries);
+        self.plugins = fresh;
+        let mut registry = mem::take(&mut self.plugins);
+        let loaded = registry.load(self);
+        self.plugins = registry;
+        loaded
+    }
+
+    /// reloads grants and plugins without resetting model spending (D47, D129). Invalid settings
+    /// leave the previous configuration in force; a host/audit failure after replacement is fatal.
     pub fn reload_policy(&mut self) -> Result<()> {
         let fresh = Setup::load(&self.setup.start, self._tmp.path(), &self.setup.overrides)?;
         let policy = fresh.parse_policy()?;
+        let file_roots = fresh
+            .roots
+            .iter()
+            .map(|(name, path)| Ok((name.clone(), fs_access::root(path)?)))
+            .collect::<Result<_>>()?;
         let before = self.setup.policy_sha256.clone();
         self.setup = fresh;
-        self.engine = Engine::new(policy);
-        self.audit.event(
-            Kind::Policy,
-            None,
-            None,
-            None,
-            json!({
-                "policy": {
-                    "path": self.setup.policy_path,
-                    "sha256": self.setup.policy_sha256,
-                    "previous_sha256": before,
-                },
-            }),
-            "policy reloaded mid-session",
-        )?;
-        Ok(())
+        self.file_roots = file_roots;
+        self.engine.replace_policy(policy);
+        self.audit
+            .event(
+                Kind::Policy,
+                None,
+                None,
+                None,
+                json!({
+                    "policy": {
+                        "path": self.setup.policy_path,
+                        "sha256": self.setup.policy_sha256,
+                        "previous_sha256": before,
+                    },
+                }),
+                "policy reloaded mid-session",
+            )
+            .map_err(|error| HostFailure(error.into()))?;
+        self.reload_plugins()
     }
 
     /// Whether the policy names this host in a net grant, asked before a literal address is

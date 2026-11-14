@@ -397,6 +397,7 @@ mod tests {
 
     fn result(n: usize) -> Item {
         Item::ToolResults(vec![ToolResult {
+            provenance: None,
             id: "c".into(),
             content: "r".repeat(n),
             images: Vec::new(),

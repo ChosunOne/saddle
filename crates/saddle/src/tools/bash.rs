@@ -153,6 +153,7 @@ pub fn run(session: &mut Session, input: &Value) -> Result<ToolOutput> {
     }
     let ok = out.code == Some(0) && !out.timed_out;
     Ok(ToolOutput {
+        provenance: None,
         ok,
         diff: None,
         images: Vec::new(),

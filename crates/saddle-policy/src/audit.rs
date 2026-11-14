@@ -101,11 +101,36 @@ impl AuditLog {
     }
 
     pub fn decision(&mut self, who: &Principal, req: &Request<'_>, d: &Decision) -> io::Result<()> {
+        self.call_decision(who, req, d, None)
+    }
+
+    /// correlates a plugin host operation without replacing its resolved arguments (D129).
+    pub fn decision_for_call(
+        &mut self,
+        who: &Principal,
+        req: &Request<'_>,
+        d: &Decision,
+        call: &str,
+    ) -> io::Result<()> {
+        self.call_decision(who, req, d, Some(call))
+    }
+
+    fn call_decision(
+        &mut self,
+        who: &Principal,
+        req: &Request<'_>,
+        d: &Decision,
+        call: Option<&str>,
+    ) -> io::Result<()> {
+        let mut args = req.args();
+        if let Some(call) = call {
+            args["call_id"] = Value::String(call.to_owned());
+        }
         self.write(Record {
             kind: Kind::Decision,
             principal: Some(who.to_string()),
             scope: Some(d.scope),
-            args: req.args(),
+            args,
             allow: Some(d.allow),
             rule: d.rule.as_ref().map(|r| r.to_string()),
             explanation: d.explanation.clone(),

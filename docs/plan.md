@@ -18,9 +18,10 @@ The agent does not get to negotiate.
 v0 is in place: the capability crate, the policy engine with its audit log, the exec sandbox, and a
 model loop that sends every built-in tool call through the gate. `saddle` opens it in a full-screen
 terminal UI, and `saddle run "<prompt>"` runs one turn without it. The v1 loader, canonical WIT and
-read-only SDK are now library crates (D126, D127); installation, session host adapters and
-model-visible registration are not wired into the binary yet. Sections 3 to 6 are settled and can be built against. Section 8 lists work that was
-considered and deferred.
+read-only SDK are library crates (D126, D127). Explicit local installation, digest-pinned loading,
+session host adapters and model-visible registration with provenance are wired into the binary
+(D128, D129). The runtime currently supports read-only tools; other scopes remain unavailable.
+Sections 3 to 6 are settled and can be built against. Section 8 lists deferred work.
 
 ## 3. Settled decisions
 
@@ -2884,6 +2885,44 @@ native code. Host services must bound their own I/O: epochs cannot interrupt a b
 native host call. Installing artifacts, reload/revocation, model-visible provenance (D25), a registry,
 and remaining host adapters are subsequent steps, not implicit authority in this runtime.
 
+**D128.** The usable read-tool integration is explicit and local. `saddle plugin install <manifest>`
+copies a bounded manifest and component into the user's protected config directory under
+`plugins/<id>`, never enables it or writes grants, and prints the component digest. A person enables
+it with `[plugins.<id>]` (`enabled = true`, a relative `manifest` under that directory, and a pinned
+`sha256`). `[plugin.<id>]` contains its grants, in base config or the workspace's protected policy
+file; neither a repository manifest nor installation grants authority. No download or repository
+auto-discovery is implied. Artifact links and escapes are refused, and mismatched identities or
+digests fail closed before compilation. Explicitly installed, digest-pinned local artifacts are the
+only automatic loads; untrusted artifact compilation isolation remains deferred.
+
+Each enabled, granted plugin registers one `plugin__<id>__<tool>` tool. Names and schemas are
+validated, descriptions are capped and tagged as plugin text, and results are wrapped with D25's
+random run delimiter with embedded delimiter prefixes neutralized. Host metadata records principal, scope,
+host-assigned call id, version and component digest beside the result and survives saving, resuming
+and branching. Native results remain unwrapped. `saddle plugin list`, `saddle plugin call <id>
+'<json>'`, `saddle tool <namespaced-name> '<json>'` and model dispatch use the same path. A plugin
+failure leaves native tools available and is reported, never silently registered with extra reach.
+
+**D129.** Component execution runs on a worker; its fs-read import asks the session thread over a
+bounded, deadline-aware channel. The session retains the one policy engine and audit log: it installs
+only D126's bounded grants for a prepared plugin and decides every requested and resolved path with
+that plugin's principal, correlating records with the host call id. No second policy engine or
+guest-selected principal is used. Files are opened by pinning directory descriptors with no-follow,
+and the final file with no-follow/nonblocking, then requiring a regular file; FIFO/device/socket
+reads cannot wedge the host. Reads are capped during I/O and check cancellation/deadlines between
+chunks. As with native file tools, a kernel filesystem operation itself is not preemptible; a stuck
+remote filesystem remains a known limitation, not something Wasm fuel interrupts.
+
+Guest traps and ordinary file errors are plugin failures. A host failure, especially an audit write
+failure during loading or invocation, is fatal and must not be downgraded to an unavailable plugin
+or a model-visible tool error that lets the session continue unaudited.
+
+Policy reload replaces policy in the existing engine without resetting model spending, discards
+prepared plugin instances/catalogues, re-reads explicit configuration and rechecks both ceilings.
+The next request gets the refreshed tool list; a stale or guessed tool name is denied. `/reload`
+refreshes plugins too. Already saved plugin output retains its original metadata and delimiter;
+reloading is not permission to rewrite transcript history.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
@@ -2953,8 +2992,9 @@ but was removed by D44 after D42 moved policy outside the agent's reach.
 `saddle:host/fs-read` without the grant and fails to instantiate, plus a test asserting the failure.
 The test runs at two levels: against `saddle_cap::component::check_component` with a hand-written
 import list, and through `saddle-loader` with a compiled component, including a trapping start
-function that must never run. These library-level tests are in place (D127); host adapter and binary
-integration follow. `docs/plugins.md` describes the current development surface and its limits.
+function that must never run. These library-level tests are in place (D127), together with production
+host adapters and CLI/model tests for explicit installation, registration, provenance and revocation
+(D128, D129). `docs/plugins.md` describes the usable read-tool surface and its limits.
 
 **v2.** Remaining scopes and their host interfaces, `veto`, then presentation. The minimum D25
 provenance wrapper moves forward to the first model-visible plugin tool, before registration, not

@@ -206,6 +206,7 @@ impl Ui for Output {
                 "content": out.content,
                 // The transcript-only diff, so a consumer can show the change (D35).
                 "diff": out.diff,
+                "provenance": out.provenance,
             })),
         }
     }

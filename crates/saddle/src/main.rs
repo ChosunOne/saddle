@@ -14,11 +14,13 @@ mod compact;
 mod config;
 mod context;
 mod defaults;
+mod fs_access;
 mod ignore;
 mod mcp;
 mod net;
 mod output;
 mod paths;
+mod plugins;
 mod provider;
 mod reserved;
 mod session;
@@ -102,6 +104,11 @@ struct AgentArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Explicit local WASI plugins: installing is separate from enablement and grants (D128).
+    Plugin {
+        #[command(subcommand)]
+        cmd: PluginCmd,
+    },
     /// Run the agent. With a prompt, answer it and exit. Without one, open the terminal UI, or
     /// read one prompt per line when stdin is not a terminal.
     Run {
@@ -143,6 +150,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AuditCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Copy a local manifest and component to protected storage; do not enable or grant it.
+    Install { manifest: PathBuf },
+    /// Inspect enabled/granted plugins and show any load failure.
+    List,
+    /// Call one enabled and granted plugin through the same path as the model.
+    Call { id: String, input: String },
 }
 
 #[derive(Subcommand)]
@@ -300,6 +317,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             tool(&cli.dir, &name, &input, &session, &paths, &overrides)
         }
         Some(Cmd::Mcp { cmd }) => mcp_cmd(cmd, &cli.dir, &session, &paths, &overrides),
+        Some(Cmd::Plugin { cmd }) => plugin_cmd(cmd, &cli.dir, &session, &paths, &overrides),
         Some(Cmd::Login { provider }) => login(&provider, &paths),
         Some(Cmd::Logout { provider }) => logout(&provider, &paths),
         Some(Cmd::Session { cmd }) => session_cmd(cmd, &paths),
@@ -393,6 +411,7 @@ fn run_agent(
         notes.push(format!("skills: {}", names.join(", ")));
     }
     notes.extend(session.skill_notes.clone());
+    notes.extend(session.plugins.report());
 
     // A bad `[ui] status` is reported where it can be seen, and the session keeps the default.
     let status = match user.ui.status.as_deref() {
@@ -466,7 +485,7 @@ fn run_agent(
         base,
         {
             let mut declared = tools::definitions();
-            declared.extend(session.mcp.declared());
+            declared.extend(session.declared_tools());
             declared
         },
         max_steps,
@@ -492,7 +511,7 @@ fn run_agent(
     if let Some(path) = &latest {
         let saved = agent.resume(path)?;
         session.mcp.restore(&saved.declared);
-        agent.refresh_tools(session.mcp.declared());
+        agent.refresh_tools(session.declared_tools());
         out.info(&format!(
             "continuing a session of {} messages, {} tokens in and {} out so far",
             saved.items.len(),
@@ -581,6 +600,8 @@ fn line_turn(
                 agent::Compacted::Failed => End::Failed,
             }
         } else if text == "/reload" {
+            session.reload_policy()?;
+            agent.refresh_extensions(session);
             // Everything the prompt and the interface were built from, read again (D70). Skills and
             // instruction files reach the model on its next request; a newly added instruction file
             // is also handed to the conversation, so the transcript shows it arriving.
@@ -969,7 +990,18 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
     }
     println!("effective");
     for line in &setup.merged {
-        println!("  {line}");
+        if line.starts_with("plugin.") {
+            println!("  {line} (requested; bounded on plugin load)");
+        } else {
+            println!("  {line}");
+        }
+    }
+    for (id, entry) in &setup.plugins {
+        let state = if entry.enabled { "enabled" } else { "disabled" };
+        println!(
+            "plugin     {id} · {state} · manifest {:?} · load/status: saddle plugin list",
+            entry.manifest
+        );
     }
     // D104: the servers a person declared, and which of them a grant enables. A server that is
     // declared and not granted, or granted and not declared, is the mistake worth seeing here.
@@ -1604,6 +1636,58 @@ fn exposure(entry: &McpEntry) -> &'static str {
     }
 }
 
+fn plugin_cmd(
+    cmd: PluginCmd,
+    dir: &Path,
+    id: &str,
+    paths: &paths::Paths,
+    overrides: &config::Overrides,
+) -> Result<ExitCode> {
+    if let PluginCmd::Install { manifest } = cmd {
+        println!("{}", plugins::install(&manifest, paths)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let workspace = dir
+        .canonicalize()
+        .map(|abs| paths::find_workspace(&abs))
+        .unwrap_or_else(|_| dir.to_path_buf());
+    let picked = gate_workspace(paths, &workspace, id)?;
+    let mut session = Session::open_with(dir, Some(picked.as_deref().unwrap_or(id)), overrides)?;
+    let result = match cmd {
+        PluginCmd::List => {
+            let rows = session.plugins.report();
+            if rows.is_empty() {
+                println!("no plugins configured or granted");
+            }
+            for row in rows {
+                println!("{row}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        PluginCmd::Call { id, input } => {
+            let input = serde_json::from_str(&input).context("plugin input is not JSON")?;
+            let name = session
+                .plugins
+                .tool(&id)
+                .unwrap_or_else(|| format!("plugin__{id}__unavailable"));
+            let output = tools::call(&mut session, &name, &input)?;
+            if output.ok {
+                println!("{}", output.content);
+            } else {
+                eprintln!("{}", output.content);
+            }
+            Ok(if output.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        PluginCmd::Install { .. } => unreachable!("handled above"),
+    };
+    session.close()?;
+    result
+}
+
 fn tool(
     dir: &Path,
     name: &str,
@@ -1612,7 +1696,7 @@ fn tool(
     paths: &paths::Paths,
     overrides: &config::Overrides,
 ) -> Result<ExitCode> {
-    if !tools::NAMES.contains(&name) {
+    if !tools::NAMES.contains(&name) && !name.starts_with(plugins::PREFIX) {
         bail!("unknown tool `{name}` (known: {})", tools::NAMES.join(", "));
     }
     let input: serde_json::Value = serde_json::from_str(input).context("tool input is not JSON")?;

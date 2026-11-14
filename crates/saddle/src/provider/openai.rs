@@ -435,6 +435,7 @@ mod tests {
             height: 3,
         };
         let items = [Item::ToolResults(vec![ToolResult {
+            provenance: None,
             id: "c1".into(),
             content: "the screenshot".into(),
             is_error: false,
@@ -462,6 +463,7 @@ mod tests {
             height: 1,
         };
         let items = [Item::ToolResults(vec![ToolResult {
+            provenance: None,
             id: "c1".into(),
             content: "  ".into(),
             is_error: false,
@@ -639,6 +641,7 @@ mod tests {
             ]),
             Item::ToolResults(vec![
                 ToolResult {
+                    provenance: None,
                     id: "c1".into(),
                     content: "text".into(),
                     images: Vec::new(),
@@ -646,6 +649,7 @@ mod tests {
                     diff: None,
                 },
                 ToolResult {
+                    provenance: None,
                     id: "c2".into(),
                     content: "bad input".into(),
                     images: Vec::new(),

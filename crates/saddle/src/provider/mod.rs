@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
+use saddle_cap::Scope;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -89,9 +90,21 @@ pub enum Part {
     },
 }
 
+/// host-owned origin, persisted with plugin results but never accepted from guest text (D25).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provenance {
+    pub principal: String,
+    pub scope: Scope,
+    pub call_id: String,
+    pub component_sha256: String,
+    pub version: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ToolResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Box<Provenance>>,
     pub id: String,
     pub content: String,
     pub is_error: bool,

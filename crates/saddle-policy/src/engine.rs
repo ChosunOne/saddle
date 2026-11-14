@@ -217,6 +217,11 @@ impl Engine {
         &self.policy
     }
 
+    /// replaces effective grants without refunding any principal's session spending (D129).
+    pub fn replace_policy(&mut self, policy: Policy) {
+        self.policy = policy;
+    }
+
     pub fn reserved(&self) -> &Reserved {
         &self.reserved
     }
@@ -446,6 +451,41 @@ model-invoke = { tokens-per-session = 100, why = "summaries" }
         assert_eq!(d.explanation, "plugin.ghost has no grants in the policy");
         let d = e.decide(&Principal::Agent, &Request::Plain(Scope::Persist));
         assert_eq!(d.explanation, "agent has no persist grant");
+    }
+
+    #[test]
+    fn replacing_policy_does_not_refund_spending_even_after_revocation() {
+        let (_dir, mut engine) = engine();
+        let who = Principal::Plugin(PluginId::new("web-search").unwrap());
+        let original = engine.policy().clone();
+        assert!(
+            engine
+                .decide(&who, &Request::ModelInvoke { tokens: 60 })
+                .allow
+        );
+        engine.replace_policy(original.clone());
+        assert!(
+            !engine
+                .decide(&who, &Request::ModelInvoke { tokens: 60 })
+                .allow
+        );
+        engine.replace_policy(Policy::default());
+        assert!(
+            !engine
+                .decide(&who, &Request::ModelInvoke { tokens: 1 })
+                .allow
+        );
+        engine.replace_policy(original);
+        assert!(
+            engine
+                .decide(&who, &Request::ModelInvoke { tokens: 40 })
+                .allow
+        );
+        assert!(
+            !engine
+                .decide(&who, &Request::ModelInvoke { tokens: 1 })
+                .allow
+        );
     }
 
     #[test]

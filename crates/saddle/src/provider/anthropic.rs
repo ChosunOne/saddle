@@ -431,6 +431,7 @@ mod tests {
     fn a_tool_result_carries_its_image_inside_itself() {
         // Anthropic accepts an image block in a tool result, so it rides with the text (D58).
         let items = [Item::ToolResults(vec![ToolResult {
+            provenance: None,
             id: "c1".into(),
             content: "here is the screenshot".into(),
             is_error: false,
@@ -454,6 +455,7 @@ mod tests {
         // Anthropic rejects an error tool result whose content is not text, so the picture is
         // moved after the result, with a line saying where it came from (D58).
         let items = [Item::ToolResults(vec![ToolResult {
+            provenance: None,
             id: "c9".into(),
             content: "denied: no exec grant".into(),
             is_error: true,
@@ -477,6 +479,7 @@ mod tests {
     #[test]
     fn a_result_with_no_image_is_sent_as_plain_content() {
         let items = [Item::ToolResults(vec![ToolResult {
+            provenance: None,
             id: "c1".into(),
             content: "ok".into(),
             is_error: false,
@@ -678,6 +681,7 @@ mod tests {
                 }),
             ]),
             Item::ToolResults(vec![ToolResult {
+                provenance: None,
                 id: "t1".into(),
                 content: "nope".into(),
                 images: Vec::new(),

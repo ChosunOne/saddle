@@ -2,6 +2,9 @@
 //! asks for tool calls, and the test checks what the policy let through, what went back to the
 //! model, and what reached the audit log.
 
+#[path = "support/plugin.rs"]
+mod plugin_fixture;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -15,6 +18,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use rusqlite::Connection;
 use serde_json::{Value, json};
 
 const POLICY: &str = r#"
@@ -829,6 +833,180 @@ fn cancel_is_immediate_while_the_server_is_silent() {
     assert!(elapsed < Duration::from_secs(2), "{elapsed:?}: {stderr}");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("cancelled"), "{stderr}");
+}
+
+#[test]
+fn plugin_results_have_host_provenance_saved_and_replayed_without_rewrapping() {
+    let (base, seen) = serve(vec![
+        sse_response(&openai_sse(
+            "",
+            &[(
+                "plugin-call",
+                "plugin__reader__reader",
+                json!({"secret":"not-for-the-audit-log"}),
+            )],
+        )),
+        sse_response(&openai_sse("done", &[])),
+        sse_response(&openai_sse("continued", &[])),
+    ]);
+    let env = Env::new(Api::Openai, &base);
+    plugin_fixture::configure(
+        &env.xdg.path().join("config/saddle/config.toml"),
+        &plugin_fixture::reader("file"),
+        plugin_fixture::GRANTS,
+    );
+    fs::write(env.ws.path().join("file"), "a fact from the plugin").unwrap();
+    let out = env.saddle(&["run", "--json", "read"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let events: Vec<Value> = text(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let result = events.iter().find(|e| e["type"] == "result").unwrap();
+    let provenance = &result["provenance"];
+    assert_eq!(provenance["principal"], "plugin.reader");
+    assert_eq!(provenance["scope"], "tool");
+    assert_eq!(provenance["version"], "0.1.0");
+    assert_eq!(provenance["component_sha256"].as_str().unwrap().len(), 64);
+    assert!(provenance["call_id"].as_str().is_some());
+    let saved = {
+        let connection = Connection::open(env.xdg.path().join("state/saddle/sessions.db")).unwrap();
+        let mut query = connection
+            .prepare("SELECT body FROM nodes WHERE kind = 'item' ORDER BY id")
+            .unwrap();
+        let bodies = query.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        bodies
+            .map(|s| serde_json::from_str::<Value>(&s.unwrap()).unwrap())
+            .find_map(|item| item.get("tool-results").and_then(|r| r.get(0)).cloned())
+            .unwrap()
+    };
+    assert_eq!(saved["provenance"], *provenance);
+    assert_eq!(saved["content"], result["content"]);
+    {
+        let seen = seen.lock().unwrap();
+        let tool = seen[0].body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["function"]["name"] == "plugin__reader__reader")
+            .unwrap();
+        assert!(
+            tool["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("<plugin-output-")
+        );
+        let message = seen[1].body["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(message["content"], saved["content"]);
+        assert!(
+            message.get("provenance").is_none(),
+            "host metadata is not provider parameters"
+        );
+    }
+    let audit = fs::read_to_string(env.audit_log()).unwrap();
+    assert!(!audit.contains("not-for-the-audit-log"));
+    let out = env.saddle(&["run", "--continue", "continue"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let seen = seen.lock().unwrap();
+    let mut replay = String::new();
+    strings(&seen[2].body, &mut replay);
+    assert!(
+        replay.contains(saved["content"].as_str().unwrap()),
+        "saved output was rewrapped: {replay}"
+    );
+}
+
+#[test]
+fn failed_plugins_are_not_advertised_and_do_not_remove_native_tools() {
+    let (base, seen) = serve(vec![sse_response(&openai_sse("ok", &[]))]);
+    let env = Env::new(Api::Openai, &base);
+    plugin_fixture::configure(
+        &env.xdg.path().join("config/saddle/config.toml"),
+        &plugin_fixture::forbidden(),
+        plugin_fixture::GRANTS,
+    );
+    let out = env.saddle(&["run", "hello"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let seen = seen.lock().unwrap();
+    let tools = seen[0].body["tools"].as_array().unwrap();
+    assert!(!tools.iter().any(|t| {
+        t["function"]["name"]
+            .as_str()
+            .unwrap()
+            .starts_with("plugin__")
+    }));
+    assert!(tools.iter().any(|t| t["function"]["name"] == "read"));
+}
+
+#[test]
+fn reloading_revokes_plugin_catalogues_and_denies_stale_model_calls() {
+    let (base, seen) = serve(vec![
+        sse_response(&openai_sse(
+            "",
+            &[("first", "plugin__reader__reader", json!({}))],
+        )),
+        sse_response(&openai_sse("first done", &[])),
+        sse_response(&openai_sse(
+            "",
+            &[("stale", "plugin__reader__reader", json!({}))],
+        )),
+        sse_response(&openai_sse("second done", &[])),
+    ]);
+    let env = Env::new(Api::Openai, &base);
+    let config = env.xdg.path().join("config/saddle/config.toml");
+    plugin_fixture::configure(
+        &config,
+        &plugin_fixture::reader("file"),
+        plugin_fixture::GRANTS,
+    );
+    fs::write(env.ws.path().join("file"), "before reload").unwrap();
+    let mut child = env
+        .command(&["run", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"first\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while seen.lock().unwrap().len() < 2 {
+        assert!(Instant::now() < deadline, "first turn did not finish");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(config, text.replace("enabled=true", "enabled=false")).unwrap();
+    fs::write(env.ws.path().join("file"), "AFTER-REVOCATION-SECRET").unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/reload\nsecond\n/quit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("AFTER-REVOCATION-SECRET"));
+    let seen = seen.lock().unwrap();
+    assert!(!seen[2].body["tools"].as_array().unwrap().iter().any(|t| {
+        t["function"]["name"]
+            .as_str()
+            .unwrap()
+            .starts_with("plugin__")
+    }));
+    let result = seen[3].body["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(result.starts_with("denied:"), "{result}");
+    let rows = records(&env.audit_log());
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["scope"] == "fs-read" && r["principal"] == "plugin.reader")
+            .count(),
+        1
+    );
 }
 
 #[test]

@@ -956,6 +956,7 @@ mod tests {
                 }),
             ]),
             Item::ToolResults(vec![ToolResult {
+                provenance: None,
                 id: "call_1".into(),
                 content: "the file".into(),
                 is_error: false,

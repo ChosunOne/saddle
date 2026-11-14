@@ -991,6 +991,7 @@ fn repair(items: &mut Vec<Item>) {
                 let results = calls
                     .into_iter()
                     .map(|id| ToolResult {
+                        provenance: None,
                         id,
                         content: "not run: the session ended before this call ran".into(),
                         is_error: true,
@@ -1099,7 +1100,8 @@ fn import_one(conn: &Connection, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{Api, ToolCall};
+    use crate::provider::{Api, Provenance, ToolCall};
+    use saddle_cap::Scope;
     use serde_json::json;
     use std::fs;
     use std::thread;
@@ -1166,6 +1168,44 @@ mod tests {
                 text: "hmm".into(),
             }]
         );
+    }
+
+    #[test]
+    fn plugin_provenance_and_wrappers_survive_fork_and_rewind_without_rewriting() {
+        let store = store();
+        let id = store.begin("p", "m").unwrap();
+        let items = vec![
+            Item::User("read a file".into()),
+            Item::Assistant(vec![Part::Call(ToolCall {
+                id: "c".into(),
+                name: "plugin__reader__reader".into(),
+                input: Ok(json!({})),
+            })]),
+            Item::ToolResults(vec![ToolResult {
+                id: "c".into(),
+                content: "<plugin-output-original plugin=\"reader\">data</plugin-output-original>"
+                    .into(),
+                is_error: false,
+                images: Vec::new(),
+                diff: None,
+                provenance: Some(Box::new(Provenance {
+                    principal: "plugin.reader".into(),
+                    scope: Scope::Tool,
+                    call_id: "host-call-1".into(),
+                    component_sha256: "0".repeat(64),
+                    version: "0.1.0".into(),
+                })),
+            }]),
+        ];
+        for item in &items {
+            store.append(&id, item).unwrap();
+        }
+        let point = store.current(&id).unwrap();
+        let fork = store.fork(&id, point).unwrap();
+        assert_eq!(store.load(&fork).unwrap().items, items);
+        store.append(&id, &Item::User("later".into())).unwrap();
+        store.rewind(&id, point).unwrap();
+        assert_eq!(store.load(&id).unwrap().items, items);
     }
 
     #[test]
@@ -1432,6 +1472,7 @@ mod tests {
         s.append(
             &id,
             &Item::ToolResults(vec![ToolResult {
+                provenance: None,
                 id: "c1".into(),
                 content: "ok".into(),
                 images: Vec::new(),
@@ -1494,6 +1535,7 @@ mod tests {
             &id,
             &Item::ToolResults(vec![
                 ToolResult {
+                    provenance: None,
                     id: "c1".into(),
                     content: "ok".into(),
                     images: Vec::new(),
@@ -1501,6 +1543,7 @@ mod tests {
                     diff: None,
                 },
                 ToolResult {
+                    provenance: None,
                     id: "c2".into(),
                     content: "denied".into(),
                     images: Vec::new(),

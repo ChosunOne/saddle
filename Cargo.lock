@@ -275,6 +275,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cap-fs-ext"
+version = "4.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56ff379b70af8e08307a8f65e7040c7301cb4a572538ade16b4984f0da77847f"
+dependencies = [
+ "cap-primitives 4.0.3",
+ "cap-std 4.0.3",
+ "io-lifetimes 3.0.1",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "cap-net-ext"
 version = "3.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2439,6 +2451,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "cap-fs-ext 4.0.3",
  "cap-std 4.0.3",
  "clap",
  "getrandom 0.3.4",
@@ -2450,8 +2463,10 @@ dependencies = [
  "regex",
  "rusqlite",
  "saddle-cap",
+ "saddle-loader",
  "saddle-policy",
  "saddle-sandbox",
+ "saddle-wit",
  "serde",
  "serde_json",
  "sha2",
@@ -2464,6 +2479,7 @@ dependencies = [
  "two-face",
  "unicode-width",
  "ureq",
+ "wat",
 ]
 
 [[package]]
@@ -2860,7 +2876,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc4592f674ce18521c2a81483873a49596655b179f71c5e05d10c1fe66c78745"
 dependencies = [
  "bitflags 2.13.2",
- "cap-fs-ext",
+ "cap-fs-ext 3.4.6",
  "cap-std 3.4.6",
  "fd-lock",
  "io-lifetimes 2.0.4",
@@ -3716,7 +3732,7 @@ dependencies = [
  "async-trait",
  "bitflags 2.13.2",
  "bytes",
- "cap-fs-ext",
+ "cap-fs-ext 3.4.6",
  "cap-net-ext",
  "cap-rand",
  "cap-std 3.4.6",

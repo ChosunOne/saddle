@@ -2,11 +2,11 @@
 //! reads keys and draws. They talk over two channels, and cancelling goes through the process-wide
 //! flag in [`crate::cancel`].
 
-use crate::agent;
 use crate::compact::Event as CompactEvent;
 use crate::compact::Settings;
 use crate::config::Overrides;
 use crate::context;
+use crate::plugins::HostFailure;
 use crate::provider::Image;
 use crate::provider::Price;
 use crate::provider::Quota;
@@ -355,7 +355,7 @@ fn work(
             Command::Clear => {
                 agent.clear();
                 session.mcp.restore(&[]);
-                agent.refresh_tools(session.mcp.declared());
+                agent.refresh_tools(session.declared_tools());
             }
             Command::SetMaxSteps(n) => agent.set_max_steps(n),
             Command::SetWindow(window) => agent.set_window(window),
@@ -364,10 +364,16 @@ fn work(
                 Ok(()) => {
                     // The prompt is sent with every request, so replacing its grants section is
                     // what tells the model (D47).
-                    agent.set_grants(agent::grants_section(&session));
+                    agent.refresh_extensions(&session);
                     let _ = events.send(AgentEvent::Note(
                         "grants reloaded; the model is told on its next request".into(),
                     ));
+                }
+                Err(error) if error.is::<HostFailure>() => {
+                    let message = format!("{error:#}");
+                    let _ = events.send(AgentEvent::Fatal(message.clone()));
+                    fatal = Some(message);
+                    break;
                 }
                 Err(e) => {
                     let _ = events.send(AgentEvent::Note(format!(
@@ -380,6 +386,20 @@ fn work(
             // instruction file is also handed to the conversation, so the transcript shows it
             // arriving rather than the next reply simply obeying a rule that appeared from nowhere.
             Command::Reload => {
+                match session.reload_policy() {
+                    Ok(()) => agent.refresh_extensions(&session),
+                    Err(error) if error.is::<HostFailure>() => {
+                        let message = format!("{error:#}");
+                        let _ = events.send(AgentEvent::Fatal(message.clone()));
+                        fatal = Some(message);
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = events.send(AgentEvent::Note(format!(
+                            "could not reload policy/plugins: {error:#}"
+                        )));
+                    }
+                }
                 let cfg = session.setup.context.clone();
                 let paths = session.setup.paths.clone();
                 let notes = match context::load(&mut session, &cfg, &paths) {
@@ -460,7 +480,7 @@ fn work(
             Command::Resume(id) => match agent.resume(&id) {
                 Ok(saved) => {
                     session.mcp.restore(&saved.declared);
-                    agent.refresh_tools(session.mcp.declared());
+                    agent.refresh_tools(session.declared_tools());
                     let _ = events.send(AgentEvent::Resumed(saved));
                 }
                 Err(e) => {
@@ -566,7 +586,7 @@ fn work(
                     // is not wasted. A failure here does not undo the move (D54).
                     let mut resumed = left.resumed;
                     session.mcp.restore(&resumed.declared);
-                    agent.refresh_tools(session.mcp.declared());
+                    agent.refresh_tools(session.declared_tools());
                     if !left.abandoned.is_empty()
                         && agent
                             .summarize_left_behind(&mut session, &mut ui, &left.abandoned)
@@ -574,7 +594,7 @@ fn work(
                     {
                         resumed = agent.state()?;
                         session.mcp.restore(&resumed.declared);
-                        agent.refresh_tools(session.mcp.declared());
+                        agent.refresh_tools(session.declared_tools());
                     }
                     let _ = events.send(AgentEvent::Resumed(resumed));
                 }

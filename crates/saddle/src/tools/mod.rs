@@ -2,6 +2,7 @@
 //! policy engine for every access, and returns the text the model would see.
 
 use crate::mcp::registry;
+use crate::plugins;
 use crate::provider::Image;
 use std::mem;
 mod bash;
@@ -19,12 +20,13 @@ pub(crate) use bash::HELPER_ARG;
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-use crate::provider::ToolDef;
+use crate::provider::{Provenance, ToolDef};
 use crate::session::Session;
 
 /// What the model sees. A denial is an ordinary result with `ok: false`, not a host error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutput {
+    pub provenance: Option<Box<Provenance>>,
     pub ok: bool,
     pub content: String,
     /// For the transcript only: a line diff of the file the call changed.
@@ -36,6 +38,7 @@ pub struct ToolOutput {
 impl ToolOutput {
     pub fn ok(content: impl Into<String>) -> Self {
         Self {
+            provenance: None,
             ok: true,
             content: content.into(),
             diff: None,
@@ -45,6 +48,7 @@ impl ToolOutput {
 
     pub fn err(content: impl Into<String>) -> Self {
         Self {
+            provenance: None,
             ok: false,
             content: content.into(),
             diff: None,
@@ -378,6 +382,12 @@ pub fn call(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutp
         "websearch" => websearch::search(session, input),
         "session_query" => session_query::run(session, input),
         "tool_search" => tool_search::search(session, input),
+        _ if name.starts_with(plugins::PREFIX) => {
+            let mut registry = mem::take(&mut session.plugins);
+            let out = registry.call(session, name, input);
+            session.plugins = registry;
+            out
+        }
         _ if name.starts_with(registry::PREFIX) => {
             // Same reason as `tool_search`: the registry is a field of the session it has to ask.
             let mut registry = mem::take(&mut session.mcp);
