@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
-use crate::mcp::McpEntry;
 use crate::mcp::stdio::{Client, Tool};
+use crate::mcp::{McpEntry, first_line};
 use crate::net::bridge::Bridge;
 use crate::provider::ToolDef;
 use crate::session::Session;
@@ -297,6 +297,79 @@ impl Registry {
         notes
     }
 
+    /// What `/mcp` shows: one line per granted server, its exposure, whether it is running, how
+    /// much of what it offers is granted, and what went wrong if anything did (D118).
+    pub fn report(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for grant in &self.grants {
+            let entry = self.entries.get(&grant.server);
+            let exposure = match entry.map(McpEntry::exposure) {
+                Some(crate::mcp::Exposure::Direct) => "direct",
+                Some(crate::mcp::Exposure::Hidden) => "hidden",
+                Some(crate::mcp::Exposure::Deferred) | None => "deferred",
+            };
+            let state = if self.servers.contains_key(&grant.server) {
+                "running".to_owned()
+            } else if let Some(why) = self.failures.get(&grant.server) {
+                format!("failed: {}", first_line(why))
+            } else if entry.is_none() {
+                "no [mcp.{}] table".to_owned().replace("{}", &grant.server)
+            } else if entry.is_some_and(|e| e.exposure() == crate::mcp::Exposure::Hidden) {
+                "off".to_owned()
+            } else {
+                "not started".to_owned()
+            };
+            let offered = self
+                .catalogue
+                .keys()
+                .filter(|key| key.starts_with(&format!("{PREFIX}{}__", grant.server)))
+                .count();
+            let granted = self
+                .catalogue
+                .iter()
+                .filter(|(_, (owner, tool))| owner == &grant.server && grant.allows(&tool.name))
+                .count();
+            out.push(format!(
+                "{:<16} {exposure:<9} {state:<24} {granted} of {offered} offered tool(s) granted, \
+                 {} declared",
+                grant.server,
+                self.loaded
+                    .iter()
+                    .filter(|key| key.starts_with(&format!("{PREFIX}{}__", grant.server)))
+                    .count(),
+            ));
+        }
+        if out.is_empty() {
+            out.push(
+                "no mcp server is granted: add `mcp = [...]` to the agent's grants".to_owned(),
+            );
+        }
+        out
+    }
+
+    /// Forgets a server and starts it again, which is what a person does when a server has been
+    /// upgraded or its credentials have changed underneath a running session (D118). Dropping the
+    /// client kills the child, so nothing of the old one survives into the new.
+    pub fn restart(&mut self, server: &str, session: &mut Session) -> Result<String> {
+        if !self.grants.iter().any(|g| g.server == server) {
+            bail!("`{server}` is not granted");
+        }
+        if self.is_hidden(server) {
+            bail!("`{server}` is turned off in config.toml (`exposure = \"hidden\"`)");
+        }
+        self.servers.remove(server);
+        self.failures.remove(server);
+        self.catalogue
+            .retain(|_, (owner, _)| owner.as_str() != server);
+        self.connect(server, session)?;
+        let tools = self
+            .catalogue
+            .iter()
+            .filter(|(_, (owner, _))| owner == server)
+            .count();
+        Ok(format!("{server} restarted, offering {tools} tool(s)"))
+    }
+
     /// Starts one server by name, so `saddle mcp call` reaches the one it was given rather than
     /// every granted server. The discovery path starts them all at once; this is the same
     /// `connect`, reached by name (D111).
@@ -515,6 +588,16 @@ impl Registry {
     }
 
     #[cfg(test)]
+    fn tool(name: &str) -> Tool {
+        use serde_json::json as object;
+        Tool {
+            name: name.to_owned(),
+            description: format!("{name} does things"),
+            schema: object!({ "type": "object" }),
+        }
+    }
+
+    #[cfg(test)]
     fn attach(&mut self, server: &str, tool: Tool) {
         let key = Self::name(server, &tool.name);
         self.catalogue.insert(key, (server.to_owned(), tool));
@@ -525,6 +608,62 @@ impl Registry {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_report_says_what_each_server_is_doing() {
+        // D118: `/mcp` is one line per granted server — exposure, state, how much of what it
+        // offers is granted — so a server that never started is visible before it is needed.
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "front".to_owned(),
+            McpEntry {
+                exposure: crate::mcp::Exposure::Direct,
+                ..McpEntry::default()
+            },
+        );
+        entries.insert(
+            "off".to_owned(),
+            McpEntry {
+                exposure: crate::mcp::Exposure::Hidden,
+                ..McpEntry::default()
+            },
+        );
+        let mut registry = Registry::new(
+            vec![
+                granted("front", &["search"]),
+                granted("off", &["search"]),
+                granted("ghost", &["search"]),
+            ],
+            entries,
+            Vec::new(),
+            None,
+        );
+        registry.attach("front", Registry::tool("search"));
+        registry.attach("front", Registry::tool("rm_rf"));
+        registry
+            .failures
+            .insert("off".to_owned(), "boom".to_owned());
+
+        let report = registry.report().join("\n");
+        assert!(report.contains("front"), "{report}");
+        assert!(
+            report.contains("direct"),
+            "the exposure is not shown: {report}"
+        );
+        assert!(
+            report.contains("1 of 2 offered tool(s) granted"),
+            "the granted count is wrong or missing: {report}"
+        );
+        assert!(report.contains("hidden"), "{report}");
+        assert!(
+            report.contains("no [mcp.ghost] table"),
+            "a granted server with no table is not called out: {report}"
+        );
+        assert!(
+            report.contains("failed: boom"),
+            "the last error is not shown: {report}"
+        );
+    }
 
     #[test]
     fn a_direct_server_is_declared_without_a_search_and_a_hidden_one_never_is() {

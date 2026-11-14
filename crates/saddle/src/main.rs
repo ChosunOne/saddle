@@ -1558,7 +1558,7 @@ impl OneServer<'_> {
             out.push(format!(
                 "  {:<28} {access:<12} {}",
                 tool.name,
-                first_line(&tool.description)
+                mcp::first_line(&tool.description)
             ));
         }
         for denial in denials {
@@ -1574,17 +1574,6 @@ fn exposure(entry: &McpEntry) -> &'static str {
         crate::mcp::Exposure::Deferred => "deferred",
         crate::mcp::Exposure::Direct => "direct",
         crate::mcp::Exposure::Hidden => "hidden",
-    }
-}
-
-/// A description as one line of at most 100 characters, since a server may write a paragraph.
-fn first_line(text: &str) -> String {
-    let line = text.lines().next().unwrap_or_default().trim();
-    if line.chars().count() > 100 {
-        let cut: String = line.chars().take(99).collect();
-        format!("{cut}…")
-    } else {
-        line.to_owned()
     }
 }
 

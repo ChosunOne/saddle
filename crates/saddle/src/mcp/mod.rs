@@ -100,6 +100,17 @@ where
     Exposure::parse(&text).map_err(serde::de::Error::custom)
 }
 
+/// A description as one line of at most 100 characters, since a server may write a paragraph.
+pub fn first_line(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    if line.chars().count() > 100 {
+        let cut: String = line.chars().take(99).collect();
+        format!("{cut}\u{2026}")
+    } else {
+        line.to_owned()
+    }
+}
+
 /// How a call reaches the server, which the table describes exactly one way (D104).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Transport<'a> {

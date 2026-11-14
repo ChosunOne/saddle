@@ -2739,6 +2739,16 @@ third way in. `codemode` is refused by name at load: saddle has no code-evaluati
 person who asked for one asked for something this harness does not do, which a silent fall back to
 deferring would hide.
 
+**D118.** `/mcp` reports the servers and can start one again. The report is one line per granted
+server: its exposure, whether it is running, failed or not started, how many of the tools it offers
+the grant names, and how many are declared; a granted server with no table in `config.toml` is
+called out on its own line, and the last failure is shown rather than remembered silently.
+`/mcp restart <server>` forgets a server and starts it again — the client is dropped, which kills the
+child, so nothing of the old one survives — which is what a person does after upgrading a server or
+changing its credentials under a running session. The registry is taken out of the session for the
+call and put back, the same shape a tool call uses (D108), because starting a server needs the
+engine and the audit log that the session owns.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

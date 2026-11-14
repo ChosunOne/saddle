@@ -92,6 +92,8 @@ enum Command {
     Name(Option<String>),
     /// Report what this conversation has done (D55).
     SessionInfo,
+    /// `/mcp`: report the servers, or start one again (D118).
+    Mcp(String),
     /// Remove a saved conversation (D55).
     Delete(String),
     /// Change the reasoning effort (D57).
@@ -486,6 +488,29 @@ fn work(
                     let _ = events.send(AgentEvent::Note(format!("{e:#}")));
                 }
             },
+            Command::Mcp(arg) => {
+                // The registry lives on the session, and starting a server needs it, so it is
+                // taken out for the call and put back (D108, D118).
+                let mut registry = std::mem::take(&mut session.mcp);
+                let outcome = match arg.strip_prefix("restart") {
+                    Some(name) if !name.trim().is_empty() => {
+                        registry.restart(name.trim(), &mut session)
+                    }
+                    Some(_) => Err(anyhow::anyhow!(
+                        "`/mcp restart` needs a server: /mcp lists them"
+                    )),
+                    None => {
+                        let mut lines = registry.report();
+                        lines.push("\n/mcp restart <server> starts one again".to_owned());
+                        Ok(lines.join("\n"))
+                    }
+                };
+                session.mcp = registry;
+                let _ = events.send(AgentEvent::Note(match outcome {
+                    Ok(text) => text,
+                    Err(e) => format!("{e:#}"),
+                }));
+            }
             Command::Delete(id) => match agent.delete_session(&id) {
                 Ok(()) => {
                     let _ = events.send(AgentEvent::Note("deleted that conversation".into()));
@@ -918,6 +943,10 @@ impl Controller {
             }
             Action::SessionInfo => {
                 self.send(app, Command::SessionInfo);
+                Ok(())
+            }
+            Action::Mcp(arg) => {
+                self.send(app, Command::Mcp(arg));
                 Ok(())
             }
             Action::DeleteSession(id) => {

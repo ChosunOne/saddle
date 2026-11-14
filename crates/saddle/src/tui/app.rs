@@ -140,6 +140,8 @@ pub enum Action {
     Name(Option<String>),
     /// What this conversation has done, for `/session` (D55).
     SessionInfo,
+    /// `/mcp`: what the granted servers are doing, or `restart <name>` for one of them (D118).
+    Mcp(String),
     /// Remove a saved conversation (D55).
     DeleteSession(String),
     /// Set the reasoning effort, or cycle to the next level (D57).
@@ -1598,6 +1600,7 @@ impl App {
                 ))
             }
             "/session" => Some(Action::SessionInfo),
+            "/mcp" => Some(Action::Mcp(text["/mcp".len()..].trim().to_owned())),
             "/clone" if self.busy.is_some() => {
                 self.info("/clone waits for the turn to end; esc cancels it");
                 None
