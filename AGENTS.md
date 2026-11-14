@@ -2,7 +2,7 @@
 
 Saddle is a coding-agent harness in Rust. Its plugin boundary is WASI components whose
 authority is a *declared* scope set, checked before instantiation and bounded by the agent's reach.
-The binary supports explicitly installed, digest-pinned filesystem/transcript tool plugins (D126–D141), alongside
+The binary supports explicitly installed, digest-pinned filesystem/transcript tool plugins (D126–D142), alongside
 built-in tools and MCP; the loader, canonical WIT and SDK are separate library crates.
 `docs/plan.md` is the specification; read it before changing behaviour in the policy, sandbox or tool
 layer.
@@ -34,6 +34,7 @@ Inside `crates/saddle/src`:
 | `agent` | the model loop (no request limit unless one is set, D37; a turn stops on a repeated call and answer, D38), the system prompt (base plus grants, so a policy reload replaces only the grants, D47), tool dispatch, and compaction — synchronous at the hard threshold, started in the background at three quarters (D78), and run by the worker thread when the session is idle (D77) |
 | `session` | opening the workspace, resolving roots, the policy engine and audit log for a session |
 | `plugins` | protected/digest-pinned loading, tool registration, provenance and CLI installation (D128); worker-to-session host calls through the one engine/audit log, reload revocation and bounded reads (D129) |
+| `execution` | caller-attributed subprocess sandbox lowering, network bridge, bounded capture and reservation restore; native/guest shell workflows are adapters (D142) |
 | `plugins/mutations` | bounded write/remove batches with all-target permission/precondition preflight, pinned staging and per-entry atomic publication under the plugin principal; not a filesystem-wide transaction (D140) |
 | `fs_access` | pinned no-follow directory/file opens for session roots and plugin artifacts/reads (D129) |
 | `transcript` | branch-only read-only SQL over messages, request usage and reasoning, shared by the gated SDK service and temporary native adapter; no saved-database access (D92, D94, D98, D137) |
@@ -319,7 +320,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D141 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D142 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

@@ -14,6 +14,7 @@ use saddle_cap::manifest::{Manifest, above_ceiling};
 use saddle_cap::{Grants, Principal, Scope};
 use saddle_wit::ReadToolPre;
 use saddle_wit::exports::saddle::plugin::tool::{Definition, Output};
+use saddle_wit::saddle::host::exec::{self, Command, Host as ExecHost, Reply as ExecReply};
 use saddle_wit::saddle::host::fs_list::EntryKind;
 use saddle_wit::saddle::host::fs_list::{self, Host as ListHost, Page as DirectoryPage};
 use saddle_wit::saddle::host::fs_paths::{self, Host as PathsHost};
@@ -123,6 +124,13 @@ impl Invocation {
 /// filesystem callbacks may hold any filesystem capability; determine authority per operation/path,
 /// never from the existence of a linked interface (D139, D140).
 pub trait HostServices: Send + 'static {
+    fn execute(
+        &mut self,
+        _call: &Invocation,
+        _request: Command,
+    ) -> anyhow::Result<Result<ExecReply, String>> {
+        Ok(Err("host does not implement execution".into()))
+    }
     fn emit_diff(
         &mut self,
         _call: &Invocation,
@@ -232,6 +240,67 @@ struct State<H> {
     wasi: WasiCtx,
     resources: ResourceTable,
     emitted_images: usize,
+    host_time_left: Duration,
+    host_calls: usize,
+}
+
+impl<H: HostServices> State<H> {
+    fn host_wait<T>(
+        &mut self,
+        allowance: Duration,
+        operation: impl FnOnce(&mut H, &Invocation, Duration) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        if self.call.cancelled() || Instant::now() >= self.call.deadline || self.host_calls >= 16 {
+            return Err(anyhow!(
+                "plugin call cancelled, timed out or exceeds 16 long host calls"
+            ));
+        }
+        let allowance = allowance.min(self.host_time_left);
+        if allowance.is_zero() {
+            return Err(anyhow!("plugin host wait budget exhausted"));
+        }
+        self.host_calls += 1;
+        let old = self.call.deadline;
+        self.call.deadline = old
+            .checked_add(allowance)
+            .ok_or_else(|| anyhow!("plugin deadline overflow"))?;
+        let start = Instant::now();
+        let result = operation(&mut self.host, &self.call, allowance);
+        let elapsed = start.elapsed().min(allowance);
+        self.host_time_left = self.host_time_left.saturating_sub(elapsed);
+        self.call.deadline = old
+            .checked_add(elapsed)
+            .ok_or_else(|| anyhow!("plugin deadline overflow"))?;
+        result
+    }
+}
+
+impl<H: HostServices> ExecHost for State<H> {
+    fn run(&mut self, mut request: Command) -> anyhow::Result<Result<ExecReply, String>> {
+        if request.argv.is_empty()
+            || request.argv.len() > 128
+            || request.argv.iter().map(String::len).sum::<usize>() > MAX_FILE_BYTES
+            || request.argv.iter().any(|s| s.contains('\0'))
+        {
+            return Ok(Err("invalid command or exceeds argument bounds".into()));
+        }
+        let granted = self
+            .call
+            .grants
+            .exec
+            .as_ref()
+            .map_or(Duration::ZERO, |grant| grant.timeout);
+        let timeout = Duration::from_secs(request.timeout_secs.clamp(1, 300)).min(granted);
+        let result = self.host_wait(timeout, |host, call, allowance| {
+            request.timeout_secs = allowance.as_secs().max(1);
+            host.execute(call, request)
+        })?;
+        if matches!(&result, Ok(reply) if reply.stdout.len() > 256*1024 || reply.stderr.len() > 256*1024 || reply.denials.iter().chain(&reply.restored).map(String::len).sum::<usize>() > MAX_FILE_BYTES)
+        {
+            return Ok(Err("execution reply exceeds bounds".into()));
+        }
+        Ok(result)
+    }
 }
 
 impl<H: HostServices> WasiView for State<H> {
@@ -600,6 +669,7 @@ impl Loader {
             if !matches!(
                 name.as_str(),
                 "saddle:host/fs-read@0.1.0"
+                    | "saddle:host/exec@0.1.0"
                     | "saddle:host/fs-read-range@0.1.0"
                     | "saddle:host/fs-write@0.1.0"
                     | "saddle:host/fs-paths@0.1.0"
@@ -616,6 +686,10 @@ impl Loader {
         }
         let mut linker = Linker::<State<H>>::new(engine);
         ambient::add(&mut linker).map_err(runtime("linking ambient WASI"))?;
+        if scopes.contains(&Scope::Exec) {
+            exec::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+                .map_err(runtime("linking exec"))?;
+        }
         // D139: one filesystem SDK, with actual root/external access decided per request.
         if scopes.contains(&Scope::FsRead)
             || scopes.contains(&Scope::ToolRead)
@@ -773,6 +847,8 @@ impl<H: HostServices> Prepared<H> {
                 table
             },
             emitted_images: 0,
+            host_time_left: Duration::from_secs(300),
+            host_calls: 0,
         };
         let mut store = Store::new(&self.runtime.engine, state);
         store.limiter(|state| &mut state.limits);

@@ -25,9 +25,11 @@ use saddle_wit::saddle::host::tool_result::ImageInfo;
 use serde_json::json;
 
 use super::{filesystem, mutations};
+use crate::execution;
 use crate::provider::Image;
 use crate::session::Session;
 use crate::{cancel, fs_access, transcript};
+use saddle_wit::saddle::host::exec::{Command, Reply as ExecReply};
 
 pub enum Job {
     Describe,
@@ -59,6 +61,11 @@ impl StdError for Fatal {
 type HostReply<T, E = Failure> = Result<Result<T, E>, String>;
 type FileReply = HostReply<Chunk>;
 enum Event {
+    Execute {
+        who: Principal,
+        request: Command,
+        answer: SyncSender<HostReply<ExecReply, String>>,
+    },
     Diff {
         who: Principal,
         text: String,
@@ -114,6 +121,24 @@ pub struct Host {
     events: SyncSender<Event>,
 }
 impl HostServices for Host {
+    fn execute(
+        &mut self,
+        call: &Invocation,
+        request: Command,
+    ) -> Result<Result<ExecReply, String>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        self.events
+            .send(Event::Execute {
+                who: call.principal().clone(),
+                request,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        result
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(|_| anyhow!("plugin execution request timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
     fn emit_diff(&mut self, call: &Invocation, text: String) -> Result<Result<(), String>> {
         let (answer, result) = mpsc::sync_channel(1);
         self.events
@@ -333,6 +358,7 @@ pub fn execute(
 ) -> Result<Result<Reply, String>> {
     let invoking = matches!(job, Job::Invoke(_));
     let mut filesystem_effects = false;
+    let mut execution_effects = false;
     let mut diff = None;
     let mut images = Vec::new();
     let (events, pending) = mpsc::sync_channel(1);
@@ -366,6 +392,36 @@ pub fn execute(
             cancelled.store(true, Ordering::Relaxed);
         }
         match pending.recv_timeout(Duration::from_millis(10)) {
+            Ok(Event::Execute {
+                who,
+                request,
+                answer,
+            }) => {
+                let result = if invoking {
+                    execution::execute(
+                        session,
+                        &who,
+                        call,
+                        request.argv,
+                        Duration::from_secs(request.timeout_secs),
+                        &mut execution_effects,
+                    )
+                } else {
+                    session
+                        .audit
+                        .event(
+                            Kind::Decision,
+                            Some(&who),
+                            Some(Scope::Exec),
+                            Some(false),
+                            json!({"call_id":call,"operation":"exec"}),
+                            "execution is refused during describe",
+                        )
+                        .map(|_| Err("execution is refused during describe".into()))
+                        .map_err(Into::into)
+                };
+                respond(result, answer, &mut fatal, &cancelled);
+            }
             Ok(Event::Diff { who, text, answer }) => {
                 let request = Request::Plain(Scope::Tool);
                 let decision = session.engine.decide(&who, &request);
@@ -501,7 +557,7 @@ pub fn execute(
             }
             Ok(Event::Finished(result)) => {
                 let result = result.map_err(|why| {
-                    if filesystem_effects { format!("{why}; filesystem changes were committed before failure; inspect paths before retrying") } else { why }
+                    if filesystem_effects { format!("{why}; filesystem changes were committed before failure; inspect paths before retrying") } else if execution_effects { format!("{why}; execution may have produced effects before failure; inspect results before retrying") } else { why }
                 });
                 break result.map(|reply| match reply {
                     Reply::Output { output, .. } if !output.is_error => Reply::Output {

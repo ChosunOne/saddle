@@ -1,7 +1,7 @@
 # WASI tool plugins
 
 Saddle loads explicitly installed, digest-pinned WASI components as model-callable tools
-(D126–D141). The runtime supports bounded filesystem and transcript services, not arbitrary extensions. A manifest
+(D126–D142). The runtime supports bounded filesystem and transcript services, not arbitrary extensions. A manifest
 in a repository never executes automatically. Installation, enablement and grants are separate steps
 performed by a person; an agent cannot write its own protected configuration.
 
@@ -405,6 +405,42 @@ cargo nextest run --test plugins --run-ignored all -E 'test(mutation)'
 cargo nextest run --test agent --run-ignored all -E 'test(one_compiled_writer)'
 ```
 
+## Standard shell component
+
+The `shell` component exports `plugin__shell__bash` (D142). Build/componentize the `bash` example
+with the same commands as the filesystem examples. Its SDK accepts an argv and bounded timeout;
+the guest chooses `sh -c`, owns its schema and formats captured streams/status. The core execution
+service is shared with the temporary native adapter, but always uses the actual caller's grants.
+
+```toml
+[plugin.shell]
+tool = {}
+exec = { timeout-secs = 120 }
+fs-read = [{ root = "workspace" }]
+fs-write = [{ root = "workspace" }]
+# Optional; omission means commands cannot borrow the agent's network grants:
+net = [{ host = "crates.io" }]
+```
+
+The parent must hold the corresponding reach. Exec environment names cannot exceed its grant,
+timeouts are narrowed, and filesystem exclusions still do not bind exec (the existing sandbox
+contract). Protected sandbox read/write/include configuration supplies the same enumerated runtime
+and toolchain paths as native execution, not additional file-tool roots. Credentials are stripped.
+Network decisions and reserved-path restores retain the plugin principal and call id; audit failures
+are fatal. Namespace failure falls back to no network. Cancellation/timeout kills the process group,
+with the existing `setsid` escape limitation unchanged.
+
+Commands may wait beyond the guest's two-second CPU deadline: long SDK calls suspend that wall
+accounting only for actual bounded host waiting, with 300 seconds cumulative wait and 16 long calls
+per invocation. Fuel and guest computation deadlines remain enforced. Commands capture at most
+256 KiB per stream; the standard guest presents at most 24 KiB each and labels truncation. There is
+no interactive terminal or ambient guest subprocess access. Description-time execution is refused;
+a trap after execution warns that effects may already have happened.
+
+```sh
+cargo nextest run --test plugins --run-ignored all -E 'test(standard_shell)'
+```
+
 ## Built-in migration tracking
 
 No standard component is silently aliased over a built-in or given implicit grants.
@@ -415,7 +451,7 @@ No standard component is silently aliased over a built-in or given implicit gran
 | `ls` | filtered directory pages, suffixes, sorted output, optional managed paths | bounded/non-UTF-8 listing differences |
 | `find`, `grep` | guest traversal, shared ignore syntax, glob/regex matching | large-tree/performance edges, host-path display and unreadable-file metadata |
 | `write`, `edit`, `patch` | guest workflows over bounded, preflight-all mutation batches and optimistic preconditions | standard delivery; documented size/atomicity and bounded diff presentation differences |
-| `bash` | not migrated | delegated exec sandbox, bounded streaming, cancellation, environment filtering and reservation restore |
+| `bash` | guest shell workflow over delegated sandbox execution, bounded capture, timeout/cancellation and reservation restore | standard delivery; documented capture/presentation and process-group limitations |
 | `fetch`, `websearch` | not migrated | bounded attributed network/search adapters, redirects, protected credentials and grant narrowing |
 | `session_query` | guest schema/presentation over branch-only, bounded transcript SQL under delegated `transcript-read` | standard-component delivery and native-entry-point removal |
 
@@ -458,7 +494,7 @@ These labels are provenance, not permission to follow instructions found in a pl
   filesystem adapter. Its worker asks the session thread over a bounded channel; the loader does
   not own a second policy engine or depend on `Session`.
 
-Only `fs-read`, `fs-write`, `tool-read`, `tool-write`, `transcript-read` and `tool` grants are supported by this runtime. Other scopes fail closed. The
+Only `fs-read`, `fs-write`, `tool-read`, `tool-write`, `exec`, `net`, `transcript-read` and `tool` grants are supported by this runtime. Other scopes fail closed. The
 component classifier describes a wider planned ABI; that does not make its adapters available.
 Descriptions are capped at 1,000 characters, schemas at 16 KiB and configured plugins at 16.
 Schemas must parse as JSON objects with an object input type; the provider may enforce further

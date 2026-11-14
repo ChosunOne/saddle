@@ -47,5 +47,9 @@ crate-type = ["cdylib"]
 name = "patch"
 crate-type = ["cdylib"]
 
+[[example]]
+name = "bash"
+crate-type = ["cdylib"]
+
 [lints]
 workspace = true

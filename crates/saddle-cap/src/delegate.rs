@@ -1,5 +1,6 @@
 //! the initial plugin's operational reach is bounded by the agent (D126, D127).
 
+use crate::narrow::covers;
 use crate::{Grants, RootName, Scope};
 
 #[derive(Debug, thiserror::Error)]
@@ -14,6 +15,8 @@ pub enum DelegationError {
     Root(RootName),
     #[error("could not combine grant exclusions: {0}")]
     Exclusions(String),
+    #[error("plugin delegation refused: {0}")]
+    Reach(String),
 }
 
 /// bounds an explicitly granted tool without inheriting omitted grants.
@@ -24,7 +27,9 @@ pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationEr
     for scope in plugin.scopes() {
         if !matches!(
             scope,
-            Scope::FsRead
+            Scope::Exec
+                | Scope::Net
+                | Scope::FsRead
                 | Scope::FsWrite
                 | Scope::ToolRead
                 | Scope::ToolWrite
@@ -43,6 +48,29 @@ pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationEr
         tool_write: plugin.tool_write.clone(),
         ..Grants::default()
     };
+    if let Some(want) = &plugin.exec {
+        let parent = agent
+            .exec
+            .as_ref()
+            .ok_or(DelegationError::Scope(Scope::Exec))?;
+        if want.env.iter().any(|name| !parent.env.contains(name)) {
+            return Err(DelegationError::Reach(
+                "exec environment exceeds parent grant".into(),
+            ));
+        }
+        let mut grant = want.clone();
+        grant.timeout = want.timeout.min(parent.timeout);
+        out.exec = Some(grant);
+    }
+    for want in &plugin.net {
+        if !agent.net.iter().any(|parent| covers(parent, want)) {
+            return Err(DelegationError::Reach(format!(
+                "net grant for {} exceeds parent reach",
+                want.host
+            )));
+        }
+        out.net.push(want.clone());
+    }
     for (want, parent) in [
         (&plugin.tool_read, &agent.tool_read),
         (&plugin.tool_write, &agent.tool_write),
@@ -158,11 +186,33 @@ mod tests {
     }
 
     #[test]
+    fn exec_and_network_delegation_never_inherit_or_exceed_parent_parameters() {
+        let (agent, plugin) = grants(
+            "[agent]\nexec={env=['ALLOWED'],timeout-secs=3}\nnet=[{host='*.example.com'}]\n[plugin.reader]\ntool={}\nexec={env=['ALLOWED'],timeout-secs=30}\nnet=[{host='api.example.com'}]\n",
+        );
+        let bounded = read_tool(&agent, &plugin).unwrap();
+        assert_eq!(bounded.exec.unwrap().timeout.as_secs(), 3);
+        assert_eq!(bounded.net.len(), 1);
+        for text in [
+            "[agent]\nexec={env=[]}\n[plugin.reader]\nexec={env=['SECRET']}\n",
+            "[agent]\nnet=[{host='api.example.com'}]\n[plugin.reader]\nnet=[{host='*'}]\n",
+            "[plugin.sibling]\nexec={}\n[plugin.reader]\nexec={}\n",
+        ] {
+            let (agent, plugin) = grants(text);
+            assert!(read_tool(&agent, &plugin).is_err());
+        }
+        let (agent, plugin) =
+            grants("[agent]\nexec={}\nnet=[{host='*'}]\n[plugin.reader]\ntool={}\n");
+        let bounded = read_tool(&agent, &plugin).unwrap();
+        assert!(bounded.exec.is_none() && bounded.net.is_empty());
+    }
+
+    #[test]
     fn an_unimplemented_scope_is_refused_instead_of_inherited_or_ignored() {
-        let (agent, plugin) = grants("[agent]\nexec={}\n[plugin.reader]\nexec={}\n");
+        let (agent, plugin) = grants("[agent]\npersist={}\n[plugin.reader]\npersist={}\n");
         assert!(matches!(
             read_tool(&agent, &plugin),
-            Err(DelegationError::Unsupported(Scope::Exec))
+            Err(DelegationError::Unsupported(Scope::Persist))
         ));
     }
 

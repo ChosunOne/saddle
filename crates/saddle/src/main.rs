@@ -14,6 +14,7 @@ mod compact;
 mod config;
 mod context;
 mod defaults;
+mod execution;
 mod fs_access;
 mod ignore;
 mod mcp;

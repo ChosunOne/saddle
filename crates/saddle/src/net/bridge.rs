@@ -23,6 +23,9 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
+use anyhow::Result as HostResult;
+use serde_json::json;
+
 use saddle_cap::sandbox::{NetBridge, PROXY_PORT};
 use saddle_cap::{Principal, Scope};
 use saddle_policy::{Kind, Request};
@@ -229,6 +232,52 @@ impl Bridge {
         denials
     }
 
+    /// serves a delegated command through the same engine, preserving fatal audit errors (D142).
+    pub fn service_as(
+        &mut self,
+        session: &mut Session,
+        who: &Principal,
+        call: Option<&str>,
+    ) -> HostResult<Vec<String>> {
+        loop {
+            match self.asks.try_recv() {
+                Ok(Ask::Decide { net, reply }) => {
+                    let result = decide_as(session, who, call, &net);
+                    match result {
+                        Ok(result) => {
+                            let _ = reply.send(result);
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err("network host failure".into()));
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(Ask::Resolve { host, port, reply }) => {
+                    let _ = reply.send(resolve_as(session, who, &host, port));
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        let denials: Vec<String> = self
+            .denials
+            .try_iter()
+            .take(32)
+            .map(|why| why.chars().take(1024).collect())
+            .collect();
+        for why in &denials {
+            session.audit.event(
+                Kind::Decision,
+                Some(who),
+                Some(Scope::Net),
+                Some(false),
+                json!({"via":"exec", "call_id":call}),
+                why,
+            )?;
+        }
+        Ok(denials)
+    }
+
     /// Stops the listener and removes the socket.
     pub fn finish(mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -297,10 +346,66 @@ fn decide(session: &mut Session, net: &Net) -> Result<Vec<SocketAddr>, String> {
     resolve(session, &net.host, net.port)
 }
 
+fn decide_as(
+    session: &mut Session,
+    who: &Principal,
+    call: Option<&str>,
+    net: &Net,
+) -> HostResult<Result<Vec<SocketAddr>, String>> {
+    let target = Target {
+        scheme: net.scheme.clone(),
+        host: net.host.clone(),
+        port: net.port,
+        path: net.path.clone(),
+    };
+    let request = Request::Net {
+        method: &net.method,
+        scheme: &net.scheme,
+        host: &net.host,
+        port: net.port,
+        path: &net.path,
+        headers: &net.headers,
+    };
+    if !session.net_names_host(who, &net.host)
+        && let Some(why) = fetch::local(&target)
+    {
+        session.audit.event(
+            Kind::Decision,
+            Some(who),
+            Some(Scope::Net),
+            Some(false),
+            json!({"request":request.args(), "call_id":call}),
+            &why,
+        )?;
+        return Ok(Err(why));
+    }
+    let decision = session.engine.decide(who, &request);
+    session.audit.decision_for_call_details(
+        who,
+        &request,
+        &decision,
+        call.unwrap_or("native-exec"),
+        json!({"via":"exec"}),
+    )?;
+    if !decision.allow {
+        return Ok(Err(decision.explanation));
+    }
+    Ok(resolve_as(session, who, &net.host, net.port))
+}
+
 /// Resolves and applies D28's address rule to what came back: an address that is private or
 /// loopback is reachable only when a grant names it, whether it was written as a name or as an
 /// address.
 fn resolve(session: &mut Session, host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    resolve_as(session, &Principal::Agent, host, port)
+}
+
+fn resolve_as(
+    session: &Session,
+    who: &Principal,
+    host: &str,
+    port: u16,
+) -> Result<Vec<SocketAddr>, String> {
     let addrs: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("{host}: {e}"))?
@@ -308,13 +413,12 @@ fn resolve(session: &mut Session, host: &str, port: u16) -> Result<Vec<SocketAdd
     if addrs.is_empty() {
         return Err(format!("{host} has no address"));
     }
-    let who = Principal::Agent;
-    let named = session.net_names_host(&who, host);
+    let named = session.net_names_host(who, host);
     for addr in &addrs {
         if fetch::private(addr.ip()).is_none() {
             continue;
         }
-        if !named && !session.net_names_host(&who, &addr.ip().to_string()) {
+        if !named && !session.net_names_host(who, &addr.ip().to_string()) {
             return Err(format!(
                 "{host} resolves to {}, and no grant names that address",
                 addr.ip()

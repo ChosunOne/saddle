@@ -684,6 +684,8 @@ impl Session {
     /// dialled (D28, D40). Not a decision, so it is not logged: the request that follows is.
     pub fn net_names_host(&self, who: &Principal, host: &str) -> bool {
         self.engine.net_names_host(who, host)
+            && (!matches!(who, Principal::Plugin(_))
+                || self.engine.net_names_host(&Principal::Agent, host))
     }
 
     /// Decides one request an MCP server's HTTP transport makes (D110). It is the server's own

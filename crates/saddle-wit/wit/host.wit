@@ -1,5 +1,15 @@
 package saddle:host@0.1.0;
 
+interface exec {
+    record command { argv: list<string>, timeout-secs: u64 }
+    record reply {
+        code: option<s32>, signal: option<s32>, stdout: list<u8>, stderr: list<u8>,
+        timed-out: bool, cancelled: bool, truncated: bool,
+        restored: list<string>, denials: list<string>,
+    }
+    run: func(request: command) -> result<reply, string>;
+}
+
 // Independent D138 types are kept for binary compatibility.
 // Legacy D138 adapter, retained for existing components; normal filesystem services cover both
 // roots and configured external directories under per-request runtime checks (D139).

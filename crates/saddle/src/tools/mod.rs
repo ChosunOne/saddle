@@ -15,7 +15,7 @@ pub(crate) mod session_query;
 mod tool_search;
 pub(crate) mod websearch;
 
-pub(crate) use bash::HELPER_ARG;
+pub(crate) use crate::execution::HELPER_ARG;
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};

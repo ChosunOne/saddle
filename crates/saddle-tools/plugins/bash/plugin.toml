@@ -1,0 +1,4 @@
+id = "shell"
+version = "0.1.0"
+component = "bash.component.wasm"
+scopes = ["tool", "exec", "fs-read", "fs-write", "net"]

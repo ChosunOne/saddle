@@ -3179,6 +3179,27 @@ not committed filesystem effects. Core does not compute plugin diffs or parse gu
 Large-text, non-UTF-8 filename and traversal limits remain explicit standard-tool bounds, not native
 fallbacks; further performance improvements must keep filtering under the same policy decisions.
 
+**D142.** The additive `saddle:host/exec` SDK service accepts a bounded argv and timeout and
+returns captured streams/status, not a shell workflow. The standard `bash` guest owns its schema,
+`sh -c` choice and formatting; the native entry point is a temporary adapter to the same privileged
+execution service. Every execution is decided/audited under its caller, and lowering uses that
+principal's bounded grants, the existing protected sandbox configuration and stripped environment.
+Plugin exec environment names cannot exceed the parent's; timeouts are the smaller ceiling. Omitted
+exec, filesystem and net grants never inherit agent/sibling grants. Network delegation checks each
+requested scheme/host/port against the parent, and private-address exemptions require both parent
+and child to name the host/address, so narrowing a wildcard to an exact name cannot gain local access.
+The proxy answers under the executing principal and call id; audit failures stop execution. Existing
+namespace/no-network fallback, bounded pipe draining, group cancellation and reserved-path restore
+remain shared core mechanisms, not guest code. Description-time execution is refused. Traps after
+execution warn that host effects may already have occurred.
+
+Guest CPU/fuel deadlines are not relaxed into command timeouts. Explicit long host calls temporarily
+extend the wall deadline and charge only actual waiting time, at most 300 seconds cumulatively and
+16 long calls per invocation; command timeouts are also bounded by the delegated grant and request.
+Guest computation retains its original two-second budget and fuel. Captured streams are bounded to
+256 KiB each, the guest's final presentation to its ordinary output limit. No interactive terminal,
+ambient guest subprocess access or unbounded streaming/storage is introduced.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

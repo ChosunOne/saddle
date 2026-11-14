@@ -85,7 +85,7 @@ fn narrow_net(agent: &[NetGrant], asked: &[NetGrant], what: &str) -> Result<Vec<
 }
 
 /// Whether `outer` allows everything `inner` does, on the same scheme and port.
-fn covers(outer: &NetGrant, inner: &NetGrant) -> bool {
+pub(crate) fn covers(outer: &NetGrant, inner: &NetGrant) -> bool {
     outer.scheme == inner.scheme
         && outer.port.unwrap_or(outer.scheme.default_port())
             == inner.port.unwrap_or(inner.scheme.default_port())

@@ -491,6 +491,81 @@ fn managed_manifest(env: &Env, scopes: &str) {
 }
 
 #[test]
+#[ignore = "build the standard bash component first; see docs/plugins.md"]
+fn standard_shell_uses_delegated_grants_waits_beyond_guest_deadlines_and_restores_reserved_paths() {
+    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/bash-plugin/bash.component.wasm");
+    let bytes = fs::read(component).expect("build the standard bash component first");
+    let env = Env::new(
+        &bytes,
+        "tool={}\nexec={timeout-secs=10}\nfs-read=[{root='workspace'}]",
+    );
+    managed_manifest(&env, "['tool','exec','fs-read','fs-write','net']");
+    env.edit(
+        "[agent]\n",
+        "[agent]\nexec={timeout-secs=10}\nnet=[{host='*'}]\n",
+    );
+    fs::write(env.ws().join("file"), "original").unwrap();
+    let out = env.run(&[
+        "plugin",
+        "call",
+        "reader",
+        r#"{"command":"printf denied > file"}"#,
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert_eq!(
+        fs::read_to_string(env.ws().join("file")).unwrap(),
+        "original"
+    );
+    env.edit(
+        "[plugin.reader]\n",
+        "[plugin.reader]\nfs-write=[{root='workspace'}]\n",
+    );
+    fs::create_dir_all(env.ws().join(".git")).unwrap();
+    fs::write(env.ws().join(".git/config"), "original config").unwrap();
+    let out = env.run(&["plugin", "call", "reader", r#"{"command":"sleep 3; printf success > file; printf changed > .git/config; printf output"}"#]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("output") && text(&out).contains("restored reserved path"));
+    assert_eq!(
+        fs::read_to_string(env.ws().join("file")).unwrap(),
+        "success"
+    );
+    assert_eq!(
+        fs::read_to_string(env.ws().join(".git/config")).unwrap(),
+        "original config"
+    );
+    assert!(env.records().iter().any(|row| row["scope"] == "exec"
+        && row["principal"] == "plugin.reader"
+        && row["args"]["call_id"].is_string()));
+    let out = env.run(&[
+        "plugin",
+        "call",
+        "reader",
+        r#"{"command":"sleep 5", "timeout_secs":1}"#,
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("timed out"), "{}", text(&out));
+    let out = env.run(&[
+        "--revoke",
+        "exec",
+        "plugin",
+        "call",
+        "reader",
+        r#"{"command":"printf revoked > file"}"#,
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        fs::read_to_string(env.ws().join("file")).unwrap(),
+        "success"
+    );
+    assert!(
+        env.run(&["audit", "verify", env.log().to_str().unwrap()])
+            .status
+            .success()
+    );
+}
+
+#[test]
 fn managed_mutations_check_both_directories_reserved_absolute_paths_and_read_preconditions() {
     let outside = tempfile::tempdir().unwrap();
     let source = outside.path().join("source");
