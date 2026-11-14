@@ -2663,6 +2663,24 @@ kept from the handshake and sent back, `notifications/initialized` before anythi
 without a token there is nothing to retry with, and looping would spend a quota to learn the same
 thing twice. OAuth is the next decision and not a silent fallback here.
 
+**D111.** `saddle mcp call <server> <tool> '<json>'` makes one call the way the model does — the
+registry starts that one server, reads its catalogue, declares what the grant names, and decides
+the call — with no conversation around it. It is deliberately not a second path: it uses the same
+`connect`, the same declaration and the same decision, so a person checking a server by hand is
+checking what the model will actually get, and a by-hand call cannot succeed where the model's
+would be refused. It is also the only way to reach a remote server before a search has declared
+anything, and the way to exercise a transport without spending a model request. A server the policy
+does not grant, or one with no `[mcp.<name>]` table, is a usage error and says so.
+
+**D112.** Every MCP tool call is audited — the allow and the refusal — as one `decision` record with
+scope `mcp`, the server and the tool named, and the arguments recorded as a length and a hash rather
+than as text (D24's rule, because an argument may hold a secret the way a query string may). It is
+one function, `record_call`, called by the registry and by nothing else: the model's call and the
+by-hand one are the same decision with the same record shape. A call that names a server the policy
+does not grant is a usage error before any call exists, so it is not a record; a call the grant does
+not name a tool for is a refusal and is. This closes the gap where an MCP tool call left no trace
+while every other tool call wrote one, which is the whole of D10's promise.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

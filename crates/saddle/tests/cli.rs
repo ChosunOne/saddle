@@ -172,12 +172,14 @@ impl Env {
             .collect()
     }
 
-    /// What the most recent run recorded, as text.
+    /// Everything the runs so far recorded, as text. Every run opens its own log, so a test that
+    /// makes two runs has to read both.
     fn audit(&self) -> String {
         self.audit_logs()
-            .last()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .unwrap_or_default()
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn audit_logs(&self) -> Vec<PathBuf> {
@@ -860,6 +862,87 @@ fn mock_http_mcp() -> (
         }
     });
     (format!("http://127.0.0.1:{port}/mcp"), seen, stop, handle)
+}
+
+#[test]
+fn mcp_call_runs_one_tool_as_the_model_would_and_refuses_an_ungranted_one() {
+    // D111: one call without a conversation around it, decided by the same grant the model's call
+    // is decided by. It is what a person checks a server with, and the only way to reach a remote
+    // one before a search has declared anything.
+    let env = Env::new();
+    let script = env.ws.path().join("fake-mcp.sh");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}\n' ;;
+    *'"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search","description":"finds things","inputSchema":{}},{"name":"rm_rf","description":"deletes everything","inputSchema":{}}]}}\n' ;;
+    *'"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"found two postings"}]}}\n' ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    env.write_config(&format!(
+        "\n[mcp.fake]\ncommand = {:?}\n",
+        script.display().to_string()
+    ));
+    env.write_policy(
+        r#"
+version = 1
+
+[agent]
+fs-read = [{ root = "workspace" }]
+exec    = { timeout-secs = 20 }
+mcp     = [{ server = "fake", tools = ["search"] }]
+"#,
+    );
+    let out = env.saddle(&["mcp", "call", "fake", "search", r#"{"q":"rust"}"#]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("found two postings"), "{text}");
+
+    // A tool the grant does not name is refused before the server is even started.
+    let out = env.saddle(&["mcp", "call", "fake", "rm_rf"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("not one of the tools granted for `fake`"),
+        "the refusal did not name the tool: {text}"
+    );
+
+    // D112: both calls are in the record — the allow and the deny — with the server, the tool and
+    // a hash of the arguments rather than the arguments themselves.
+    let log = env.audit();
+    assert!(
+        log.contains(r#""server":"fake","tool":"search""#),
+        "the granted call was not recorded: {log}"
+    );
+    assert!(
+        log.contains(r#""allow":true"#),
+        "the granted call is not marked as allowed: {log}"
+    );
+    assert!(
+        log.contains(r#""sha256""#),
+        "the arguments were not summarised: {log}"
+    );
+    assert!(
+        log.contains(r#""server":"fake","tool":"rm_rf""#),
+        "the refused call was not recorded: {log}"
+    );
+    assert!(
+        log.contains(r#""arguments":{"bytes":12,"sha256":"#),
+        "the record does not summarise what was sent: {log}"
+    );
+    assert!(
+        !log.contains("rust"),
+        "the arguments themselves must never be recorded: {log}"
+    );
 }
 
 #[test]

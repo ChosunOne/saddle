@@ -17,6 +17,48 @@ use crate::provider::ToolDef;
 use crate::session::Session;
 use crate::tools::ToolOutput;
 
+/// What a call carried, for the audit log: how much and what, never what it said. A tool's
+/// arguments may hold a secret the way a `fetch` query string may, so both are recorded the same
+/// way — a length and a hash (D24, D112).
+pub fn arguments_record(input: &Value) -> Value {
+    let text = input.to_string();
+    serde_json::json!({
+        "bytes": text.len(),
+        "sha256": saddle_policy::audit::sha256_hex(text.as_bytes()),
+    })
+}
+
+/// One MCP tool call, allowed or refused, recorded against the server it was for (D112). One
+/// function, because the model's call and a person's `saddle mcp call` are the same decision and
+/// two record shapes would be two answers to what the audit log means.
+pub fn record_call(
+    session: &mut Session,
+    server: &str,
+    tool: &str,
+    arguments: &Value,
+    allow: Option<bool>,
+    explanation: &str,
+) -> Result<()> {
+    let args = serde_json::json!({
+        "via": "mcp",
+        "server": server,
+        "tool": tool,
+        "arguments": arguments,
+    });
+    session
+        .audit
+        .event(
+            saddle_policy::Kind::Decision,
+            Some(&saddle_cap::Principal::Agent),
+            Some(saddle_cap::Scope::Mcp),
+            allow,
+            args,
+            explanation,
+        )
+        .context("writing the audit log")?;
+    Ok(())
+}
+
 /// The prefix that keeps a server's tool from ever shadowing a built-in one.
 pub const PREFIX: &str = "mcp__";
 
@@ -180,6 +222,24 @@ impl Registry {
         }
     }
 
+    /// Starts one server by name, so `saddle mcp call` reaches the one it was given rather than
+    /// every granted server. The discovery path starts them all at once; this is the same
+    /// `connect`, reached by name (D111).
+    pub fn start(&mut self, server: &str, session: &mut Session) -> Result<()> {
+        self.connect(server, session)
+    }
+
+    /// Declares every tool of one server the grant names, without a search (D111). A by-hand call
+    /// has no conversation to declare into, so this is the model's "search for everything" with
+    /// nothing recorded: the session it belongs to is about to end.
+    pub fn declare_server(&mut self, server: &str) {
+        for (key, (owner, tool)) in &self.catalogue {
+            if owner == server && self.granted(server, &tool.name) {
+                self.loaded.insert(key.clone());
+            }
+        }
+    }
+
     /// Declares what matches `query`. An empty query declares everything the granted servers offer,
     /// which is what a model with no idea what is available should ask for.
     pub fn search(&mut self, query: &str) -> Vec<String> {
@@ -273,14 +333,44 @@ impl Registry {
             .get(key)
             .cloned()
             .ok_or_else(|| anyhow!("unknown tool `{key}`"))?;
-        if !self.grants.iter().any(|g| g.server == server) {
-            return Ok(ToolOutput::denied(&format!("`{server}` is not granted")));
-        }
-        if !self.granted(&server, &tool.name) {
-            return Ok(ToolOutput::denied(&format!(
+        // D112: a call is a decision wherever it is answered, so a refusal is recorded here and a
+        // grant is recorded below — the same shape every other tool's allow carries, with the
+        // arguments hashed rather than quoted (D24).
+        let arguments = arguments_record(input);
+        let refusal = if !self.grants.iter().any(|g| g.server == server) {
+            Some(format!("`{server}` is not granted"))
+        } else if !self.granted(&server, &tool.name) {
+            Some(format!(
                 "`{}` is not one of the tools granted for `{server}`",
                 tool.name
-            )));
+            ))
+        } else {
+            None
+        };
+        let grant = self.grants.iter().find(|g| g.server == server);
+        match &refusal {
+            Some(why) => {
+                record_call(session, &server, &tool.name, &arguments, None, why)?;
+                return Ok(ToolOutput::denied(why));
+            }
+            None => {
+                let (rule, why) = grant
+                    .map(|g| (g.rule.to_string(), g.why.clone()))
+                    .unwrap_or_default();
+                let explanation = if why.is_empty() {
+                    format!("granted by {rule}")
+                } else {
+                    format!("granted by {rule}: {why}")
+                };
+                record_call(
+                    session,
+                    &server,
+                    &tool.name,
+                    &arguments,
+                    Some(true),
+                    &explanation,
+                )?;
+            }
         }
         if !self.loaded.contains(key) {
             bail!("`{key}` has not been declared: search for it first");

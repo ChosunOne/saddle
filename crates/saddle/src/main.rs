@@ -142,6 +142,16 @@ enum Cmd {
 enum McpCmd {
     /// Start each declared and granted server, and say what it offers against what is granted.
     List,
+    /// Call one tool of a declared server, the way the model would, with no conversation around it.
+    Call {
+        /// The server's name, as `[mcp.<name>]` and the grant spell it.
+        server: String,
+        /// The tool's own name, without the `mcp__…` prefix.
+        tool: String,
+        /// The arguments, as one JSON object.
+        #[arg(default_value = "{}")]
+        input: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1210,7 +1220,85 @@ fn mcp_cmd(
 ) -> Result<ExitCode> {
     match cmd {
         McpCmd::List => mcp_list(dir, session, paths, overrides),
+        McpCmd::Call {
+            server,
+            tool,
+            input,
+        } => mcp_call(dir, session, paths, overrides, &server, &tool, &input),
     }
+}
+
+/// `saddle mcp call <server> <tool> '<json>'`: one call, decided and audited exactly as the model's
+/// would be (D111). It is what a person checks a server with before letting a model near it, and it
+/// is the only way to reach a remote server without a conversation to search from first.
+fn mcp_call(
+    dir: &Path,
+    session: &str,
+    paths: &paths::Paths,
+    overrides: &config::Overrides,
+    server: &str,
+    tool: &str,
+    input: &str,
+) -> Result<ExitCode> {
+    let arguments: serde_json::Value =
+        serde_json::from_str(input).with_context(|| format!("`{input}` is not a JSON object"))?;
+    if !arguments.is_object() {
+        bail!("the arguments must be one JSON object, as the model would send them");
+    }
+    let workspace = dir
+        .canonicalize()
+        .map(|abs| paths::find_workspace(&abs))
+        .unwrap_or_else(|_| dir.to_path_buf());
+    let picked = gate_workspace(paths, &workspace, session)?;
+    let id = picked.as_deref().unwrap_or(session);
+    let mut session = Session::open_with(dir, Some(id), overrides)?;
+    let user = UserConfig::load(&session.setup.paths.user_config())?;
+    let agent = session
+        .engine
+        .policy()
+        .grants(&Principal::Agent)
+        .cloned()
+        .context("the policy gives the agent no grants")?;
+    if !agent.mcp.iter().any(|m| m.server == server) {
+        session.close()?;
+        bail!(
+            "`{server}` is not granted: add `mcp = [{{ server = \"{server}\", … }}]` to the policy"
+        );
+    }
+    if !user.mcp.contains_key(server) {
+        session.close()?;
+        bail!("`{server}` has no [mcp.{server}] table in config.toml");
+    }
+    let tmp = session.roots().get(&RootName::tmp()).map(Path::to_path_buf);
+    // The model's own path, not a second one beside it: the registry starts the server, declares
+    // what the grant allows, and decides the call exactly as it does for a model (D108, D112).
+    let mut registry = mcp::registry::Registry::new(
+        agent.mcp.clone(),
+        user.mcp.clone(),
+        session.host_env.clone(),
+        tmp,
+    );
+    let key = format!("mcp__{server}__{tool}");
+    let out = registry.start(server, &mut session).and_then(|()| {
+        registry.declare_server(server);
+        registry.call(&key, &arguments, &mut session)
+    });
+    let code = match &out {
+        Ok(out) if out.ok => {
+            println!("{}", out.content);
+            ExitCode::SUCCESS
+        }
+        Ok(out) => {
+            println!("{}", out.content);
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            println!("{server}  failed: {e:#}");
+            ExitCode::FAILURE
+        }
+    };
+    session.close()?;
+    Ok(code)
 }
 
 fn mcp_list(
@@ -1293,7 +1381,51 @@ struct OneServer<'a> {
     host_env: &'a [(String, String)],
 }
 
+/// One server, opened: whichever transport its table names (D107, D110).
+enum Opened {
+    Stdio(Box<Client>, Option<Bridge>),
+    Http(Box<mcp::http::Client>),
+}
+
 impl OneServer<'_> {
+    fn open(
+        &self,
+        session: &mut Session,
+        grant: &McpGrant,
+        entry: &McpEntry,
+        stdio: Option<&(String, Vec<String>)>,
+    ) -> Result<Opened> {
+        match (entry.transport()?, stdio) {
+            (Transport::Stdio { command, args }, Some(_)) => {
+                // One lowering, shared with the session's registry (D105, D107).
+                let mut spec =
+                    mcp::lower::spec(session, grant, entry, command, args, self.host_env)?;
+                // A server gets the same network a command gets (D79): the relay here, one way out.
+                let bridge = self.tmp.and_then(|dir| Bridge::start(dir).ok());
+                if let Some(bridge) = &bridge {
+                    spec.net = Some(bridge.spec());
+                }
+                Ok(Opened::Stdio(
+                    Box::new(Client::start(&grant.server, self.helper, &spec)?),
+                    bridge,
+                ))
+            }
+            (Transport::Http { url }, _) => {
+                // No child to start, so the host makes the requests itself, decided against the
+                // server's own reach like every other one (D110).
+                let reach = mcp::lower::net_reach(session, grant)?;
+                Ok(Opened::Http(Box::new(mcp::http::Client::start(
+                    &grant.server,
+                    url,
+                    reach,
+                )?)))
+            }
+            (Transport::Stdio { .. }, None) => {
+                bail!("`{}` is a stdio server with no command", grant.server)
+            }
+        }
+    }
+
     fn list(
         &self,
         session: &mut Session,
@@ -1302,17 +1434,8 @@ impl OneServer<'_> {
         stdio: Option<&(String, Vec<String>)>,
     ) -> Result<Vec<String>> {
         let mut denials: Vec<String> = Vec::new();
-        let tools = match (entry.transport()?, stdio) {
-            (crate::mcp::Transport::Stdio { command, args }, Some(_)) => {
-                // One lowering, shared with the session's registry (D105, D107).
-                let mut spec =
-                    mcp::lower::spec(session, grant, entry, command, args, self.host_env)?;
-                // A server gets the same network a command gets (D79): the relay here, one way out.
-                let mut bridge = self.tmp.and_then(|dir| Bridge::start(dir).ok());
-                if let Some(bridge) = &bridge {
-                    spec.net = Some(bridge.spec());
-                }
-                let mut client = Client::start(&grant.server, self.helper, &spec)?;
+        let tools = match self.open(session, grant, entry, stdio)? {
+            Opened::Stdio(mut client, mut bridge) => {
                 let mut service = || {
                     if let Some(bridge) = bridge.as_mut() {
                         denials.extend(bridge.service(session));
@@ -1325,16 +1448,9 @@ impl OneServer<'_> {
                 drop(client);
                 tools
             }
-            (crate::mcp::Transport::Http { url }, _) => {
-                // No child to start, so the listing makes the requests itself, decided against the
-                // server's own reach like every other one (D110).
-                let reach = mcp::lower::net_reach(session, grant)?;
-                let mut client = mcp::http::Client::start(&grant.server, url, reach)?;
+            Opened::Http(mut client) => {
                 client.initialize(session)?;
                 client.tools(session)?
-            }
-            (crate::mcp::Transport::Stdio { .. }, None) => {
-                bail!("`{}` is a stdio server with no command", grant.server)
             }
         };
         let mut out = vec![format!("{}  {} tool(s)", grant.server, tools.len())];
