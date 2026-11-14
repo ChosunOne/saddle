@@ -6,6 +6,8 @@ use crate::{Grants, RootName, Scope};
 pub enum DelegationError {
     #[error("scope `{0}` is not implemented by the read-only plugin runtime")]
     Unsupported(Scope),
+    #[error("plugin asks for scope `{0}`, which the agent does not hold")]
+    Scope(Scope),
     #[error("plugin asks to read root `{0}`, which the agent does not hold")]
     Root(RootName),
     #[error("could not combine grant exclusions: {0}")]
@@ -18,8 +20,11 @@ pub enum DelegationError {
 /// check before their scopes can be linked; unsupported grants are never silently ignored.
 pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationError> {
     for scope in plugin.scopes() {
-        if !matches!(scope, Scope::FsRead | Scope::Tool) {
+        if !matches!(scope, Scope::FsRead | Scope::Tool | Scope::TranscriptRead) {
             return Err(DelegationError::Unsupported(scope));
+        }
+        if scope == Scope::TranscriptRead && !agent.scopes().contains(&scope) {
+            return Err(DelegationError::Scope(scope));
         }
     }
     let mut out = Grants {
@@ -134,6 +139,29 @@ mod tests {
         assert!(matches!(
             read_tool(&agent, &plugin),
             Err(DelegationError::Unsupported(Scope::Exec))
+        ));
+    }
+
+    #[test]
+    fn transcript_reach_is_explicit_and_cannot_come_from_a_sibling() {
+        let (agent, plugin) = grants("[agent]\ntranscript-read={}\n[plugin.reader]\ntool={}\n");
+        assert!(
+            !read_tool(&agent, &plugin)
+                .unwrap()
+                .scopes()
+                .contains(&Scope::TranscriptRead)
+        );
+        let (agent, plugin) =
+            grants("[agent]\ntranscript-read={}\n[plugin.reader]\ntool={}\ntranscript-read={}\n");
+        let bounded = read_tool(&agent, &plugin).unwrap();
+        assert!(bounded.scopes().contains(&Scope::TranscriptRead));
+        assert!(bounded.fs_read.is_empty());
+        let (agent, plugin) = grants(
+            "[plugin.sibling]\ntranscript-read={}\n[plugin.reader]\ntool={}\ntranscript-read={}\n",
+        );
+        assert!(matches!(
+            read_tool(&agent, &plugin),
+            Err(DelegationError::Scope(Scope::TranscriptRead))
         ));
     }
 }

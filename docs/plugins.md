@@ -145,10 +145,10 @@ open the supplied name or perform image decoding/recompression. Only one image p
 accepted. Failed/trapped calls publish no images, and saved image data/provenance survives replay.
 The 64 KiB text result limit is not enlarged to accommodate image bytes.
 
-This is an incremental migration, not a replacement of built-in `read` yet. Shared tool-visible
-directories and a person-controlled tool-selection/default
-grant story still need parity work. Standard plugins are not silently enabled or given the agent's
-authority merely because their source ships in the repository.
+This is an incremental migration toward replacing built-in `read`, not a permanent implementation
+picker. Shared tool-visible directories and standard-component delivery still need work. Standard
+plugins are not silently enabled or given the agent's authority merely because their source ships
+in the repository.
 
 ## Standard directory listing plugin
 
@@ -237,23 +237,60 @@ cargo nextest run --test plugins --run-ignored only \
   -E 'test(standard_search_components_walk_and_match_without_bypassing_exclusions)'
 ```
 
+## Standard transcript-query component
+
+The `session_query` guest owns the schema and presentation; core `transcript` services own the
+active-branch snapshot, SQL authorizer, execution and bounds (D137). The plugin has no database or
+filesystem access. Build it with:
+
+```sh
+cargo build -p saddle-tools --example session_query --target wasm32-unknown-unknown --release
+mkdir -p target/session-query-plugin
+cargo run -p saddle-loader --example componentize -- \
+  target/wasm32-unknown-unknown/release/examples/session_query.wasm \
+  target/session-query-plugin/session_query.component.wasm
+cp crates/saddle-tools/plugins/session_query/plugin.toml target/session-query-plugin/plugin.toml
+cargo run --bin saddle -- plugin install target/session-query-plugin/plugin.toml
+```
+
+Enable and pin it as above under `[plugins.transcript]`, and explicitly grant its services:
+
+```toml
+[plugin.transcript]
+tool = {}
+transcript-read = {}
+```
+
+The agent must also hold `transcript-read = {}`. No `fs-read` grant is needed. Its namespaced tool
+is `plugin__transcript__session_query`, taking `{"sql":"SELECT ordinal,role,text FROM messages LIMIT 10"}`.
+The SDK entry point is `query_transcript(sql)`: SQL is capped at 16 KiB, results at 100 rows/50 KiB,
+with `columns`, `rows` and `truncated` fields. Only `messages`, `requests` and `reasoning` views of
+the active branch are queryable. Saved-database tables, other sessions, writes and file functions
+remain inaccessible. With no active conversation, it returns an error instead of choosing one.
+
+Services are independently linked by each plugin's bounded grants. Enabling transcript access does
+not enable filesystem access or vice versa; an omitted service is unavailable even when the agent
+or a sibling plugin holds it. Compiling against SDK bindings does not grant their authority.
+
 ## Built-in migration tracking
 
 No standard component is silently aliased over a built-in or given implicit grants.
 
 | Tool | Guest implementation | Remaining parity/adapters |
 | --- | --- | --- |
-| `read` | native-style text pagination/totals, deep offsets, bounded range reads and image results | managed tool paths, scans beyond resource bounds, standard-tool selection |
+| `read` | native-style text pagination/totals, deep offsets, bounded range reads and explicit image mode | managed tool paths, scans beyond resource bounds, standard-component delivery |
 | `ls` | filtered directory pages, suffixes, sorted output | managed tool paths; bounded/non-UTF-8 listing differences |
 | `find`, `grep` | guest traversal, shared ignore syntax, glob/regex matching | large-tree/performance edges, host-path display and unreadable-file metadata |
 | `write`, `edit`, `patch` | not migrated | scoped mutation/atomic transaction services, reserved paths, preflight all patch paths |
 | `bash` | not migrated | delegated exec sandbox, bounded streaming, cancellation, environment filtering and reservation restore |
 | `fetch`, `websearch` | not migrated | bounded attributed network/search adapters, redirects, protected credentials and grant narrowing |
-| `session_query` | not migrated | branch-only, bounded transcript SQL service under explicit delegated `transcript-read` |
+| `session_query` | guest schema/presentation over branch-only, bounded transcript SQL under delegated `transcript-read` | standard-component delivery and native-entry-point removal |
 
-All replacements also need a person-controlled standard-tool selection/default configuration story
-before native fallbacks can be removed. Remaining adapters must act as the plugin principal, not
-reuse a built-in's hard-coded agent identity. D65/D66 tool-visible paths remain distinct from roots.
+The target is replacement, not parallel selectable implementations: native entry points go away as
+parity and standard-component delivery land. Remaining adapters must act as the plugin principal,
+not reuse a built-in's hard-coded agent identity. D65/D66 tool-visible paths remain distinct from
+roots; their SDK adapter must reuse the existing configuration rather than require another directory
+declaration. That adapter is not implemented yet.
 
 ## Authority and provenance
 
@@ -287,7 +324,7 @@ These labels are provenance, not permission to follow instructions found in a pl
   filesystem adapter. Its worker asks the session thread over a bounded channel; the loader does
   not own a second policy engine or depend on `Session`.
 
-Only `fs-read` and `tool` grants are supported by this runtime. Other scopes fail closed. The
+Only `fs-read`, `transcript-read` and `tool` grants are supported by this runtime. Other scopes fail closed. The
 component classifier describes a wider planned ABI; that does not make its adapters available.
 Descriptions are capped at 1,000 characters, schemas at 16 KiB and configured plugins at 16.
 Schemas must parse as JSON objects with an object input type; the provider may enforce further

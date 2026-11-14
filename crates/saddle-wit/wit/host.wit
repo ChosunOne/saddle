@@ -1,5 +1,10 @@
 package saddle:host@0.1.0;
 
+// A query over the active branch, never a handle to the saved database.
+interface transcript-read {
+    query: func(sql: string) -> result<string, string>;
+}
+
 interface fs-read {
     record path {
         root: string,

@@ -1564,7 +1564,9 @@ impl Agent {
                     ),
                     _ if ui.cancelled() => ToolOutput::err("not run: cancelled by the user"),
                     _ => {
-                        if call.name == "session_query" {
+                        if call.name == "session_query"
+                            || session.plugins.reads_transcript(&call.name)
+                        {
                             session.query_conversation = self.saved.clone();
                             session.query_snapshot = match (&self.store, &self.saved) {
                                 (Some(store), Some(id)) => Some(store.snapshot(id)?),

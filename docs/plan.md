@@ -3026,6 +3026,32 @@ header inspection still determines image metadata for attachments, but never cho
 Native read and existing compiled plugins are unchanged; rebuilt standard readers expose this schema.
 This changes content handling, not filesystem authority, image emission grants or resource bounds.
 
+**D137.** Standard plugins replace native tools once parity and standard-component delivery are in
+place; they are not a permanent alternative selected by an implementation picker. This supersedes
+D131's selection/default-grant prerequisite as a product direction, not its prohibition on implicit
+plugin authority. Native entry points are temporary migration adapters. Tool schemas, workflow and
+presentation belong in guests; privileged mechanisms remain core services exposed through gated SDK
+interfaces. Existing D66 directory declarations must be reused by their future SDK adapter, not
+copied into new roots or a second directory allowlist. Per-plugin service access remains explicit.
+
+The additive `saddle:host/transcript-read@0.1.0` interface accepts a SQL string and returns bounded
+JSON result text or an error. It requires the plugin's explicit `transcript-read` grant, the manifest
+ceiling and the agent's same capability; neither `tool`, filesystem grants nor a sibling's grants
+supply it. The linker offers this interface only to that bounded principal. SDK bindings are not
+authority: importing a service without its grant fails before initialization. Filesystem-only
+components do not acquire a transcript dependency merely by using the SDK.
+
+`saddle::transcript` owns active-branch, in-memory query execution and is shared by the temporary
+native adapter and the standard transcript guest. It exposes no saved-database handle, session
+selector, arbitrary tables, writes or file functions. The model loop supplies only the current
+branch snapshot, including pre-compaction history, to loaded tools holding this service, and clears
+it after the call. SQL is capped at 16 KiB; results at 100 rows/50 KiB, including escaped column
+names. D92/D94/D98's authorizer, expression and execution limits still apply, with deadline and
+cancellation checks during snapshot materialization and query execution. Every dispatched query is
+decided and audited by the session's engine under the host-assigned principal and call id. Host and
+audit failures remain fatal; standalone calls report no active conversation. The guest owns the
+tool schema and result presentation, not SQL authorization or branch selection.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

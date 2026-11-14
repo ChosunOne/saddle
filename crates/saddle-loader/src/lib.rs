@@ -19,6 +19,7 @@ use saddle_wit::saddle::host::fs_paths::{self, Host as PathsHost};
 use saddle_wit::saddle::host::fs_read::{self, Failure, Host, Path};
 use saddle_wit::saddle::host::fs_read_range::{self, Chunk, Host as RangeHost};
 use saddle_wit::saddle::host::tool_result::{self, Host as ResultHost, ImageInfo};
+use saddle_wit::saddle::host::transcript_read::{self, Host as TranscriptHost};
 use sha2::{Digest, Sha256};
 use wasmtime::component::types::{Component as ComponentType, ComponentItem};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
@@ -29,6 +30,8 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 pub const MAX_FILE_BYTES: usize = 64 * 1024;
 pub const MAX_DIRECTORY_ENTRIES: usize = 128;
 pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+pub const MAX_QUERY_BYTES: usize = 16 * 1024;
+pub const MAX_QUERY_RESULT_BYTES: usize = 50 * 1024;
 const MAX_COMPONENT_BYTES: usize = 4 * 1024 * 1024;
 const TICK: Duration = Duration::from_millis(10);
 
@@ -110,6 +113,13 @@ impl Invocation {
 /// root-relative paths and symlinks, and bound/cancel I/O independently of Wasm's epoch deadline.
 /// `Err` is a host failure (including audit failure), not a guest-visible policy denial.
 pub trait HostServices: Send + 'static {
+    fn query_transcript(
+        &mut self,
+        _call: &Invocation,
+        _sql: String,
+    ) -> anyhow::Result<Result<String, String>> {
+        Ok(Err("host does not implement transcript queries".into()))
+    }
     fn emit_image(
         &mut self,
         _call: &Invocation,
@@ -186,6 +196,22 @@ impl<H: HostServices> Host for State<H> {
         let result = self.host.read_file(&self.call, path)?;
         if matches!(&result, Ok(bytes) if bytes.len() > MAX_FILE_BYTES) {
             return Ok(Err(Failure::TooLarge));
+        }
+        Ok(result)
+    }
+}
+
+impl<H: HostServices> TranscriptHost for State<H> {
+    fn query(&mut self, sql: String) -> anyhow::Result<Result<String, String>> {
+        if self.call.cancelled() || Instant::now() >= self.call.deadline {
+            return Err(anyhow!("plugin call cancelled or timed out"));
+        }
+        if sql.len() > MAX_QUERY_BYTES {
+            return Ok(Err("transcript SQL exceeds 16 KiB".into()));
+        }
+        let result = self.host.query_transcript(&self.call, sql)?;
+        if matches!(&result, Ok(value) | Err(value) if value.len() > MAX_QUERY_RESULT_BYTES) {
+            return Ok(Err("transcript result exceeds 50 KiB".into()));
         }
         Ok(result)
     }
@@ -368,6 +394,7 @@ impl Loader {
                     | "saddle:host/fs-paths@0.1.0"
                     | "saddle:host/fs-list@0.1.0"
                     | "saddle:host/tool-result@0.1.0"
+                    | "saddle:host/transcript-read@0.1.0"
             ) && !ambient::supports(name)
             {
                 return Err(Error::Refused(format!(
@@ -390,6 +417,10 @@ impl Loader {
         if scopes.contains(&Scope::Tool) {
             tool_result::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
                 .map_err(runtime("linking tool-result"))?;
+        }
+        if scopes.contains(&Scope::TranscriptRead) {
+            transcript_read::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+                .map_err(runtime("linking transcript-read"))?;
         }
         check_tool_types(engine, &ty)?;
         let pre = linker
@@ -672,6 +703,99 @@ mod tests {
                 .is_err()
         );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    struct QueryHost {
+        calls: Arc<AtomicUsize>,
+        result: Result<String, String>,
+    }
+    impl HostServices for QueryHost {
+        fn read_file(
+            &mut self,
+            _: &Invocation,
+            _: Path,
+        ) -> anyhow::Result<Result<Vec<u8>, Failure>> {
+            panic!("transcript-only plugin must not read files");
+        }
+        fn query_transcript(
+            &mut self,
+            call: &Invocation,
+            _: String,
+        ) -> anyhow::Result<Result<String, String>> {
+            assert!(call.grants().fs_read.is_empty());
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.result.clone())
+        }
+    }
+
+    #[test]
+    fn transcript_adapter_bounds_input_and_both_success_and_error_outputs() {
+        let (_dir, agent, plugin) =
+            grants("[agent]\ntranscript-read={}\n[plugin.reader]\ntool={}\ntranscript-read={}\n");
+        let manifest = Manifest::parse("id='reader'\nversion='0.1.0'\ncomponent='query.wasm'\nscopes=['tool','transcript-read']\n").unwrap();
+        let bytes = wat::parse_str(include_str!("fixtures/transcript-tool.wat")).unwrap();
+        let prepared = Loader::new()
+            .unwrap()
+            .prepare::<QueryHost>(&manifest, &agent, &plugin, &bytes, Limits::default())
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut store = prepared
+            .store(
+                QueryHost {
+                    calls: calls.clone(),
+                    result: Ok("ok".into()),
+                },
+                cancelled(),
+            )
+            .unwrap();
+        assert!(
+            TranscriptHost::query(store.data_mut(), "x".repeat(MAX_QUERY_BYTES + 1))
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            TranscriptHost::query(store.data_mut(), "SELECT 1".into())
+                .unwrap()
+                .unwrap(),
+            "ok"
+        );
+        for result in [
+            Ok("x".repeat(MAX_QUERY_RESULT_BYTES + 1)),
+            Err("x".repeat(MAX_QUERY_RESULT_BYTES + 1)),
+        ] {
+            store.data_mut().host.result = result;
+            assert!(
+                TranscriptHost::query(store.data_mut(), "SELECT 1".into())
+                    .unwrap()
+                    .unwrap_err()
+                    .contains("50 KiB")
+            );
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn transcript_import_without_its_grant_fails_before_initialization() {
+        let (_dir, agent, plugin) =
+            grants("[agent]\ntranscript-read={}\n[plugin.reader]\ntool={}\n");
+        let bytes = wat::parse_str(include_str!("fixtures/transcript-tool.wat").replace(
+            ";; initialization-probe",
+            "(func $start unreachable) (start $start)",
+        ))
+        .unwrap();
+        let why = refusal(Loader::new().unwrap().prepare::<NoHost>(
+            &manifest(),
+            &agent,
+            &plugin,
+            &bytes,
+            Limits::default(),
+        ));
+        assert!(
+            why.contains("transcript-read") && why.contains("not granted"),
+            "{why}"
+        );
+        assert!(!why.contains("unreachable"), "{why}");
     }
 
     struct NoHost;

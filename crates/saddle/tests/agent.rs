@@ -1006,6 +1006,96 @@ fn standard_read_plugin_sends_file_images_to_the_model() {
 }
 
 #[test]
+fn plugin_transcript_queries_use_the_active_branch_and_plugin_identity_without_files() {
+    for (sql, expected) in [
+        (
+            "SELECT text FROM messages WHERE role='user'",
+            "\"rows\":[[\"remember teal\"]]",
+        ),
+        ("DELETE FROM messages", "session query failed"),
+    ] {
+        let (base, seen) = serve(vec![
+            sse_response(&openai_sse(
+                "",
+                &[("query", "plugin__reader__session_query", json!({}))],
+            )),
+            sse_response(&openai_sse("done", &[])),
+        ]);
+        let env = Env::new(Api::Openai, &base);
+        env.write_override("[agent]\ntranscript-read={}\n");
+        plugin_fixture::configure_transcript(
+            &env.xdg.path().join("config/saddle/config.toml"),
+            &plugin_fixture::transcript_query(sql),
+            "tool={}\ntranscript-read={}",
+        );
+        let out = env.saddle(&["run", "remember teal"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let seen = seen.lock().unwrap();
+        let messages = seen[1].body["messages"].as_array().unwrap();
+        let result = messages.iter().find(|m| m["role"] == "tool").unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(result.contains(expected), "{result}");
+        assert!(result.contains("plugin-output"), "{result}");
+        let audit = records(&env.audit_log());
+        let queries: Vec<_> = audit
+            .iter()
+            .filter(|r| r["scope"] == "transcript-read")
+            .collect();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0]["principal"], "plugin.reader");
+        assert_eq!(queries[0]["allow"], true);
+        assert!(queries[0]["args"]["call_id"].is_string());
+        assert!(
+            !audit
+                .iter()
+                .any(|r| r["principal"] == "plugin.reader" && r["scope"] == "fs-read")
+        );
+        assert!(
+            env.saddle(&["audit", "verify", env.audit_log().to_str().unwrap()])
+                .status
+                .success()
+        );
+    }
+}
+
+#[test]
+#[ignore = "build the standard session_query component first; see docs/plugins.md"]
+fn standard_transcript_component_queries_the_active_branch_without_filesystem_grants() {
+    let (base, seen) = serve(vec![
+        sse_response(&openai_sse(
+            "",
+            &[(
+                "query",
+                "plugin__reader__session_query",
+                json!({"sql":"SELECT text FROM messages WHERE role='user'"}),
+            )],
+        )),
+        sse_response(&openai_sse("done", &[])),
+    ]);
+    let env = Env::new(Api::Openai, &base);
+    env.write_override("[agent]\ntranscript-read={}\n");
+    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/session-query-plugin/session_query.component.wasm");
+    plugin_fixture::configure_transcript(
+        &env.xdg.path().join("config/saddle/config.toml"),
+        &fs::read(component).expect("build the standard session_query component first"),
+        "tool={}\ntranscript-read={}",
+    );
+    let out = env.saddle(&["run", "remember amber"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let seen = seen.lock().unwrap();
+    let messages = seen[1].body["messages"].as_array().unwrap();
+    let result = messages.iter().find(|m| m["role"] == "tool").unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(
+        result.contains("\"rows\":[[\"remember amber\"]]"),
+        "{result}"
+    );
+}
+
+#[test]
 fn failed_plugins_are_not_advertised_and_do_not_remove_native_tools() {
     let (base, seen) = serve(vec![sse_response(&openai_sse("ok", &[]))]);
     let env = Env::new(Api::Openai, &base);

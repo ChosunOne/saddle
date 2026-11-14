@@ -30,5 +30,9 @@ crate-type = ["cdylib"]
 name = "grep"
 crate-type = ["cdylib"]
 
+[[example]]
+name = "session_query"
+crate-type = ["cdylib"]
+
 [lints]
 workspace = true

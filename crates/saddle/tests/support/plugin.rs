@@ -9,6 +9,33 @@ use base64::engine::general_purpose::STANDARD;
 use saddle_policy::audit::sha256_hex;
 
 const READER: &str = include_str!("../../../saddle-loader/src/fixtures/read-tool.wat");
+const TRANSCRIPT: &str = include_str!("../../../saddle-loader/src/fixtures/transcript-tool.wat");
+
+pub fn transcript_query(sql: &str) -> Vec<u8> {
+    let escaped: String = sql.bytes().map(|byte| format!("\\{byte:02x}")).collect();
+    wat::parse_str(
+        TRANSCRIPT
+            .replace(
+                ";; initialization-probe",
+                &format!("(data (i32.const 256) \"{escaped}\")"),
+            )
+            .replace(
+                "local.get $sql local.get $len i32.const 32 call $query",
+                &format!(
+                    "i32.const 256 i32.const {} i32.const 32 call $query",
+                    sql.len()
+                ),
+            ),
+    )
+    .unwrap()
+}
+
+#[allow(dead_code)] // shared with CLI tests, which configure an existing fixture installation.
+pub fn configure_transcript(config: &Path, bytes: &[u8], grants: &str) {
+    configure(config, bytes, grants);
+    fs::write(config.parent().unwrap().join("plugins/reader/plugin.toml"),
+        "id='reader'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes=['tool','transcript-read']\n").unwrap();
+}
 
 pub fn reader(path: &str) -> Vec<u8> {
     reader_on_root("workspace", path)

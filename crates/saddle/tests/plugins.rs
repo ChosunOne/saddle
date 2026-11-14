@@ -83,6 +83,59 @@ fn no_file_reads(env: &Env) {
 }
 
 #[test]
+fn transcript_plugins_need_both_grants_and_never_open_the_saved_database() {
+    for (agent, plugin, expected) in [
+        (
+            true,
+            "tool={}\ntranscript-read={}",
+            "no saved conversation is active",
+        ),
+        (true, "tool={}", "not granted"),
+        (false, "tool={}\ntranscript-read={}", "agent does not hold"),
+    ] {
+        let env = Env::new(&fixture::transcript_query("SELECT * FROM messages"), plugin);
+        let manifest = env
+            .config()
+            .parent()
+            .unwrap()
+            .join("plugins/reader/plugin.toml");
+        fs::write(manifest, "id='reader'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes=['tool','transcript-read']\n").unwrap();
+        if agent {
+            env.edit("[agent]\n", "[agent]\ntranscript-read={}\n");
+        }
+        let listing = env.run(&["plugin", "list"]);
+        assert!(listing.status.success(), "{}", text(&listing));
+        if agent && plugin.contains("transcript-read") {
+            let out = env.run(&["plugin", "call", "reader", "{}"]);
+            assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+            assert!(text(&out).contains(expected), "{}", text(&out));
+            assert!(env.records().iter().any(|r| r["scope"] == "transcript-read"
+                && r["principal"] == "plugin.reader"
+                && r["allow"] == true
+                && r["args"]["call_id"].is_string()));
+        } else {
+            assert!(text(&listing).contains(expected), "{}", text(&listing));
+            assert!(
+                !env.records()
+                    .iter()
+                    .any(|r| r["scope"] == "transcript-read")
+            );
+        }
+        assert!(
+            !env.records()
+                .iter()
+                .any(|r| r["principal"] == "plugin.reader" && r["scope"] == "fs-read")
+        );
+        let log = env.log();
+        assert!(
+            env.run(&["audit", "verify", log.to_str().unwrap()])
+                .status
+                .success()
+        );
+    }
+}
+
+#[test]
 fn enabled_plugin_is_callable_through_both_cli_paths_with_audited_identity() {
     let env = Env::new(&fixture::reader("file"), fixture::GRANTS);
     fs::write(env.ws().join("file"), "hello from a component").unwrap();

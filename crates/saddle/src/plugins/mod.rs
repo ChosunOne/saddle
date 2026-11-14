@@ -81,6 +81,18 @@ impl Registry {
         self.loaded.values().map(|l| l.definition.clone()).collect()
     }
 
+    /// requests a branch snapshot only for a loaded tool holding the transcript service.
+    pub fn reads_transcript(&self, name: &str) -> bool {
+        self.loaded.values().any(|loaded| {
+            loaded.definition.name == name
+                && loaded
+                    .prepared
+                    .grants()
+                    .scopes()
+                    .contains(&Scope::TranscriptRead)
+        })
+    }
+
     pub fn report(&self) -> Vec<String> {
         self.status
             .iter()

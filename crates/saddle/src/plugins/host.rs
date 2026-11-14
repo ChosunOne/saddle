@@ -27,7 +27,7 @@ use super::filesystem;
 use crate::provider::Image;
 use crate::session::Session;
 use crate::tools::fs::resolve_beneath;
-use crate::{cancel, fs_access};
+use crate::{cancel, fs_access, transcript};
 
 pub enum Job {
     Describe,
@@ -55,6 +55,12 @@ impl StdError for Fatal {
 type HostReply<T, E = Failure> = Result<Result<T, E>, String>;
 type FileReply = HostReply<Chunk>;
 enum Event {
+    Query {
+        who: Principal,
+        deadline: Instant,
+        sql: String,
+        answer: SyncSender<HostReply<String, String>>,
+    },
     Read {
         who: Principal,
         deadline: Instant,
@@ -90,6 +96,25 @@ pub struct Host {
     events: SyncSender<Event>,
 }
 impl HostServices for Host {
+    fn query_transcript(
+        &mut self,
+        call: &Invocation,
+        sql: String,
+    ) -> Result<Result<String, String>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        self.events
+            .send(Event::Query {
+                who: call.principal().clone(),
+                deadline: call.deadline(),
+                sql,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        result
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(|_| anyhow!("plugin transcript request timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
     fn emit_image(
         &mut self,
         call: &Invocation,
@@ -228,6 +253,20 @@ pub fn execute(
             cancelled.store(true, Ordering::Relaxed);
         }
         match pending.recv_timeout(Duration::from_millis(10)) {
+            Ok(Event::Query {
+                who,
+                deadline,
+                sql,
+                answer,
+            }) => {
+                respond(
+                    transcript::execute(session, &who, &sql, Some(call), Some(deadline))
+                        .map(|result| result.map(|value| value.to_string())),
+                    answer,
+                    &mut fatal,
+                    &cancelled,
+                );
+            }
             Ok(Event::Read {
                 who,
                 deadline,

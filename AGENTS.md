@@ -22,7 +22,7 @@ because it is followed.
 | `crates/saddle-wit` | canonical read-tool WIT and generated host bindings (D127) |
 | `crates/saddle-loader` | actual component inspection, bounded delegation, grant-shaped pre-linking, fresh bounded instances and a narrow host-services trait, without a dependency on the binary's session (D126, D127) |
 | `crates/saddle-sdk` | guest bindings from the same WIT and a read-only example; no `std::fs` authority (D12, D127) |
-| `crates/saddle-tools` | standard guest tools: explicitly selected text/image reads, streaming text pagination, listing, traversal and glob/regex search; uses bounded host byte ranges/filtered metadata and validated image emission, not native filesystem access (D131–D136) |
+| `crates/saddle-tools` | standard guest tools: explicitly selected text/image reads, streaming text pagination, listing, traversal, glob/regex search and transcript queries; uses bounded, individually gated SDK services, not native filesystem/database access (D131–D137) |
 | `crates/saddle-ignore` | authority-free ignore-file parsing, shared by native search/skill discovery and guest search components (D68, D133) |
 | `crates/saddle-sandbox` | applies a sandbox spec to the current process and execs the target, including the command's own network namespace and the relay in it (D79); starts a long-lived child whose stdin and stdout belong to the caller, with the spec on fd 3 (D106); also builds the `saddle-sandbox` helper binary used by its own tests |
 | `crates/saddle` | the binary: built-in tools, model providers, the model loop, the TUI |
@@ -35,6 +35,7 @@ Inside `crates/saddle/src`:
 | `session` | opening the workspace, resolving roots, the policy engine and audit log for a session |
 | `plugins` | protected/digest-pinned loading, tool registration, provenance and CLI installation (D128); worker-to-session host calls through the one engine/audit log, reload revocation and bounded reads (D129) |
 | `fs_access` | pinned no-follow directory/file opens for session roots and plugin artifacts/reads (D129) |
+| `transcript` | branch-only read-only SQL over messages, request usage and reasoning, shared by the gated SDK service and temporary native adapter; no saved-database access (D92, D94, D98, D137) |
 | `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch`, `tools/websearch`, `tools/session_query` | the eleven built-in tools (`fetch` is host-side network, D39; `patch` is D56; `websearch` asks the provider, or Exa, D82; `session_query` is branch-only read-only SQL over messages, request usage and reasoning, D92, D94, D98) |
 | `net` | the command network (D79): `hello` reads a hostname out of a TLS handshake, `head` out of a `CONNECT` line or a `Host` header, `proxy` decides and carries a connection, `bridge` joins the proxy's threads to the one engine and the one audit log |
 | `tools/diff` | line diffs of edited files, for the transcript only — the model never sees them |
@@ -296,7 +297,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D136 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D137 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

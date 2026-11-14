@@ -3,6 +3,7 @@
 pub mod listing;
 mod pagination;
 pub mod search;
+pub mod transcript;
 pub use pagination::read_with;
 
 use saddle_sdk::ImageInfo;

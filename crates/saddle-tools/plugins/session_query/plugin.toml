@@ -1,0 +1,4 @@
+id = "transcript"
+version = "0.1.0"
+component = "session_query.component.wasm"
+scopes = ["tool", "transcript-read"]

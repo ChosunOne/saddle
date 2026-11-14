@@ -28,6 +28,7 @@ mod skills;
 mod store;
 mod term;
 mod tools;
+mod transcript;
 mod tui;
 
 use std::io::{BufRead, IsTerminal, Write, stdin};

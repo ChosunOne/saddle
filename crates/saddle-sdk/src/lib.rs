@@ -14,3 +14,4 @@ pub use saddle::host::fs_paths::resolve_path;
 pub use saddle::host::fs_read::{Failure, Path as FilePath, read_file};
 pub use saddle::host::fs_read_range::{Chunk, read_range};
 pub use saddle::host::tool_result::{ImageInfo, emit_image};
+pub use saddle::host::transcript_read::query as query_transcript;
