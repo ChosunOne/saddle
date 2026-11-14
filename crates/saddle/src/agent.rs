@@ -1801,15 +1801,18 @@ pub fn base_prompt(session: &Session, context: &[ContextFile]) -> String {
     s.push_str(&mcp_section(session));
     match &session.sandbox {
         Ok(_) => s.push_str(
-            // D65: two different sets, said plainly, because they are not the same and a model
+            // D65, D79: two different sets, said plainly, because they are not the same and a model
             // that assumes they are will either give up on a file bash can read or be surprised
             // that read refuses one.
-            "\nCommands run in a sandbox: no network access, killed when their time limit passes. A \
+            "\nCommands run in a sandbox and are killed when their time limit passes. Their network \
+             requests go through a proxy checked against the same net grants as fetch, so builds \
+             may download dependencies and commands may reach web services where those grants \
+             allow it. If the network namespace or relay cannot start, commands run with no \
+             network instead; saddle check reports network availability. A \
              command sees more of the machine than these tools do -- a toolchain, and your home \
              directory with the credential stores left out -- while read, ls, find, grep, write and \
              edit see only the roots below. So when a tool refuses a path that a command can read, \
-             that is the expected difference and a command is the way to read it. Do not try to \
-             download packages or call web services from a command.\n",
+             that is the expected difference and a command is the way to read it.\n",
         ),
         Err(reason) => {
             let _ = writeln!(s, "\nbash is unavailable in this session: {reason}.");

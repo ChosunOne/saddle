@@ -832,6 +832,65 @@ fn cancel_is_immediate_while_the_server_is_silent() {
 }
 
 #[test]
+fn the_prompt_and_tool_descriptions_explain_policy_checked_command_networking() {
+    // D79: a prompt that still claims D19's unconditional no-network boundary prevents builds
+    // from even trying an allowed download. Check the actual request, not just the source strings.
+    let (base, seen) = serve(vec![sse_response(&openai_sse("ok", &[]))]);
+    let env = Env::new(Api::Openai, &base);
+    env.write_override("\n[agent]\nnet = [{ host = \"registry.example\" }]\n");
+    let out = env.saddle(&["run", "hi"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+
+    let seen = seen.lock().unwrap();
+    let body = &seen[0].body;
+    let system = body["messages"][0]["content"].as_str().unwrap();
+    if !system.contains("bash is unavailable in this session") {
+        for required in [
+            "proxy checked against the same net grants as fetch",
+            "builds may download dependencies",
+            "If the network namespace or relay cannot start",
+            "commands run with no network instead",
+            "A command sees more",
+        ] {
+            assert!(system.contains(required), "missing {required}: {system}");
+        }
+    }
+    for stale in [
+        "Commands run in a sandbox: no network access",
+        "Do not try to download packages",
+        "call web services from a command",
+    ] {
+        assert!(!system.contains(stale), "stale instruction: {system}");
+    }
+
+    let tools = body["tools"].as_array().unwrap();
+    let description = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t["function"]["name"] == name)
+            .unwrap()["function"]["description"]
+            .as_str()
+            .unwrap()
+    };
+    let bash = description("bash");
+    assert!(bash.contains("same net grants as fetch"), "{bash}");
+    assert!(bash.contains("Builds may download dependencies"), "{bash}");
+    assert!(bash.contains("with no network instead"), "{bash}");
+    assert!(!bash.contains("sandbox: no network"), "{bash}");
+    assert!(
+        !bash.contains("files limited to the granted roots"),
+        "{bash}"
+    );
+
+    let fetch = description("fetch");
+    assert!(
+        fetch.contains("bash networking is governed by the same net grants"),
+        "{fetch}"
+    );
+    assert!(!fetch.contains("never has network access"), "{fetch}");
+}
+
+#[test]
 fn the_prompt_names_the_servers_and_says_whose_words_a_result_is() {
     // D120: the model cannot search for what it does not know exists, so a granted server is one
     // line in the prompt — the person's description, never the server's — and a result is labelled

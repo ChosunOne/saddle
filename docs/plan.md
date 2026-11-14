@@ -1767,6 +1767,11 @@ sentence of D28 and D19's no-network rule; both remain as the fallback described
 - **No new vocabulary.** The bridge is plumbing and carries no authority: `net` grants are the only
   authority, checked per request, exactly as `fetch` checks them (D39). There is no `exec`-level
   switch, so no policy can grant a network that bypasses the grants.
+- **The model is told the same boundary.** The generated prompt and the `bash` and `fetch` tool
+  descriptions say that commands can download dependencies and reach services where `net` grants
+  allow it, and that namespace or relay failure falls back to no network. They must not retain
+  D19's unconditional no-network claim or prohibit downloads that D79 permits. Filesystem wording
+  distinguishes a command's sandbox paths from the file tools' roots (D65).
 - **The command's own loopback is free.** It is its own, it cannot leave, and no grant is asked for.
   The *host's* loopback and the network behind it are unchanged: reachable only by a grant that names
   that address, so `*` still does not open them (D40).

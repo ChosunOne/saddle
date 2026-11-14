@@ -278,10 +278,13 @@ pub fn definitions() -> Vec<ToolDef> {
             name: "bash".into(),
             description: "Run a shell command with `sh -c` in the workspace root and return its \
                           exit code, stdout and stderr. Use it for builds, tests and git. The \
-                          command runs in a sandbox: no network, \
-                          files limited to the granted roots, a time limit, and background \
+                          command runs in a sandbox: filesystem access is restricted, network \
+                          requests go through a proxy checked against the same net grants as \
+                          fetch, a time limit applies, and background \
                           processes are killed when it exits. Output past 256 KiB per stream is \
-                          cut."
+                          cut. Builds may download dependencies where the net grants allow it. \
+                          If the network namespace or relay cannot start, the command runs \
+                          with no network instead."
                 .into(),
             schema: json!({
                 "type": "object",
@@ -300,10 +303,10 @@ pub fn definitions() -> Vec<ToolDef> {
             name: "fetch".into(),
             description: "Fetch one http or https URL and return its status, content type and \
                           body as text. The host makes the request, so it needs a net grant for \
-                          that host; `bash` never has network access, so use this rather than \
-                          curl. Only GET, and the body is cut at 100 KiB. A key or other secret \
-                          belongs in `headers`; it is never written to the audit log or shown \
-                          back to you."
+                          that host. Use this for a known URL; bash networking is governed by \
+                          the same net grants. Only GET, and the body is cut at 100 KiB. A key \
+                          or other secret belongs in `headers`; it is never written to the \
+                          audit log or shown back to you."
                 .into(),
             schema: json!({
                 "type": "object",
