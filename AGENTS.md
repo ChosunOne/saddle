@@ -384,7 +384,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D153 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D154 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

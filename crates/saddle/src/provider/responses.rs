@@ -87,6 +87,8 @@ pub fn body(cfg: &ProviderConfig, conv: &Conversation<'_>) -> Value {
                 "name": t.name,
                 "description": t.description,
                 "parameters": t.schema,
+                // D154: Responses otherwise normalizes optional fields into required ones.
+                "strict": false,
             })
         })
         .collect();
@@ -1061,6 +1063,58 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(body["tools"][0]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn tool_schemas_keep_optional_arguments_optional_on_responses() {
+        // D154: omitted strict mode lets Responses require every property, breaking both
+        // bash run (which forbids task_id) and status (which forbids command).
+        let schemas = [
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "background": {"type": "boolean"},
+                    "action": {"type": "string", "enum": ["run", "status", "list", "cancel"]},
+                    "task_id": {"type": "string"},
+                    "timeout_secs": {"type": "integer", "minimum": 1}
+                },
+                "additionalProperties": false
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "options": {
+                        "type": "object",
+                        "properties": {"limit": {"type": "integer"}}
+                    }
+                },
+                "required": ["path"]
+            }),
+        ];
+        let tools: Vec<ToolDef> = ["bash", "plugin_tool"]
+            .into_iter()
+            .zip(&schemas)
+            .map(|(name, schema)| ToolDef {
+                name: name.into(),
+                description: "test tool".into(),
+                schema: schema.clone(),
+            })
+            .collect();
+        let sent = body(
+            &config(),
+            &Conversation {
+                system: "s",
+                tools: &tools,
+                items: &[],
+                session: "",
+            },
+        );
+        for (tool, schema) in sent["tools"].as_array().unwrap().iter().zip(&schemas) {
+            assert_eq!(tool["strict"], false);
+            assert_eq!(&tool["parameters"], schema);
+        }
     }
 
     #[test]

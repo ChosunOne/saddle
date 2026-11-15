@@ -3542,6 +3542,15 @@ model request; output must be inspected through the owning tool and retains its 
 A saved notice is historical context, not evidence that its task still exists after restart.
 Further concurrent shell work, streaming subscriptions and persistent jobs remain deferred.
 
+**D154.** Responses function tools explicitly send `strict: false`. Leaving strictness unspecified
+lets the provider normalize schemas into strict mode, making every property required. That changes
+the guest/MCP argument contract: bash `run` must omit `task_id`, while `status` and `cancel` must omit
+`command` (D153), and `timeout_secs` must remain optional (D152). The renderer preserves each supplied
+schema, including its required list and nested optional fields, rather than rewriting it or filling
+unused arguments with empty strings or nulls. Guest validation and host permission checks remain
+unchanged. The shared Responses request body applies this setting to HTTP and WebSocket requests,
+including declared MCP and third-party tools.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
