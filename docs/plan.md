@@ -43,9 +43,10 @@ rebuilding a component or changing its digest (D139). MCP servers run on both tr
 per-server narrowed reach, discovered OAuth, lazily declared tools and their own failures refused by
 name (D103–D123).
 
-**What is not here yet is the hook half of the extension surface**: `veto`, `ui`, `persist`,
-`model-invoke`, `context-contribute` and the observer export have no host interface, so a component
-that imports one is refused at load. Section 8 lists them with the rest of the deferred work, and
+**The first hook slice is built (D155):** harness observers and custom plugin events have separate
+SDK registration and delivery channels, with explicit grants and bounded session-owned dispatch.
+`veto`, `ui`, `persist`, `model-invoke` and `context-contribute` still have no host interface, so a
+component that imports one is refused at load. Section 8 lists them with the rest of the deferred work, and
 section 6 marks every extension point's state. Sections 3 to 6 are settled and can be built against.
 
 ## 3. Settled decisions
@@ -3551,6 +3552,40 @@ unused arguments with empty strings or nulls. Guest validation and host permissi
 unchanged. The shared Responses request body applies this setting to HTTP and WebSocket requests,
 including declared MCP and third-party tools.
 
+**D155.** Harness hooks and custom plugin events are disjoint typed channels, not topic prefixes.
+Only the host constructs `saddle:plugin/observer` events: `turn-start`, `turn-end`, `tool-start`
+and `tool-end`. Registration is the observer export's `subscriptions`; delivery requires
+`transcript-read` on every invocation. They observe, never veto or rewrite calls. A handler failure
+is audited but does not deny the underlying operation; fatal host/audit failures stop the session.
+
+Custom publication uses `saddle:host/plugin-events.emit` under `event-publish`. Custom subscriptions
+use the separate `saddle:plugin/plugin-events` export under `event-subscribe`, selecting exact
+`(publisher plugin id, name)` pairs. The host supplies the publisher identity from the invocation,
+never from payload fields; names matching harness events remain custom events. Both event grants
+must be held by the parent agent and explicitly delegated within the manifest ceiling. Observing a
+custom event does not require or confer transcript access. Subscriptions express interest, not grants.
+Handlers run as their own principals; event input is untrusted and cannot lend the emitter's grants.
+A handler author must validate its payload before using its own capabilities.
+
+Instances remain fresh and bounded, including registration calls, with no required tool export for
+hook-only components. The budgets interface is ambient public metadata, not `tool` authority, so
+hook-only components can initialize the same runtime SDK limits without an unrelated registration grant. Registration cannot publish events. Handler return values are success/failure,
+not model context or policy. Veto, context contributions, persistence, model invocation and UI remain
+separate, deferred services; this supersedes v3's ordering only to deliver observer/custom events first.
+
+Custom events are queued per session and delivered FIFO at tool/turn safe points, with deterministic
+plugin-id order, never recursively during a host call. A bounded drain includes events emitted by
+handlers, so cycles cannot reset its delivery or wall-clock budget. Runtime limits are `event-queue`
+(64), `event-deliveries` (128), `event-bytes` (16 KiB), `event-name-bytes` (128),
+`event-subscriptions` (64), and `event-seconds` (30). Names are nonempty ASCII alphanumeric, dot,
+underscore or hyphen. Full queues/oversize publications fail before enqueueing; oversized harness
+payloads are refused for delivery rather than truncated. Exhausted drains drop remaining deliveries
+with an audit record. Fatal host failure never starts another hook. Reload clears pending events and
+rebuilds subscriptions under the new grants without changing the artifact digest. Events do not persist
+across close/restart, and neither custom event payloads nor handler errors are injected into model
+context or trusted UI notices. Audit records include channel, publisher, name, byte count, content hash,
+recipient principal and call id, not raw payloads.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
@@ -3562,6 +3597,8 @@ including declared MCP and third-party tools.
 | `fs-write` | writing files under granted roots | `saddle:host/fs-write` import | policy per call, reserved paths (D23) |
 | `net` | HTTP requests to granted hosts | `saddle:host/http` and `saddle:host/web-search`, a command's proxy; raw WASI HTTP remains unlinked | host HTTP client, policy per hop under the calling principal (D28, D79, D143) |
 | `transcript-read` | reading session messages and their request usage, and observing them as they arrive | `saddle:host/transcript-read` import, `saddle:plugin/observer` export | policy per call |
+| `event-publish` | publishing custom events as the calling plugin | `saddle:host/plugin-events` import | per publication, principal attribution and queue/size budgets |
+| `event-subscribe` | receiving custom events, never harness events | `saddle:plugin/plugin-events` export | registration and every delivery |
 | `context-contribute` | adding notes and diagnostics to the context | `saddle:host/context-contribute` import | policy per call, slot schemas (D26) |
 | `tool` | registering tools the model can call | `saddle:plugin/tool` export | load-time check, catalogue rendering (D26) |
 | `veto` | denying a pending tool call | `saddle:plugin/veto` export | policy per call (D21) |
@@ -3608,7 +3645,8 @@ scope is defined, and nothing behind it decides a call yet (section 8).
 | reach the network | `net` | built: `saddle:host/http` and `web-search`, every request decided (D143) |
 | read the transcript | `transcript-read` | built: bounded, read-only branch SQL and snapshots (D137) |
 | contribute text into the context | `context-contribute` | no host interface |
-| observe messages and tool results | `transcript-read` | no host interface: the `observer` export is named and unimplemented |
+| observe turn/tool lifecycle events | `transcript-read` | built: typed `observer` subscriptions and bounded delivery (D155) |
+| custom plugin events | `event-publish`, `event-subscribe` | built: disjoint publishing/subscription APIs (D155) |
 | block a pending tool call | `veto` | no host interface |
 | invoke the model | `model-invoke` | no host interface |
 | render UI | `ui` | no host interface |
@@ -3637,12 +3675,11 @@ provenance wrapper went in *before* the first model-visible plugin tool rather t
 unlabelled third-party text ever reached a conversation (D128). Presentation is shared with the TUI,
 which draws a human diff and an image as metadata rather than as model text (D134, D146).
 
-**v3 — the hook surface (not started).** `veto`, the `observer` export, `context-contribute`,
-`model-invoke`, `persist` and `ui`. Each needs an interface the core defines and decides per call, and
-none may become the generic escape hatch section 9 warns about. Order: `persist` first, because a
-namespaced store is the smallest new authority and every later hook has somewhere to keep state;
-then `veto`, then `observer`, then `context-contribute`, then `model-invoke`; `ui` last, because it is
-the only one where the core has to own a rendering contract the guest draws inside.
+**v3 — the hook surface (partly built).** D155 delivers harness observers and a disjoint custom
+event channel first, superseding the original persistence-first ordering. Remaining: `persist`,
+`veto`, `context-contribute`, `model-invoke` and `ui`. Each needs its own typed, per-call-checked
+interface; an event return is not a generic escape hatch for those authorities. `ui` remains last,
+because the core must own the rendering contract a guest draws inside.
 
 The v1 refusal remains the thesis: a component with no eligible filesystem capability must not
 initialize filesystem imports. D139–D141 distinguish bindings from per-operation authority: linking
@@ -3650,8 +3687,8 @@ read bindings under a write capability must never let that principal read a file
 
 ## 8. Deferred
 
-- The hook half of the extension surface: `veto`, `ui`, `persist`, `model-invoke`,
-  `context-contribute` and the `saddle:plugin/observer` export. The scopes are defined and the load
+- The remaining hook scopes: `veto`, `ui`, `persist`, `model-invoke`,
+  `context-contribute`. Harness observer/custom events are implemented under D155. The scopes are defined and the load
   check names their interfaces, and the loader refuses them by name ("not implemented by the
   runtime"), so a component that expects one fails at load rather than at its first call. `ui` also
   carries "input widgets" below; a plugin is not given the terminal before the core owns the contract

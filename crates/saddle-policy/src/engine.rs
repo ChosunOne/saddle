@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use crate::audit::sha256_hex;
 use globset::GlobSet;
 use saddle_cap::policy::{FsGrant, NetGrant, POLICY_FILE, exclude_set, net_allows};
 use saddle_cap::{Location, Policy, Principal, RelPath, RootName, RuleId, Scope};
@@ -53,6 +54,15 @@ pub enum Request<'a> {
         session: &'a str,
         sql: &'a str,
     },
+    /// host-attributed hook delivery or custom-event publication (D155).
+    Hook {
+        scope: Scope,
+        operation: &'a str,
+        channel: &'a str,
+        publisher: &'a str,
+        name: &'a str,
+        data: &'a str,
+    },
     /// Scopes without arguments: transcript-read, context-contribute, tool, veto, ui, persist.
     Plain(Scope),
 }
@@ -68,7 +78,7 @@ impl Request<'_> {
             Request::Net { .. } => Scope::Net,
             Request::ModelInvoke { .. } => Scope::ModelInvoke,
             Request::TranscriptQuery { .. } => Scope::TranscriptRead,
-            Request::Plain(s) => *s,
+            Request::Plain(s) | Request::Hook { scope: s, .. } => *s,
         }
     }
 
@@ -108,6 +118,16 @@ impl Request<'_> {
             }
             Request::ModelInvoke { tokens } => json!({ "tokens": tokens }),
             Request::TranscriptQuery { session, sql } => json!({ "session": session, "sql": sql }),
+            Request::Hook {
+                operation,
+                channel,
+                publisher,
+                name,
+                data,
+                ..
+            } => {
+                json!({"operation":operation,"channel":channel,"publisher":publisher,"name":name,"bytes":data.len(),"sha256":sha256_hex(data.as_bytes())})
+            }
             Request::Plain(_) => json!({}),
         }
     }
@@ -343,7 +363,7 @@ impl Engine {
             Request::TranscriptQuery { .. } => {
                 self.decide(who, &Request::Plain(Scope::TranscriptRead))
             }
-            Request::Plain(s) => match grants.plain.get(s) {
+            Request::Plain(s) | Request::Hook { scope: s, .. } => match grants.plain.get(s) {
                 Some(g) => Decision::allow(scope, &g.rule, &g.why),
                 None => Decision::deny(scope, format!("{who} has no {s} grant")),
             },

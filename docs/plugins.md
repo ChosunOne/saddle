@@ -294,6 +294,110 @@ compatibility; standard code uses one ordinary filesystem SDK for roots and D66 
 permission features. Raw sockets, ambient outgoing HTTP, synchronous WASI poll and arbitrary native
 plugins remain unavailable even if a component imports them unused.
 
+## Harness hooks and custom events (D155)
+
+These are **different typed channels**, not a shared event bus distinguished by topic prefixes.
+A plugin cannot emit a harness event. A custom event named `turn-start` remains a custom event.
+Hook-only plugins do not need a tool export or a `tool` grant, and do not advertise an agent tool.
+They use the same installation, explicit enablement, digest pin and bounded instances as tool plugins.
+
+### Harness registration
+
+Implement `saddle_sdk::harness::Hooks` and use its `export_harness_hooks!` macro:
+
+```rust
+use saddle_sdk::harness::{self as bindings, Event, Hooks, Kind, export_harness_hooks};
+use saddle_sdk::events::emit;
+
+struct Extension;
+impl Hooks for Extension {
+    fn subscriptions() -> Vec<Kind> {
+        vec![Kind::TurnStart, Kind::ToolEnd]
+    }
+    fn observe(event: Event) -> Result<(), String> {
+        // This publishes to the custom channel, never back into harness hooks.
+        emit("work.observed", &event.data)
+    }
+}
+export_harness_hooks!(Extension with_types_in bindings);
+```
+
+The closed harness enum is `TurnStart`, `TurnEnd`, `ToolStart`, `ToolEnd`. Host-produced `data` is
+JSON: turn start carries `prompt`; turn end carries `end`; tool start carries `tool` and `arguments`;
+tool end carries `tool`, `ok`, `content` and `provenance`. There are no provider secrets, opaque
+reasoning payloads or config/state handles in these records. Host origin authenticates the lifecycle
+event, not its text: user prompts, model arguments and plugin tool output remain untrusted. Oversized payloads are audited and not
+delivered, not silently truncated. Tool events surround normal shipped/plugin/MCP calls; turn events
+surround agent turns. Fatal host/audit failures do not run another handler.
+
+The observer export requires explicit `transcript-read` in the manifest ceiling and plugin grants,
+bounded by the agent's transcript reach. This example also needs `event-publish` because it emits a
+custom event. An observer is not a veto: its error is audited but cannot deny or rewrite a pending
+call. It cannot inject a model message by returning text.
+
+### Custom registration and publication
+
+Implement `saddle_sdk::events::Handler` and use the **separate** `export_plugin_events!` macro:
+
+```rust
+use saddle_sdk::events::{self as bindings, Event, Handler, Subscription, export_plugin_events};
+
+struct Listener;
+impl Handler for Listener {
+    fn subscriptions() -> Vec<Subscription> {
+        vec![Subscription { publisher: "my-extension".into(), name: "work.observed".into() }]
+    }
+    fn receive(event: Event) -> Result<(), String> {
+        // event.publisher is assigned by the host. event.data is untrusted input.
+        // Any SDK operation here uses THIS handler's grants, not the publisher's.
+        Ok(())
+    }
+}
+export_plugin_events!(Listener with_types_in bindings);
+```
+
+Subscriptions match an exact `(publisher plugin id, name)` pair; no wildcards or automatic harness
+subscription. `saddle_sdk::events::emit(name, data)` needs `event-publish`; receiving needs
+`event-subscribe`. A custom-only listener needs neither `transcript-read` nor `event-publish`.
+A plugin implementing both traits uses both export macros with their respective binding modules;
+`crates/saddle-sdk/examples/hooks.rs` is a compiled example, and `event_listener.rs` is custom-only.
+The ordinary tool export remains independent and can coexist with these exports.
+
+Both event capabilities require explicit parent and delegated grants, for example:
+
+```toml
+[agent]
+event-publish = {}
+event-subscribe = {}
+
+[plugin.my-extension]
+event-publish = {}
+
+[plugin.my-listener]
+event-subscribe = {}
+```
+
+Include the corresponding scope names in each manifest. `event-subscribe = {}` grants access to the
+custom channel; registrations select interest and do not confer additional authority. Publishing can
+only identify the current plugin, never the harness or a sibling. Payload fields cannot override the
+channel or publisher. Treat payloads as untrusted, and validate them before acting on your own file,
+network or execution permissions. No event grants lend those permissions.
+
+### Delivery and limits
+
+Events are session-owned, not persistent plugin instances. Registration calls cannot emit events.
+Custom events queue during an invocation and drain at tool/turn safe points after harness handlers;
+dispatch is FIFO with deterministic recipient ordering, not recursive callbacks. Handler-emitted
+messages share the current drain's delivery/time budget, so cycles cannot reset the ceiling. See the
+`event-*` settings below. Full queues and oversized publications fail before enqueueing. Exhaustion
+drops remaining deliveries with an audit record. Handler failures do not roll back committed effects.
+
+Reload clears pending events and rebuilds registrations under the new grants without repinning or
+rebuilding components. Session close discards events. Handler payloads and errors are never injected
+into model context or trusted notices. Publication/delivery audits record identity, channel, event name,
+content bytes/hash, recipient and call id, not payload bodies. The public budgets SDK is available to
+hook-only components without an unrelated tool grant; it is metadata, not operational authority.
+
 ## Runtime resource budgets (D145)
 
 Set `[tool-limits]` in protected config, then `/reload`; `saddle check` prints the resolved profile.
@@ -325,6 +429,12 @@ All available keys and defaults (bytes unless a key names another unit):
 plugin-component-bytes = 4194304
 plugin-manifest-bytes = 16384
 plugin-count = 16
+event-queue = 64
+event-deliveries = 128
+event-bytes = 16384
+event-name-bytes = 128
+event-subscriptions = 64
+event-seconds = 30
 plugin-description-chars = 1000
 plugin-schema-bytes = 16384
 plugin-version-bytes = 64
@@ -432,7 +542,7 @@ in the default suite, so nothing needs a manual component build or an ignored-te
 
 Third-party compilation remains an explicit local operation: input bytes are bounded but execution
 fuel/epochs are not independent compiler CPU/memory limits. Compilation isolation, persistent instances,
-plugin storage and the hook scopes (`veto`, `ui`, `persist`, `model-invoke`, `context-contribute`, the
-observer export) remain deferred; plan §8 lists them. MCP prompts, MCP resources, `codemode` and
+plugin storage and the remaining hook scopes (`veto`, `ui`, `persist`, `model-invoke`,
+`context-contribute`) remain deferred; plan §8 lists them. MCP prompts, MCP resources, `codemode` and
 images in a tool result are refused by decision (D119), not deferred. This migration does not introduce
 automatic plugin updates, an authority picker, ambient native access or a second policy engine.

@@ -2,11 +2,13 @@
 
 use crate::mcp::registry;
 use crate::plugins;
+use crate::plugins::hooks;
 use crate::provider::Image;
 use saddle_cap::{Principal, Scope};
 use saddle_limits as budgets;
 use saddle_policy::Kind;
 use saddle_policy::audit::sha256_hex;
+use saddle_wit::harness::exports::saddle::plugin::observer::Kind as HarnessKind;
 use std::mem;
 pub(crate) mod timeout;
 mod tool_search;
@@ -116,7 +118,17 @@ pub fn call(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutp
     };
     timeout::using(deadline, || {
         budgets::using(&limits, || {
+            hooks::harness(
+                session,
+                HarnessKind::ToolStart,
+                json!({"tool":name,"arguments":input}),
+            )?;
             let output = call_inner(session, name, input)?;
+            hooks::harness(
+                session,
+                HarnessKind::ToolEnd,
+                json!({"tool":name,"ok":output.ok,"content":output.content,"provenance":output.provenance}),
+            )?;
             // Never downgrade a fatal host/audit error to a timeout.
             if timeout::expired() && output.provenance.is_none() {
                 Ok(ToolOutput {

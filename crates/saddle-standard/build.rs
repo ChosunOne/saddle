@@ -80,6 +80,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             .validate(true)
             .encode()?,
     )?;
+    let hooks = fs::read(guest_target.join("wasm32-unknown-unknown/release/examples/hooks.wasm"))?;
+    fs::write(
+        out.join("sdk-hooks.wasm"),
+        ComponentEncoder::default()
+            .module(&hooks)?
+            .validate(true)
+            .encode()?,
+    )?;
+    let listener =
+        fs::read(guest_target.join("wasm32-unknown-unknown/release/examples/event_listener.wasm"))?;
+    fs::write(
+        out.join("sdk-event-listener.wasm"),
+        ComponentEncoder::default()
+            .module(&listener)?
+            .validate(true)
+            .encode()?,
+    )?;
     let target = env::var("TARGET")?;
     let mut generated = String::from(
         "/// immutable components shipped with this binary.\npub static ARTIFACTS: &[Artifact] = &[\n",

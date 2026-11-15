@@ -485,6 +485,8 @@ struct RawGrants {
     mcp: Vec<RawMcp>,
     model_invoke: Option<RawBudget>,
     transcript_read: Option<RawPlain>,
+    event_publish: Option<RawPlain>,
+    event_subscribe: Option<RawPlain>,
     context_contribute: Option<RawPlain>,
     tool: Option<RawPlain>,
     veto: Option<RawPlain>,
@@ -877,6 +879,8 @@ fn lower(who: &Principal, raw: RawGrants, roots: &Roots) -> Result<Grants, Polic
 
     let plain = [
         (Scope::TranscriptRead, raw.transcript_read),
+        (Scope::EventPublish, raw.event_publish),
+        (Scope::EventSubscribe, raw.event_subscribe),
         (Scope::ContextContribute, raw.context_contribute),
         (Scope::Tool, raw.tool),
         (Scope::Veto, raw.veto),

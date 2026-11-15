@@ -99,8 +99,14 @@ accepted before effects; safe patch additions require absence.
 
 `saddle plugin install/list/call` is the explicit third-party workflow; `docs/plugins.md` documents its
 configuration, grants, SDK build and limits. Installation never enables a plugin or changes grants.
-The hook scopes — `veto`, `ui`, `persist`, `model-invoke`, `context-contribute` and the observer
-export — have no host interface yet, and the loader refuses a component that imports one by name.
+Harness observers and custom plugin events are separate channels and SDK registration APIs (D155).
+The observer export needs `transcript-read`; custom publication/subscription need explicit
+`event-publish`/`event-subscribe` grants held by the agent and delegated to the plugin. Only the host
+constructs harness events. Custom events carry host-assigned publisher identity, exact subscriptions,
+bounded queued delivery and the handler's own grants, never the publisher's. Hook-only plugins need
+no tool export. `plugins/hooks` owns dispatch; reload clears pending events and rebuilds registrations.
+The other hook scopes — `veto`, `ui`, `persist`, `model-invoke`, `context-contribute` — remain deferred,
+and the loader refuses a component that imports one by name.
 Persistent instances and automatic updates remain deferred; no repository auto-loading or
 plugin-to-MCP adapter exists. MCP
 prompts, MCP resources, `codemode` and images in a tool result are refused rather than missing
@@ -384,7 +390,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D154 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D155 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

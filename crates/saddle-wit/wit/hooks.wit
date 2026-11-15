@@ -1,0 +1,13 @@
+package saddle:host@0.1.0;
+
+// Names are local to the host-assigned publishing principal, not harness event names.
+interface plugin-events {
+    emit: func(name: string, data: string) -> result<_, string>;
+}
+
+world harness-hook {
+    export saddle:plugin/observer@0.1.0;
+}
+world plugin-event-handler {
+    export saddle:plugin/plugin-events@0.1.0;
+}

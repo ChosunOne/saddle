@@ -22,10 +22,12 @@ pub enum Scope {
     Ui,
     Persist,
     Mcp,
+    EventPublish,
+    EventSubscribe,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 14] = [
+    pub const ALL: [Scope; 16] = [
         Scope::Exec,
         Scope::FsRead,
         Scope::ToolRead,
@@ -40,6 +42,8 @@ impl Scope {
         Scope::Ui,
         Scope::Persist,
         Scope::Mcp,
+        Scope::EventPublish,
+        Scope::EventSubscribe,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -58,6 +62,8 @@ impl Scope {
             Scope::Ui => "ui",
             Scope::Persist => "persist",
             Scope::Mcp => "mcp",
+            Scope::EventPublish => "event-publish",
+            Scope::EventSubscribe => "event-subscribe",
         }
     }
 }

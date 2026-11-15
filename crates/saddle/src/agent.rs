@@ -35,6 +35,7 @@ use crate::context::ContextFile;
 use crate::mcp;
 use crate::plugins;
 use crate::plugins::HostFailure;
+use crate::plugins::hooks;
 use crate::provider::{
     Cancelled, Conversation, Item, Part, Provider, Quota, Reply, Sink, Stop, ToolCall, ToolDef,
     ToolResult, Usage,
@@ -42,6 +43,7 @@ use crate::provider::{
 use crate::session::Session;
 use crate::store::{self, Request as StoreRequest, RequestKind, Store};
 use crate::tools::{self, ToolOutput};
+use saddle_wit::harness::exports::saddle::plugin::observer::Kind as HarnessKind;
 
 /// Tool output past this many bytes is cut before it enters the context.
 pub const RESULT_LIMIT: usize = 100 * 1024;
@@ -1578,6 +1580,40 @@ impl Agent {
     }
 
     pub fn turn(&mut self, session: &mut Session, prompt: &str, ui: &mut dyn Ui) -> Result<End> {
+        // An unexpected host/store/audit error must not trigger further guest effects, even if
+        // a later audit write might succeed. Ordinary model failures return an End instead.
+        let end = self.turn_inner(session, prompt, ui)?;
+        if self.provider.is_some() {
+            self.turn_hook(
+                session,
+                HarnessKind::TurnEnd,
+                json!({"end":format!("{end:?}").to_ascii_lowercase()}),
+            )?;
+        }
+        Ok(end)
+    }
+
+    fn turn_hook(&self, session: &mut Session, kind: HarnessKind, data: Value) -> Result<()> {
+        let needs_snapshot = session.plugins.hooks_read_transcript();
+        let snapshot = if needs_snapshot {
+            match (&self.store, &self.saved) {
+                (Some(store), Some(id)) => Some(store.snapshot(id)?),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let previous = session.query_snapshot.take();
+        let conversation = session.query_conversation.take();
+        session.query_snapshot = snapshot;
+        session.query_conversation = self.saved.clone();
+        let result = hooks::harness(session, kind, data);
+        session.query_snapshot = previous;
+        session.query_conversation = conversation;
+        result
+    }
+
+    fn turn_inner(&mut self, session: &mut Session, prompt: &str, ui: &mut dyn Ui) -> Result<End> {
         self.turn_usage = Usage::default();
         // A miss last turn does not silence this one (D50).
         self.misses.turn_end();
@@ -1587,6 +1623,7 @@ impl Agent {
         }
         self.start_turn(session, ui);
         let (prompt, images) = self.attach(session, prompt, ui)?;
+        let hook_prompt = json!({"prompt":prompt});
         // A prompt with pictures is its own kind of item, so every place that reads an item has to
         // say what an attachment means there (D58).
         if images.is_empty() {
@@ -1600,6 +1637,7 @@ impl Agent {
                 ui,
             );
         }
+        self.turn_hook(session, HarnessKind::TurnStart, hook_prompt)?;
         let mut overflow_retried = false;
         let mut requests = 0usize;
         let mut guard = LoopGuard::default();
@@ -1738,6 +1776,7 @@ impl Agent {
                     _ => {
                         if call.name == "session_query"
                             || session.plugins.reads_transcript(&call.name)
+                            || session.plugins.hooks_read_transcript()
                         {
                             session.query_conversation = self.saved.clone();
                             session.query_snapshot = match (&self.store, &self.saved) {

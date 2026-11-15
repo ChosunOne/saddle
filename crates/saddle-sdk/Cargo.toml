@@ -15,5 +15,13 @@ wit-bindgen.workspace = true
 name = "reader"
 crate-type = ["cdylib"]
 
+[[example]]
+name = "hooks"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "event_listener"
+crate-type = ["cdylib"]
+
 [lints]
 workspace = true

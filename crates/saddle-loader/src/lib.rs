@@ -8,13 +8,19 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
-use saddle_cap::component::{Direction, HostInterface, Interface, check_component};
+use saddle_cap::component::{Direction, HostInterface, Interface, PluginExport, check_component};
 use saddle_cap::delegate::{self, DelegationError};
 use saddle_cap::manifest::{Manifest, above_ceiling};
 use saddle_cap::{Grants, Principal, Scope};
 use saddle_limits::{self as budgets, Budgets};
 use saddle_wit::ReadToolPre;
+use saddle_wit::events::exports::saddle::plugin::plugin_events::{
+    Event as PluginEvent, Subscription,
+};
 use saddle_wit::exports::saddle::plugin::tool::{Definition, Output};
+use saddle_wit::harness::exports::saddle::plugin::observer::{
+    Event as HarnessEvent, Kind as HarnessKind,
+};
 use saddle_wit::saddle::host::budgets::{self as budgets_interface, Host as BudgetsHost};
 use saddle_wit::saddle::host::exec::{self, Command, Host as ExecHost, Reply as ExecReply};
 use saddle_wit::saddle::host::exec_tasks::{self, Host as TasksHost, Task};
@@ -28,6 +34,7 @@ use saddle_wit::saddle::host::fs_write::{self, Change, Expectation, Host as Writ
 use saddle_wit::saddle::host::http::{
     self, Host as HttpHost, Request as HttpRequest, Response as HttpResponse,
 };
+use saddle_wit::saddle::host::plugin_events::{self, Host as EventsHost};
 use saddle_wit::saddle::host::tool_paths::{
     self, Chunk as ToolChunk, Entry as ToolEntry, EntryKind as ToolEntryKind,
     Failure as ToolFailure, Host as ToolPathsHost, Page as ToolPage, Path as ToolPath,
@@ -37,7 +44,9 @@ use saddle_wit::saddle::host::transcript_read::{self, Host as TranscriptHost};
 use saddle_wit::saddle::host::web_search::{self, Host as SearchHost, Snapshot as SearchSnapshot};
 use sha2::{Digest, Sha256};
 use wasmtime::component::types::{Component as ComponentType, ComponentItem};
-use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
+use wasmtime::component::{
+    Component, ComponentNamedList, HasSelf, InstancePre, Lift, Linker, Lower, ResourceTable,
+};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
@@ -150,6 +159,16 @@ pub enum TaskOperation {
 /// filesystem callbacks may hold any filesystem capability; determine authority per operation/path,
 /// never from the existence of a linked interface (D139, D140).
 pub trait HostServices: Send + 'static {
+    /// enqueue a custom event; the host attaches the publishing principal (D155).
+    fn emit_event(
+        &mut self,
+        _call: &Invocation,
+        _name: String,
+        _data: String,
+    ) -> anyhow::Result<Result<(), String>> {
+        Ok(Err("host does not implement plugin events".into()))
+    }
+
     fn read_preimage(
         &mut self,
         _call: &Invocation,
@@ -359,6 +378,15 @@ impl<H: HostServices> State<H> {
             self.call.deadline = self.call.deadline.min(end);
         }
         result
+    }
+}
+
+impl<H: HostServices> EventsHost for State<H> {
+    fn emit(&mut self, name: String, data: String) -> anyhow::Result<Result<(), String>> {
+        self.host_wait(
+            Duration::from_secs(budgets::host_wait_seconds() as u64),
+            |host, call, _| host.emit_event(call, name, data),
+        )
     }
 }
 
@@ -1020,6 +1048,17 @@ impl Loader {
                     .join("; "),
             )
         })?;
+        let exports: Vec<PluginExport> = checked
+            .exports
+            .into_iter()
+            .map(|interface| match interface {
+                Interface::Export(export) => Ok(export),
+                _ => Err(Error::Refused("import in checked export plan".into())),
+            })
+            .collect::<Result<_, _>>()?;
+        if exports.is_empty() {
+            return Err(Error::Refused("plugin has no supported export".into()));
+        }
         let mut linker = Linker::<State<H>>::new(engine);
         for interface in checked.imports {
             match interface {
@@ -1029,14 +1068,58 @@ impl Loader {
             }
             .map_err(runtime("binding checked import"))?;
         }
-        check_tool_types(engine, &ty)?;
+        if exports.contains(&PluginExport::Tool) {
+            check_tool_types(engine, &ty)?;
+        }
+        for export in &exports {
+            match export {
+                PluginExport::Observer => {
+                    check_function::<(), (Vec<HarnessKind>,)>(
+                        engine,
+                        &ty,
+                        export.name(),
+                        "subscriptions",
+                    )?;
+                    check_function::<(HarnessEvent,), (Result<(), String>,)>(
+                        engine,
+                        &ty,
+                        export.name(),
+                        "observe",
+                    )?;
+                }
+                PluginExport::PluginEvents => {
+                    check_function::<(), (Vec<Subscription>,)>(
+                        engine,
+                        &ty,
+                        export.name(),
+                        "subscriptions",
+                    )?;
+                    check_function::<(PluginEvent,), (Result<(), String>,)>(
+                        engine,
+                        &ty,
+                        export.name(),
+                        "receive",
+                    )?;
+                }
+                PluginExport::Tool => {}
+                PluginExport::Veto | PluginExport::Ui => {
+                    return Err(Error::Refused("unsupported plugin export".into()));
+                }
+            }
+        }
         let pre = linker
             .instantiate_pre(&component)
             .map_err(runtime("pre-linking component"))?;
-        let pre = ReadToolPre::new(pre).map_err(runtime("checking tool export types"))?;
+        let tool = if exports.contains(&PluginExport::Tool) {
+            Some(ReadToolPre::new(pre.clone()).map_err(runtime("checking tool export types"))?)
+        } else {
+            None
+        };
         Ok(Prepared {
             runtime: self.0.clone(),
             pre,
+            tool,
+            exports,
             principal: Principal::Plugin(manifest.id.clone()),
             grants: Arc::new(grants),
             hash: Sha256::digest(bytes).into(),
@@ -1054,6 +1137,9 @@ fn bind_host<H: HostServices>(
         HostInterface::Http => http::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
         HostInterface::WebSearch => {
             web_search::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
+        }
+        HostInterface::PluginEvents => {
+            plugin_events::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
         }
         HostInterface::Exec => exec::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
         HostInterface::ExecTasks => {
@@ -1092,6 +1178,30 @@ fn bind_host<H: HostServices>(
 
 /// the generated `Pre::new` checks export names, not their signatures. Check the canonical
 /// generated record types before instantiation too, rather than discovering a mismatch after start.
+fn check_function<P, R>(
+    engine: &Engine,
+    ty: &ComponentType,
+    interface: &str,
+    name: &str,
+) -> Result<(), Error>
+where
+    P: ComponentNamedList + Lower,
+    R: ComponentNamedList + Lift,
+{
+    let interface = format!("{interface}@0.1.0");
+    let Some(ComponentItem::ComponentInstance(exports)) = ty.get_export(engine, &interface) else {
+        return Err(Error::Refused(format!("missing {interface} export")));
+    };
+    let Some(ComponentItem::ComponentFunc(function)) = exports.get_export(engine, name) else {
+        return Err(Error::Refused(format!(
+            "missing {interface} function {name}"
+        )));
+    };
+    function
+        .typecheck::<P, R>(&ty.instance_type())
+        .map_err(runtime("checking hook export types"))
+}
+
 fn check_tool_types(engine: &Engine, ty: &ComponentType) -> Result<(), Error> {
     let Some(ComponentItem::ComponentInstance(tool)) =
         ty.get_export(engine, "saddle:plugin/tool@0.1.0")
@@ -1142,7 +1252,9 @@ fn interfaces(
 /// one pre-linked plugin; every public call creates a fresh instance, even `describe`.
 pub struct Prepared<H: HostServices> {
     runtime: Arc<Runtime>,
-    pre: ReadToolPre<State<H>>,
+    pre: InstancePre<State<H>>,
+    tool: Option<ReadToolPre<State<H>>>,
+    exports: Vec<PluginExport>,
     principal: Principal,
     grants: Arc<Grants>,
     hash: [u8; 32],
@@ -1150,6 +1262,154 @@ pub struct Prepared<H: HostServices> {
 }
 
 impl<H: HostServices> Prepared<H> {
+    pub fn exports(&self) -> &[PluginExport] {
+        &self.exports
+    }
+
+    fn hook<P, R>(
+        &self,
+        host: H,
+        cancelled: Arc<AtomicBool>,
+        interface: PluginExport,
+        name: &str,
+        args: P,
+        deadline: Option<Instant>,
+    ) -> Result<R, Error>
+    where
+        P: ComponentNamedList + Lower,
+        R: ComponentNamedList + Lift,
+    {
+        budgets::using(&self.limits.budgets, || {
+            if !self.exports.contains(&interface) {
+                return Err(Error::Refused("plugin does not export this hook".into()));
+            }
+            let mut store = self.store_until(host, cancelled, deadline)?;
+            let instance = self
+                .pre
+                .instantiate(&mut store)
+                .map_err(runtime("initializing hook"))?;
+            let (_, parent) = instance
+                .get_export(&mut store, None, &format!("{}@0.1.0", interface.name()))
+                .ok_or_else(|| Error::Refused("missing hook interface".into()))?;
+            let (_, index) = instance
+                .get_export(&mut store, Some(&parent), name)
+                .ok_or_else(|| Error::Refused("missing hook function".into()))?;
+            let func = instance
+                .get_typed_func::<P, R>(&mut store, &index)
+                .map_err(runtime("checking hook function"))?;
+            let result = func
+                .call(&mut store, args)
+                .map_err(runtime("calling hook"))?;
+            func.post_return(&mut store)
+                .map_err(runtime("finishing hook"))?;
+            Self::check_live(&store)?;
+            Ok(result)
+        })
+    }
+
+    pub fn harness_subscriptions(
+        &self,
+        host: H,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Vec<HarnessKind>, Error> {
+        let (items,): (Vec<HarnessKind>,) = self.hook(
+            host,
+            cancelled,
+            PluginExport::Observer,
+            "subscriptions",
+            (),
+            None,
+        )?;
+        if items.len() > self.limits.budgets.event_subscriptions {
+            return Err(Error::Size(self.limits.budgets.event_subscriptions));
+        }
+        Ok(items)
+    }
+    pub fn event_subscriptions(
+        &self,
+        host: H,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Vec<Subscription>, Error> {
+        let (items,): (Vec<Subscription>,) = self.hook(
+            host,
+            cancelled,
+            PluginExport::PluginEvents,
+            "subscriptions",
+            (),
+            None,
+        )?;
+        if items.len() > self.limits.budgets.event_subscriptions
+            || items.iter().fold(0usize, |total, item| {
+                total
+                    .saturating_add(item.publisher.len())
+                    .saturating_add(item.name.len())
+            }) > self.limits.output_bytes
+            || items.iter().any(|item| {
+                item.publisher.len().saturating_add(item.name.len())
+                    > self.limits.budgets.event_bytes
+            })
+        {
+            return Err(Error::Size(self.limits.budgets.event_subscriptions));
+        }
+        Ok(items)
+    }
+    pub fn observe(
+        &self,
+        host: H,
+        event: HarnessEvent,
+        cancelled: Arc<AtomicBool>,
+        deadline: Option<Instant>,
+    ) -> Result<Result<(), String>, Error> {
+        if event.data.len() > self.limits.input_bytes {
+            return Err(Error::Size(self.limits.input_bytes));
+        }
+        let (result,): (Result<(), String>,) = self.hook(
+            host,
+            cancelled,
+            PluginExport::Observer,
+            "observe",
+            (event,),
+            deadline,
+        )?;
+        self.hook_result(result)
+    }
+    pub fn receive(
+        &self,
+        host: H,
+        event: PluginEvent,
+        cancelled: Arc<AtomicBool>,
+        deadline: Option<Instant>,
+    ) -> Result<Result<(), String>, Error> {
+        if event
+            .publisher
+            .len()
+            .saturating_add(event.name.len())
+            .saturating_add(event.data.len())
+            > self.limits.input_bytes
+        {
+            return Err(Error::Size(self.limits.input_bytes));
+        }
+        let (result,): (Result<(), String>,) = self.hook(
+            host,
+            cancelled,
+            PluginExport::PluginEvents,
+            "receive",
+            (event,),
+            deadline,
+        )?;
+        self.hook_result(result)
+    }
+    fn hook_result(&self, result: Result<(), String>) -> Result<Result<(), String>, Error> {
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|why| why.len() > self.limits.output_bytes)
+        {
+            return Err(Error::Size(self.limits.output_bytes));
+        }
+        Ok(result)
+    }
+
     fn check_live(store: &Store<State<H>>) -> Result<(), Error> {
         if store.data().call.cancelled() {
             return Err(Error::Cancelled);
@@ -1250,7 +1510,9 @@ impl<H: HostServices> Prepared<H> {
     fn describe_inner(&self, host: H, cancelled: Arc<AtomicBool>) -> Result<Definition, Error> {
         let mut store = self.store(host, cancelled)?;
         let guest = self
-            .pre
+            .tool
+            .as_ref()
+            .ok_or_else(|| Error::Refused("plugin does not export a tool".into()))?
             .instantiate(&mut store)
             .map_err(runtime("initializing plugin"))?;
         let definition = guest
@@ -1303,7 +1565,9 @@ impl<H: HostServices> Prepared<H> {
         }
         let mut store = self.store_until(host, cancelled, deadline)?;
         let guest = self
-            .pre
+            .tool
+            .as_ref()
+            .ok_or_else(|| Error::Refused("plugin does not export a tool".into()))?
             .instantiate(&mut store)
             .map_err(runtime("initializing plugin"))?;
         let output = guest
@@ -1331,7 +1595,7 @@ mod tests {
     use saddle_cap::{Location, PluginId, Policy, RelPath, RootName, Roots};
     use saddle_policy::audit::{self, AuditLog};
     use saddle_policy::{Engine as PolicyEngine, Request};
-    use saddle_standard::SDK_READER;
+    use saddle_standard::{SDK_HOOKS, SDK_READER};
     use serde_json::Value;
     use tempfile::TempDir;
     use wasmtime_wasi::p2::bindings::cli::environment::Host as EnvironmentHost;
@@ -2218,7 +2482,30 @@ mod tests {
     }
 
     #[test]
-    fn an_unused_observer_export_is_refused_before_initialization() {
+    fn a_hook_only_sdk_artifact_registers_without_a_tool_export() {
+        let (_dir, agent, plugin) = grants(
+            "[agent]\ntranscript-read={}\nevent-publish={}\nevent-subscribe={}\nfs-read=[{root='workspace'}]\nfs-write=[{root='workspace'}]\n[plugin.reader]\ntranscript-read={}\nevent-publish={}\nevent-subscribe={}\nfs-read=[{root='workspace'}]\nfs-write=[{root='workspace'}]\n",
+        );
+        let mut manifest = manifest();
+        manifest.scopes = plugin.scopes();
+        let prepared = Loader::new()
+            .unwrap()
+            .prepare::<NoHost>(&manifest, &agent, &plugin, SDK_HOOKS, Limits::default())
+            .unwrap();
+        assert!(!prepared.exports().contains(&PluginExport::Tool));
+        assert_eq!(
+            prepared.harness_subscriptions(NoHost, cancelled()).unwrap(),
+            [HarnessKind::TurnStart]
+        );
+        let subscriptions = prepared.event_subscriptions(NoHost, cancelled()).unwrap();
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].publisher, "hooks");
+        assert_eq!(subscriptions[0].name, "turn-start");
+        assert!(prepared.describe(NoHost, cancelled()).is_err());
+    }
+
+    #[test]
+    fn an_incomplete_observer_export_is_refused_before_initialization() {
         let (_dir, agent, plugin) = grants(
             "[agent]\nfs-read=[{root='workspace'}]\ntranscript-read={}\n[plugin.reader]\ntool={}\nfs-read=[{root='workspace'}]\ntranscript-read={}\n",
         );
@@ -2233,7 +2520,7 @@ mod tests {
             Limits::default(),
         ));
         assert!(
-            why.contains("observer") && why.contains("not implemented"),
+            why.contains("observer") && why.contains("subscriptions"),
             "{why}"
         );
         assert!(!why.contains("unreachable"), "{why}");

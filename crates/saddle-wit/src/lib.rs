@@ -5,3 +5,18 @@ wasmtime::component::bindgen!({
     world: "read-tool",
     imports: { default: trappable },
 });
+
+/// typed harness hooks, separate from plugin-originated messages (D155).
+pub mod harness {
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "harness-hook",
+    });
+}
+/// typed custom-event handlers (D155).
+pub mod events {
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "plugin-event-handler",
+    });
+}

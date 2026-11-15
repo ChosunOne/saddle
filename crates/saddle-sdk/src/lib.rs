@@ -35,6 +35,29 @@ pub use saddle::host::web_search::{
     Snapshot as SearchSnapshot, last as last_search, search as search_web,
 };
 
+/// register host-originated lifecycle hooks; this API cannot publish harness events (D155).
+pub mod harness {
+    wit_bindgen::generate!({
+        path: "../saddle-wit/wit",
+        world: "harness-hook",
+        pub_export_macro: true,
+        export_macro_name: "export_harness_hooks",
+    });
+    pub use exports::saddle::plugin::observer::{Event, Guest as Hooks, Kind};
+}
+
+/// register custom-event subscriptions independently of harness hooks (D155).
+pub mod events {
+    wit_bindgen::generate!({
+        path: "../saddle-wit/wit",
+        world: "plugin-event-handler",
+        pub_export_macro: true,
+        export_macro_name: "export_plugin_events",
+    });
+    pub use crate::saddle::host::plugin_events::emit;
+    pub use exports::saddle::plugin::plugin_events::{Event, Guest as Handler, Subscription};
+}
+
 /// read resource budgets from the host before a standard guest workflow starts (D145).
 /// fresh instances prevent cached settings from surviving a config reload.
 pub fn configure_limits() -> Result<(), String> {

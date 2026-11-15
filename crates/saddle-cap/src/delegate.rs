@@ -29,7 +29,11 @@ pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationEr
         if !runtime_supports_scope(scope) {
             return Err(DelegationError::Unsupported(scope));
         }
-        if scope == Scope::TranscriptRead && !agent.scopes().contains(&scope) {
+        if matches!(
+            scope,
+            Scope::TranscriptRead | Scope::EventPublish | Scope::EventSubscribe
+        ) && !agent.scopes().contains(&scope)
+        {
             return Err(DelegationError::Scope(scope));
         }
     }
@@ -266,6 +270,38 @@ mod tests {
             read_tool(&agent, &plugin),
             Err(DelegationError::Scope(Scope::TranscriptRead))
         ));
+    }
+
+    #[test]
+    fn event_channels_need_their_own_explicit_parent_and_plugin_grants() {
+        for scope in [Scope::EventPublish, Scope::EventSubscribe] {
+            let (agent, plugin) = grants(&format!(
+                "[agent]\n{scope}={{}}\n[plugin.reader]\ntool={{}}\n"
+            ));
+            assert!(
+                !read_tool(&agent, &plugin)
+                    .unwrap()
+                    .scopes()
+                    .contains(&scope)
+            );
+            let (agent, plugin) = grants(&format!(
+                "[plugin.sibling]\n{scope}={{}}\n[plugin.reader]\n{scope}={{}}\n"
+            ));
+            assert!(
+                matches!(read_tool(&agent, &plugin), Err(DelegationError::Scope(missing)) if missing == scope)
+            );
+            let (agent, plugin) = grants(&format!(
+                "[agent]\n{scope}={{}}\n[plugin.reader]\n{scope}={{}}\n"
+            ));
+            assert_eq!(
+                read_tool(&agent, &plugin)
+                    .unwrap()
+                    .scopes()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                [scope]
+            );
+        }
     }
 
     #[test]

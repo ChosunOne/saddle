@@ -1,6 +1,7 @@
 //! protected plugins and shipped tools share bounded dispatch, provenance and audit (D25, D128, D129, D147).
 
 mod filesystem;
+pub mod hooks;
 mod host;
 mod mutations;
 
@@ -12,11 +13,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use cap_std::fs::Dir;
+use saddle_cap::component::PluginExport;
 use saddle_cap::manifest::Manifest;
 use saddle_cap::{Grants, PluginId, Principal, RelPath, Scope};
 use saddle_loader::{Limits, Loader, Prepared};
 use saddle_policy::audit::sha256_hex;
 use saddle_policy::{Kind, Request};
+use saddle_wit::events::exports::saddle::plugin::plugin_events::Subscription;
+use saddle_wit::harness::exports::saddle::plugin::observer::Kind as HarnessKind;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -55,7 +59,9 @@ struct Source<'a> {
 
 struct Loaded {
     prepared: Arc<Prepared<Host>>,
-    definition: ToolDef,
+    definition: Option<ToolDef>,
+    harness: Vec<HarnessKind>,
+    subscriptions: Vec<Subscription>,
     version: String,
     sha256: String,
 }
@@ -91,14 +97,29 @@ impl Registry {
     pub fn definitions(&self) -> Vec<ToolDef> {
         self.loaded
             .values()
-            .map(|l| timeout::definition(l.definition.clone()))
+            .filter_map(|l| l.definition.clone().map(timeout::definition))
             .collect()
     }
 
     /// requests a branch snapshot only for a loaded tool holding the transcript service.
     pub fn reads_transcript(&self, name: &str) -> bool {
         self.loaded.values().any(|loaded| {
-            loaded.definition.name == name
+            loaded
+                .definition
+                .as_ref()
+                .is_some_and(|definition| definition.name == name)
+                && loaded
+                    .prepared
+                    .grants()
+                    .scopes()
+                    .contains(&Scope::TranscriptRead)
+        })
+    }
+
+    /// hook callbacks query only the active branch snapshot supplied by the agent (D155).
+    pub fn hooks_read_transcript(&self) -> bool {
+        self.loaded.values().any(|loaded| {
+            (!loaded.harness.is_empty() || !loaded.subscriptions.is_empty())
                 && loaded
                     .prepared
                     .grants()
@@ -118,7 +139,12 @@ impl Registry {
         self.loaded
             .iter()
             .find(|(key, _)| key.as_str() == id)
-            .map(|(_, loaded)| loaded.definition.name.to_string())
+            .and_then(|(_, loaded)| {
+                loaded
+                    .definition
+                    .as_ref()
+                    .map(|definition| definition.name.to_string())
+            })
     }
 
     pub fn load(&mut self, session: &mut Session) -> Result<()> {
@@ -131,14 +157,6 @@ impl Registry {
                 continue;
             }
             let who = Principal::Plugin(id.clone());
-            let decision = session
-                .decide(&who, &Request::Plain(Scope::Tool))
-                .map_err(HostFailure)?;
-            if !decision.allow {
-                self.status
-                    .insert(id, format!("not granted: {}", decision.explanation));
-                continue;
-            }
             // A trap or bad artifact makes only that component unavailable, not the other tools.
             // Host/audit failure retains a fatal marker, even if a later write could succeed.
             match self.load_one(session, &id, &entry) {
@@ -147,7 +165,11 @@ impl Registry {
                         id.clone(),
                         format!(
                             "ready: {} · sha256 {}",
-                            loaded.definition.name, loaded.sha256
+                            loaded
+                                .definition
+                                .as_ref()
+                                .map_or("hooks", |definition| definition.name.as_ref()),
+                            loaded.sha256
                         ),
                     );
                     self.loaded.insert(id, loaded);
@@ -345,11 +367,64 @@ impl Registry {
             .principals
             .insert(who.clone(), prepared.grants().clone());
         session.engine.replace_policy(policy);
-        let registration = session
-            .decide(&who, &Request::Plain(Scope::Tool))
-            .map_err(HostFailure)?;
-        if !registration.allow {
-            bail!("registration refused: {}", registration.explanation);
+        let mut harness = Vec::new();
+        let mut subscriptions = Vec::new();
+        for export in prepared.exports() {
+            let scope = match export {
+                PluginExport::Tool => Scope::Tool,
+                PluginExport::Observer => Scope::TranscriptRead,
+                PluginExport::PluginEvents => Scope::EventSubscribe,
+                PluginExport::Veto | PluginExport::Ui => bail!("unsupported export"),
+            };
+            let registration = session
+                .decide(&who, &Request::Plain(scope))
+                .map_err(HostFailure)?;
+            if !registration.allow {
+                bail!("registration refused: {}", registration.explanation);
+            }
+            let job = match export {
+                PluginExport::Observer => Some(Job::HarnessSubscriptions),
+                PluginExport::PluginEvents => Some(Job::EventSubscriptions),
+                _ => None,
+            };
+            if let Some(job) = job {
+                let call = self.next_call();
+                match execute(prepared.clone(), session, job, &call)? {
+                    Ok(Reply::HarnessSubscriptions(items)) => harness = items,
+                    Ok(Reply::EventSubscriptions(items)) => {
+                        if items.iter().any(|item| {
+                            PluginId::new(&item.publisher).is_none()
+                                || !hooks::valid_name(&item.name, &session.setup.tool_limits)
+                        }) {
+                            bail!("invalid plugin-event subscription");
+                        }
+                        subscriptions = items;
+                    }
+                    Ok(_) => bail!("wrong hook registration response"),
+                    Err(why) => bail!("hook registration failed: {why}"),
+                }
+            }
+        }
+        if !prepared.exports().contains(&PluginExport::Tool) {
+            session
+                .audit
+                .event(
+                    Kind::Decision,
+                    Some(&who),
+                    None,
+                    Some(true),
+                    json!({"operation":"load-hooks","sha256":hash,"manifest_sha256":manifest_hash}),
+                    "plugin hooks registered",
+                )
+                .map_err(|error| HostFailure(error.into()))?;
+            return Ok(Loaded {
+                prepared,
+                definition: None,
+                harness,
+                subscriptions,
+                version: manifest.version,
+                sha256: hash,
+            });
         }
         let call = self.next_call();
         let description = match execute(prepared.clone(), session, Job::Describe, &call)? {
@@ -395,11 +470,13 @@ impl Registry {
         session.audit.event(Kind::Decision, Some(&who), Some(Scope::Tool), Some(true), json!({"via":"plugin", "operation":"load", "sha256":hash, "manifest_sha256":manifest_hash, "requested_scopes":requested.scopes().iter().map(ToString::to_string).collect::<Vec<_>>(), "call_id":call}), "plugin prepared and described").map_err(|error| HostFailure(error.into()))?;
         Ok(Loaded {
             prepared,
-            definition: ToolDef {
+            harness,
+            subscriptions,
+            definition: Some(ToolDef {
                 name: tool_name.into(),
                 description: description.into(),
                 schema,
-            },
+            }),
             version: manifest.version,
             sha256: hash,
         })
@@ -452,7 +529,11 @@ impl Registry {
         let owner = self
             .loaded
             .iter()
-            .find(|(_, l)| l.definition.name == name)
+            .find(|(_, l)| {
+                l.definition
+                    .as_ref()
+                    .is_some_and(|definition| definition.name == name)
+            })
             .map(|(id, _)| id.clone());
         let Some(id) = owner else {
             let status = artifact(name)
@@ -490,7 +571,8 @@ impl Registry {
             component_sha256: loaded.sha256.clone(),
             version: loaded.version.clone(),
         };
-        let arguments = timeout::arguments(input, &loaded.definition.schema).to_string();
+        let definition = loaded.definition.as_ref().context("plugin has no tool")?;
+        let arguments = timeout::arguments(input, &definition.schema).to_string();
         session.audit.event(Kind::Decision, Some(&who), Some(Scope::Tool), Some(true), json!({"via":"plugin", "tool":name, "call_id":call, "timeout_secs":input.get("timeout_secs"), "arguments":{"bytes":arguments.len(),"sha256":sha256_hex(arguments.as_bytes())}, "component_sha256":loaded.sha256}), "plugin tool invocation")?;
         let result = execute(
             loaded.prepared.clone(),

@@ -18,7 +18,13 @@ use saddle_cap::{Location, Principal, RelPath, RootName, Scope};
 use saddle_loader::{HostServices, Invocation, Prepared, TaskOperation};
 use saddle_policy::audit::sha256_hex;
 use saddle_policy::{Kind, Request};
+use saddle_wit::events::exports::saddle::plugin::plugin_events::{
+    Event as PluginEvent, Subscription,
+};
 use saddle_wit::exports::saddle::plugin::tool::{Definition, Output};
+use saddle_wit::harness::exports::saddle::plugin::observer::{
+    Event as HarnessEvent, Kind as HarnessKind,
+};
 use saddle_wit::saddle::host::exec_tasks::Task;
 use saddle_wit::saddle::host::fs_list::Page as DirectoryPage;
 use saddle_wit::saddle::host::fs_read::{Failure, Path};
@@ -27,7 +33,7 @@ use saddle_wit::saddle::host::fs_write::Change;
 use saddle_wit::saddle::host::tool_result::ImageInfo;
 use serde_json::json;
 
-use super::{filesystem, mutations};
+use super::{filesystem, hooks, mutations};
 use crate::execution;
 use crate::network::Operation;
 use crate::provider::Image;
@@ -42,9 +48,16 @@ use saddle_wit::saddle::host::web_search::Snapshot as SearchSnapshot;
 pub enum Job {
     Describe,
     Invoke(String),
+    HarnessSubscriptions,
+    EventSubscriptions,
+    Observe(HarnessEvent),
+    Receive(PluginEvent),
 }
 pub enum Reply {
     Description(Definition),
+    HarnessSubscriptions(Vec<HarnessKind>),
+    EventSubscriptions(Vec<Subscription>),
+    Handled(Result<(), String>),
     Output {
         output: Output,
         images: Vec<Image>,
@@ -69,6 +82,13 @@ impl StdError for Fatal {
 type HostReply<T, E = Failure> = Result<Result<T, E>, String>;
 type FileReply = HostReply<Chunk>;
 enum Event {
+    Emit {
+        who: Principal,
+        deadline: Instant,
+        name: String,
+        data: String,
+        answer: SyncSender<HostReply<(), String>>,
+    },
     Task {
         who: Principal,
         operation: TaskOperation,
@@ -181,6 +201,28 @@ impl Host {
     }
 }
 impl HostServices for Host {
+    fn emit_event(
+        &mut self,
+        call: &Invocation,
+        name: String,
+        data: String,
+    ) -> Result<Result<(), String>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        self.events
+            .send(Event::Emit {
+                who: call.principal().clone(),
+                deadline: call.deadline(),
+                name,
+                data,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        result
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(|_| anyhow!("plugin event emission timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
+
     fn read_preimage(
         &mut self,
         call: &Invocation,
@@ -513,7 +555,7 @@ fn execute_inner(
     job: Job,
     call: &str,
 ) -> Result<Result<Reply, String>> {
-    let invoking = matches!(job, Job::Invoke(_));
+    let invoking = matches!(job, Job::Invoke(_) | Job::Observe(_) | Job::Receive(_));
     let mut filesystem_effects = false;
     let mut execution_effects = false;
     let mut network_effects = false;
@@ -537,6 +579,18 @@ fn execute_inner(
         .spawn(move || {
             let result = match job {
                 Job::Describe => prepared.describe(host, flag).map(Reply::Description),
+                Job::HarnessSubscriptions => prepared
+                    .harness_subscriptions(host, flag)
+                    .map(Reply::HarnessSubscriptions),
+                Job::EventSubscriptions => prepared
+                    .event_subscriptions(host, flag)
+                    .map(Reply::EventSubscriptions),
+                Job::Observe(event) => prepared
+                    .observe(host, event, flag, deadline)
+                    .map(Reply::Handled),
+                Job::Receive(event) => prepared
+                    .receive(host, event, flag, deadline)
+                    .map(Reply::Handled),
                 Job::Invoke(arguments) => prepared
                     .invoke_until(host, &arguments, flag, deadline)
                     .map(|output| Reply::Output {
@@ -559,6 +613,20 @@ fn execute_inner(
             cancelled.store(true, Ordering::Relaxed);
         }
         match pending.recv_timeout(Duration::from_millis(10)) {
+            Ok(Event::Emit {
+                who,
+                deadline,
+                name,
+                data,
+                answer,
+            }) => {
+                respond(
+                    hooks::publish(session, &who, call, &name, data, invoking, deadline),
+                    answer,
+                    &mut fatal,
+                    &cancelled,
+                );
+            }
             Ok(Event::Preimage {
                 who,
                 deadline,

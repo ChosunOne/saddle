@@ -113,6 +113,7 @@ macro_rules! catalogue {
 }
 catalogue!(HostInterface {
     Exec => ("saddle:host/exec", Requirement::Scope(Scope::Exec), true),
+    PluginEvents => ("saddle:host/plugin-events", Requirement::Scope(Scope::EventPublish), true),
     ExecTasks => ("saddle:host/exec-tasks", Requirement::Scope(Scope::Exec), true),
     Http => ("saddle:host/http", Requirement::Scope(Scope::Net), true),
     WebSearch => ("saddle:host/web-search", Requirement::Scope(Scope::Net), true),
@@ -124,7 +125,7 @@ catalogue!(HostInterface {
     FsWrite => ("saddle:host/fs-write", Requirement::AnyScope(FILESYSTEM_SCOPES), true),
     FsPreimage => ("saddle:host/fs-preimage", Requirement::AnyScope(FILESYSTEM_SCOPES), true),
     ToolResult => ("saddle:host/tool-result", Requirement::Scope(Scope::Tool), true),
-    Budgets => ("saddle:host/budgets", Requirement::Scope(Scope::Tool), true),
+    Budgets => ("saddle:host/budgets", Requirement::Ambient, true),
     TranscriptRead => ("saddle:host/transcript-read", Requirement::Scope(Scope::TranscriptRead), true),
     ContextContribute => ("saddle:host/context-contribute", Requirement::Scope(Scope::ContextContribute), false),
     ModelInvoke => ("saddle:host/model-invoke", Requirement::Scope(Scope::ModelInvoke), false),
@@ -132,7 +133,8 @@ catalogue!(HostInterface {
 });
 catalogue!(PluginExport {
     Tool => ("saddle:plugin/tool", Requirement::Scope(Scope::Tool), true),
-    Observer => ("saddle:plugin/observer", Requirement::Scope(Scope::TranscriptRead), false),
+    Observer => ("saddle:plugin/observer", Requirement::Scope(Scope::TranscriptRead), true),
+    PluginEvents => ("saddle:plugin/plugin-events", Requirement::Scope(Scope::EventSubscribe), true),
     Veto => ("saddle:plugin/veto", Requirement::Scope(Scope::Veto), false),
     Ui => ("saddle:plugin/ui", Requirement::Scope(Scope::Ui), false),
 });
@@ -364,7 +366,15 @@ mod tests {
                 .collect()
         );
         assert_eq!(
-            world_names(world.exports.values().collect()),
+            ["read-tool", "harness-hook", "plugin-event-handler"]
+                .into_iter()
+                .flat_map(|name| world_names(
+                    resolve.worlds[resolve.packages[host].worlds[name]]
+                        .exports
+                        .values()
+                        .collect()
+                ))
+                .collect::<BTreeSet<_>>(),
             catalogue_exports
                 .iter()
                 .map(|name| format!("{name}@0.1.0"))
@@ -462,8 +472,11 @@ mod tests {
         assert!(err[0].reason.contains("`tool`"));
         let ok = BTreeSet::from([Scope::Tool, Scope::TranscriptRead]);
         check_component(&ok, [], ["saddle:plugin/tool@0.1.0"]).unwrap();
-        let refused = check_component(&ok, [], ["saddle:plugin/observer@0.1.0"]).unwrap_err();
-        assert!(refused[0].reason.contains("not implemented"));
+        check_component(&ok, [], ["saddle:plugin/observer@0.1.0"]).unwrap();
+        assert!(check_component(&ok, [], ["saddle:plugin/plugin-events@0.1.0"]).is_err());
+        let custom = BTreeSet::from([Scope::EventSubscribe]);
+        check_component(&custom, [], ["saddle:plugin/plugin-events@0.1.0"]).unwrap();
+        assert!(check_component(&custom, [], ["saddle:plugin/observer@0.1.0"]).is_err());
         // A command-style export is not a plugin hook.
         assert!(check_component(&ok, [], ["wasi:cli/run@0.2.3"]).is_err());
     }

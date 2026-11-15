@@ -37,3 +37,12 @@ session_query = ["transcript-read"]
 /// sdk compatibility fixture, built automatically alongside the standard tools.
 #[doc(hidden)]
 pub const SDK_READER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sdk-reader.wasm"));
+
+/// hook-only SDK compatibility fixture, not an automatically loaded plugin.
+#[doc(hidden)]
+pub const SDK_HOOKS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sdk-hooks.wasm"));
+
+/// custom-only SDK listener fixture with no harness registration or publishing imports.
+#[doc(hidden)]
+pub const SDK_EVENT_LISTENER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/sdk-event-listener.wasm"));

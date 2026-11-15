@@ -1,0 +1,16 @@
+package saddle:plugin@0.1.0;
+
+// Only the host can construct this channel. Plugin events have a different interface.
+interface observer {
+    enum kind { turn-start, turn-end, tool-start, tool-end }
+    record event { kind: kind, data: string }
+    subscriptions: func() -> list<kind>;
+    observe: func(event: event) -> result<_, string>;
+}
+
+interface plugin-events {
+    record subscription { publisher: string, name: string }
+    record event { publisher: string, name: string, data: string }
+    subscriptions: func() -> list<subscription>;
+    receive: func(event: event) -> result<_, string>;
+}
