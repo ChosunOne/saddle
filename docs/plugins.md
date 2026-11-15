@@ -83,7 +83,10 @@ Other third-party components compile from checked raw WASM as before.
 
 Guest execution uses fresh bounded stores/instances with fuel, epochs and cancellation, empty args/
 environment/streams, no preopens and no ambient sockets. SDK availability never implies permission
-to perform an operation. Each SDK effect is decided and audited by the session's one engine under
+to perform an operation. The typed D150 interface catalogue supplies load-time requirements and
+implementation availability; the loader binds checked identities without repeating permission tables.
+Canonical WIT and actual adapter coverage are tested against that catalogue. Deferred hooks and
+unknown imports still fail before initialization, even when unused. Each SDK effect is decided and audited by the session's one engine under
 the host-assigned principal and call id. Fatal host/audit failures stop the session, not merely a tool.
 
 ## Mutation behavior and diffs

@@ -1,6 +1,5 @@
-//! The load-time check (D11): a component's imports and exports, as interface names, against the
-//! scopes granted to it. Pure and wasmtime-free, so the v1 thesis test can run on a hand-written
-//! list as well as on a compiled component.
+//! typed interface catalogue and pre-initialization eligibility checks (D11, D14, D139, D150).
+//! pure and wasmtime-free; service bindings never substitute for per-resource authorization.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -59,132 +58,244 @@ impl fmt::Display for Direction {
     }
 }
 
-/// What an interface needs before a component may use it.
-/// filesystem-service eligibility never substitutes for its per-resource decisions (D139, D140).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// service eligibility is not per-resource operational authority (D139, D150).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Requirement {
     Scope(Scope),
     AnyScope(&'static [Scope]),
     Ambient,
-    Refused(String),
 }
+impl Requirement {
+    pub fn satisfied_by(self, scopes: &BTreeSet<Scope>) -> bool {
+        self == Self::Ambient || scopes.iter().any(|scope| self.mentions(*scope))
+    }
+    fn mentions(self, scope: Scope) -> bool {
+        match self {
+            Self::Scope(s) => s == scope,
+            Self::AnyScope(scopes) => scopes.contains(&scope),
+            Self::Ambient => false,
+        }
+    }
+    fn refusal(self) -> String {
+        match self {
+            Self::Scope(s) => format!("needs scope `{s}`, which is not granted"),
+            Self::AnyScope(scopes) => format!(
+                "needs scope {}, which are not granted",
+                scopes
+                    .iter()
+                    .map(|s| format!("`{s}`"))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            ),
+            Self::Ambient => "ambient interface".into(),
+        }
+    }
+}
+const FILESYSTEM_SCOPES: &[Scope] = &[
+    Scope::FsRead,
+    Scope::ToolRead,
+    Scope::FsWrite,
+    Scope::ToolWrite,
+];
 
-pub fn classify(direction: Direction, name: &str) -> Requirement {
-    let Some(n) = InterfaceName::parse(name) else {
-        return Requirement::Refused("not a `namespace:package/interface@version` name".into());
+// One production catalogue generates identities, names, requirements and availability (D150).
+macro_rules! catalogue {
+    ($kind:ident { $( $variant:ident => ($name:literal, $requirement:expr, $implemented:literal) ),* $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum $kind { $( $variant, )* }
+        impl $kind {
+            pub const ALL: &'static [Self] = &[$( Self::$variant, )*];
+            pub fn name(self) -> &'static str { match self { $( Self::$variant => $name, )* } }
+            pub fn requirement(self) -> Requirement { match self { $( Self::$variant => $requirement, )* } }
+            pub fn implemented(self) -> bool { match self { $( Self::$variant => $implemented, )* } }
+        }
     };
+}
+catalogue!(HostInterface {
+    Exec => ("saddle:host/exec", Requirement::Scope(Scope::Exec), true),
+    Http => ("saddle:host/http", Requirement::Scope(Scope::Net), true),
+    WebSearch => ("saddle:host/web-search", Requirement::Scope(Scope::Net), true),
+    FsRead => ("saddle:host/fs-read", Requirement::AnyScope(FILESYSTEM_SCOPES), true),
+    FsReadRange => ("saddle:host/fs-read-range", Requirement::AnyScope(FILESYSTEM_SCOPES), true),
+    FsPaths => ("saddle:host/fs-paths", Requirement::AnyScope(FILESYSTEM_SCOPES), true),
+    FsList => ("saddle:host/fs-list", Requirement::AnyScope(FILESYSTEM_SCOPES), true),
+    ToolPaths => ("saddle:host/tool-paths", Requirement::AnyScope(FILESYSTEM_SCOPES), true),
+    FsWrite => ("saddle:host/fs-write", Requirement::AnyScope(FILESYSTEM_SCOPES), true),
+    FsPreimage => ("saddle:host/fs-preimage", Requirement::AnyScope(FILESYSTEM_SCOPES), true),
+    ToolResult => ("saddle:host/tool-result", Requirement::Scope(Scope::Tool), true),
+    Budgets => ("saddle:host/budgets", Requirement::Scope(Scope::Tool), true),
+    TranscriptRead => ("saddle:host/transcript-read", Requirement::Scope(Scope::TranscriptRead), true),
+    ContextContribute => ("saddle:host/context-contribute", Requirement::Scope(Scope::ContextContribute), false),
+    ModelInvoke => ("saddle:host/model-invoke", Requirement::Scope(Scope::ModelInvoke), false),
+    Persist => ("saddle:host/persist", Requirement::Scope(Scope::Persist), false),
+});
+catalogue!(PluginExport {
+    Tool => ("saddle:plugin/tool", Requirement::Scope(Scope::Tool), true),
+    Observer => ("saddle:plugin/observer", Requirement::Scope(Scope::TranscriptRead), false),
+    Veto => ("saddle:plugin/veto", Requirement::Scope(Scope::Veto), false),
+    Ui => ("saddle:plugin/ui", Requirement::Scope(Scope::Ui), false),
+});
+catalogue!(WasiInterface {
+    Environment => ("wasi:cli/environment", Requirement::Ambient, true),
+    Exit => ("wasi:cli/exit", Requirement::Ambient, true),
+    Stdin => ("wasi:cli/stdin", Requirement::Ambient, true),
+    Stdout => ("wasi:cli/stdout", Requirement::Ambient, true),
+    Stderr => ("wasi:cli/stderr", Requirement::Ambient, true),
+    TerminalInput => ("wasi:cli/terminal-input", Requirement::Ambient, true),
+    TerminalOutput => ("wasi:cli/terminal-output", Requirement::Ambient, true),
+    TerminalStdin => ("wasi:cli/terminal-stdin", Requirement::Ambient, true),
+    TerminalStdout => ("wasi:cli/terminal-stdout", Requirement::Ambient, true),
+    TerminalStderr => ("wasi:cli/terminal-stderr", Requirement::Ambient, true),
+    MonotonicClock => ("wasi:clocks/monotonic-clock", Requirement::Ambient, true),
+    WallClock => ("wasi:clocks/wall-clock", Requirement::Ambient, true),
+    FilesystemTypes => ("wasi:filesystem/types", Requirement::Ambient, true),
+    Preopens => ("wasi:filesystem/preopens", Requirement::Ambient, true),
+    Random => ("wasi:random/random", Requirement::Ambient, true),
+    InsecureRandom => ("wasi:random/insecure", Requirement::Ambient, true),
+    InsecureSeed => ("wasi:random/insecure-seed", Requirement::Ambient, true),
+    IoError => ("wasi:io/error", Requirement::Ambient, true),
+    Streams => ("wasi:io/streams", Requirement::Ambient, true),
+    Poll => ("wasi:io/poll", Requirement::Ambient, false),
+    HttpOutgoingHandler => ("wasi:http/outgoing-handler", Requirement::Scope(Scope::Net), false),
+    HttpTypes => ("wasi:http/types", Requirement::Ambient, false),
+});
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interface {
+    Host(HostInterface),
+    Wasi(WasiInterface),
+    Export(PluginExport),
+}
+impl Interface {
+    pub fn all() -> impl Iterator<Item = Self> {
+        HostInterface::ALL
+            .iter()
+            .copied()
+            .map(Self::Host)
+            .chain(WasiInterface::ALL.iter().copied().map(Self::Wasi))
+            .chain(PluginExport::ALL.iter().copied().map(Self::Export))
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Host(i) => i.name(),
+            Self::Wasi(i) => i.name(),
+            Self::Export(i) => i.name(),
+        }
+    }
+    pub fn direction(self) -> Direction {
+        match self {
+            Self::Host(_) | Self::Wasi(_) => Import,
+            Self::Export(_) => Export,
+        }
+    }
+    pub fn requirement(self) -> Requirement {
+        match self {
+            Self::Host(i) => i.requirement(),
+            Self::Wasi(i) => i.requirement(),
+            Self::Export(i) => i.requirement(),
+        }
+    }
+    pub fn implemented(self) -> bool {
+        match self {
+            Self::Host(i) => i.implemented(),
+            Self::Wasi(i) => i.implemented(),
+            Self::Export(i) => i.implemented(),
+        }
+    }
+}
+/// rejects unsupported grants even when their service is not imported (D150).
+pub fn runtime_supports_scope(scope: Scope) -> bool {
+    Interface::all().any(|i| i.implemented() && i.requirement().mentions(scope))
+}
+pub fn classify(direction: Direction, name: &str) -> Result<Interface, String> {
+    let n = InterfaceName::parse(name).ok_or("not a `namespace:package/interface@version` name")?;
     let line = match n.namespace {
         "saddle" => SADDLE_ABI_LINE,
         "wasi" => WASI_LINE,
-        _ => return Requirement::Refused("not in the import table".into()),
+        _ => return Err("not in the import table".into()),
     };
     match n.version {
         Some(v) if v.starts_with(line) => {}
         Some(v) => {
-            return Requirement::Refused(format!(
+            return Err(format!(
                 "version {v} is unsupported; this host supports {line}x"
             ));
         }
-        None => return Requirement::Refused(format!("unversioned; this host supports {line}x")),
+        None => return Err(format!("unversioned; this host supports {line}x")),
     }
-
-    let scope = |s| Requirement::Scope(s);
-    match (direction, n.namespace, n.package, n.interface) {
-        (Import, "saddle", "host", i) => match i {
-            "exec" => scope(Scope::Exec),
-            "http" | "web-search" => scope(Scope::Net),
-            "fs-read" | "fs-read-range" | "fs-paths" | "fs-list" | "tool-paths" | "fs-write"
-            | "fs-preimage" => Requirement::AnyScope(&[
-                Scope::FsRead,
-                Scope::ToolRead,
-                Scope::FsWrite,
-                Scope::ToolWrite,
-            ]),
-            "tool-result" | "budgets" => scope(Scope::Tool),
-            "transcript-read" => scope(Scope::TranscriptRead),
-            "context-contribute" => scope(Scope::ContextContribute),
-            "model-invoke" => scope(Scope::ModelInvoke),
-            "persist" => scope(Scope::Persist),
-            _ => Requirement::Refused("unknown host interface".into()),
-        },
-        (Export, "saddle", "plugin", i) => match i {
-            "tool" => scope(Scope::Tool),
-            "observer" => scope(Scope::TranscriptRead),
-            "veto" => scope(Scope::Veto),
-            "ui" => scope(Scope::Ui),
-            _ => Requirement::Refused("unknown plugin hook".into()),
-        },
-        (Import, "wasi", "http", "outgoing-handler") => scope(Scope::Net),
-        (Import, "wasi", "http", "types") => Requirement::Ambient,
-        (Import, "wasi", "sockets", _) => Requirement::Refused(
-            "raw sockets are not offered; use wasi:http/outgoing-handler with a net grant".into(),
-        ),
-        (Import, "wasi", "filesystem", "types" | "preopens") => Requirement::Ambient,
-        (Import, "wasi", "cli", i)
-            if matches!(i, "environment" | "exit" | "stdin" | "stdout" | "stderr")
-                || i.starts_with("terminal-") =>
-        {
-            Requirement::Ambient
-        }
-        (Import, "wasi", "io", _) => Requirement::Ambient,
-        (Import, "wasi", "clocks", "monotonic-clock" | "wall-clock") => Requirement::Ambient,
-        (Import, "wasi", "random", _) => Requirement::Ambient,
-        _ => Requirement::Refused(format!("not in the {direction} table")),
+    // Canonical Saddle bindings remain exact; WASI retains its compatible 0.2.x line.
+    if n.namespace == "saddle" && n.version != Some("0.1.0") {
+        return Err("only the canonical saddle ABI version 0.1.0 is implemented".into());
     }
+    if n.namespace == "wasi" && n.package == "sockets" {
+        return Err("raw sockets are not offered; use saddle:host/http with a net grant".into());
+    }
+    let base = name.split_once('@').map(|(base, _)| base).unwrap_or(name);
+    Interface::all()
+        .find(|i| i.direction() == direction && i.name() == base)
+        .ok_or_else(|| format!("not in the {direction} table"))
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     pub direction: Direction,
     pub name: String,
     pub reason: String,
 }
-
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} `{}`: {}", self.direction, self.name, self.reason)
     }
 }
-
-/// Refuses the component unless every import and export is ambient or covered by a granted scope.
-/// Returns every refusal, not only the first, so the log names the whole problem.
+/// interface identities checked for eligibility and implementation before initialization.
+#[derive(Debug)]
+pub struct CheckedComponent {
+    pub imports: Vec<Interface>,
+    pub exports: Vec<Interface>,
+}
+/// collects all refusals, including unused interfaces, before any guest initialization (D150).
 pub fn check_component<'a>(
     granted: &BTreeSet<Scope>,
     imports: impl IntoIterator<Item = &'a str>,
     exports: impl IntoIterator<Item = &'a str>,
-) -> Result<(), Vec<Refusal>> {
-    let items = imports
+) -> Result<CheckedComponent, Vec<Refusal>> {
+    let mut checked = CheckedComponent {
+        imports: Vec::new(),
+        exports: Vec::new(),
+    };
+    let mut refusals = Vec::new();
+    for (direction, name) in imports
         .into_iter()
-        .map(|n| (Direction::Import, n))
-        .chain(exports.into_iter().map(|n| (Direction::Export, n)));
-    let refusals: Vec<Refusal> = items
-        .filter_map(|(direction, name)| {
-            let reason = match classify(direction, name) {
-                Requirement::Ambient => return None,
-                Requirement::Scope(s) if granted.contains(&s) => return None,
-                Requirement::Scope(s) => format!("needs scope `{s}`, which is not granted"),
-                Requirement::AnyScope(scopes) if scopes.iter().any(|s| granted.contains(s)) => {
-                    return None;
+        .map(|n| (Import, n))
+        .chain(exports.into_iter().map(|n| (Export, n)))
+    {
+        let result = classify(direction, name).and_then(|i| {
+            if !i.requirement().satisfied_by(granted) {
+                Err(i.requirement().refusal())
+            } else if !i.implemented() {
+                Err("interface is not implemented by the runtime".into())
+            } else {
+                Ok(i)
+            }
+        });
+        match result {
+            Ok(i) => {
+                let plan = match direction {
+                    Import => &mut checked.imports,
+                    Export => &mut checked.exports,
+                };
+                // Compatible WASI patch versions can name the same adapter more than once.
+                if !plan.contains(&i) {
+                    plan.push(i);
                 }
-                Requirement::AnyScope(scopes) => format!(
-                    "needs scope {}, which are not granted",
-                    scopes
-                        .iter()
-                        .map(|s| format!("`{s}`"))
-                        .collect::<Vec<_>>()
-                        .join(" or ")
-                ),
-                Requirement::Refused(reason) => reason,
-            };
-            Some(Refusal {
+            }
+            Err(reason) => refusals.push(Refusal {
                 direction,
                 name: name.to_owned(),
                 reason,
-            })
-        })
-        .collect();
+            }),
+        }
+    }
     if refusals.is_empty() {
-        Ok(())
+        Ok(checked)
     } else {
         Err(refusals)
     }
@@ -193,6 +304,119 @@ pub fn check_component<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use wit_parser::{Resolve, WorldItem};
+
+    #[test]
+    fn catalogue_matches_canonical_wit_interfaces_and_world() {
+        let mut resolve = Resolve::default();
+        let (host, _) = resolve
+            .push_dir(Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../saddle-wit/wit"
+            )))
+            .unwrap();
+        let host_names: BTreeSet<_> = resolve.packages[host]
+            .interfaces
+            .keys()
+            .map(|name| format!("saddle:host/{name}"))
+            .collect();
+        let catalogue_host: BTreeSet<_> = HostInterface::ALL
+            .iter()
+            .filter(|i| i.implemented())
+            .map(|i| i.name().to_owned())
+            .collect();
+        assert_eq!(host_names, catalogue_host);
+        let (_, plugin) = resolve
+            .packages
+            .iter()
+            .find(|(_, package)| {
+                package.name.namespace == "saddle" && package.name.name == "plugin"
+            })
+            .unwrap();
+        let export_names: BTreeSet<_> = plugin
+            .interfaces
+            .keys()
+            .map(|name| format!("saddle:plugin/{name}"))
+            .collect();
+        let catalogue_exports: BTreeSet<_> = PluginExport::ALL
+            .iter()
+            .filter(|i| i.implemented())
+            .map(|i| i.name().to_owned())
+            .collect();
+        assert_eq!(export_names, catalogue_exports);
+        let world = &resolve.worlds[resolve.packages[host].worlds["read-tool"]];
+        let world_names = |items: Vec<&WorldItem>| -> BTreeSet<_> {
+            items
+                .into_iter()
+                .map(|item| match item {
+                    WorldItem::Interface { id, .. } => resolve.id_of(*id).unwrap(),
+                    _ => panic!("only interface instances belong in the tool world"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            world_names(world.imports.values().collect()),
+            catalogue_host
+                .iter()
+                .map(|name| format!("{name}@0.1.0"))
+                .collect()
+        );
+        assert_eq!(
+            world_names(world.exports.values().collect()),
+            catalogue_exports
+                .iter()
+                .map(|name| format!("{name}@0.1.0"))
+                .collect()
+        );
+    }
+
+    #[test]
+    fn catalogue_names_are_unique_and_every_entry_round_trips() {
+        let mut names = BTreeSet::new();
+        let all: BTreeSet<_> = Scope::ALL.into_iter().collect();
+        for interface in Interface::all() {
+            assert!(names.insert(interface.name()));
+            let version = if matches!(interface, Interface::Wasi(_)) {
+                "0.2.3"
+            } else {
+                "0.1.0"
+            };
+            let name = format!("{}@{version}", interface.name());
+            assert_eq!(classify(interface.direction(), &name), Ok(interface));
+            let result = match interface.direction() {
+                Import => check_component(&all, [name.as_str()], []),
+                Export => check_component(&all, [], [name.as_str()]),
+            };
+            assert_eq!(result.is_ok(), interface.implemented(), "{name}");
+        }
+    }
+
+    #[test]
+    fn compatible_wasi_imports_share_one_binding_without_inheriting_other_services() {
+        let checked = check_component(
+            &BTreeSet::new(),
+            ["wasi:io/error@0.2.0", "wasi:io/error@0.2.3"],
+            [],
+        )
+        .unwrap();
+        assert_eq!(checked.imports, [Interface::Wasi(WasiInterface::IoError)]);
+        assert!(checked.exports.is_empty());
+    }
+
+    #[test]
+    fn filesystem_service_eligibility_is_shared_but_registration_is_not_read_authority() {
+        for interface in HostInterface::ALL
+            .iter()
+            .filter(|i| i.requirement() == Requirement::AnyScope(FILESYSTEM_SCOPES))
+        {
+            let name = format!("{}@0.1.0", interface.name());
+            for scope in FILESYSTEM_SCOPES {
+                check_component(&BTreeSet::from([*scope]), [name.as_str()], []).unwrap();
+            }
+            assert!(check_component(&BTreeSet::from([Scope::Tool]), [name.as_str()], []).is_err());
+        }
+    }
 
     /// What a minimal Rust std component imports before it touches any scope.
     const STD_AMBIENT: &[&str] = &[
@@ -236,12 +460,9 @@ mod tests {
         let err = check_component(&BTreeSet::new(), [], ["saddle:plugin/tool@0.1.0"]).unwrap_err();
         assert!(err[0].reason.contains("`tool`"));
         let ok = BTreeSet::from([Scope::Tool, Scope::TranscriptRead]);
-        check_component(
-            &ok,
-            [],
-            ["saddle:plugin/tool@0.1.0", "saddle:plugin/observer@0.1.0"],
-        )
-        .unwrap();
+        check_component(&ok, [], ["saddle:plugin/tool@0.1.0"]).unwrap();
+        let refused = check_component(&ok, [], ["saddle:plugin/observer@0.1.0"]).unwrap_err();
+        assert!(refused[0].reason.contains("not implemented"));
         // A command-style export is not a plugin hook.
         assert!(check_component(&ok, [], ["wasi:cli/run@0.2.3"]).is_err());
     }
@@ -262,7 +483,7 @@ mod tests {
                 "{name} should be refused"
             );
         }
-        check_component(&all, ["wasi:http/outgoing-handler@0.2.3"], []).unwrap();
+        assert!(check_component(&all, ["wasi:http/outgoing-handler@0.2.3"], []).is_err());
     }
 
     #[test]

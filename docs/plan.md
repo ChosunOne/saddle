@@ -3428,6 +3428,31 @@ delivered rather than where it was typed, so what is on screen is the order the 
 The mailbox is shared memory, not a command: the command channel is blocked by the very turn that has
 to read it, which is exactly why steering could not be built on it.
 
+**D150.** Interface eligibility and implementation availability have one production catalogue in
+`saddle-cap::component`, without Wasmtime or authority of its own. Typed host, WASI and export
+identities carry their names, direction, scope requirement and implemented/deferred status. One
+requirement evaluator checks actual component imports/exports and returns a deduplicated typed
+binding plan. Known deferred interfaces remain nameable for diagnostics but are refused, including
+unused imports and the observer export, before initialization. Unknown names fail closed; Saddle
+bindings remain exactly 0.1.0 and WASI retains its compatible 0.2.x line. This replaces the generic
+classifier's acceptance of deferred interfaces with the runtime's existing fail-closed contract.
+
+The loader consumes only checked import identities through exhaustive adapter matches. It has no
+second string whitelist, scope conditions around linker registration or ambient `supports` list.
+Compatible WASI import versions share one binding. Adapter availability is tested against the
+catalogue; implemented Saddle entries and the tool world are checked against parsed canonical WIT,
+including exact interface identities and versions, not a source-text scan or an unused helper table.
+Unsupported grants are still rejected even without a corresponding import: delegation derives its
+supported-scope guard from implemented catalogue requirements instead of a second scope list.
+
+Manifest ceilings, parent-resource narrowing, registration and operational authorization remain
+separate. Service eligibility is not read/write/path/network authority; the filesystem family keeps
+D139–D141's shared binding requirement and the core still decides/audits each effect under the
+bounded caller. No grants, directories, exclusions, guest artifacts, digests or SDK signatures change.
+Acceptance uses the same reader bytes/digest across workspace access and external denial, runtime
+enablement and revocation, with unchanged root exclusions and principal isolation. Unused imports,
+unimplemented grants/hooks, wrong signatures and unsupported versions fail before guest start.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
@@ -3529,7 +3554,7 @@ read bindings under a write capability must never let that principal read a file
 
 - The hook half of the extension surface: `veto`, `ui`, `persist`, `model-invoke`,
   `context-contribute` and the `saddle:plugin/observer` export. The scopes are defined and the load
-  check names their interfaces, and the loader refuses them by name ("not implemented by the initial
+  check names their interfaces, and the loader refuses them by name ("not implemented by the
   runtime"), so a component that expects one fails at load rather than at its first call. `ui` also
   carries "input widgets" below; a plugin is not given the terminal before the core owns the contract
   it draws inside.
@@ -3556,23 +3581,12 @@ read bindings under a write capability must never let that principal read a file
 
 ## 9. Known risks
 
-- The policy engine and the WIT world are one design. Getting them out of step produces a system that
-  looks enforced and is not. The same fact is written down in four places today and cross-checked by
-  nothing: `saddle_cap::component::classify` gives each interface name the scope that permits it;
-  `saddle-loader` keeps a literal list of the imports it implements, and the sentence it refuses the
-  rest with; the same loader registers the host adapters in `add_to_linker` behind
-  `scopes.contains(..)` conditions that repeat the scope mapping; and
-  `crates/saddle-wit/wit/host.wit` holds the names and signatures themselves. They agree because
-  every change so far has touched all four, which is a habit rather than a guarantee. The deleted
-  `host_interfaces` is what a fifth copy looked like after it drifted. Naming interfaces the runtime
-  does not implement is deliberate (section 6): the refusal is the point, and it names what is
-  missing. What is not deliberate is that the naming, the implementation list, the registration and
-  the WIT can disagree without anything noticing. The fix is one table in `saddle-cap` giving each
-  interface its direction, the scope it needs, and whether the runtime implements it, with
-  `classify`, the load-time refusal and the linker registration all reading from it, plus a test that
-  the table covers exactly the interfaces the WIT defines. Until then a change to any of the four
-  must be mirrored in the other three, and the hook surface (section 7, v3) is where that is easiest
-  to get wrong.
+- The policy engine and the WIT world are one design. D150 replaces the hand-maintained classifier,
+  loader whitelist and scope-gated registration with a typed production catalogue and exhaustive
+  adapter dispatch. Tests compare availability with actual binders and implemented Saddle entries
+  with parsed canonical WIT. This does not make binding authority: per-operation policy, attribution,
+  exclusions and sandbox lowering must still agree with the delegated grants. New adapters need both
+  the catalogue/signature coverage and hostile resource-operation tests, not another permission list.
 - Building an argv matcher for `exec` first is the tempting shortcut. It works until a plugin writes a
   Makefile.
 - Parity pressure will pull toward extension points that have no scope yet, and the easy answer will be

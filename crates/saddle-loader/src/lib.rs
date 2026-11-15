@@ -1,4 +1,4 @@
-//! bounded, grant-shaped component loading (D11, D13, D126, D127).
+//! bounded, grant-shaped component loading (D11, D13, D126, D127, D150).
 
 mod ambient;
 
@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
-use saddle_cap::component::{Direction, check_component};
+use saddle_cap::component::{Direction, HostInterface, Interface, check_component};
 use saddle_cap::delegate::{self, DelegationError};
 use saddle_cap::manifest::{Manifest, above_ceiling};
 use saddle_cap::{Grants, Principal, Scope};
@@ -905,7 +905,7 @@ impl Loader {
         let ty = component.component_type();
         let imports = interfaces(Direction::Import, ty.imports(engine))?;
         let exports = interfaces(Direction::Export, ty.exports(engine))?;
-        check_component(
+        let checked = check_component(
             &scopes,
             imports.iter().map(String::as_str),
             exports.iter().map(String::as_str),
@@ -918,77 +918,14 @@ impl Loader {
                     .join("; "),
             )
         })?;
-        // There is deliberately no broad WASI linker helper: it would also define raw sockets.
-        // Even an empty, unused import must be refused if its adapter is not implemented;
-        // Wasmtime can otherwise elide it during pre-linking.
-        for name in &imports {
-            if !matches!(
-                name.as_str(),
-                "saddle:host/fs-read@0.1.0"
-                    | "saddle:host/budgets@0.1.0"
-                    | "saddle:host/exec@0.1.0"
-                    | "saddle:host/http@0.1.0"
-                    | "saddle:host/web-search@0.1.0"
-                    | "saddle:host/fs-read-range@0.1.0"
-                    | "saddle:host/fs-write@0.1.0"
-                    | "saddle:host/fs-preimage@0.1.0"
-                    | "saddle:host/fs-paths@0.1.0"
-                    | "saddle:host/fs-list@0.1.0"
-                    | "saddle:host/tool-result@0.1.0"
-                    | "saddle:host/tool-paths@0.1.0"
-                    | "saddle:host/transcript-read@0.1.0"
-            ) && !ambient::supports(name)
-            {
-                return Err(Error::Refused(format!(
-                    "import `{name}` is not implemented by the initial runtime"
-                )));
-            }
-        }
         let mut linker = Linker::<State<H>>::new(engine);
-        ambient::add(&mut linker).map_err(runtime("linking ambient WASI"))?;
-        if scopes.contains(&Scope::Net) {
-            http::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-                .map_err(runtime("linking HTTP"))?;
-            web_search::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-                .map_err(runtime("linking search"))?;
-        }
-        if scopes.contains(&Scope::Exec) {
-            exec::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-                .map_err(runtime("linking exec"))?;
-        }
-        // D139: one filesystem SDK, with actual root/external access decided per request.
-        if scopes.contains(&Scope::FsRead)
-            || scopes.contains(&Scope::ToolRead)
-            || scopes.contains(&Scope::FsWrite)
-            || scopes.contains(&Scope::ToolWrite)
-        {
-            fs_preimage::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-                .map_err(runtime("linking preimages"))?;
-            fs_write::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-                .map_err(runtime("linking fs-write"))?;
-            fs_read::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-                .map_err(runtime("linking fs-read"))?;
-            fs_read_range::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-                .map_err(runtime("linking fs-read-range"))?;
-            fs_paths::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-                .map_err(runtime("linking fs-paths"))?;
-            fs_list::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-                .map_err(runtime("linking fs-list"))?;
-            // Compatibility imports are service bindings too, never external-directory authority.
-            tool_paths::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-                .map_err(runtime("linking tool-paths"))?;
-        }
-        if scopes.contains(&Scope::Tool) {
-            budgets_interface::add_to_linker::<State<H>, HasSelf<State<H>>>(&mut linker, |state| {
-                state
-            })
-            .map_err(runtime("linking resource budgets"))?;
-            tool_result::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-                .map_err(runtime("linking tool-result"))?;
-        }
-        if scopes.contains(&Scope::TranscriptRead) {
-            transcript_read::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-                .map_err(runtime("linking transcript-read"))?;
+        for interface in checked.imports {
+            match interface {
+                Interface::Host(host) => bind_host(&mut linker, host),
+                Interface::Wasi(wasi) => ambient::bind(&mut linker, wasi),
+                Interface::Export(_) => Err(anyhow!("plugin export cannot be bound as an import")),
+            }
+            .map_err(runtime("binding checked import"))?;
         }
         check_tool_types(engine, &ty)?;
         let pre = linker
@@ -1003,6 +940,48 @@ impl Loader {
             hash: Sha256::digest(bytes).into(),
             limits,
         })
+    }
+}
+
+/// adapter dispatch contains no names or permission expressions; those live in the catalogue (D150).
+fn bind_host<H: HostServices>(
+    linker: &mut Linker<State<H>>,
+    interface: HostInterface,
+) -> anyhow::Result<()> {
+    match interface {
+        HostInterface::Http => http::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
+        HostInterface::WebSearch => {
+            web_search::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
+        }
+        HostInterface::Exec => exec::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
+        HostInterface::FsPreimage => {
+            fs_preimage::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
+        }
+        HostInterface::FsWrite => fs_write::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
+        HostInterface::FsRead => fs_read::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
+        HostInterface::FsReadRange => {
+            fs_read_range::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
+        }
+        HostInterface::FsPaths => fs_paths::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
+        HostInterface::FsList => fs_list::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
+        HostInterface::ToolPaths => {
+            tool_paths::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
+        }
+        HostInterface::ToolResult => {
+            tool_result::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
+        }
+        HostInterface::TranscriptRead => {
+            transcript_read::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
+        }
+        HostInterface::Budgets => {
+            budgets_interface::add_to_linker::<State<H>, HasSelf<State<H>>>(linker, |state| state)
+        }
+        HostInterface::ContextContribute | HostInterface::ModelInvoke | HostInterface::Persist => {
+            Err(anyhow!(
+                "host adapter is not implemented: {}",
+                interface.name()
+            ))
+        }
     }
 }
 
@@ -1220,6 +1199,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use cap_std::fs::Dir;
+    use saddle_cap::component::WasiInterface;
     use saddle_cap::{Location, PluginId, Policy, RelPath, RootName, Roots};
     use saddle_policy::audit::{self, AuditLog};
     use saddle_policy::{Engine as PolicyEngine, Request};
@@ -1230,6 +1210,46 @@ mod tests {
     use wasmtime_wasi::p2::bindings::filesystem::preopens::Host as PreopensHost;
     use wasmtime_wasi::p2::bindings::random::random::Host as RandomHost;
     use wasmtime_wasi::random::WasiRandomView;
+
+    #[test]
+    fn exhaustive_binders_agree_with_catalogue_availability() {
+        let loader = Loader::new().unwrap();
+        for interface in HostInterface::ALL {
+            let mut linker = Linker::<State<NoHost>>::new(&loader.0.engine);
+            assert_eq!(
+                bind_host(&mut linker, *interface).is_ok(),
+                interface.implemented(),
+                "{}",
+                interface.name()
+            );
+        }
+        for interface in WasiInterface::ALL {
+            let mut linker = Linker::<State<NoHost>>::new(&loader.0.engine);
+            assert_eq!(
+                ambient::bind(&mut linker, *interface).is_ok(),
+                interface.implemented(),
+                "{}",
+                interface.name()
+            );
+        }
+    }
+
+    #[test]
+    fn compatible_wasi_import_versions_bind_once() {
+        let (_dir, agent, plugin) = grants(GRANTS);
+        let source = READER.replacen("(component", "(component (import \"wasi:io/error@0.2.0\" (instance)) (import \"wasi:io/error@0.2.3\" (instance))", 1);
+        let prepared = Loader::new()
+            .unwrap()
+            .prepare::<NoHost>(
+                &manifest(),
+                &agent,
+                &plugin,
+                &wat::parse_str(source).unwrap(),
+                Limits::default(),
+            )
+            .unwrap();
+        prepared.describe(NoHost, cancelled()).unwrap();
+    }
 
     const READER: &str = include_str!("fixtures/read-tool.wat");
     const GRANTS: &str = "[agent]\nfs-read=[{root='workspace',exclude=['.env*']}]\n[plugin.reader]\ntool={}\nfs-read=[{root='workspace',exclude=['private']}]\n";
@@ -1956,7 +1976,14 @@ mod tests {
     fn a_blocking_poll_or_http_adapter_is_not_linked_in_the_initial_runtime() {
         let (_dir, agent, plugin) = grants(GRANTS);
         let loader = Loader::new().unwrap();
-        for name in ["wasi:io/poll@0.2.3", "wasi:http/outgoing-handler@0.2.3"] {
+        for name in [
+            "wasi:io/poll@0.2.3",
+            "wasi:http/outgoing-handler@0.2.3",
+            "wasi:http/types@0.2.3",
+            "wasi:io/unknown@0.2.3",
+            "wasi:random/unknown@0.2.3",
+            "wasi:cli/terminal-unknown@0.2.3",
+        ] {
             let source = READER
                 .replacen(
                     "(component",
@@ -1977,6 +2004,28 @@ mod tests {
             assert!(why.contains(name), "{why}");
             assert!(!why.contains("unreachable"), "initialization ran: {why}");
         }
+    }
+
+    #[test]
+    fn an_unused_observer_export_is_refused_before_initialization() {
+        let (_dir, agent, plugin) = grants(
+            "[agent]\nfs-read=[{root='workspace'}]\ntranscript-read={}\n[plugin.reader]\ntool={}\nfs-read=[{root='workspace'}]\ntranscript-read={}\n",
+        );
+        let mut manifest = manifest();
+        manifest.scopes.insert(Scope::TranscriptRead);
+        let source = READER.replacen("(component", r#"(component (instance $observer) (export "saddle:plugin/observer@0.1.0" (instance $observer))"#, 1).replace(";; initialization-probe", "(func $start unreachable) (start $start)");
+        let why = refusal(Loader::new().unwrap().prepare::<NoHost>(
+            &manifest,
+            &agent,
+            &plugin,
+            &wat::parse_str(source).unwrap(),
+            Limits::default(),
+        ));
+        assert!(
+            why.contains("observer") && why.contains("not implemented"),
+            "{why}"
+        );
+        assert!(!why.contains("unreachable"), "{why}");
     }
 
     struct FailedHost;

@@ -1,5 +1,6 @@
-//! the initial plugin's operational reach is bounded by the agent (D126, D127).
+//! the initial plugin's operational reach is bounded by the agent (D126, D127, D150).
 
+use crate::component::runtime_supports_scope;
 use crate::narrow::covers;
 use crate::{Grants, RootName, Scope};
 
@@ -21,21 +22,11 @@ pub enum DelegationError {
 
 /// bounds an explicitly granted tool without inheriting omitted grants.
 ///
-/// `tool` registers an export, not operational authority. Additional adapters must extend this
-/// check before their scopes can be linked; unsupported grants are never silently ignored.
+/// `tool` registers an export, not operational authority. Additional adapters must extend the interface
+/// catalogue before their scopes can be linked; unsupported grants are never silently ignored.
 pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationError> {
     for scope in plugin.scopes() {
-        if !matches!(
-            scope,
-            Scope::Exec
-                | Scope::Net
-                | Scope::FsRead
-                | Scope::FsWrite
-                | Scope::ToolRead
-                | Scope::ToolWrite
-                | Scope::Tool
-                | Scope::TranscriptRead
-        ) {
+        if !runtime_supports_scope(scope) {
             return Err(DelegationError::Unsupported(scope));
         }
         if scope == Scope::TranscriptRead && !agent.scopes().contains(&scope) {
@@ -208,12 +199,27 @@ mod tests {
     }
 
     #[test]
-    fn an_unimplemented_scope_is_refused_instead_of_inherited_or_ignored() {
-        let (agent, plugin) = grants("[agent]\npersist={}\n[plugin.reader]\npersist={}\n");
-        assert!(matches!(
-            read_tool(&agent, &plugin),
-            Err(DelegationError::Unsupported(Scope::Persist))
-        ));
+    fn unimplemented_scopes_are_refused_even_without_importing_a_service() {
+        for scope in [
+            Scope::Persist,
+            Scope::Veto,
+            Scope::Ui,
+            Scope::ModelInvoke,
+            Scope::ContextContribute,
+        ] {
+            let value = if scope == Scope::ModelInvoke {
+                "{tokens-per-session=100}"
+            } else {
+                "{}"
+            };
+            let (agent, plugin) = grants(&format!(
+                "[agent]\n{scope}={value}\n[plugin.reader]\ntool={{}}\n{scope}={value}\n"
+            ));
+            assert!(
+                matches!(read_tool(&agent, &plugin), Err(DelegationError::Unsupported(refused)) if refused == scope)
+            );
+        }
+        assert!(!runtime_supports_scope(Scope::Mcp));
     }
 
     #[test]

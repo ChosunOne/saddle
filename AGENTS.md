@@ -21,10 +21,10 @@ because it is followed.
 | --- | --- |
 | `crates/saddle-standard` | automatically builds, componentizes and precompiles immutable shipped WASI tools; embeds source/digests and matching native artifacts, with no runtime authority or writable native cache (D147) |
 | `crates/saddle-limits` | typed runtime resource/presentation budgets shared by host, loader and guests; no authority, filesystem or Wasmtime dependency (D145) |
-| `crates/saddle-cap` | scopes, roots, grants, policy and manifest parsing, the component import check, the exec lowering, and the narrowing of a delegated principal's reach (D105, D126). No wasmtime dependency. |
+| `crates/saddle-cap` | scopes, roots, grants, policy and manifest parsing, the typed interface/eligibility catalogue and component import check (D150), the exec lowering, and the narrowing of a delegated principal's reach (D105, D126). No wasmtime dependency. |
 | `crates/saddle-policy` | per-call decisions (`engine`) and the hash-chained audit log (`audit`) |
 | `crates/saddle-wit` | canonical read-tool WIT and generated host bindings (D127) |
-| `crates/saddle-loader` | actual component inspection, bounded delegation, grant-shaped pre-linking, fresh bounded instances and a narrow host-services trait, without a dependency on the binary's session (D126, D127) |
+| `crates/saddle-loader` | actual component inspection, bounded delegation, typed checked-import binding with exhaustive adapters (D150), fresh bounded instances and a narrow host-services trait, without a dependency on the binary's session (D126, D127) |
 | `crates/saddle-sdk` | guest bindings generated from the same WIT, so a guest can call only the host services it imports; no `std::fs` authority, no ambient filesystem or socket (D12, D127, D140) |
 | `crates/saddle-tools` | standard guest tools: text/image reads, pagination, listing, traversal/search, transcript queries, write/edit/patch, shell and HTTP/search workflows; uses runtime-gated SDK services, not native filesystem/database access. Mutations and reads cover policy roots and delegated D66 directories; guests emit minimal human-only hunks and guarded preimages (D131–D147) |
 | `crates/saddle-ignore` | authority-free ignore-file parsing, shared by skill discovery, the editor's file-name completion and the guest search components (D68, D133) |
@@ -366,7 +366,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D147 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D150 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

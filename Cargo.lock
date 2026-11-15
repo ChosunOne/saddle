@@ -2495,6 +2495,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml",
+ "wit-parser 0.238.1",
 ]
 
 [[package]]

@@ -43,6 +43,7 @@ wasmtime-wasi = { version = "=36.0.20", default-features = false }
 wit-bindgen = { version = "=0.45.0", default-features = false, features = ["macros", "realloc", "std"] }
 wat = "=1.236.1"
 wit-component = "=0.238.1"
+wit-parser = "=0.238.1"
 
 anyhow = "1"
 cap-std = "4"
