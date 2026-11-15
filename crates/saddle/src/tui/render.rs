@@ -4163,6 +4163,10 @@ mod tests {
         let buf = terminal.backend().buffer();
         assert_eq!(buf[(0, row)].bg, Theme::default().tool_error_bg);
         assert_eq!(buf[(59, row)].bg, Theme::default().tool_error_bg);
+        // Inspect the painted glyph, not just its text: matching foreground/background hid errors.
+        let column = screen[row as usize].find("denied:").unwrap() as u16;
+        assert_eq!(buf[(column, row)].fg, Theme::default().error);
+        assert_ne!(buf[(column, row)].fg, buf[(column, row)].bg);
         assert_eq!(terminal.backend().cursor_position(), Position::new(5, 17));
     }
 }

@@ -339,7 +339,7 @@ impl Palette {
             tool_error_bg: self.tool_error_bg,
             tool_title: self.tool_title,
             tool_output: self.tool_output,
-            tool_error_text: self.tool_error_bg,
+            tool_error_text: self.error,
             compact_done_bg: self.tool_pending_bg,
             md_heading: self.md_heading,
             md_link: self.md_link,
@@ -415,7 +415,7 @@ fn alias(role: &str) -> Option<&'static str> {
         "code" => "mdCode",
         "link" => "mdLink",
         "tool-text" => "toolOutput",
-        "tool-error-text" => "toolErrorBg",
+        "tool-error-text" => "error",
         "tool-ok-bg" => "toolSuccessBg",
         "tool-pending-bg" => "toolPendingBg",
         "tool-error-bg" => "toolErrorBg",
@@ -878,6 +878,28 @@ fn srgb((r, g, b): (f64, f64, f64)) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_error_text_uses_the_error_foreground_not_the_block_background() {
+        let palette = Palette {
+            error: Color::Rgb(240, 110, 120),
+            tool_error_bg: Color::Rgb(62, 38, 40),
+            ..Palette::default()
+        };
+        let theme = palette.to_theme("custom", Appearance::Dark);
+        assert_eq!(theme.tool_error_text, palette.error);
+        assert_eq!(theme.tool_error_bg, palette.tool_error_bg);
+    }
+
+    #[test]
+    fn legacy_tool_error_text_alias_changes_foreground_not_background() {
+        let mut palette = Palette::default();
+        let background = palette.tool_error_bg;
+        palette.set("tool-error-text", Color::Yellow).unwrap();
+        let theme = palette.to_theme("legacy", Appearance::Dark);
+        assert_eq!(theme.tool_error_text, Color::Yellow);
+        assert_eq!(theme.tool_error_bg, background);
+    }
 
     #[test]
     fn every_role_in_the_list_can_be_set_on_a_palette() {

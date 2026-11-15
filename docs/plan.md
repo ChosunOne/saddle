@@ -1503,6 +1503,9 @@ one place at its root.
   and `toolOutput` its body; `thinkingText` is a reasoning block; `userMessageText` the prompt;
   `mdHeading`/`mdListBullet`/`mdHr`/`mdQuoteBorder` the markdown pieces; `toolDiffContext` a diff's
   gutter; `borderAccent`, `borderMuted` and `bashMode` the three states of the editor's frame.
+  Failed tool output and compaction errors use the `error` foreground; `toolErrorBg` is only the
+  failed block's background, never its ink. The legacy `tool-error-text` alias selects `error`,
+  independently of `tool-error-bg`. Matching ink and fill would hide the diagnostic as blank space.
 - **Not taken here: pi's `system` theme.** It queries the terminal's own palette and derives every
   role from it; that is D73.
 
