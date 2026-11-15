@@ -13,15 +13,40 @@ extensions. That gap is the reason this project exists.
 Security rests on declared scopes rather than per-use approval prompts. A human reviews a policy file.
 The agent does not get to negotiate.
 
+The same boundary carries the harness's own tools: every ordinary tool is a component too (D146), so
+there is one gate rather than a privileged path beside it.
+
 ## 2. Status
 
-v0 is in place: the capability crate, the policy engine with its audit log, the exec sandbox, and a
-model loop that sends every built-in tool call through the gate. `saddle` opens it in a full-screen
-terminal UI, and `saddle run "<prompt>"` runs one turn without it. The v1 loader, canonical WIT and
-read-only SDK are library crates (D126, D127). Explicit local installation, digest-pinned loading,
-session host adapters and model-visible registration with provenance are wired into the binary
-(D128, D129). The runtime currently supports read-only tools; other scopes remain unavailable.
-Sections 3 to 6 are settled and can be built against. Section 8 lists deferred work.
+The gate is built, and the tool surface now sits behind it rather than beside it. `saddle` opens a
+full-screen terminal UI, `saddle run "<prompt>"` runs one turn without it, and every tool call is
+decided by the policy engine and recorded in the audit log (D10).
+
+**Every ordinary tool is a WASI component** — `read`, `write`, `edit`, `patch`, `ls`, `find`, `grep`,
+`bash`, `fetch`, `websearch`, `session_query`. The package build compiles, componentizes and
+precompiles them and embeds the bytes, manifests and digests in the executable (D146, D147); the
+binary holds no native implementation and there is no runtime-writable native-code cache and no
+implementation picker. `[standard-tools]` in the protected config selects which of them may register,
+and every operation scope delegates the agent's *current* reach instead of new resources (D132–D137).
+The privileged half stays in the core behind SDK services: path resolution, permissions, audit,
+sandboxed execution, HTTP and credentials, branch-only transcript SQL (D138–D143). `tool_search`
+alone is host MCP discovery, not a component.
+
+**Third-party plugins are explicit and local.** `saddle plugin install <manifest>` copies a
+digest-pinned artifact into protected storage; enabling it and granting it are two further steps in a
+file a person writes, and its reach is the agent's grants intersected with the manifest ceiling and
+its own grants (D126–D128). Installation never enables, no repository is discovered, and nothing
+updates itself.
+
+Budgets are runtime configuration (`[tool-limits]`, D145), so a permission or a limit changes without
+rebuilding a component or changing its digest (D139). MCP servers run on both transports with a
+per-server narrowed reach, discovered OAuth, lazily declared tools and their own failures refused by
+name (D103–D123).
+
+**What is not here yet is the hook half of the extension surface**: `veto`, `ui`, `persist`,
+`model-invoke`, `context-contribute` and the observer export have no host interface, so a component
+that imports one is refused at load. Section 8 lists them with the rest of the deferred work, and
+section 6 marks every extension point's state. Sections 3 to 6 are settled and can be built against.
 
 ## 3. Settled decisions
 
@@ -319,6 +344,31 @@ agent cannot read earlier conversations through its tools. A conversation can sp
 saddle and so several audit logs; the turn records tie them together. `/resume` and `saddle -c`
 continue a conversation from the current workspace. On load, a tool call left without a result by
 a crash gets an error result, so the history is valid to send again.
+
+**D32.** The prompt carries instruction files, and their order is the order a repository's own rules
+are meant to be read in: the global file from the config directory first, then, from the workspace
+root down to the directory the session started in, each directory's `AGENTS.md` (or its `CLAUDE.md`
+where there is no `AGENTS.md`), then its `AGENTS.local.md`. More specific comes later, so it has the
+last word. Nothing above the workspace is read: that is outside every root, so a parent directory's
+rules would arrive by a path the policy never saw. Project files are read **through the policy** as
+the agent, like the `read` tool, so a file it may not read — or a symlink leading out of the
+workspace — never reaches the prompt; a refusal is a note to the user, not a silent skip. The global
+file is the one exception, host-read with no root at all, because a path that is not a `[roots]`
+entry cannot be named by a workspace policy (D65). Each file is cut at a fixed byte budget with a
+note saying so, and every file that went in is recorded in the audit log with its hash, so what the
+model was told is reproducible. `/reload` reads them again (D70).
+
+**D33.** When a conversation nears the model's context window (D34) the older part is replaced by a
+summary the model writes, and the most recent part is kept word for word. The summary takes the
+position of the messages it replaced rather than being appended, so the conversation keeps its order
+and its branch, and a replay of that branch reproduces the same request: what the summary was written
+from is a truncated view (bounded tool input and output), while what is sent afterwards is the summary
+itself. Three things can trigger it — the hard threshold, synchronously before a request that would
+not fit; three quarters of the window in the background while the turn continues (D78); and a session
+left alone at half the window (D77) — and each is configuration, because each spends a request. A
+summary is a request of its own in the usage log (D94), so it is not billed to whatever was being
+answered, and it is shown in the transcript as a compaction block rather than as conversation text
+(D124). Compaction never edits the saved tree: it replaces items on the branch being read.
 
 **D34.** The window compaction and the status line use is the model's real context limit, not a
 default: a guess of 128k is wrong for most models served over these APIs, and being wrong is
@@ -3372,21 +3422,23 @@ the network through `curl` in a child process.
 
 ## 6. Extension surface, from the parity benchmarks
 
-Roughly the union of what pi and opencode let an extension do, with the scope each maps to:
+Roughly the union of what pi and opencode let an extension do, with the scope each maps to and what
+exists today. A point marked "no host interface" is refused at load rather than silently ignored: the
+scope is defined, and nothing behind it decides a call yet (section 8).
 
-| extension point | scope |
-| --- | --- |
-| register a tool, whose body runs with the plugin's authority and whose output becomes agent input | `tool` |
-| execute commands | `exec` |
-| read and write files | `fs-read`, `fs-write` |
-| reach the network | `net` |
-| read the transcript | `transcript-read` |
-| contribute text into the context | `context-contribute` |
-| observe messages and tool results | `transcript-read` |
-| block a pending tool call | `veto` |
-| invoke the model | `model-invoke` |
-| render UI | `ui` |
-| persist state | `persist` |
+| extension point | scope | today |
+| --- | --- | --- |
+| register a tool, whose body runs with the plugin's authority and whose output becomes agent input | `tool` | built: `saddle:plugin/tool`, shipped and third-party components alike (D126–D128) |
+| execute commands | `exec` | built: `saddle:host/exec` lowers the same sandbox the core uses (D142) |
+| read and write files | `fs-read`, `fs-write` | built: one filesystem SDK, each read and write decided per resource (D131, D138–D141) |
+| reach the network | `net` | built: `saddle:host/http` and `web-search`, every request decided (D143) |
+| read the transcript | `transcript-read` | built: bounded, read-only branch SQL and snapshots (D137) |
+| contribute text into the context | `context-contribute` | no host interface |
+| observe messages and tool results | `transcript-read` | no host interface: the `observer` export is named and unimplemented |
+| block a pending tool call | `veto` | no host interface |
+| invoke the model | `model-invoke` | no host interface |
+| render UI | `ui` | no host interface |
+| persist state | `persist` | no host interface |
 
 ## 7. Milestones
 
@@ -3401,11 +3453,22 @@ The test runs at two levels: against `saddle_cap::component::check_component` wi
 import list, and through `saddle-loader` with a compiled component, including a trapping start
 function that must never run. These library-level tests are in place (D127), together with production
 host adapters and CLI/model tests for explicit installation, registration, provenance and revocation
-(D128, D129). `docs/plugins.md` describes the usable read-tool surface and its limits.
+(D128, D129). `docs/plugins.md` describes the surface that grew from it: the delegation table, budgets,
+the mutation contracts and how to build and install a component.
 
-**v2.** Remaining scopes and their host interfaces, `veto`, then presentation. The minimum D25
-provenance wrapper moves forward to the first model-visible plugin tool, before registration, not
-after unlabelled output has already reached a conversation.
+**v2 — the tool surface (built).** Every remaining tool scope: ranged reads with pagination,
+lexical listing, traversal and search, mutations with guarded preimages and guest-owned minimal
+diffs, delegated exec, HTTP and search, and branch transcript SQL (D131–D144). The minimum D25
+provenance wrapper went in *before* the first model-visible plugin tool rather than after, so no
+unlabelled third-party text ever reached a conversation (D128). Presentation is shared with the TUI,
+which draws a human diff and an image as metadata rather than as model text (D134, D146).
+
+**v3 — the hook surface (not started).** `veto`, the `observer` export, `context-contribute`,
+`model-invoke`, `persist` and `ui`. Each needs an interface the core defines and decides per call, and
+none may become the generic escape hatch section 9 warns about. Order: `persist` first, because a
+namespaced store is the smallest new authority and every later hook has somewhere to keep state;
+then `veto`, then `observer`, then `context-contribute`, then `model-invoke`; `ui` last, because it is
+the only one where the core has to own a rendering contract the guest draws inside.
 
 The v1 refusal remains the thesis: a component with no eligible filesystem capability must not
 initialize filesystem imports. D139–D141 distinguish bindings from per-operation authority: linking
@@ -3413,6 +3476,12 @@ read bindings under a write capability must never let that principal read a file
 
 ## 8. Deferred
 
+- The hook half of the extension surface: `veto`, `ui`, `persist`, `model-invoke`,
+  `context-contribute` and the `saddle:plugin/observer` export. The scopes are defined and the load
+  check names their interfaces, and the loader refuses them by name ("not implemented by the initial
+  runtime"), so a component that expects one fails at load rather than at its first call. `ui` also
+  carries "input widgets" below; a plugin is not given the terminal before the core owns the contract
+  it draws inside.
 - Long-lived plugin instances (`lifetime = "session"`, D13).
 - Isolating component compilation under independent time/memory limits before automatic loading
   of untrusted artifacts; D127 caps input bytes but fuel/epochs bound execution, not the compiler.
@@ -3425,11 +3494,22 @@ read bindings under a write capability must never let that principal read a file
 - Input widgets in `ui`.
 - A skill's bundled files are not listed by anything: the skill's own text names them, and listing
   them would be a directory read the policy does not decide.
+- Removing or updating an installed plugin. Installation is explicit and local, and deleting the
+  directory under the protected config directory is the removal; no `saddle plugin remove` or
+  `update` verb exists, and nothing updates itself.
+- Tool annotations a plugin or an MCP server advertises (`readOnlyHint`, `destructiveHint`): nothing
+  consumes them, because there is no confirmation prompt for them to inform. They stay a claim the
+  grant has already decided.
+- `saddle mcp tools <server>` and a name-level filter over a run's tools: the grant decides what may
+  be called, so both are presentation conveniences.
 
 ## 9. Known risks
 
 - The policy engine and the WIT world are one design. Getting them out of step produces a system that
-  looks enforced and is not.
+  looks enforced and is not. The live form of this today: `saddle_cap::component::host_interfaces`
+  computes the interfaces a grant permits (and names several that have no WIT), while `saddle-loader`
+  keeps its own list of the imports it implements. The two agree by hand; deriving one from the other
+  is the fix, and until then a change to either must be mirrored.
 - Building an argv matcher for `exec` first is the tempting shortcut. It works until a plugin writes a
   Makefile.
 - Parity pressure will pull toward extension points that have no scope yet, and the easy answer will be

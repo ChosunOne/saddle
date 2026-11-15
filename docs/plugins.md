@@ -156,9 +156,11 @@ text cannot provide or forge it. Saved results keep their original metadata/fram
 disable, resume or branching. Human diffs are never model text.
 
 Human line/TUI rendering removes only a matching outer frame authenticated by host provenance.
-It does not mutate stored/provider content. Thus normal CLI tool text and resumed tool cards do not
-show framing noise, while `run --json` result events retain framed `content`, `provenance` and separate
-`diff` for programs. Explicit third-party `plugin call` output retains its existing framing.
+It does not mutate stored/provider content. Thus an ordinary tool's CLI text and resumed tool cards
+do not show framing noise, while `run --json` result events retain framed `content`, `provenance` and
+separate `diff` for programs. A third-party name keeps the frame on purpose: `saddle plugin call` and
+`saddle tool plugin__<id>__<tool>` print exactly what the model would receive, so what a person is
+debugging is the same bytes the model reads.
 
 ## Explicit third-party plugins
 
@@ -348,10 +350,12 @@ name dispatch, minimal edit/patch diffs and save/model separation, no blind prei
 before effects, explicit enablement/delegation, grant/budget reload without repinning, managed paths,
 symlinks/reservations, delegated execution/networking, credential isolation, sibling caches, images and
 branch SQL. TUI rendering/replay retains human diffs and strips only authenticated display frames.
-The optional library SDK-reader tutorial test is separate and still documents its manual build step.
+The SDK reader compatibility fixture is built by the same package build and its round-trip test runs
+in the default suite, so nothing needs a manual component build or an ignored-test opt-in.
 
 Third-party compilation remains an explicit local operation: input bytes are bounded but execution
 fuel/epochs are not independent compiler CPU/memory limits. Compilation isolation, persistent instances,
-plugin storage/observers/vetoes, richer host adapters and MCP resources/prompts/codemode remain deferred.
-This migration does not introduce automatic plugin updates, an authority picker, ambient native access
-or a second policy engine.
+plugin storage and the hook scopes (`veto`, `ui`, `persist`, `model-invoke`, `context-contribute`, the
+observer export) remain deferred; plan §8 lists them. MCP prompts, MCP resources, `codemode` and
+images in a tool result are refused by decision (D119), not deferred. This migration does not introduce
+automatic plugin updates, an authority picker, ambient native access or a second policy engine.

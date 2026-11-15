@@ -7,7 +7,9 @@ shipped standard tools and MCP; the loader, canonical WIT and SDK are separate l
 `docs/plan.md` is the specification; read it before changing behaviour in the policy, sandbox or tool
 layer.
 
-There is no README. `docs/plan.md` is the design document, the rationale and the milestone list.
+There is no README. `docs/plan.md` is the design document, the rationale and the milestone list, and
+`docs/plugins.md` is the tool surface a person uses: the delegation table, the budgets, the mutation
+contracts and how to build and install a third-party component.
 
 This file is one of the instruction files saddle loads into its own prompt (the workspace root
 `AGENTS.md`; `crates/saddle/src/context.rs`, D32). Keep it accurate — a stale instruction file is worse than none,
@@ -23,11 +25,11 @@ because it is followed.
 | `crates/saddle-policy` | per-call decisions (`engine`) and the hash-chained audit log (`audit`) |
 | `crates/saddle-wit` | canonical read-tool WIT and generated host bindings (D127) |
 | `crates/saddle-loader` | actual component inspection, bounded delegation, grant-shaped pre-linking, fresh bounded instances and a narrow host-services trait, without a dependency on the binary's session (D126, D127) |
-| `crates/saddle-sdk` | guest bindings from the same WIT and a read-only example; no `std::fs` authority (D12, D127) |
+| `crates/saddle-sdk` | guest bindings generated from the same WIT, so a guest can call only the host services it imports; no `std::fs` authority, no ambient filesystem or socket (D12, D127, D140) |
 | `crates/saddle-tools` | standard guest tools: text/image reads, pagination, listing, traversal/search, transcript queries, write/edit/patch, shell and HTTP/search workflows; uses runtime-gated SDK services, not native filesystem/database access. Mutations and reads cover policy roots and delegated D66 directories; guests emit minimal human-only hunks and guarded preimages (D131–D147) |
-| `crates/saddle-ignore` | authority-free ignore-file parsing, shared by native search/skill discovery and guest search components (D68, D133) |
+| `crates/saddle-ignore` | authority-free ignore-file parsing, shared by skill discovery, the editor's file-name completion and the guest search components (D68, D133) |
 | `crates/saddle-sandbox` | applies a sandbox spec to the current process and execs the target, including the command's own network namespace and the relay in it (D79); starts a long-lived child whose stdin and stdout belong to the caller, with the spec on fd 3 (D106); also builds the `saddle-sandbox` helper binary used by its own tests |
-| `crates/saddle` | the binary: built-in tools, model providers, the model loop, the TUI |
+| `crates/saddle` | the binary: tool dispatch, model providers, the model loop, the TUI |
 
 Inside `crates/saddle/src`:
 
@@ -47,7 +49,7 @@ Inside `crates/saddle/src`:
 | `saddle-tools::diff` | guest-owned minimal line hunks of edited files, human-only and retained on replay; no native diff implementation remains (D146) |
 | `context` | instruction files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md` fallback), read through the policy |
 | `skills` | `SKILL.md` skills: discovery through the `read` gate, the prompt listing, `/skill:name` (D64, D67, D68, D69) |
-| `ignore` | re-exports `saddle-ignore`'s matching (`.gitignore`, `.ignore`, `.fdignore`), shared with native and guest search and `skills` (D68, D133) |
+| `ignore` | re-exports `saddle-ignore`'s matching (`.gitignore`, `.ignore`, `.fdignore`), shared with `skills` and the editor's completion; the searching itself happens in a guest (D68, D133) |
 | `mcp` | the MCP servers a person declared in `config.toml` (`[mcp.<name>]`): the transport fields and their validation (D104), the `check` lines that compare them with the grants, `saddle mcp call` as the model's own path with no conversation around it (D111), a `decision` record for every call allowed or refused with the arguments hashed (D112), the answers to what a server asks — `roots/list`, `-32601` for sampling and elicitation, a re-read when a catalogue changes (D114) — the discovered OAuth sign-in with its tokens in `auth.json` (D115), and the bearer a call carries with one refresh and one retry when a token expires (D116), the stdio client — JSON-RPC over a sandboxed child's pipes, with a reply deadline and a bounded stderr tail (D107) — the streamable-HTTP transport, whose every request is decided against that server's own narrowed net reach and recorded with the server named (D110), and the per-server deadline both transports enforce from the table's own `timeout` (D113), the prompt line per granted server and the label on whose words a result is (D120), `saddle mcp logout` (D121), the `/mcp` report, its restart, and its session-scoped disable and enable (D118, D123), the `exposure` word each table chooses — `deferred`, `direct` or `hidden`, with `codemode` refused by name (D117) — and its exact-name `tool-exposure` overrides (D122), and the registry that `tool_search` declares tools from, so nothing a server offers is in the prompt until the model asks (D108), with a declaration saved as a branch node so a resume, a fork or a `/tree` jump brings it back and a rewind forgets it — and restoring one re-checks the grant (D109) |
 | `compact` | replacing the older part of a long conversation with a model-written summary (D33), of a session left alone (D77) or written while the turn carries on (D78) |
 | `store` | the saved conversations: a SQLite tree of messages per workspace (D53), imported from the older JSON Lines files once, with one row per model request recording what it used and which model answered (D94), and a `declared` node for what an MCP search declared on a branch (D109) |
@@ -55,17 +57,22 @@ Inside `crates/saddle/src`:
 | `cache` | the cache-miss notice: one line to the user when a prompt is re-read at full price (D50) |
 | `reserved` | the D20 snapshot and restore of reserved paths around `exec` |
 | `provider/` | the neutral conversation form, the Anthropic, OpenAI-compatible and Responses renderers (every other server is a `[providers.<name>]` table naming which one it imitates, D84), the cache-affinity key, headers, lifetime and originator, sent to OpenAI's own API and to the subscription backend (D100), and the WebSocket that backend is spoken to over, with the delta a kept connection allows (D101), its endpoint/authentication-bound reuse and completed-socket handoff (D102), and one HTTP recovery of a transient Responses stream failure before text or reasoning is shown (D125), OAuth login and token refresh (D85), the model list, the cached context windows and prices (D34, D36); reasoning is kept for every model and replayed in its original position (D95, D96) |
-| `tui/` | the full-screen UI: app state, rendering (a prompt is markdown in the user's colour, D81; tables are fitted to the width, D83), editor, login (a key or an OAuth sign-in, D85; the searchable model picker `/model` opens, D88), selection (a drag copies the transcript's text or the open dialog's, D87), settings, session list, `permissions` (the grants editor, D45), `tree` (the message tree, D54), `image` (drawing a picture: kitty and iTerm2, D59), `status` (the `[ui] status` template, D36), `theme` (the colour roles, D71), `palette` (pi's role vocabulary, colour forms and the palette derived from the terminal, D72, D73), `terminal` (asking the terminal for its colours, D73), `syntax` (code blocks: syntect's grammars, nine roles, the theme's colours, D80) and `themes` (the `/theme` picker, D74), and `browser` (opening the link a sign-in shows, D86) |
+| `tui/` | the full-screen UI: app state, rendering (a prompt is markdown in the user's colour, D81; tables are fitted to the width, D83), editor, login (a key or an OAuth sign-in, D85; the searchable model picker `/model` opens, D88), selection (a drag copies the transcript's text or the open dialog's, D87), settings, session list, `permissions` (the grants editor, D45), `tree` (the message tree, D54), `image` (drawing a picture: kitty and iTerm2, D59), `status` (the `[ui] status` template, D36), `theme` (the colour roles, D71), `catppuccin` (the four built-in flavours, D76), `palette` (pi's role vocabulary, colour forms and the palette derived from the terminal, D72, D73), `terminal` (asking the terminal for its colours, D73), `syntax` (code blocks: syntect's grammars, nine roles, the theme's colours, D80), `themes` (the `/theme` picker, D74), `grant` (writing one change into this workspace's policy file, D45), `files` (the `@` file-name completion's own enumeration, which is not an agent tool) and `browser` (opening the link a sign-in shows, D86) |
 
-`crates/saddle/src/main.rs` dispatches subcommands (`run`, `check`, `tool`, `audit verify`)
-and intercepts `__sandbox` before clap parses anything — that is the helper process path, and it must
-stay first in `main`.
+`crates/saddle/src/main.rs` dispatches subcommands (`tools`, `plugin install|list|call`, `run`,
+`check`, `tool`, `mcp list|auth|logout|call`, `login`, `logout`, `session`, `audit verify`) and
+intercepts `__sandbox` before clap parses anything — that is the helper process path, and it must stay
+first in `main`.
 
-Built-in tools are `read`, `write`, `edit`, `patch`, `ls`, `find`, `grep`, `bash`, `fetch` and
-`websearch` and `session_query` (`tools::NAMES`). `patch` applies one apply-patch document across several files, deciding
+The ordinary tool names are `read`, `write`, `edit`, `patch`, `ls`, `find`, `grep`, `bash`, `fetch`,
+`websearch` and `session_query` (`tools::NAMES`); each runs a shipped WASI component chosen by the
+protected `[standard-tools]` table, and the binary holds no native implementation of any of them
+(D146, D147). The twelfth name, `tool_search`, is host MCP discovery rather than a component.
+`patch` applies one apply-patch document across several files, deciding
 every path before writing any of them, and refuses the whole patch if one is denied (D56).
-`fetch` gets a URL that is already known and `websearch` finds one that is not: both are made by the
-**host** after the engine allows them (D39, D82), and both name their host in a `net` grant — `fetch`
+`fetch` gets a URL that is already known and `websearch` finds one that is not: the request is carried
+out by the **core** transport after the engine allows it, while the guest owns the schema, the parsing
+and the presentation (D39, D82, D143), and both name their host in a `net` grant — `fetch`
 the URL's, `websearch` the search host's, which is the provider's own (`search-url`, `api.synthetic.new`
 for the built-in Synthetic preset) and Exa's (`api.exa.ai`, or `mcp.exa.ai` without a key) when the
 provider serves no search (D82).
@@ -87,8 +94,10 @@ accepted before effects; safe patch additions require absence.
 
 `saddle plugin install/list/call` is the explicit third-party workflow; `docs/plugins.md` documents its
 configuration, grants, SDK build and limits. Installation never enables a plugin or changes grants.
-Other plugin scopes/adapters, persistent instances and automatic updates remain deferred; no
-repository auto-loading or plugin-to-MCP adapter exists. MCP
+The hook scopes — `veto`, `ui`, `persist`, `model-invoke`, `context-contribute` and the observer
+export — have no host interface yet, and the loader refuses a component that imports one by name.
+Persistent instances and automatic updates remain deferred; no repository auto-loading or
+plugin-to-MCP adapter exists. MCP
 prompts, MCP resources, `codemode` and images in a tool result are refused rather than missing
 (D119) — a boundary that is written down, not an omission.
 
@@ -151,7 +160,7 @@ manual `target/*-plugin` preparation is needed for standard tests or end users (
 
 Use **`cargo nextest`** to run tests, not `cargo test`: one process per test, run in parallel, so a
 test cannot see another one's state and a leak is caught here rather than in CI. On a suite this
-size the wall clock comes out about the same as `cargo test` — the binary's 470 tests take ~2.1 s
+size the wall clock comes out about the same as `cargo test` — the binary's 518 tests take ~2.6 s
 either way, because a process per test costs what a thread saved — and the reason to use it is
 everything else: `-E` filters by name, `--no-fail-fast` summaries, per-test timeouts and retries,
 and isolation that makes a flaky test obvious.
@@ -323,11 +332,13 @@ exists to prevent. Two concrete consequences worth restating, because they are t
   because a root is nameable by any workspace policy. Content the harness chooses — the global
   `AGENTS.md`, an attachment — is host-read with no root at all; a skill is not, since `read` loads
   it (D67).
-- Built-in tools are not privileged. None of the eleven is a bypass: each passes through the same
-  engine, the same audit log and the same sandbox as a plugin call (D17). `ls`, `find` and `grep`
-  decide and log one read of the directory they start from, then filter everything beneath it through
-  the same policy without a record per file, so an excluded file is skipped rather than shown
-  (`tools/search.rs`).
+- No tool is privileged. The eleven ordinary ones run as bounded component principals, so each passes
+  through the same engine, the same audit log, the same budgets and the same sandbox as a third-party
+  plugin call (D17, D126, D139): a `[standard-tools]` entry selects a fixed shipped component and the
+  operation scopes in it delegate the agent's current reach, never reach of their own. `ls`, `find` and
+  `grep` decide and log one read of the directory they start from, then filter everything beneath it
+  through the same policy without a record per file, so an excluded file is skipped rather than shown
+  (`crates/saddle-tools/src/search.rs`).
 
 A **skill** (D64) is instructions and never authority: its `allowed-tools` is ignored, because a
 pre-approval written by whoever wrote the skill would be a second source of authority. A skill is
