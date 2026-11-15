@@ -306,6 +306,10 @@ it lands, and is discarded if the conversation changed while it was written. Nei
 pi or opencode, so there is no reference behaviour — `docs/plan.md` is the specification.
 A compaction summary is collapsed in the transcript like a tool's output — five lines and a note,
 its first when done and its last while it streams, with ctrl+o showing all (D124).
+While a turn is running, `enter` **steers**: the message enters the conversation at the next request,
+after the tool results the turn is waiting on, and the model answers it before the turn ends;
+`alt+enter` **queues** it instead, for after the turn (D149). A steered message is an ordinary user
+item on the branch, so a resume replays it in the order the model saw it.
 `/thinking` (or shift+tab) changes the reasoning effort for the session (D57), `/name` and
 `/session` name and describe it (D55), and escape twice on an empty prompt opens the message tree (D54), where a prompt can be sent again to
 make another branch; `/clone` copies the branch into a separate session instead. `/new` (or `/clear`,

@@ -64,6 +64,8 @@ pub enum AgentEvent {
         /// Pictures the call returned, such as a screenshot `read` was asked for (D58).
         images: Vec<Image>,
     },
+    /// A message the user sent while the turn was running entered the conversation (D149).
+    Steered(String),
     /// A reply: what it used, and what it cost (D36).
     Reply {
         usage: Usage,
@@ -113,6 +115,8 @@ pub enum Effort {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Send(String),
+    /// A prompt typed while a turn was running, for the agent to take at the next request (D149).
+    Steer(String),
     /// A prompt built from a skill by `/skill:name`, and the skill it came from (D69).
     Skill {
         name: String,
@@ -484,6 +488,8 @@ pub struct App {
     pub cache: Vec<Option<Cached>>,
     pub editor: Editor,
     pub queue: VecDeque<String>,
+    /// Messages handed to the running turn and not yet delivered, oldest first (D149).
+    pub steering: VecDeque<String>,
     pub busy: Option<Activity>,
     pub cancelling: bool,
     /// The session ended after a host error; no more prompts.
@@ -559,8 +565,9 @@ pub struct App {
 }
 
 const KEYS: &str = "\
-enter        send (while the agent works, the prompt is queued)
-shift+enter  newline (also alt+enter, ctrl+j)
+enter        send; while the agent works, enter steers it at the next request
+alt+enter    newline; while the agent works, queue the prompt for after the turn
+             (shift+enter and ctrl+j insert a newline too)
 esc          cancel the running turn; queued prompts return to the editor
 ctrl+c       cancel, clear the editor, or quit when it is empty
 ctrl+d       quit when the editor is empty
@@ -610,6 +617,7 @@ impl App {
             cache: Vec::new(),
             editor: Editor::default(),
             queue: VecDeque::new(),
+            steering: VecDeque::new(),
             busy: None,
             cancelling: false,
             stopped: None,
@@ -967,7 +975,7 @@ impl App {
                 // Runs the command, unless it takes an argument that has not been typed yet.
                 if chosen.args.is_empty() || self.editor.text() == chosen.name {
                     self.editor.set(chosen.name.clone());
-                    return Some(self.submit());
+                    return Some(self.submit(false));
                 }
                 self.complete(&chosen);
             }
@@ -1147,9 +1155,12 @@ impl App {
                     }
                 }
             }
+            // While a turn is running the two ways to send differ: enter steers it, alt+enter
+            // waits for it to finish (D149). ctrl+j still inserts a newline then.
+            KeyCode::Enter if alt && self.busy.is_some() => return self.submit(true),
             KeyCode::Enter if shift || alt => self.editor.insert('\n'),
             KeyCode::Char('j') if ctrl => self.editor.insert('\n'),
-            KeyCode::Enter => return self.submit(),
+            KeyCode::Enter => return self.submit(false),
             KeyCode::Char('o') if ctrl => {
                 self.expand_tools = !self.expand_tools;
             }
@@ -1490,7 +1501,9 @@ impl App {
         }
     }
 
-    fn submit(&mut self) -> Option<Action> {
+    /// `queued` chooses what happens when a turn is already running: the prompt waits for the turn
+    /// to finish, or enters the conversation at the next request (D149).
+    fn submit(&mut self, queued: bool) -> Option<Action> {
         let text = self.editor.text().trim().to_owned();
         if text.is_empty() {
             return None;
@@ -1510,8 +1523,12 @@ impl App {
             return None;
         }
         if self.busy.is_some() {
-            self.queue.push_back(text);
-            return None;
+            if queued {
+                self.queue.push_back(text);
+                return None;
+            }
+            self.steering.push_back(text.clone());
+            return Some(Action::Steer(text));
         }
         Some(self.start(text))
     }
@@ -1751,6 +1768,15 @@ impl App {
                 if self.busy.is_some() {
                     self.busy = Some(Activity::Waiting);
                 }
+            }
+            AgentEvent::Steered(text) => {
+                // It is in the conversation now, so it leaves the pending line and joins the
+                // transcript in the order the model saw it (D149).
+                if let Some(at) = self.steering.iter().position(|waiting| *waiting == text) {
+                    self.steering.remove(at);
+                }
+                self.scroll = 0;
+                self.push(Entry::User(display(&text)));
             }
             AgentEvent::Reply { usage: u, cost } => {
                 self.usage.input += u.input;
@@ -2188,6 +2214,42 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_sent_during_a_turn_can_steer_it_or_wait_for_it() {
+        // D149: enter while the agent works hands the message to the running turn, which takes it
+        // at its next request; alt+enter keeps it for after the turn.
+        let mut a = app();
+        type_text(&mut a, "first");
+        assert_eq!(
+            a.key(key(KeyCode::Enter)),
+            Some(Action::Send("first".into()))
+        );
+        assert_eq!(a.busy, Some(Activity::Waiting));
+
+        type_text(&mut a, "steer this");
+        assert_eq!(
+            a.key(key(KeyCode::Enter)),
+            Some(Action::Steer("steer this".into()))
+        );
+        assert_eq!(a.steering, ["steer this"]);
+        assert!(a.queue.is_empty());
+
+        type_text(&mut a, "and then this");
+        assert_eq!(
+            a.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            None
+        );
+        assert_eq!(a.queue, ["and then this"]);
+
+        // The agent says it delivered one: it leaves the pending line and joins the transcript,
+        // between the tool output and the reply that follows it.
+        a.agent(AgentEvent::Text("working".into()));
+        a.agent(AgentEvent::Steered("steer this".into()));
+        assert!(a.steering.is_empty());
+        assert_eq!(a.entries.last(), Some(&Entry::User("steer this".into())));
+        assert_eq!(a.queue, ["and then this"]);
+    }
+
+    #[test]
     fn prompts_send_queue_and_flush() {
         let mut a = app();
         type_text(&mut a, "first");
@@ -2197,7 +2259,10 @@ mod tests {
         );
         assert_eq!(a.busy, Some(Activity::Waiting));
         type_text(&mut a, "second");
-        assert_eq!(a.key(key(KeyCode::Enter)), None);
+        assert_eq!(
+            a.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            None
+        );
         assert_eq!(a.queue, ["second"]);
 
         a.agent(AgentEvent::Text("he\x1b[2Jllo".into()));
@@ -2238,7 +2303,7 @@ mod tests {
         type_text(&mut a, "go");
         a.key(key(KeyCode::Enter));
         type_text(&mut a, "later");
-        a.key(key(KeyCode::Enter));
+        a.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
         type_text(&mut a, "draft");
         assert_eq!(a.key(key(KeyCode::Esc)), Some(Action::Cancel));
         assert_eq!(a.key(key(KeyCode::Esc)), None, "one cancel at a time");

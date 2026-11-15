@@ -7,11 +7,14 @@ use crate::provider::Price;
 use crate::skills;
 use saddle_policy::audit;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::env;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::slice;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::TryRecvError;
@@ -41,6 +44,9 @@ pub const RESULT_LIMIT: usize = 100 * 1024;
 
 pub trait Ui: Sink {
     fn call(&mut self, call: &ToolCall);
+    /// A message the user sent while the turn was running entered the conversation (D149). Line
+    /// mode has no one to tell: nothing arrives there while a turn runs.
+    fn steered(&mut self, _text: &str) {}
     /// An image was attached to the prompt, for a UI that can show it (D58).
     fn attached(&mut self, _images: &[Image]) {}
     fn result(&mut self, out: &ToolOutput);
@@ -260,6 +266,30 @@ pub struct Rewound {
     pub abandoned: Vec<Item>,
 }
 
+/// What the user typed while a turn was running, for the loop to take at the next point where
+/// nothing is in flight (D149). It is shared rather than sent as a command because a message can
+/// arrive mid-request, and only the loop knows when the conversation is quiet enough to carry it.
+#[derive(Clone, Default)]
+pub struct Steer(Arc<Mutex<VecDeque<String>>>);
+
+impl Steer {
+    /// Hands over one message, in the order it was typed.
+    pub fn push(&self, text: String) {
+        if let Ok(mut waiting) = self.0.lock() {
+            waiting.push_back(text);
+        }
+    }
+
+    /// Everything waiting, oldest first. A lock that cannot be taken yields nothing rather than
+    /// panicking inside a turn: a lost message is the lesser failure for a request in progress.
+    pub fn take(&self) -> Vec<String> {
+        let Ok(mut waiting) = self.0.lock() else {
+            return Vec::new();
+        };
+        waiting.drain(..).collect()
+    }
+}
+
 pub struct Agent {
     /// `None` until the user picks one with /login.
     provider: Option<Provider>,
@@ -279,6 +309,8 @@ pub struct Agent {
     /// The conversation being appended to, created at its first prompt (D53).
     saved: Option<String>,
     compaction: compact::Settings,
+    /// Messages sent while a turn is running, taken between requests (D149).
+    steering: Steer,
     /// Tokens in the context at the last reply, and how many items it covered.
     context_tokens: u64,
     measured: usize,
@@ -313,6 +345,7 @@ impl Agent {
             store,
             saved: None,
             compaction,
+            steering: Steer::default(),
             context_tokens: 0,
             measured: 0,
             turn_usage: Usage::default(),
@@ -320,6 +353,11 @@ impl Agent {
             misses: cache::Watcher::default(),
             background: None,
         }
+    }
+
+    /// A handle the interface keeps, so a message typed while a turn is running reaches it (D149).
+    pub fn steering(&self) -> Steer {
+        self.steering.clone()
     }
 
     /// A limit of zero is no limit: a prompt that may not take even one request would fail
@@ -1064,6 +1102,20 @@ impl Agent {
         self.items.push(item);
     }
 
+    /// Takes what the user sent while this turn was running, records it in the order it arrived and
+    /// tells the interface (D149). Answers whether anything was taken, which is what decides
+    /// whether the turn has another request to make.
+    fn take_steering(&mut self, ui: &mut dyn Ui) -> bool {
+        let waiting = self.steering.take();
+        let mut taken = false;
+        for text in waiting {
+            ui.steered(&text);
+            self.record(Item::User(text), ui);
+            taken = true;
+        }
+        taken
+    }
+
     fn saving_failed(&mut self, e: anyhow::Error, ui: &mut dyn Ui) {
         ui.note(&format!("this session is no longer being saved: {e:#}"));
         self.store = None;
@@ -1468,6 +1520,13 @@ impl Agent {
             if ui.cancelled() {
                 return Ok(End::Cancelled);
             }
+            // D149: a message typed while the last request was running enters the conversation
+            // here, where nothing is in flight, so the request below carries it.
+            if self.take_steering(ui) {
+                // What the user just asked for may legitimately repeat a call the guard would stop
+                // for; the count starts again from the new instruction (D38).
+                guard = LoopGuard::default();
+            }
             // Nothing is written to the conversation between here and the request, so this is
             // where a background summary can be installed and where one is started (D78).
             self.poll_background(session, ui)?;
@@ -1539,6 +1598,12 @@ impl Agent {
             self.context_tokens = u.input + u.cache_read + u.cache_write + u.output;
             self.measured = self.items.len();
             if calls.is_empty() {
+                // A steer that arrived while this reply streamed is still owed an answer, so the
+                // turn goes on rather than ending: that is what steering means (D149).
+                if self.take_steering(ui) {
+                    guard = LoopGuard::default();
+                    continue;
+                }
                 return Ok(match stop {
                     Stop::Refusal => {
                         ui.note("the model declined to answer");
@@ -1900,9 +1965,86 @@ mod tests {
     use crate::provider::Api;
     use crate::provider::Auth;
     use crate::provider::ProviderConfig;
+    use crate::provider::Quota;
+    use crate::provider::Reply as ProviderReply;
     use crate::provider::Reported;
+    use crate::provider::Sink;
+    use crate::provider::ToolCall;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// A `Ui` that remembers what it was told, for the tests that never reach a provider.
+    #[derive(Default)]
+    struct Notes {
+        steered: Vec<String>,
+    }
+
+    impl Sink for Notes {
+        fn text(&mut self, _s: &str) {}
+
+        fn note(&mut self, _s: &str) {}
+
+        fn reasoning(&mut self, _s: &str) {}
+
+        fn quota(&mut self, _quota: &Quota) {}
+
+        fn cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    impl Ui for Notes {
+        fn call(&mut self, _call: &ToolCall) {}
+
+        fn result(&mut self, _out: &ToolOutput) {}
+
+        fn reply(&mut self, _reply: &ProviderReply, _cost: f64) {}
+
+        fn compaction(&mut self, _event: compact::Event) {}
+
+        fn steered(&mut self, text: &str) {
+            self.steered.push(text.to_owned());
+        }
+    }
+
+    #[test]
+    fn a_steered_message_is_taken_after_what_the_turn_already_recorded() {
+        // D149: what the user sends mid-turn enters the conversation where the loop takes it, so a
+        // request that follows carries it after the tool results it was waiting on.
+        let mut agent = Agent::new(
+            None,
+            String::new(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            Settings::default(),
+        );
+        let steering = agent.steering();
+        let mut ui = Notes::default();
+        agent.record(Item::ToolResults(Vec::new()), &mut ui);
+
+        steering.push("first".to_owned());
+        steering.push("second".to_owned());
+        assert!(agent.take_steering(&mut ui));
+        assert_eq!(
+            ui.steered,
+            ["first", "second"],
+            "in the order they were typed"
+        );
+        assert!(
+            matches!(
+                agent.items.as_slice(),
+                [Item::ToolResults(_), Item::User(first), Item::User(second)]
+                    if first == "first" && second == "second"
+            ),
+            "{:?}",
+            agent.items
+        );
+        // Taken once: the next request must not carry it a second time.
+        assert!(!agent.take_steering(&mut ui));
+        assert_eq!(agent.items.len(), 3);
+    }
 
     #[test]
     fn only_an_instruction_file_that_was_not_there_before_is_an_addition() {

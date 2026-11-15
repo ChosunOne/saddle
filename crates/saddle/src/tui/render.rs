@@ -1305,7 +1305,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let inner_width = area.width.saturating_sub(2) as usize;
     let layout = app.editor.layout(inner_width.max(1));
     let editor_rows = layout.rows.len().clamp(1, MAX_EDITOR_ROWS);
-    let queue_rows = app.queue.len().min(3);
+    // What is waiting to be delivered, the sooner one first: a steer enters at the next request,
+    // a queued prompt only after the turn (D149).
+    let queue_rows = (app.steering.len() + app.queue.len()).min(3);
     let [
         transcript_area,
         queue_area,
@@ -1323,18 +1325,25 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     draw_transcript(frame, app, transcript_area);
 
-    let queued: Vec<Line> = app
-        .queue
+    let pending = |label: &'static str, text: &String| {
+        let first = text.lines().next().unwrap_or_default();
+        Line::from(vec![
+            Span::styled(label, dim(&app.theme)),
+            Span::raw(first.to_owned()),
+        ])
+    };
+    let mut queued: Vec<Line> = app
+        .steering
         .iter()
         .take(queue_rows)
-        .map(|q| {
-            let first = q.lines().next().unwrap_or_default();
-            Line::from(vec![
-                Span::styled("queued › ", dim(&app.theme)),
-                Span::raw(first.to_owned()),
-            ])
-        })
+        .map(|q| pending("steering › ", q))
         .collect();
+    queued.extend(
+        app.queue
+            .iter()
+            .take(queue_rows - queued.len())
+            .map(|q| pending("queued › ", q)),
+    );
     frame.render_widget(Paragraph::new(queued), queue_area);
 
     let activity = match (&app.busy, &app.stopped) {

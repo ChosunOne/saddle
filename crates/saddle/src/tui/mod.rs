@@ -74,7 +74,7 @@ use app::{Action, AgentEvent, App, Drawn, NoteKind, Placed};
 use login::{CUSTOM_LABEL, Choice, Draft, Listed, Login, LoginRequest, Pick};
 use permissions::{Kind, Permissions, Row};
 
-use crate::agent::{Agent, Compacted, End, Ui, call_detail};
+use crate::agent::{Agent, Compacted, End, Steer, Ui, call_detail};
 use crate::auth::AuthStore;
 use crate::cancel;
 use crate::compact::Reason;
@@ -167,6 +167,8 @@ pub fn run(
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (ev_tx, ev_rx) = mpsc::channel();
     let ev_tx_ui = ev_tx.clone();
+    // Before the agent moves to its thread: the turn running there reads this (D149).
+    let steering = agent.steering();
     let worker = thread::Builder::new()
         .name("saddle-agent".into())
         .spawn(move || work(agent, session, cmd_rx, ev_tx))
@@ -190,6 +192,7 @@ pub fn run(
         paths,
         store,
         signing: Mutex::new(None),
+        steering,
     };
     if let Some(path) = resume {
         control.send(&mut app, Command::Resume(path));
@@ -652,6 +655,10 @@ impl Sink for ChannelUi {
 }
 
 impl Ui for ChannelUi {
+    fn steered(&mut self, text: &str) {
+        let _ = self.0.send(AgentEvent::Steered(text.to_owned()));
+    }
+
     fn attached(&mut self, images: &[Image]) {
         let _ = self.0.send(AgentEvent::Attached(images.to_vec()));
     }
@@ -894,6 +901,9 @@ struct Controller {
     /// The sign-in the login dialog is waiting on, so a cancel or a second attempt stops the poll
     /// that is no longer wanted (D85).
     signing: Mutex<Option<Arc<AtomicBool>>>,
+    /// What a prompt typed during a turn is handed to (D149): the agent thread reads it between
+    /// requests, so it does not sit in the command channel the turn is blocking on.
+    steering: Steer,
 }
 
 impl Controller {
@@ -903,6 +913,12 @@ impl Controller {
                 // Reset here, before the turn starts, so an Esc pressed right after Enter counts.
                 cancel::reset();
                 self.send(app, Command::Prompt { text, skill: None });
+                Ok(())
+            }
+            Action::Steer(text) => {
+                // Straight to the running turn, not through the command channel: that is what
+                // makes it arrive before the next request rather than after the turn (D149).
+                self.steering.push(text);
                 Ok(())
             }
             Action::Theme(name) => {
@@ -2306,6 +2322,7 @@ mod tests {
             store: store::Store::open(&paths.sessions_index(), dir.to_path_buf()).unwrap(),
             paths,
             signing: Mutex::new(None),
+            steering: Steer::default(),
         }
     }
 
@@ -2360,6 +2377,7 @@ mod tests {
             store: store::Store::open(&paths.sessions_index(), dir.path().to_path_buf()).unwrap(),
             paths,
             signing: Mutex::new(None),
+            steering: Steer::default(),
         };
         let mut app = an_app();
         // An unreachable endpoint is a failure the dialog has to be told about, not a hang: nothing

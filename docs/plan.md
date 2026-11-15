@@ -3404,6 +3404,30 @@ theme struct, which exist so that a file pi accepts parses whole; the config's i
 field, which exists so an old file still parses; and the compiled test fixtures, which two test
 binaries include and no one of them uses whole.
 
+**D149.** A message sent while a turn is running is either **queued** or **steered**. A queued one
+waits for the turn to end and is then sent as the next prompt, which is what the interface did
+before. A steered one enters the conversation at the next point where nothing is in flight: the top
+of the loop, before the next model request, or after a reply that asked for no tool call, where it
+keeps the turn going instead of ending it. That is "between tool calls" as a reader sees it, and it
+is the only honest answer to "as soon as possible" — a reply already streaming cannot be interrupted
+mid-token.
+
+The two front-ends choose differently, because they are used differently. In the terminal interface
+`enter` steers and `alt+enter` queues while a turn runs; `ctrl+j` (and `shift+enter` when idle) still
+inserts a newline. Line mode sends every line as a prompt and has nothing concurrent to steer with.
+
+A steered message is an ordinary user item on the branch, recorded at the moment it is taken — not
+when it was typed — so a resumed conversation replays it in the order the model saw it, and the
+request that follows carries it with the tool results before it. Nothing already sent is rewritten,
+so the prompt cache is appended to rather than invalidated. Taking one resets the repeated-call guard
+(D38): the user's new instruction may legitimately repeat a call the guard would have stopped for. A
+steer that arrives after a turn's last request is not lost; it stays in the mailbox and is taken, and
+shown, at the next turn's first request. The transcript shows a steered message where it was
+delivered rather than where it was typed, so what is on screen is the order the conversation has.
+
+The mailbox is shared memory, not a command: the command channel is blocked by the very turn that has
+to read it, which is exactly why steering could not be built on it.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
