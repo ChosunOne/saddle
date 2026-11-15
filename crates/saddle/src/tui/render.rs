@@ -55,14 +55,6 @@ impl Row {
             ..Self::default()
         }
     }
-
-    fn prefixed(first: &str, rest: &str, style: Style, spans: Vec<Span<'static>>) -> Self {
-        Self {
-            first: vec![Span::styled(first.to_owned(), style)],
-            rest: vec![Span::styled(rest.to_owned(), style)],
-            spans,
-        }
-    }
 }
 
 fn spans_width(spans: &[Span<'_>]) -> usize {
@@ -758,7 +750,7 @@ struct View {
     images: bool,
 }
 
-fn thinking_rows(text: &str, shown: bool, theme: &Theme) -> Vec<Row> {
+fn thinking_rows(text: &str, shown: bool, theme: &Theme, room: usize) -> Vec<Row> {
     let text = text.trim();
     let bar = Style::new().fg(theme.thinking_text);
     if !shown {
@@ -769,19 +761,18 @@ fn thinking_rows(text: &str, shown: bool, theme: &Theme) -> Vec<Row> {
             dim(theme).add_modifier(Modifier::ITALIC),
         )])];
     }
-    text.lines()
-        .map(|l| {
-            Row::prefixed(
-                "│ ",
-                "│ ",
-                bar,
-                vec![Span::styled(
-                    l.to_owned(),
-                    dim(theme).add_modifier(Modifier::ITALIC),
-                )],
-            )
-        })
-        .collect()
+    // D151: summaries contain Markdown too. Preserve list/code prefixes inside the thinking bar.
+    let mut rows = markdown_over(
+        text,
+        theme,
+        bar.add_modifier(Modifier::ITALIC),
+        room.saturating_sub(2),
+    );
+    for row in &mut rows {
+        row.first.insert(0, Span::styled("│ ", bar));
+        row.rest.insert(0, Span::styled("│ ", bar));
+    }
+    rows
 }
 
 /// What the user typed, read as markdown in their own colour (D81).
@@ -807,7 +798,7 @@ fn user_rows(text: &str, theme: &Theme, room: usize) -> Vec<Row> {
 /// Rows for entries drawn as plain text; tool calls are drawn as blocks by [`tool_block`].
 fn entry_rows(entry: &Entry, view: View, theme: &Theme) -> Vec<Row> {
     match entry {
-        Entry::Thinking(text) => thinking_rows(text, view.thinking, theme),
+        Entry::Thinking(text) => thinking_rows(text, view.thinking, theme, view.room.0 as usize),
         Entry::User(text) => user_rows(text, theme, view.room.0 as usize),
         Entry::Assistant(text) => markdown(text, theme, view.room.0 as usize),
         Entry::Image(image) => {
@@ -872,9 +863,12 @@ fn compaction_block(
     if !reasoning.is_empty() {
         rows.push(Row::default());
         if thinking {
-            rows.extend(reasoning.lines().map(|l| {
-                Row::prefixed("│ ", "│ ", muted, vec![Span::styled(l.to_owned(), italic)])
-            }));
+            rows.extend(thinking_rows(
+                reasoning,
+                true,
+                theme,
+                room.saturating_sub(2),
+            ));
         } else {
             rows.push(Row::plain(vec![Span::styled(
                 format!(
@@ -2864,7 +2858,11 @@ mod tests {
 
     #[test]
     fn wrapping_keeps_indent_and_splits_long_words() {
-        let row = Row::prefixed("› ", "  ", Style::new(), vec![Span::raw("aaa bbb ccc")]);
+        let row = Row {
+            first: vec![Span::raw("› ")],
+            rest: vec![Span::raw("  ")],
+            spans: vec![Span::raw("aaa bbb ccc")],
+        };
         assert_eq!(text(&wrap(&row, 9)), ["› aaa bbb", "  ccc"]);
         let code = Row::plain(vec![Span::raw("    fn x()")]);
         assert_eq!(text(&wrap(&code, 40)), ["    fn x()"]);
@@ -3760,6 +3758,52 @@ mod tests {
             images: None,
             theme: None,
         })
+    }
+
+    #[test]
+    fn reasoning_renders_markdown_emphasis_and_paragraphs_inside_its_gutter() {
+        let theme = Theme::default();
+        let reasoning = "***Testing the library***\n\nChecking **results**.\n\n- a long list entry that wraps onto another line";
+        let rows = thinking_rows(reasoning, true, &theme, 30);
+        let lines: Vec<_> = rows.iter().flat_map(|row| text(&wrap(row, 30))).collect();
+        let shown = lines.join("\n");
+        assert!(
+            shown.contains("│ Testing the library\n│ \n│ Checking results."),
+            "{shown}"
+        );
+        assert!(!shown.contains("***") && !shown.contains("**"), "{shown}");
+        assert!(rows[0].spans.iter().any(|span| {
+            span.content.contains("Testing")
+                && span
+                    .style
+                    .add_modifier
+                    .contains(Modifier::BOLD | Modifier::ITALIC)
+        }));
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.starts_with("│ ") && line.width() <= 30)
+        );
+        let folded = thinking_rows(reasoning, false, &theme, 30);
+        assert_eq!(folded.len(), 1);
+        assert!(text(&wrap(&folded[0], 80))[0].contains("ctrl+t shows it"));
+        let view = CompactionView {
+            header: "earlier conversation".into(),
+            reasoning: reasoning.into(),
+            summary: String::new(),
+            state: CompactState::Running,
+            blocks: false,
+        };
+        let (rows, _) = compaction_block(&view, true, false, 0, &theme, 30);
+        let shown = rows
+            .iter()
+            .flat_map(|row| text(&wrap(row, 30)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            shown.contains("│ Testing the library") && !shown.contains("***"),
+            "{shown}"
+        );
     }
 
     #[test]

@@ -60,7 +60,7 @@ Inside `crates/saddle/src`:
 | `output` | line-mode output: a terminal, or one JSON object per line for a program (D52) |
 | `cache` | the cache-miss notice: one line to the user when a prompt is re-read at full price (D50) |
 | `reserved` | the D20 snapshot and restore of reserved paths around `exec` |
-| `provider/` | the neutral conversation form, the Anthropic, OpenAI-compatible and Responses renderers (every other server is a `[providers.<name>]` table naming which one it imitates, D84), the cache-affinity key, headers, lifetime and originator, sent to OpenAI's own API and to the subscription backend (D100), and the WebSocket that backend is spoken to over, with the delta a kept connection allows (D101), its endpoint/authentication-bound reuse and completed-socket handoff (D102), and one HTTP recovery of a transient Responses stream failure before text or reasoning is shown (D125), OAuth login and token refresh (D85), the model list, the cached context windows and prices (D34, D36); reasoning is kept for every model and replayed in its original position (D95, D96) |
+| `provider/` | the neutral conversation form, the Anthropic, OpenAI-compatible and Responses renderers (every other server is a `[providers.<name>]` table naming which one it imitates, D84), the cache-affinity key, headers, lifetime and originator, sent to OpenAI's own API and to the subscription backend (D100), and the WebSocket that backend is spoken to over, with the delta a kept connection allows (D101), its endpoint/authentication-bound reuse and completed-socket handoff (D102), and one HTTP recovery of a transient Responses stream failure before text or reasoning is shown (D125), OAuth login and token refresh (D85), the model list, the cached context windows and prices (D34, D36); reasoning is kept for every model and replayed in its original position (D95, D96), while Responses summary parts retain display paragraph boundaries and reasoning renders as Markdown live and on resume (D151) |
 | `tui/` | the full-screen UI: app state, rendering (a prompt is markdown in the user's colour, D81; tables are fitted to the width, D83), editor, login (a key or an OAuth sign-in, D85; the searchable model picker `/model` opens, D88), selection (a drag copies the transcript's text or the open dialog's, D87), settings, session list, `permissions` (the grants editor, D45), `tree` (the message tree, D54), `image` (drawing a picture: kitty and iTerm2, D59), `status` (the `[ui] status` template, D36), `theme` (the colour roles, D71), `catppuccin` (the four built-in flavours, D76), `palette` (pi's role vocabulary, colour forms and the palette derived from the terminal, D72, D73), `terminal` (asking the terminal for its colours, D73), `syntax` (code blocks: syntect's grammars, nine roles, the theme's colours, D80), `themes` (the `/theme` picker, D74), `grant` (writing one change into this workspace's policy file, D45), `files` (the `@` file-name completion's own enumeration, which is not an agent tool) and `browser` (opening the link a sign-in shows, D86) |
 
 `crates/saddle/src/main.rs` dispatches subcommands (`tools`, `plugin install|list|call`, `run`,
@@ -366,7 +366,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D150 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D151 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

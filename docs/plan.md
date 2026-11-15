@@ -3453,6 +3453,22 @@ Acceptance uses the same reader bytes/digest across workspace access and externa
 enablement and revocation, with unchanged root exclusions and principal isolation. Unused imports,
 unimplemented grants/hooks, wrong signatures and unsupported versions fail before guest start.
 
+**D151.** Reasoning prose is Markdown in the human transcript, not a literal string containing
+formatting markers. Expanded thinking uses the existing Markdown renderer over `thinkingText`,
+with its gutter retained on every line and continuation; its width leaves room for that gutter.
+Paragraphs, emphasis, lists and code retain their structure. The same presentation applies to
+compaction reasoning and saved/replayed reasoning, while ctrl+t still folds thinking to a note.
+
+Responses summary deltas within one part concatenate unchanged. Changes of output/summary/content
+index, explicit summary-part/text boundaries and reasoning-item boundaries separate display prose
+with a blank line, without adding leading/trailing or duplicate separators. This applies to live
+terminal/JSON reasoning events, not opaque wire data. A fallback synthetic summary keeps these
+boundaries when the server provides no native reasoning item. Native reasoning items, including
+summary arrays, ids, encrypted content and unknown fields, remain stored and replayed verbatim
+under D95/D96. Saved transcript entries use D98's shared prose extractor, so Responses summaries
+reappear after resume without exposing ciphertext or redacted data. No provider replay payload is
+rebuilt from rendered Markdown.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

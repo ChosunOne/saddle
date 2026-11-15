@@ -227,6 +227,9 @@ struct Pending {
 pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<Reply> {
     let mut text = String::new();
     let mut reasoning = String::new();
+    // D151: delimit display paragraphs, not token chunks. Native replay items stay verbatim.
+    let mut reasoning_segment = None;
+    let mut reasoning_break = false;
     // D95: the reasoning items exactly as the server sent them. They carry an opaque
     // `encrypted_content` and an id, and only the server can read either: what comes back here must
     // go back out unchanged, or the model starts the next step without the thinking it already did.
@@ -264,13 +267,54 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
                 }
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                if let Some(d) = event["delta"].as_str() {
+                if let Some(d) = event["delta"].as_str().filter(|d| !d.is_empty()) {
+                    let segment = (
+                        event["output_index"].as_u64(),
+                        event["summary_index"]
+                            .as_u64()
+                            .or_else(|| event["content_index"].as_u64()),
+                        kind == "response.reasoning_summary_text.delta",
+                    );
+                    if !reasoning.is_empty()
+                        && (reasoning_break
+                            || reasoning_segment.is_some_and(|previous| previous != segment))
+                    {
+                        let trailing = reasoning
+                            .bytes()
+                            .rev()
+                            .take_while(|b| *b == b'\n')
+                            .take(2)
+                            .count();
+                        let leading = d.bytes().take_while(|b| *b == b'\n').take(2).count();
+                        let separator = match 2usize.saturating_sub(trailing + leading) {
+                            0 => "",
+                            1 => "\n",
+                            _ => "\n\n",
+                        };
+                        if !separator.is_empty() {
+                            sink.reasoning(separator);
+                            reasoning.push_str(separator);
+                        }
+                    }
                     sink.reasoning(d);
                     reasoning.push_str(d);
+                    reasoning_segment = Some(segment);
+                    reasoning_break = false;
                 }
+            }
+            "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_part.done"
+            | "response.reasoning_summary_text.done"
+            | "response.reasoning_text.done" => {
+                // Some compatible servers omit indices; explicit boundaries still separate parts.
+                reasoning_break = !reasoning.is_empty();
             }
             "response.output_item.added" => {
                 let item = &event["item"];
+                if item["type"] == "reasoning" {
+                    reasoning_break = !reasoning.is_empty();
+                    reasoning_segment = None;
+                }
                 if item["type"] == "function_call" {
                     let index = event["output_index"].as_u64().unwrap_or(calls.len() as u64);
                     let pending = calls.entry(index).or_default();
@@ -300,6 +344,8 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
                     // Verbatim: id, summary, encrypted_content and whatever else the server put
                     // there. This is the thing D95 exists for.
                     reasoning_items.push(item.clone());
+                    reasoning_break = !reasoning.is_empty();
+                    reasoning_segment = None;
                 }
                 if item["type"] == "function_call" {
                     let index = event["output_index"].as_u64().unwrap_or(0);
@@ -1136,6 +1182,161 @@ mod tests {
         let reply = read_stream(events, &mut sink).unwrap();
         assert_eq!(reply.stop, Stop::MaxTokens);
         assert_eq!(reply.stop_raw, "max_output_tokens");
+    }
+
+    #[test]
+    fn reasoning_summary_parts_are_separated_without_changing_native_replay() {
+        let events = Script(vec![
+            (
+                "response.reasoning_summary_part.added",
+                r#"{"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":0}"#,
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"***Testing "}"#,
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"the library***"}"#,
+            ),
+            (
+                "response.reasoning_summary_text.done",
+                r#"{"type":"response.reasoning_summary_text.done","output_index":0,"summary_index":0}"#,
+            ),
+            (
+                "response.reasoning_summary_part.done",
+                r#"{"type":"response.reasoning_summary_part.done","output_index":0,"summary_index":0}"#,
+            ),
+            (
+                "response.reasoning_summary_part.added",
+                r#"{"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":1}"#,
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":1,"delta":"***Reviewing results***"}"#,
+            ),
+            (
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"***Testing the library***"},{"type":"summary_text","text":"***Reviewing results***"}],"encrypted_content":"opaque","extra":"keep"}}"#,
+            ),
+            (
+                "response.completed",
+                r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+            ),
+        ]);
+        let mut sink = Capture::default();
+        let reply = read_stream(events, &mut sink).unwrap();
+        assert_eq!(
+            sink.reasoning,
+            "***Testing the library***\n\n***Reviewing results***"
+        );
+        let original = json!({"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"***Testing the library***"},{"type":"summary_text","text":"***Reviewing results***"}],"encrypted_content":"opaque","extra":"keep"});
+        assert_eq!(
+            reply.parts,
+            [Part::Native {
+                api: Api::OpenaiResponses,
+                block: original.clone()
+            }]
+        );
+        assert_eq!(input(&[Item::Assistant(reply.parts)])[0], original);
+    }
+
+    #[test]
+    fn reasoning_indices_delimit_parts_and_items_not_individual_deltas() {
+        let events = Script(vec![
+            (
+                "response.reasoning_summary_text.delta",
+                r#"{"output_index":0,"summary_index":0,"delta":"first "}"#,
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                r#"{"output_index":0,"summary_index":0,"delta":"entry"}"#,
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                r#"{"output_index":0,"summary_index":1,"delta":"second entry"}"#,
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                r#"{"output_index":1,"summary_index":0,"delta":"third entry"}"#,
+            ),
+            (
+                "response.completed",
+                r#"{"response":{"status":"completed"}}"#,
+            ),
+        ]);
+        let mut sink = Capture::default();
+        let reply = read_stream(events, &mut sink).unwrap();
+        let expected = "first entry\n\nsecond entry\n\nthird entry";
+        assert_eq!(sink.reasoning, expected);
+        assert_eq!(
+            reply.parts,
+            [Part::Native {
+                api: Api::OpenaiResponses,
+                block: json!({"type":"reasoning","summary":[{"type":"summary_text","text":expected}]})
+            }]
+        );
+    }
+
+    #[test]
+    fn completed_unindexed_reasoning_items_and_raw_content_keep_their_boundaries() {
+        let events = Script(vec![
+            (
+                "response.reasoning_text.delta",
+                r#"{"content_index":0,"delta":"raw "}"#,
+            ),
+            (
+                "response.reasoning_text.delta",
+                r#"{"content_index":0,"delta":"entry"}"#,
+            ),
+            (
+                "response.reasoning_text.delta",
+                r#"{"content_index":1,"delta":"next content"}"#,
+            ),
+            (
+                "response.output_item.done",
+                r#"{"item":{"type":"reasoning","summary":[{"text":"raw entry"},{"text":"next content"}]}}"#,
+            ),
+            (
+                "response.reasoning_text.delta",
+                r#"{"content_index":1,"delta":"next item"}"#,
+            ),
+            (
+                "response.completed",
+                r#"{"response":{"status":"completed"}}"#,
+            ),
+        ]);
+        let mut sink = Capture::default();
+        read_stream(events, &mut sink).unwrap();
+        assert_eq!(sink.reasoning, "raw entry\n\nnext content\n\nnext item");
+    }
+
+    #[test]
+    fn unindexed_reasoning_boundaries_do_not_add_leading_trailing_or_duplicate_gaps() {
+        for (first, second) in [
+            (r#"{"delta":"first\n"}"#, r#"{"delta":"second"}"#),
+            (r#"{"delta":"first"}"#, r#"{"delta":"\n\nsecond"}"#),
+            (r#"{"delta":"first\n"}"#, r#"{"delta":"\nsecond"}"#),
+            (r#"{"delta":"first\n\n"}"#, r#"{"delta":"second"}"#),
+        ] {
+            let events = Script(vec![
+                ("response.reasoning_summary_part.added", "{}"),
+                ("response.reasoning_summary_text.delta", r#"{"delta":""}"#),
+                ("response.reasoning_summary_text.delta", first),
+                ("response.reasoning_summary_text.done", "{}"),
+                ("response.reasoning_summary_part.done", "{}"),
+                ("response.reasoning_summary_part.added", "{}"),
+                ("response.reasoning_summary_text.delta", second),
+                ("response.reasoning_summary_text.done", "{}"),
+                (
+                    "response.completed",
+                    r#"{"response":{"status":"completed"}}"#,
+                ),
+            ]);
+            let mut sink = Capture::default();
+            read_stream(events, &mut sink).unwrap();
+            assert_eq!(sink.reasoning, "first\n\nsecond");
+        }
     }
 
     #[test]

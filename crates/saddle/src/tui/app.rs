@@ -4,7 +4,7 @@ use super::files;
 use crate::provider;
 use crate::provider::Image;
 use crate::provider::Quota;
-use crate::provider::visible_tool_text;
+use crate::provider::{reasoning_text, visible_tool_text};
 use crate::skills;
 use crate::skills::Skill;
 use crate::store::Point;
@@ -1967,14 +1967,11 @@ pub fn entries_from(items: &[Item]) -> Vec<Entry> {
                                 ),
                             ));
                         }
-                        Part::Native { block, .. } => {
-                            let reasoning = block["reasoning_content"].as_str().or_else(|| {
-                                (block["type"] == "thinking")
-                                    .then(|| block["thinking"].as_str())
-                                    .flatten()
-                            });
-                            if let Some(r) = reasoning.filter(|r| !r.trim().is_empty()) {
-                                out.push(Entry::Thinking(display(r)));
+                        Part::Native { .. } => {
+                            if let Some(reasoning) =
+                                reasoning_text(part).filter(|r| !r.trim().is_empty())
+                            {
+                                out.push(Entry::Thinking(display(&reasoning)));
                             }
                         }
                         Part::Text(_) => {}
@@ -2033,6 +2030,8 @@ mod tests {
     use crate::tui::status::Template;
     use crate::tui::theme::ThemeTables;
     use crate::tui::themes::ThemePicker;
+
+    use serde_json::json;
 
     fn app() -> App {
         App::new(Header {
@@ -2748,6 +2747,28 @@ mod tests {
         assert_eq!(a.entries[n - 1], Entry::Assistant("answer".into()));
         a.key(ctrl('t'));
         assert!(!a.show_thinking);
+    }
+
+    #[test]
+    fn resumed_responses_reasoning_uses_summary_parts_without_exposing_opaque_data() {
+        let items = [Item::Assistant(vec![
+            Part::Native {
+                api: Api::OpenaiResponses,
+                block: json!({"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"***Testing the library***"},{"type":"summary_text","text":"***Reviewing results***"}],"encrypted_content":"never display"}),
+            },
+            Part::Native {
+                api: Api::OpenaiResponses,
+                block: json!({"type":"reasoning","summary":[],"encrypted_content":"never display"}),
+            },
+            Part::Text("Done.".into()),
+        ])];
+        assert_eq!(
+            entries_from(&items),
+            [
+                Entry::Thinking("***Testing the library***\n\n***Reviewing results***".into()),
+                Entry::Assistant("Done.".into())
+            ]
+        );
     }
 
     #[test]
