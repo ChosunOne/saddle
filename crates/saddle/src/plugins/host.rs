@@ -30,6 +30,7 @@ use crate::execution;
 use crate::network::Operation;
 use crate::provider::Image;
 use crate::session::Session;
+use crate::tools::timeout;
 use crate::{cancel, fs_access, transcript};
 use crate::{network, search_transport};
 use saddle_wit::saddle::host::exec::{Command, Reply as ExecReply};
@@ -499,6 +500,7 @@ fn execute_inner(
     };
     let cancelled = Arc::new(AtomicBool::new(cancel::FLAG.load(Ordering::Relaxed)));
     let flag = cancelled.clone();
+    let deadline = timeout::deadline();
     // Reserve host frames beyond Wasmtime's configured guest stack; never silently exceed the thread.
     let stack_bytes = prepared
         .stack_bytes()
@@ -510,15 +512,13 @@ fn execute_inner(
         .spawn(move || {
             let result = match job {
                 Job::Describe => prepared.describe(host, flag).map(Reply::Description),
-                Job::Invoke(arguments) => {
-                    prepared
-                        .invoke(host, &arguments, flag)
-                        .map(|output| Reply::Output {
-                            output,
-                            diff: None,
-                            images: Vec::new(),
-                        })
-                }
+                Job::Invoke(arguments) => prepared
+                    .invoke_until(host, &arguments, flag, deadline)
+                    .map(|output| Reply::Output {
+                        output,
+                        diff: None,
+                        images: Vec::new(),
+                    }),
             }
             .map_err(|e| e.to_string());
             let _ = events.send(Event::Finished(result));
@@ -526,7 +526,7 @@ fn execute_inner(
         .map_err(|error| Fatal(anyhow!(error)))?;
     let mut fatal = None;
     let result = loop {
-        if cancel::FLAG.load(Ordering::Relaxed) {
+        if cancel::FLAG.load(Ordering::Relaxed) || timeout::expired() {
             cancelled.store(true, Ordering::Relaxed);
         }
         match pending.recv_timeout(Duration::from_millis(10)) {

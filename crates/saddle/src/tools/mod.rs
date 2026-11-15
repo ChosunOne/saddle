@@ -3,8 +3,12 @@
 use crate::mcp::registry;
 use crate::plugins;
 use crate::provider::Image;
+use saddle_cap::{Principal, Scope};
 use saddle_limits as budgets;
+use saddle_policy::Kind;
+use saddle_policy::audit::sha256_hex;
 use std::mem;
+pub(crate) mod timeout;
 mod tool_search;
 
 pub(crate) use crate::execution::HELPER_ARG;
@@ -75,7 +79,7 @@ pub const NAMES: &[&str] = &[
 
 /// The tools as the model sees them. The descriptions say when to use each one.
 pub fn definitions() -> Vec<ToolDef> {
-    vec![ToolDef {
+    vec![timeout::definition(ToolDef {
         name: "tool_search".into(),
         description: "Find and declare a tool an MCP server offers. A server's tools are not \
                           declared until this matches them, so use it before calling one: an \
@@ -94,14 +98,40 @@ pub fn definitions() -> Vec<ToolDef> {
             "required": ["query"],
             "additionalProperties": false,
         }),
-    }]
+    })]
 }
 
 /// Runs one tool as the agent. `Err` means the host itself failed (for example, the audit log
 /// could not be written) and the session must stop.
 pub fn call(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutput> {
     let limits = session.setup.tool_limits.clone();
-    budgets::using(&limits, || call_inner(session, name, input))
+    let deadline = match timeout::parse(input) {
+        Ok(deadline) => deadline,
+        Err(why) => {
+            let arguments = input.to_string();
+            session.audit.event(Kind::Decision, Some(&Principal::Agent), Some(Scope::Tool), Some(false),
+                json!({"operation":"invalid-tool-arguments", "tool":name, "arguments":{"bytes":arguments.len(), "sha256":sha256_hex(arguments.as_bytes())}}), &why)?;
+            return Ok(ToolOutput::err(why));
+        }
+    };
+    timeout::using(deadline, || {
+        budgets::using(&limits, || {
+            let output = call_inner(session, name, input)?;
+            // Never downgrade a fatal host/audit error to a timeout.
+            if timeout::expired() && output.provenance.is_none() {
+                Ok(ToolOutput {
+                    ok: false,
+                    content: format!(
+                        "{}\ntool call timed out; effects already completed are not rolled back",
+                        output.content
+                    ),
+                    ..output
+                })
+            } else {
+                Ok(output)
+            }
+        })
+    })
 }
 
 fn call_inner(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutput> {

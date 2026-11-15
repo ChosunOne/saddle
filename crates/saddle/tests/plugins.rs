@@ -1048,6 +1048,24 @@ fn transcript_plugins_need_both_grants_and_never_open_the_saved_database() {
 }
 
 #[test]
+fn host_timeout_is_optional_for_a_strict_third_party_reader_without_repinning() {
+    let bytes = standard_component("read");
+    let env = Env::new(&bytes, fixture::GRANTS);
+    managed_manifest(&env, "['tool','fs-read','tool-read']");
+    fs::write(env.ws().join("file"), "reader result").unwrap();
+    for arguments in [r#"{"path":"file","timeout_secs":1}"#, r#"{"path":"file"}"#] {
+        let out = env.run(&["plugin", "call", "reader", arguments]);
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(text(&out).contains("reader result") && text(&out).contains("<plugin-output-"));
+        assert!(
+            env.records()
+                .iter()
+                .any(|row| row["principal"] == "plugin.reader" && row["scope"] == "fs-read")
+        );
+    }
+}
+
+#[test]
 fn enabled_plugin_is_callable_through_both_cli_paths_with_audited_identity() {
     let env = Env::new(&fixture::reader("file"), fixture::GRANTS);
     fs::write(env.ws().join("file"), "hello from a component").unwrap();

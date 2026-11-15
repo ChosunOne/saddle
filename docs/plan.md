@@ -3469,6 +3469,31 @@ under D95/D96. Saved transcript entries use D98's shared prose extractor, so Res
 reappear after resume without exposing ciphertext or redacted data. No provider replay payload is
 rebuilt from rendered Markdown.
 
+**D152.** Every model-facing tool accepts optional `timeout_secs`, a positive integer total
+wall-clock deadline, not a new grant or a replacement for protected resource limits. Omission
+retains existing defaults. The host advertises this execution option on shipped/plugin/MCP schemas
+and consumes it before forwarding arguments unless the original schema already declares the field
+(as bash does); a declared field keeps its underlying semantics and also supplies the host deadline.
+Invalid, zero, fractional, negative and overflowing values fail before tool effects. The same option
+works through standalone tool/plugin/MCP calls. MCP CLI discovery and invocation share one deadline.
+
+One absolute deadline covers component initialization, guest work and every host wait. The loader's
+independent CPU/fuel and aggregate host-wait budgets remain intact; long host calls cannot extend
+past the caller deadline. Commands use the remaining duration without rounding it up to a second,
+kill their process group at expiry, drain bounded output and restore reserved paths before returning.
+Filesystem, mutation, transcript and HTTP/search services receive deadline-aware calls. MCP discovery,
+HTTP attempts/OAuth refreshes and stdio requests reuse the remaining budget rather than resetting it;
+stdio checks even during message floods and uses nonblocking deadline-bound pipe writes. A timed-out
+local MCP server is closed/killed and must be restarted; closing an HTTP request cannot guarantee
+remote work stops. Remote cancellation is best-effort, not remote rollback or a new protocol promise.
+
+Timeout is an ordinary failed tool result with existing component provenance, never an excuse to
+swallow fatal host/audit failures. Completed effects are not rolled back. Mandatory process cleanup,
+reservation restore and audit can finish after the deadline; D129's non-preemptible kernel filesystem
+operations and D19's escaped-process-group limitation still apply. The deadline scope is per call,
+unwind-safe, passed explicitly to the component worker and never leaks to subsequent invocations.
+No SDK ABI, component build variant, digest or operational authority changes.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

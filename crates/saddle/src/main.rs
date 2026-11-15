@@ -56,6 +56,7 @@ use crate::net::bridge::Bridge;
 use crate::provider::Provider;
 use crate::session::{PrivateTmp, Session, Setup, session_id};
 use crate::term::Terminal;
+use crate::tools::{ToolOutput, timeout};
 
 #[derive(Parser)]
 #[command(
@@ -1466,10 +1467,25 @@ fn mcp_call(
         tmp,
     );
     let key = format!("mcp__{server}__{tool}");
-    let out = registry.start(server, &mut session).and_then(|()| {
-        registry.declare_server(server);
-        registry.call(&key, &arguments, &mut session)
-    });
+    let out = match timeout::parse(&arguments) {
+        Err(why) => {
+            mcp::registry::record_call(
+                &mut session,
+                server,
+                tool,
+                &mcp::registry::arguments_record(&arguments),
+                None,
+                &why,
+            )?;
+            Ok(ToolOutput::err(why))
+        }
+        Ok(deadline) => timeout::using(deadline, || {
+            registry.start(server, &mut session).and_then(|()| {
+                registry.declare_server(server);
+                registry.call(&key, &arguments, &mut session)
+            })
+        }),
+    };
     let code = match &out {
         Ok(out) if out.ok => {
             println!("{}", out.content);

@@ -15,6 +15,7 @@ use serde_json::json;
 
 use crate::net::bridge::Bridge;
 use crate::session::Session;
+use crate::tools::timeout;
 use crate::{cancel, reserved};
 
 pub const HELPER_ARG: &str = "__sandbox";
@@ -72,6 +73,10 @@ pub fn execute(
         .min(Duration::from_secs(budgets::exec_seconds() as u64))
         .max(Duration::from_secs(1))
         .min(lowered.timeout);
+    let timeout = match timeout::remaining(timeout) {
+        Ok(timeout) => timeout,
+        Err(why) => return Ok(Err(why.to_string())),
+    };
     let tmp = session
         .roots()
         .get(&RootName::tmp())
@@ -92,6 +97,11 @@ pub fn execute(
     let mut denials = Vec::new();
     let mut failure = None;
     *effects = true;
+    // Snapshot/setup time counts against the same invocation deadline.
+    let timeout = match timeout::remaining(timeout) {
+        Ok(timeout) => timeout,
+        Err(why) => return Ok(Err(why.to_string())),
+    };
     let output = run_sandbox(
         &helper,
         &[HELPER_ARG],

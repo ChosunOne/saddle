@@ -231,6 +231,111 @@ fn ready() -> Env {
 }
 
 #[test]
+fn every_shipped_tool_accepts_the_optional_host_timeout_without_guest_schema_changes() {
+    let env = ready();
+    env.edit_agent(|agent| {
+        agent.insert(
+            "transcript-read".into(),
+            toml::Value::Table(toml::Table::new()),
+        );
+    });
+    for (name, mut input, success) in [
+        ("read", serde_json::json!({"path":"README"}), true),
+        ("ls", serde_json::json!({"path":"."}), true),
+        ("find", serde_json::json!({"pattern":"README"}), true),
+        ("grep", serde_json::json!({"pattern":"hello"}), true),
+        (
+            "write",
+            serde_json::json!({"path":"new","content":"one"}),
+            true,
+        ),
+        (
+            "edit",
+            serde_json::json!({"path":"new","old":"one","new":"two"}),
+            true,
+        ),
+        (
+            "patch",
+            serde_json::json!({"patch":"*** Begin Patch\n*** Add File: added\n+hello\n*** End Patch"}),
+            true,
+        ),
+        ("bash", serde_json::json!({"command":"printf hello"}), true),
+        (
+            "fetch",
+            serde_json::json!({"url":"https://example.test/"}),
+            false,
+        ),
+        ("websearch", serde_json::json!({"query":"rust"}), false),
+        (
+            "session_query",
+            serde_json::json!({"sql":"SELECT 1"}),
+            false,
+        ),
+        ("tool_search", serde_json::json!({"query":""}), true),
+    ] {
+        input["timeout_secs"] = serde_json::json!(5);
+        let (ok, text) = env.tool(name, input);
+        assert_eq!(ok, success, "{name}: {text}");
+        assert!(
+            !text.contains("unknown field") && !text.contains("invalid arguments"),
+            "{name}: {text}"
+        );
+    }
+    // Invalid deadlines are rejected before any effects, and omitted timeout remains compatible.
+    let (ok, text) = env.tool(
+        "write",
+        serde_json::json!({"path":"never-created", "content":"x", "timeout_secs":0}),
+    );
+    assert!(!ok && text.contains("positive integer"), "{text}");
+    assert!(!env.path("never-created").exists());
+    assert!(env.tool("read", serde_json::json!({"path":"README"})).0);
+}
+
+#[test]
+fn fetch_total_timeout_cuts_off_host_io_and_keeps_the_audit_chain_valid() {
+    let env = ready();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = stop.clone();
+    let seen = Arc::new(AtomicBool::new(false));
+    let accepted = seen.clone();
+    let server = thread::spawn(move || {
+        let mut streams = Vec::new();
+        while !done.load(Ordering::Relaxed) {
+            if let Ok((stream, _)) = listener.accept() {
+                streams.push(stream); // Accept, but deliberately send no response.
+                accepted.store(true, Ordering::Relaxed);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    });
+    env.write_policy(format!(
+        "{POLICY}\nnet=[{{host='127.0.0.1',scheme='http',port={port}}}]\n"
+    ));
+    let start = Instant::now();
+    let (ok, text) = env.tool(
+        "fetch",
+        serde_json::json!({"url":format!("http://127.0.0.1:{port}/"), "timeout_secs":1}),
+    );
+    let elapsed = start.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+    assert!(
+        seen.load(Ordering::Relaxed),
+        "request did not reach the mock: {text}"
+    );
+    assert!(!ok && text.contains("timed out"), "{text}");
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    assert!(env.tool("read", serde_json::json!({"path":"README"})).0);
+    for log in env.audit_logs() {
+        let out = env.saddle(&["audit", "verify", log.to_str().unwrap()]);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+}
+
+#[test]
 fn shipped_components_honor_runtime_envelopes_without_rebuilding_code() {
     let env = Env::new();
     let mut config: toml::Table = env.policy().parse().unwrap();
@@ -887,6 +992,12 @@ mcp     = [{ server = "scout", tools = ["search"] }, { server = "ghost", tools =
 /// so both framings a server may answer with are exercised (D110). It stops when the test says so,
 /// because a refused request never reaches it and would otherwise leave a thread waiting forever.
 fn mock_http_mcp() -> (String, Arc<AtomicUsize>, Arc<AtomicBool>, JoinHandle<()>) {
+    mock_http_mcp_with_slow_call(false)
+}
+
+fn mock_http_mcp_with_slow_call(
+    slow: bool,
+) -> (String, Arc<AtomicUsize>, Arc<AtomicBool>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let port = listener.local_addr().expect("the bound address").port();
     listener
@@ -938,6 +1049,16 @@ fn mock_http_mcp() -> (String, Arc<AtomicUsize>, Arc<AtomicBool>, JoinHandle<()>
                 .find("\r\n\r\n")
                 .map(|at| &text[at + 4..])
                 .unwrap_or_default();
+            if slow && body.contains("tools/call") {
+                assert!(
+                    !body.contains("timeout_secs"),
+                    "host option leaked to MCP server: {body}"
+                );
+                while !done.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                break;
+            }
             let answer = if body.contains("tools/list") {
                 // An event stream, which is what a server may answer any request with.
                 let event = r#"data: {"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"says it back","inputSchema":{}}]}}
@@ -960,6 +1081,40 @@ fn mock_http_mcp() -> (String, Arc<AtomicUsize>, Arc<AtomicBool>, JoinHandle<()>
         }
     });
     (format!("http://127.0.0.1:{port}/mcp"), seen, stop, handle)
+}
+
+#[test]
+fn remote_mcp_tool_timeout_is_shared_across_startup_and_the_call() {
+    let env = Env::new();
+    let (url, seen, stop, handle) = mock_http_mcp_with_slow_call(true);
+    let port = url
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap()
+        .rsplit(':')
+        .next()
+        .unwrap();
+    env.write_config(&format!("\n[mcp.remote]\nurl={url:?}\ntimeout=30\n"));
+    env.write_policy(format!(
+        r#"[agent]
+net=[{{host='127.0.0.1',scheme='http',port={port}}}]
+mcp=[{{server='remote',tools=['echo'],net=[{{host='127.0.0.1',scheme='http',port={port}}}]}}]
+"#
+    ));
+    let start = Instant::now();
+    let out = env.saddle(&["mcp", "call", "remote", "echo", r#"{"timeout_secs":1}"#]);
+    let elapsed = start.elapsed();
+    stop.store(true, Ordering::SeqCst);
+    handle.join().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success() && text.contains("timed out"),
+        "{text} {}",
+        stderr(&out)
+    );
+    assert_eq!(seen.load(Ordering::SeqCst), 4);
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
 }
 
 #[test]
@@ -1065,6 +1220,14 @@ mcp     = [{ server = "fake", tools = ["search"] }]
         took < Duration::from_secs(20),
         "it waited past the deadline its table names: {took:?}"
     );
+    let began = Instant::now();
+    let out = env.saddle(&["mcp", "call", "fake", "search", r#"{"timeout_secs":1}"#]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success() && text.contains("timed out"),
+        "{text}"
+    );
+    assert!(began.elapsed() < Duration::from_secs(5));
 }
 
 /// A loopback authorization server: metadata, registration and a token endpoint, each echoing the

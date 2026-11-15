@@ -23,7 +23,7 @@ use crate::mcp::{McpEntry, first_line};
 use crate::net::bridge::Bridge;
 use crate::provider::ToolDef;
 use crate::session::Session;
-use crate::tools::ToolOutput;
+use crate::tools::{ToolOutput, timeout};
 
 /// What a call carried, for the audit log: how much and what, never what it said. A tool's
 /// arguments may hold a secret the way a `fetch` query string may, so both are recorded the same
@@ -148,6 +148,9 @@ impl Registry {
             .filter(|name| !self.is_off(name))
             .collect();
         for name in pending.into_iter() {
+            if timeout::expired() {
+                break;
+            }
             if let Err(e) = self.connect(&name, session) {
                 let why = format!("{e:#}");
                 notes.push(format!("{name}: {why}"));
@@ -158,6 +161,9 @@ impl Registry {
         // anything, so the model is never offered a tool the server has since withdrawn (D114).
         let running: Vec<String> = self.servers.keys().cloned().collect();
         for name in running {
+            if timeout::expired() {
+                break;
+            }
             if let Err(e) = self.refresh(&name, session) {
                 notes.push(format!("{name}: {e:#}"));
             }
@@ -535,7 +541,7 @@ impl Registry {
                 if !self.granted(server, &tool.name) {
                     return None;
                 }
-                Some(ToolDef {
+                Some(timeout::definition(ToolDef {
                     name: key.clone().into(),
                     description: format!(
                         "{}\n\n(the tool `{}` of the `{}` server)",
@@ -543,7 +549,7 @@ impl Registry {
                     )
                     .into(),
                     schema: tool.schema.clone(),
-                })
+                }))
             })
             .collect()
     }
@@ -627,33 +633,50 @@ impl Registry {
         if !self.loaded.contains(key) {
             bail!("`{key}` has not been declared: search for it first");
         }
+        let input = timeout::arguments(input, &tool.schema);
         let mut denials = Vec::new();
         let running = self
             .servers
             .get_mut(&server)
             .ok_or_else(|| anyhow!("`{server}` is not running"))?;
         let Running { conn, bridge } = running;
-        let outcome = match conn {
-            Connection::Stdio(client) => {
-                let mut service = || {
-                    if let Some(bridge) = bridge.as_mut() {
-                        denials.extend(bridge.service(session));
+        let outcome = (|| -> Result<ToolOutput> {
+            Ok(match conn {
+                Connection::Stdio(client) => {
+                    let mut service = || {
+                        if let Some(bridge) = bridge.as_mut() {
+                            denials.extend(bridge.service(session));
+                        }
+                    };
+                    let (ok, text) = client.call(&tool.name, &input, &mut service)?;
+                    if ok {
+                        ToolOutput::ok(text)
+                    } else {
+                        ToolOutput::err(text)
                     }
-                };
-                let (ok, text) = client.call(&tool.name, input, &mut service)?;
-                if ok {
-                    ToolOutput::ok(text)
-                } else {
-                    ToolOutput::err(text)
                 }
+                Connection::Http(client) => match client.call(session, &tool.name, &input)? {
+                    Outcome::Answered(text) => ToolOutput::ok(text),
+                    Outcome::Failed(text) => ToolOutput::err(text),
+                    Outcome::Denied(why) => ToolOutput::denied(&why),
+                },
+            })
+        })();
+        let mut out = match outcome {
+            Ok(out) => out,
+            Err(why) if why.is::<timeout::TimedOut>() => {
+                // Closing a local server kills its process group; remote work cannot be guaranteed stopped.
+                if matches!(conn, Connection::Stdio(_)) {
+                    self.servers.remove(&server);
+                    self.failures.insert(
+                        server.clone(),
+                        "tool timed out; restart the server with /mcp restart".into(),
+                    );
+                }
+                ToolOutput::err(format!("{why:#}; effects may already have occurred"))
             }
-            Connection::Http(client) => match client.call(session, &tool.name, input)? {
-                Outcome::Answered(text) => ToolOutput::ok(text),
-                Outcome::Failed(text) => ToolOutput::err(text),
-                Outcome::Denied(why) => ToolOutput::denied(&why),
-            },
+            Err(why) => return Err(why),
         };
-        let mut out = outcome;
         for denial in denials {
             out.content.push_str(&format!("\n{denial}"));
         }

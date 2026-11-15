@@ -5,8 +5,10 @@
 
 use crate::mcp::host;
 use crate::tools;
+use crate::tools::timeout;
 use saddle_cap::sandbox::SandboxSpec;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Write};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 #[cfg(test)]
 use std::process::Command;
@@ -46,6 +48,7 @@ pub struct Tool {
 pub struct Client {
     name: String,
     child: Child,
+    closed: bool,
     stdin: ChildStdin,
     messages: Receiver<Message>,
     stderr: Arc<Mutex<Vec<u8>>>,
@@ -80,6 +83,19 @@ impl Client {
     /// protocol is checked without needing landlock.
     pub fn from_child(name: &str, mut child: Child) -> Result<Self> {
         let stdin = child.stdin.take().context("the server has no stdin")?;
+        // Pipe writes must not bypass a deadline when a server stops reading (D152).
+        let fd = stdin.as_raw_fd();
+        // SAFETY: fd is a live pipe owned by stdin; fcntl changes only its status flags.
+        let nonblocking = unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
+        };
+        if !nonblocking {
+            let error = IoError::last_os_error();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("setting nonblocking MCP stdin");
+        }
         let stdout = child.stdout.take().context("the server has no stdout")?;
         let stderr = child.stderr.take().context("the server has no stderr")?;
         let (tx, messages) = channel();
@@ -121,6 +137,7 @@ impl Client {
         Ok(Self {
             name: name.to_owned(),
             child,
+            closed: false,
             stdin,
             messages,
             stderr: tail,
@@ -206,18 +223,54 @@ impl Client {
     }
 
     fn send(&mut self, line: &str) -> Result<()> {
-        writeln!(self.stdin, "{line}")
-            .and_then(|_| self.stdin.flush())
-            .with_context(|| format!("writing to the `{}` server", self.name))
+        let deadline = Instant::now() + timeout::remaining(self.timeout)?;
+        self.send_until(line, deadline)
+    }
+
+    fn send_until(&mut self, line: &str, deadline: Instant) -> Result<()> {
+        let message = format!("{line}\n");
+        let mut bytes = message.as_bytes();
+        while !bytes.is_empty() {
+            if Instant::now() >= deadline {
+                self.close();
+                return Err(timeout::TimedOut.into());
+            }
+            match self.stdin.write(bytes) {
+                Ok(0) => bail!("`{}` closed its input", self.name),
+                Ok(n) => bytes = &bytes[n..],
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("writing to the `{}` server", self.name));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn request(&mut self, method: &str, params: Value, service: &mut dyn FnMut()) -> Result<Value> {
+        let allowance = timeout::remaining(self.timeout)?;
+        let deadline = Instant::now() + allowance;
         self.next += 1;
         let id = self.next;
-        self.send(&protocol::request(id, method, params.clone()))?;
-        let deadline = Instant::now() + self.timeout;
+        self.send_until(&protocol::request(id, method, params.clone()), deadline)?;
         loop {
-            match self.messages.recv_timeout(POLL) {
+            // Check on every iteration, including when a server floods unrelated messages.
+            if Instant::now() >= deadline {
+                let (name, secs) = (self.name.clone(), allowance.as_secs_f64());
+                self.close();
+                return Err(anyhow!(timeout::TimedOut).context(format!(
+                    "`{name}` did not answer `{method}` within {secs}s{}",
+                    self.why()
+                )));
+            }
+            match self
+                .messages
+                .recv_timeout(POLL.min(deadline.saturating_duration_since(Instant::now())))
+            {
                 Ok(Message::Reply(Reply {
                     id: answered,
                     result,
@@ -229,7 +282,7 @@ impl Client {
                 // `service` closure, so the answer comes from what the client was given.
                 Ok(Message::Request { id, method, .. }) => {
                     let reply = host::answer(&self.roots, &method);
-                    self.send(&protocol::response(id, reply))?;
+                    self.send_until(&protocol::response(id, reply), deadline)?;
                     continue;
                 }
                 Ok(Message::Notification { method }) => {
@@ -244,13 +297,6 @@ impl Client {
                 Ok(_) => continue,
                 Err(RecvTimeoutError::Timeout) => {
                     service();
-                    if Instant::now() >= deadline {
-                        let (name, secs) = (self.name.clone(), self.timeout.as_secs());
-                        bail!(
-                            "`{name}` did not answer `{method}` within {secs}s{}",
-                            self.why()
-                        );
-                    }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     let name = self.name.clone();
@@ -284,6 +330,10 @@ impl Client {
     /// Ends the server and everything it started. The child has its own process group (D106), so a
     /// negative pid reaches the group rather than only the process that speaks the protocol.
     pub fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
         let pid = self.child.id() as libc::pid_t;
         // SAFETY: `pid` is the group leader this client started; the call has no other effect.
         unsafe {
@@ -359,6 +409,50 @@ fn piped(mut command: Command) -> Result<Child> {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn caller_timeout_kills_a_silent_or_flooding_server_and_restores_next_call_budget() {
+        for script in [
+            "exec sleep 30",
+            "while :; do printf '{\"jsonrpc\":\"2.0\",\"method\":\"noise\"}\\n'; done",
+        ] {
+            let mut command = Command::new("/bin/sh");
+            command.arg("-c").arg(script);
+            let mut client = Client::from_child("mute", piped(command).unwrap()).unwrap();
+            let start = Instant::now();
+            let why = timeout::using(Some(start + Duration::from_millis(60)), || {
+                client.call("slow", &json!({}), &mut || {}).unwrap_err()
+            });
+            assert!(why.is::<timeout::TimedOut>(), "{why:#}");
+            assert!(start.elapsed() < Duration::from_secs(2));
+            assert!(client.child.try_wait().unwrap().is_some());
+        }
+        assert!(timeout::deadline().is_none());
+        let mut client = fake();
+        client.initialize(&mut || {}).unwrap();
+        client.tools(&mut || {}).unwrap();
+        assert!(client.call("search", &json!({}), &mut || {}).unwrap().0);
+    }
+
+    #[test]
+    fn caller_timeout_also_bounds_a_full_input_pipe() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("exec sleep 30");
+        let mut client = Client::from_child("not-reading", piped(command).unwrap()).unwrap();
+        let start = Instant::now();
+        let why = timeout::using(Some(start + Duration::from_millis(60)), || {
+            client
+                .call(
+                    "large",
+                    &json!({"text":"x".repeat(1024 * 1024)}),
+                    &mut || {},
+                )
+                .unwrap_err()
+        });
+        assert!(why.is::<timeout::TimedOut>(), "{why:#}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(client.child.try_wait().unwrap().is_some());
+    }
 
     /// A server that answers the two methods a session needs, in the order they are asked, so the
     /// transport is checked without a sandbox or a real MCP implementation.

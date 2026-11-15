@@ -112,6 +112,7 @@ pub struct Invocation {
     grants: Arc<Grants>,
     cancelled: Arc<AtomicBool>,
     deadline: Instant,
+    hard_deadline: Option<Instant>,
 }
 
 impl Invocation {
@@ -315,7 +316,11 @@ impl<H: HostServices> State<H> {
                 "plugin call cancelled, timed out or exceeds configured host call limit"
             ));
         }
-        let allowance = allowance.min(self.host_time_left);
+        let allowance = allowance.min(self.host_time_left).min(
+            self.call.hard_deadline.map_or(allowance, |end| {
+                end.saturating_duration_since(Instant::now())
+            }),
+        );
         if allowance.is_zero() {
             return Err(anyhow!("plugin host wait budget exhausted"));
         }
@@ -324,6 +329,9 @@ impl<H: HostServices> State<H> {
         self.call.deadline = old
             .checked_add(allowance)
             .ok_or_else(|| anyhow!("plugin deadline overflow"))?;
+        if let Some(end) = self.call.hard_deadline {
+            self.call.deadline = self.call.deadline.min(end);
+        }
         let start = Instant::now();
         let result = operation(&mut self.host, &self.call, allowance);
         let elapsed = start.elapsed().min(allowance);
@@ -331,6 +339,9 @@ impl<H: HostServices> State<H> {
         self.call.deadline = old
             .checked_add(elapsed)
             .ok_or_else(|| anyhow!("plugin deadline overflow"))?;
+        if let Some(end) = self.call.hard_deadline {
+            self.call.deadline = self.call.deadline.min(end);
+        }
         result
     }
 }
@@ -1071,12 +1082,22 @@ impl<H: HostServices> Prepared<H> {
     }
 
     fn store(&self, host: H, cancelled: Arc<AtomicBool>) -> Result<Store<State<H>>, Error> {
+        self.store_until(host, cancelled, None)
+    }
+
+    fn store_until(
+        &self,
+        host: H,
+        cancelled: Arc<AtomicBool>,
+        hard_deadline: Option<Instant>,
+    ) -> Result<Store<State<H>>, Error> {
         if cancelled.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
         let deadline = Instant::now()
             .checked_add(self.limits.timeout)
             .ok_or_else(|| Error::Refused("timeout is too large".into()))?;
+        let deadline = hard_deadline.map_or(deadline, |end| deadline.min(end));
         let state = State {
             host,
             call: Invocation {
@@ -1086,6 +1107,7 @@ impl<H: HostServices> Prepared<H> {
                 grants: self.grants.clone(),
                 cancelled,
                 deadline,
+                hard_deadline,
             },
             limits: StoreLimitsBuilder::new()
                 .memory_size(self.limits.memory_bytes)
@@ -1159,8 +1181,19 @@ impl<H: HostServices> Prepared<H> {
         arguments: &str,
         cancelled: Arc<AtomicBool>,
     ) -> Result<Output, Error> {
+        self.invoke_until(host, arguments, cancelled, None)
+    }
+
+    /// apply an absolute caller deadline in addition to CPU and host-wait budgets (D152).
+    pub fn invoke_until(
+        &self,
+        host: H,
+        arguments: &str,
+        cancelled: Arc<AtomicBool>,
+        deadline: Option<Instant>,
+    ) -> Result<Output, Error> {
         budgets::using(&self.limits.budgets, || {
-            self.invoke_inner(host, arguments, cancelled)
+            self.invoke_inner(host, arguments, cancelled, deadline)
         })
     }
 
@@ -1169,11 +1202,12 @@ impl<H: HostServices> Prepared<H> {
         host: H,
         arguments: &str,
         cancelled: Arc<AtomicBool>,
+        deadline: Option<Instant>,
     ) -> Result<Output, Error> {
         if arguments.len() > self.limits.input_bytes {
             return Err(Error::Size(self.limits.input_bytes));
         }
-        let mut store = self.store(host, cancelled)?;
+        let mut store = self.store_until(host, cancelled, deadline)?;
         let guest = self
             .pre
             .instantiate(&mut store)
@@ -1837,6 +1871,89 @@ mod tests {
             };
             assert!(result.is_err(), "unbounded guest succeeded");
         }
+    }
+
+    #[test]
+    fn caller_deadline_interrupts_guest_without_repreparing_or_extending_cpu_budget() {
+        let (_dir, agent, plugin) = grants(GRANTS);
+        let bytes =
+            wat::parse_str(READER.replace(";; invoke-probe", "(loop $spin br $spin)")).unwrap();
+        let loader = Loader::new().unwrap();
+        let prepared = loader
+            .prepare::<NoHost>(
+                &manifest(),
+                &agent,
+                &plugin,
+                &bytes,
+                Limits {
+                    fuel: u64::MAX,
+                    timeout: Duration::from_secs(30),
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        let start = Instant::now();
+        let why = prepared
+            .invoke_until(
+                NoHost,
+                "",
+                cancelled(),
+                Some(start + Duration::from_millis(40)),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("timed out"), "{why}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        // A later caller deadline cannot replace the independent guest CPU deadline.
+        let mut store = prepared
+            .store_until(
+                NoHost,
+                cancelled(),
+                Some(Instant::now() + Duration::from_secs(60)),
+            )
+            .unwrap();
+        assert!(store.data().call.deadline <= Instant::now() + Duration::from_secs(30));
+        store.data_mut().call.deadline = Instant::now();
+        assert!(Prepared::<NoHost>::check_live(&store).is_err());
+    }
+
+    #[test]
+    fn absolute_deadline_caps_all_host_waits_and_does_not_leak_to_the_next_invocation() {
+        let (_dir, agent, plugin) = grants(GRANTS);
+        let prepared = Loader::new()
+            .unwrap()
+            .prepare::<NoHost>(
+                &manifest(),
+                &agent,
+                &plugin,
+                &wat::parse_str(READER).unwrap(),
+                Limits::default(),
+            )
+            .unwrap();
+        let end = Instant::now() + Duration::from_secs(1);
+        let mut store = prepared
+            .store_until(NoHost, cancelled(), Some(end))
+            .unwrap();
+        for _ in 0..2 {
+            store
+                .data_mut()
+                .host_wait(Duration::from_secs(30), |_, call, allowance| {
+                    assert!(call.deadline() <= end);
+                    assert!(allowance <= Duration::from_secs(1));
+                    thread::sleep(Duration::from_millis(10));
+                    Ok(())
+                })
+                .unwrap();
+            assert!(store.data().call.deadline <= end);
+        }
+        let why = prepared
+            .invoke_until(NoHost, "", cancelled(), Some(Instant::now()))
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("timed out"), "{why}");
+        // Same prepared artifact, ordinary call after expiry, fresh deadline.
+        assert!(prepared.store(NoHost, cancelled()).is_ok());
+        assert!(prepared.describe(NoHost, cancelled()).is_ok());
     }
 
     #[test]

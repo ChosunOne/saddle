@@ -116,6 +116,12 @@ constants or grants. `saddle check` prints them and `/reload` updates host/guest
 repinning. `docs/plugins.md` lists every key/default. Keep budget defaults in `saddle-limits`; keep
 permission checks independent, and do not add a hard-coded second ceiling in a guest or adapter.
 
+Every tool accepts optional `timeout_secs`, a positive integer total wall-clock deadline (D152),
+including component work and host waits, without raising protected limits. The host consumes the
+execution option unless the underlying schema already declares it. Expiry stops local execution and
+returns a failed result; cleanup/restore/audit still finish, committed effects are not rolled back,
+and remote MCP work cannot be guaranteed cancelled. Omission retains existing defaults.
+
 `session_query` requires `transcript-read = {}` in the agent grants. First-run defaults include it;
 existing explicit `[agent]` tables remain as written, and `--revoke transcript-read` disables it for
 one run. It queries only the active conversation branch, including pre-compaction messages, through
@@ -366,7 +372,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D151 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D152 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

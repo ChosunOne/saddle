@@ -61,6 +61,32 @@ replacements. Profiles enter the policy hash; reload rebuilds the catalogue and 
 views without resetting spending or changing artifact digests. Changing a profile does not change
 `[agent]`, and granting the agent more reach does not lend an omitted operation scope to a tool.
 
+## Per-call timeouts
+
+Every tool accepts optional `timeout_secs`, a positive integer number of seconds (D152):
+
+```json
+{"path":"src/main.rs", "timeout_secs":5}
+```
+
+This is a **total wall-clock deadline**, including component initialization and host I/O waits.
+Omit it to retain existing behavior. Protected CPU/fuel, host-wait, command and MCP server limits
+still apply and may stop the call sooner; this option never raises them. Zero, negative, fractional,
+null, string and overflowing values are rejected before effects.
+
+The host adds the optional execution field to model-facing schemas and removes it from forwarded
+arguments unless the tool's original schema declares it. Existing declared `timeout_secs` fields
+(such as bash's) are preserved and also interpreted as the host deadline. New plugin/MCP schemas
+should leave this execution-option name to the host. No guest rebuild or SDK change is needed.
+`saddle tool`, `saddle plugin call` and `saddle mcp call` accept it in their JSON arguments too.
+
+At expiry, guest execution stops, command process groups are killed and a failed result reports the
+timeout. Cleanup, reserved-path restoration and audit finish before returning; completed mutations
+are **not rolled back**. A local MCP server that times out is stopped; restart it with `/mcp restart`.
+Remote MCP requests stop waiting, but remote work may continue: there is no guarantee of remote
+cancellation. Non-preemptible kernel filesystem operations and children escaping a process group
+remain the existing limitations. Timeout does not turn a fatal host/audit failure into a tool error.
+
 ## Build and delivery
 
 Developers/package builders need Rust's `wasm32-unknown-unknown` target. Normal `cargo build` and

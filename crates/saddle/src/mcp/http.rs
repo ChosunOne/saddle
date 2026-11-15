@@ -17,6 +17,7 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::fmt::Result as FmtResult;
 use std::time::Duration;
+use ureq::Error as HttpError;
 use ureq::http::Response;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -28,6 +29,7 @@ use crate::mcp::protocol::{Reply, notification, reply, request};
 use crate::mcp::stdio::Tool;
 use crate::net::client::{Target, authority, resolve_public};
 use crate::session::Session;
+use crate::tools::timeout;
 
 /// What the server said about one call, once it answered.
 pub enum Outcome {
@@ -399,6 +401,7 @@ pub(crate) fn send(
         authority(&target.host, target.port, target.scheme == "https"),
         target.request_path()
     );
+    let timeout = timeout::remaining(timeout)?;
     let agent = fetch::agent_for(named, timeout);
     // ureq types a request by whether it carries a body, so the two are built apart.
     let outcome = if method == "GET" {
@@ -416,7 +419,13 @@ pub(crate) fn send(
     } else {
         return Err(anyhow!("{method} is not a method this client makes"));
     };
-    let mut response = outcome.map_err(|e| anyhow!("{url}: {e}"))?;
+    let mut response = outcome.map_err(|e| {
+        if timeout::expired() || matches!(e, HttpError::Timeout(_)) {
+            anyhow!(timeout::TimedOut)
+        } else {
+            anyhow!("{url}: {e}")
+        }
+    })?;
     let header = |response: &Response<ureq::Body>, name: &str| {
         response
             .headers()
@@ -432,7 +441,13 @@ pub(crate) fn send(
         .with_config()
         .limit(MAX_BODY)
         .read_to_string()
-        .context("reading the server's reply")?;
+        .map_err(|error| {
+            if timeout::expired() || matches!(error, HttpError::Timeout(_)) {
+                anyhow!(timeout::TimedOut)
+            } else {
+                anyhow!(error).context("reading the server's reply")
+            }
+        })?;
     Ok(Answer {
         status,
         content_type,

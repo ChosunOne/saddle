@@ -29,6 +29,7 @@ use crate::provider::{Provenance, ToolDef};
 use crate::session::{Session, session_id};
 use crate::standard;
 use crate::tools::ToolOutput;
+use crate::tools::timeout;
 use saddle_standard::{ARTIFACTS, Artifact, artifact};
 
 pub const PREFIX: &str = "plugin__";
@@ -88,7 +89,10 @@ impl Registry {
     }
 
     pub fn definitions(&self) -> Vec<ToolDef> {
-        self.loaded.values().map(|l| l.definition.clone()).collect()
+        self.loaded
+            .values()
+            .map(|l| timeout::definition(l.definition.clone()))
+            .collect()
     }
 
     /// requests a branch snapshot only for a loaded tool holding the transcript service.
@@ -486,8 +490,8 @@ impl Registry {
             component_sha256: loaded.sha256.clone(),
             version: loaded.version.clone(),
         };
-        let arguments = input.to_string();
-        session.audit.event(Kind::Decision, Some(&who), Some(Scope::Tool), Some(true), json!({"via":"plugin", "tool":name, "call_id":call, "arguments":{"bytes":arguments.len(),"sha256":sha256_hex(arguments.as_bytes())}, "component_sha256":loaded.sha256}), "plugin tool invocation")?;
+        let arguments = timeout::arguments(input, &loaded.definition.schema).to_string();
+        session.audit.event(Kind::Decision, Some(&who), Some(Scope::Tool), Some(true), json!({"via":"plugin", "tool":name, "call_id":call, "timeout_secs":input.get("timeout_secs"), "arguments":{"bytes":arguments.len(),"sha256":sha256_hex(arguments.as_bytes())}, "component_sha256":loaded.sha256}), "plugin tool invocation")?;
         let result = execute(
             loaded.prepared.clone(),
             session,
@@ -513,6 +517,13 @@ impl Registry {
             Ok(_) => ToolOutput::err("plugin returned the wrong invocation response"),
             Err(why) => ToolOutput::err(format!("plugin call failed: {why}")),
         };
+        if timeout::expired() {
+            output.ok = false;
+            output.content = format!(
+                "tool call timed out; effects already completed are not rolled back\n{}",
+                output.content
+            );
+        }
         output.content = self.wrap(&id, &output.content);
         output.provenance = Some(Box::new(provenance));
         Ok(output)
