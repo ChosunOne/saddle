@@ -1237,11 +1237,17 @@ fn forbidden_interfaces_do_not_initialize_and_shipped_tools_stay_available() {
     let listing = env.run(&["plugin", "list"]);
     assert!(text(&listing).contains("raw sockets"), "{}", text(&listing));
     no_file_reads(&env);
-    fs::write(env.ws().join("native"), "native tools still work").unwrap();
-    let out = env.run(&["tool", "read", r#"{"path":"native"}"#]);
+    fs::write(env.ws().join("shipped"), "shipped WASI tools still work").unwrap();
+    let out = env.run(&["tool", "read", r#"{"path":"shipped"}"#]);
     assert!(out.status.success(), "{}", text(&out));
-    assert!(text(&out).contains("native tools still work"));
+    assert!(text(&out).contains("shipped WASI tools still work"));
     assert!(!text(&out).contains("<plugin-output-"));
+    assert!(env.records().iter().any(|record| {
+        record["principal"] == "plugin.standard-read"
+            && record["scope"] == "fs-read"
+            && record["allow"] == true
+            && record["args"]["path"] == "workspace:shipped"
+    }));
 }
 
 #[test]

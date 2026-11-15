@@ -40,7 +40,7 @@ Inside `crates/saddle/src`:
 | `execution` | caller-attributed subprocess sandbox lowering, network bridge, bounded capture and reservation restore; native/guest shell workflows are adapters (D142) |
 | `plugins/mutations` | bounded write/remove batches with all-target permission/precondition preflight, pinned staging and per-entry atomic publication under the plugin principal; not a filesystem-wide transaction (D140) |
 | `fs_access` | pinned no-follow directory/file opens for session roots and plugin artifacts/reads (D129) |
-| `transcript` | branch-only read-only SQL over messages, request usage and reasoning, shared by the gated SDK service and temporary native adapter; no saved-database access (D92, D94, D98, D137) |
+| `transcript` | branch-only read-only SQL over messages, request usage and reasoning behind the gated SDK service; no native tool adapter or saved-database access (D92, D94, D98, D137, D147) |
 | `tools` | dispatches ordinary names to shipped WASI components and third-party names to their loaded plugins; owns tool results, not native implementations. `tool_search` remains host MCP discovery (D147) |
 | `standard`, `file_read`, `net/client` | protected scope-only delegation profiles; harness context/attachment reads and no-escape resolution; checked DNS/HTTP client helpers, none a native tool fallback (D147) |
 | `net` | the command network (D79): `hello` reads a hostname out of a TLS handshake, `head` out of a `CONNECT` line or a `Host` header, `proxy` decides and carries a connection, `bridge` joins the proxy's threads to the one engine and the one audit log |

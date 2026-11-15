@@ -135,7 +135,7 @@ impl Registry {
                     .insert(id, format!("not granted: {}", decision.explanation));
                 continue;
             }
-            // A trap or bad artifact is an unavailable extension, not a broken native toolset.
+            // A trap or bad artifact makes only that component unavailable, not the other tools.
             // Host/audit failure retains a fatal marker, even if a later write could succeed.
             match self.load_one(session, &id, &entry) {
                 Ok(loaded) => {

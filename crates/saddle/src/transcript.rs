@@ -1,4 +1,4 @@
-//! branch-only transcript queries shared by native and SDK adapters (D92, D137).
+//! active-branch transcript SQL behind the gated SDK service, not a native tool (D92, D137, D147).
 //!
 //! Three views: the branch's messages, one row per model request with what it used and what
 //! answered it (D94), and the reasoning behind those messages (D98).
