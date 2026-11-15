@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 
 use super::retry::{self, Transient};
 use super::{
-    Api, Conversation, Item, Part, Provider, ProviderConfig, Reply, Sink, Stop, ToolCall, Usage,
-    http, prompt_cache_key, prompt_cache_retention, ws,
+    Api, Conversation, Image, Item, Part, Provider, ProviderConfig, Reply, Sink, Stop, ToolCall,
+    Usage, http, prompt_cache_key, prompt_cache_retention, ws,
 };
 use super::{Cancelled, SUMMARY_INTRO, sse};
 
@@ -204,7 +204,7 @@ fn output_text_part(text: &str) -> Value {
     json!({ "type": "output_text", "text": text })
 }
 
-fn image_part(image: &super::Image) -> Value {
+fn image_part(image: &Image) -> Value {
     json!({
         "type": "input_image",
         "image_url": format!("data:{};base64,{}", image.media_type, image.data),

@@ -2510,7 +2510,7 @@ mod tests {
     use crate::provider::Image;
     use crate::provider::Usage;
     use crate::store::{Point, PointKind, Summary};
-    use crate::tui::app::Action;
+    use crate::tui::app::{Action, Cell, Selection};
     use crate::tui::app::{AgentEvent, Header};
     use crate::tui::permissions::{Kind, Permissions, Row as PermissionRow};
     use crate::tui::settings::Values;
@@ -3796,9 +3796,9 @@ mod tests {
             .position(|l| l.starts_with("a selected"))
             .expect("the reply line");
 
-        app.selection = Some(super::super::app::Selection {
-            anchor: super::super::app::Cell { line: first, ch: 2 },
-            focus: super::super::app::Cell {
+        app.selection = Some(Selection {
+            anchor: Cell { line: first, ch: 2 },
+            focus: Cell {
                 line: first,
                 ch: 10,
             },

@@ -10,7 +10,8 @@ use anyhow::{Context, Result, bail};
 use ratatui::style::Color;
 use std::collections::BTreeMap;
 
-use super::theme::{Appearance, Theme, colour_value, palette};
+use super::terminal;
+use super::theme::{Appearance, Theme, builtin_palette, colour_value, palette};
 
 /// Every role pi requires.
 pub const REQUIRED: &[&str] = &[
@@ -653,7 +654,7 @@ impl Palette {
         let background = report.background;
         let appearance = match background.and_then(rgb) {
             Some(bg) => {
-                if super::palette::luminance(bg) > 0.35 {
+                if luminance(bg) > 0.35 {
                     Appearance::Light
                 } else {
                     Appearance::Dark
@@ -671,7 +672,7 @@ impl Palette {
         // role. `place` then puts it at a lightness that reads against the background.
         let base = match appearance {
             Appearance::Dark => Palette::default(),
-            Appearance::Light => super::theme::builtin_palette("light").unwrap_or_default(),
+            Appearance::Light => builtin_palette("light").unwrap_or_default(),
         };
         let mut palette = base.clone();
         let text = report.foreground.unwrap_or(Color::Reset);
@@ -786,7 +787,7 @@ impl Palette {
     /// The answer is fetched once, before the interface starts (see [`super::terminal::prime`]); a
     /// theme rebuilt mid-session reuses it, so a light/dark switch is the one thing that re-derives.
     pub fn from_terminal() -> Derived {
-        Self::from_report(&super::terminal::prime())
+        Self::from_report(&terminal::prime())
     }
 }
 

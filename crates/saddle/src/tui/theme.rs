@@ -18,7 +18,9 @@ use std::env;
 use anyhow::{Context, Result, bail};
 use ratatui::style::Color;
 
-use super::palette::{Palette, SyntaxColours};
+use super::catppuccin;
+use super::palette::{self, Palette, SyntaxColours};
+use super::terminal;
 
 /// The roles the renderer paints with, named as pi names them.
 
@@ -99,7 +101,7 @@ impl Default for Theme {
 /// [`Palette::from_terminal`](crate::tui::palette::Palette::from_terminal).
 pub fn builtin_palette(name: &str) -> Option<Palette> {
     // The four Catppuccin flavours, whose 26 colours each are the palette's own (D76).
-    if let Some(flavour) = super::catppuccin::flavour(name) {
+    if let Some(flavour) = catppuccin::flavour(name) {
         return Some(flavour.palette());
     }
     match name {
@@ -200,7 +202,7 @@ pub fn builtin_palette(name: &str) -> Option<Palette> {
 /// Every built-in theme name, for a message that has to list them.
 pub fn builtin_names() -> Vec<&'static str> {
     let mut names = vec!["default", "dark", "light", "mono"];
-    names.extend(super::catppuccin::NAMES);
+    names.extend(catppuccin::NAMES);
     names.push("system");
     names
 }
@@ -294,7 +296,7 @@ fn resolve(
 
 /// The appearance a built-in name implies.
 fn appearance_of(name: &str) -> Appearance {
-    if let Some(flavour) = super::catppuccin::flavour(name) {
+    if let Some(flavour) = catppuccin::flavour(name) {
         return flavour.appearance;
     }
     match name {
@@ -311,10 +313,10 @@ fn appearance_of(name: &str) -> Appearance {
 pub fn terminal_appearance() -> Appearance {
     // The terminal's own answer first, since it is the truth; `COLORFGBG` is a guess for terminals
     // that were asked nothing (D73).
-    if let Some(colour) = super::terminal::reported().and_then(|r| r.background)
-        && let Some(rgb) = super::palette::rgb(colour)
+    if let Some(colour) = terminal::reported().and_then(|r| r.background)
+        && let Some(rgb) = palette::rgb(colour)
     {
-        return if super::palette::luminance(rgb) > 0.35 {
+        return if palette::luminance(rgb) > 0.35 {
             Appearance::Light
         } else {
             Appearance::Dark

@@ -3377,6 +3377,31 @@ picker. Missing/ineligible components return ordinary audited denials. Core reta
 filesystem/exec/network/transcript effects and harness/human-UI helpers; third-party plugins and MCP
 retain their existing names and explicit grants. `tool_search` remains the MCP catalogue operation.
 
+**D148.** The workspace manifest denies the lints that decide an item is unused or a name arrives
+badly: rustc's `dead_code` and `unused_imports`, and Clippy's `wildcard_imports` and
+`single_component_path_imports`, beside the `absolute_paths` and `items_after_statements` already
+there. Turning `dead_code` on is what removed `saddle_cap::component::host_interfaces`: nothing
+called it, its comment claimed to describe the linker, it listed three interfaces no WIT defines and
+omitted `fs-preimage`, `budgets` and `tool-result`, and a unit test asserted that wrong set, so
+neither reading nor testing could notice. A function like that cannot accumulate while the compiler
+is asked; a comment can.
+
+One part of the same convention no lint sees: `crate::`, `super::` and `self::` written inside an
+expression. `absolute_paths` allows them because they start with a keyword, and
+`items_after_statements` only looks after statements, so twenty-eight survived the sweep that
+removed the others. `crates/saddle/build.rs` reads every `.rs` under `crates/` and fails the build
+with the file and line. It is a build script rather than a test because a build is the earliest place
+a person sees it, and because a rule enforced by whoever remembers it is how the twenty-eight
+arrived. It runs when the binary is built — which is every documented command, but not a
+single-crate `cargo build -p`, so a crate can be compiled on its own with a violation in it and the
+next full build says so.
+
+`#[allow(dead_code)]` survives in four places, each for an item that must exist without being read:
+the Catppuccin flavour table, whose 26 colours are checked as a table by a test; two fields of the pi
+theme struct, which exist so that a file pi accepts parses whole; the config's ignored `workspaces`
+field, which exists so an old file still parses; and the compiled test fixtures, which two test
+binaries include and no one of them uses whole.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

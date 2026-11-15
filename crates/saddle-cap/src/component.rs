@@ -190,43 +190,6 @@ pub fn check_component<'a>(
     }
 }
 
-/// The interfaces a Linker for this grant set should define (D11: the Linker is built from the
-/// grants, so an import the check missed still fails to link).
-pub fn host_interfaces(granted: &BTreeSet<Scope>) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    for scope in granted {
-        let interface = match scope {
-            Scope::Exec => "saddle:host/exec",
-            Scope::FsRead | Scope::ToolRead | Scope::FsWrite | Scope::ToolWrite => {
-                if !out.contains(&"saddle:host/fs-read") {
-                    out.extend([
-                        "saddle:host/fs-read",
-                        "saddle:host/fs-read-range",
-                        "saddle:host/fs-paths",
-                        "saddle:host/fs-list",
-                        "saddle:host/tool-paths",
-                        "saddle:host/fs-write",
-                    ]);
-                }
-                continue;
-            }
-            Scope::TranscriptRead => "saddle:host/transcript-read",
-            Scope::ContextContribute => "saddle:host/context-contribute",
-            Scope::ModelInvoke => "saddle:host/model-invoke",
-            Scope::Persist => "saddle:host/persist",
-            Scope::Net => {
-                out.extend(["saddle:host/http", "saddle:host/web-search"]);
-                continue;
-            }
-            // An MCP grant declares no component import: the client is host-side and reached
-            // through built-in tools (D103). A plugin calling one needs `saddle:host/mcp`.
-            Scope::Tool | Scope::Veto | Scope::Ui | Scope::Mcp => continue,
-        };
-        out.push(interface);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,24 +266,6 @@ mod tests {
     }
 
     #[test]
-    fn linker_interfaces_follow_grants() {
-        let granted = BTreeSet::from([Scope::FsRead, Scope::Net, Scope::Tool]);
-        assert_eq!(
-            host_interfaces(&granted),
-            [
-                "saddle:host/fs-read",
-                "saddle:host/fs-read-range",
-                "saddle:host/fs-paths",
-                "saddle:host/fs-list",
-                "saddle:host/tool-paths",
-                "saddle:host/fs-write",
-                "saddle:host/http",
-                "saddle:host/web-search"
-            ]
-        );
-    }
-
-    #[test]
     fn one_read_service_family_accepts_either_read_capability_not_registration_alone() {
         let imports = [
             "saddle:host/fs-read@0.1.0",
@@ -333,13 +278,5 @@ mod tests {
             check_component(&BTreeSet::from([scope]), imports, []).unwrap();
         }
         assert!(check_component(&BTreeSet::from([Scope::Tool]), imports, []).is_err());
-        assert_eq!(
-            host_interfaces(&BTreeSet::from([Scope::FsRead])),
-            host_interfaces(&BTreeSet::from([Scope::ToolRead]))
-        );
-        assert_eq!(
-            host_interfaces(&BTreeSet::from([Scope::FsRead, Scope::ToolRead])),
-            host_interfaces(&BTreeSet::from([Scope::FsRead]))
-        );
     }
 }

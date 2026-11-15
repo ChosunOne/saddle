@@ -14,7 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
 use super::retry::Transient;
-use super::{Api, Cancelled, Price, Provider, Quota, Sink, sse};
+use super::{
+    Api, Cancelled, Price, Provider, ProviderConfig, Quota, Sink, anthropic, openai_account,
+    responses, sse,
+};
 
 const ATTEMPTS: u32 = 4;
 /// A reply larger than this is cut off rather than buffered without bound.
@@ -278,7 +281,7 @@ pub struct ModelInfo {
 ///
 /// The windows it carries are where a real context limit comes from, so `/login` and `/model`
 /// cache them (D34).
-pub fn list_models(p: &super::Provider) -> Result<Vec<ModelInfo>, ModelsError> {
+pub fn list_models(p: &Provider) -> Result<Vec<ModelInfo>, ModelsError> {
     let served = served(list_from_endpoint(p)?, p.config.api)?;
     Ok(served)
 }
@@ -289,12 +292,12 @@ pub fn list_models(p: &super::Provider) -> Result<Vec<ModelInfo>, ModelsError> {
 /// subscription backend gates its catalogue on the client version and replies `{"models": []}`
 /// rather than an error, so silence there has a cause, and naming it is the difference between a
 /// picker and a bug report (D85). Every other server is allowed to list nothing.
-pub fn served(models: Vec<ModelInfo>, api: super::Api) -> Result<Vec<ModelInfo>, ModelsError> {
-    if models.is_empty() && api == super::Api::OpenaiResponses {
+pub fn served(models: Vec<ModelInfo>, api: Api) -> Result<Vec<ModelInfo>, ModelsError> {
+    if models.is_empty() && api == Api::OpenaiResponses {
         return Err(ModelsError::Failed(format!(
             "the backend served no models for client version {} — that version may be too old, or \
              the plan may not include any",
-            super::responses::CLIENT_VERSION
+            responses::CLIENT_VERSION
         )));
     }
     Ok(models)
@@ -305,18 +308,17 @@ pub fn served(models: Vec<ModelInfo>, api: super::Api) -> Result<Vec<ModelInfo>,
 /// One place, because the subscription backend's route is `/codex/models` *with* a version, and a
 /// base URL that already ends in `/codex` makes this the easiest thing in the file to get wrong
 /// (D85).
-pub fn listing_url(config: &super::ProviderConfig) -> String {
+pub fn listing_url(config: &ProviderConfig) -> String {
     let base = config.base_url.trim_end_matches('/');
     match config.api {
         Api::Openai | Api::Anthropic => format!("{base}/models"),
-        Api::OpenaiResponses => format!(
-            "{base}/models?client_version={}",
-            super::responses::CLIENT_VERSION
-        ),
+        Api::OpenaiResponses => {
+            format!("{base}/models?client_version={}", responses::CLIENT_VERSION)
+        }
     }
 }
 
-fn list_from_endpoint(p: &super::Provider) -> Result<Vec<ModelInfo>, ModelsError> {
+fn list_from_endpoint(p: &Provider) -> Result<Vec<ModelInfo>, ModelsError> {
     let config = &p.config;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
@@ -335,7 +337,7 @@ fn list_from_endpoint(p: &super::Provider) -> Result<Vec<ModelInfo>, ModelsError
         Api::OpenaiResponses => agent.get(listing_url(config)),
         Api::Anthropic => agent
             .get(format!("{base}/v1/models?limit=1000"))
-            .header("anthropic-version", super::anthropic::VERSION),
+            .header("anthropic-version", anthropic::VERSION),
     };
     for (name, value) in &headers {
         request = request.header(name.as_str(), value.as_str());
@@ -500,7 +502,7 @@ fn known_quota(page: &Value) -> Option<Quota> {
 /// `quota.tokens_left` are the same figure. Anything not found stays absent rather than becoming a
 /// zero.
 pub fn quota_from_page(page: &Value) -> (Quota, Option<f64>) {
-    if let Some(quota) = super::openai_account::quota(page) {
+    if let Some(quota) = openai_account::quota(page) {
         return (quota, None);
     }
     if let Some(quota) = known_quota(page) {
@@ -863,7 +865,7 @@ fn quota_from(headers: &HeaderMap) -> Option<Quota> {
             }
         }
     }
-    if let Some(q) = super::openai_account::quota(&json!({"rate_limit": {
+    if let Some(q) = openai_account::quota(&json!({"rate_limit": {
         "primary_window": primary, "secondary_window": secondary
     }}))
     .filter(|q| !q.is_empty())
@@ -966,8 +968,8 @@ fn error_message(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::responses::CLIENT_VERSION;
     use super::super::{Api, Auth, ProviderConfig};
+    use super::responses::CLIENT_VERSION;
     use super::*;
 
     #[test]

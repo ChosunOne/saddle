@@ -95,8 +95,8 @@ pub struct Window {
 }
 
 impl Window {
-    /// The whole picture.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The whole picture, which is what a test draws when the point is the encoding, not the crop.
+    #[cfg(test)]
     pub fn all(full: Fit) -> Self {
         Self {
             full,

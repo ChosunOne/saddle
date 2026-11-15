@@ -8,11 +8,22 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.88"
 
+[workspace.lints.rust]
+# An item nothing reaches is either a bug or a fossil. The compiler decides which, not a later
+# reader: `host_interfaces` was both, and a passing test kept it looking maintained.
+dead_code = "deny"
+# An import is a name a module decides to depend on. One nothing uses is a stale claim about that.
+unused_imports = "deny"
+
 [workspace.lints.clippy]
 # Import names at module scope instead of qualifying them at the point of use.
 absolute_paths = "deny"
 # Also reject local items (including imports) appearing after executable statements.
 items_after_statements = "deny"
+# No glob imports: every name arrives by a `use` that says where it came from.
+wildcard_imports = "deny"
+# `use serde;` names a crate without importing anything a reader needs told.
+single_component_path_imports = "deny"
 
 [workspace.dependencies]
 saddle-standard = { path = "crates/saddle-standard" }

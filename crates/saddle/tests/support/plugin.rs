@@ -1,4 +1,9 @@
 //! tiny compiled components shared by plugin CLI/model tests; no guest target is needed.
+//!
+//! Each test binary includes this file and uses a different subset, so a fixture no binary in this
+//! build happens to call is still live for the other one: the allow is scoped to this file and says
+//! why, rather than sitting on seven functions in two places.
+#![allow(dead_code)]
 
 use std::fs;
 use std::path::Path;
@@ -11,7 +16,6 @@ use saddle_policy::audit::sha256_hex;
 const READER: &str = include_str!("../../../saddle-loader/src/fixtures/read-tool.wat");
 const MUTATOR: &str = include_str!("../../../saddle-loader/src/fixtures/mutation-tool.wat");
 
-#[allow(dead_code)] // mutation fixtures are used by the CLI suite.
 pub fn mutator(changes: &[(&str, Option<&str>, &str)], describe: bool, trap: bool) -> Vec<u8> {
     let mut records = vec![0u8; changes.len() * 32];
     let mut payload = Vec::new();
@@ -90,7 +94,6 @@ pub fn transcript_query(sql: &str) -> Vec<u8> {
     .unwrap()
 }
 
-#[allow(dead_code)] // shared with CLI tests, which configure an existing fixture installation.
 pub fn configure_transcript(config: &Path, bytes: &[u8], grants: &str) {
     configure(config, bytes, grants);
     fs::write(config.parent().unwrap().join("plugins/reader/plugin.toml"),
@@ -133,17 +136,14 @@ fn reader_source(root: &str, path: &str) -> String {
         )
 }
 
-#[allow(dead_code)] // shared with the model suite, which does not need this fixture.
 pub fn range_reader(path: &str, offset: u64, limit: u32) -> Vec<u8> {
     wat::parse_str(range_source("workspace", path, offset, limit)).unwrap()
 }
 
-#[allow(dead_code)] // generic filesystem namespace fixtures are used by the CLI suite.
 pub fn range_reader_on_root(root: &str, path: &str) -> Vec<u8> {
     wat::parse_str(range_source(root, path, 0, 128)).unwrap()
 }
 
-#[allow(dead_code)] // managed-path fixtures are only used by the CLI suite.
 pub fn tool_range_reader(root: &str, path: &str, offset: u64, limit: u32) -> Vec<u8> {
     wat::parse_str(
         range_source(root, path, offset, limit).replace("fs-read-range@0.1.0", "tool-paths@0.1.0"),
@@ -161,7 +161,6 @@ fn range_source(root: &str, path: &str, offset: u64, limit: u32) -> String {
         .replace("i32.const 32 call $read", &format!("i64.const {offset} i32.const {limit} i32.const 32 call $read"))
 }
 
-#[allow(dead_code)] // shared with model tests that do not need metadata fixtures.
 pub fn directory_reader(path: &str, after: &str, limit: u32) -> Vec<u8> {
     assert!(after.is_ascii() && !after.contains(['"', '\\']));
     let source = reader_source("workspace", path)
@@ -177,7 +176,6 @@ pub fn directory_reader(path: &str, after: &str, limit: u32) -> Vec<u8> {
     wat::parse_str(source).unwrap()
 }
 
-#[allow(dead_code)] // shared with model tests that do not need metadata fixtures.
 pub fn path_resolver(path: &str) -> Vec<u8> {
     let source = reader_source("workspace", path)
         .replace("fs-read@0.1.0", "fs-paths@0.1.0")

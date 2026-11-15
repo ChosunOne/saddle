@@ -145,6 +145,7 @@ pub fn rules_of(grants: &Grants) -> Vec<&RuleId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Principal;
     use crate::policy::Policy;
     use crate::roots::{RelPath, Roots};
     use std::fs;
@@ -167,7 +168,7 @@ mod tests {
     }
 
     fn agent_grants(policy: &Policy) -> &Grants {
-        policy.grants(&crate::Principal::Agent).unwrap()
+        policy.grants(&Principal::Agent).unwrap()
     }
 
     const BASE: &str = r#"

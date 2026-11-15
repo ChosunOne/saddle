@@ -5,6 +5,7 @@
 //! the server advertises it.
 
 use crate::mcp::Exposure;
+use crate::mcp::Transport;
 use crate::mcp::host;
 use crate::mcp::http::Client as HttpClient;
 use crate::mcp::http::Outcome;
@@ -207,7 +208,7 @@ impl Registry {
             .cloned()
             .ok_or_else(|| anyhow!("`{server}` has no [mcp.{server}] table in config.toml"))?;
         match entry.transport()? {
-            crate::mcp::Transport::Stdio { command, args } => {
+            Transport::Stdio { command, args } => {
                 let helper = self.helper.clone().context("locating the saddle binary")?;
                 let mut spec = lower::spec(session, &grant, &entry, command, args, &self.host_env)?;
                 let mut bridge = self.tmp.as_deref().and_then(|dir| Bridge::start(dir).ok());
@@ -234,7 +235,7 @@ impl Registry {
                     },
                 );
             }
-            crate::mcp::Transport::Http { url } => {
+            Transport::Http { url } => {
                 // A server with no child still has a reach: its net grants, narrowed from the
                 // agent's, are what every request of its own is decided against (D105, D110).
                 let reach = lower::net_reach(session, &grant)?;
@@ -693,7 +694,6 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::Exposure;
     use serde_json::json;
 
     #[test]

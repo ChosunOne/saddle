@@ -29,7 +29,7 @@ because it is followed.
 | `crates/saddle-tools` | standard guest tools: text/image reads, pagination, listing, traversal/search, transcript queries, write/edit/patch, shell and HTTP/search workflows; uses runtime-gated SDK services, not native filesystem/database access. Mutations and reads cover policy roots and delegated D66 directories; guests emit minimal human-only hunks and guarded preimages (D131–D147) |
 | `crates/saddle-ignore` | authority-free ignore-file parsing, shared by skill discovery, the editor's file-name completion and the guest search components (D68, D133) |
 | `crates/saddle-sandbox` | applies a sandbox spec to the current process and execs the target, including the command's own network namespace and the relay in it (D79); starts a long-lived child whose stdin and stdout belong to the caller, with the spec on fd 3 (D106); also builds the `saddle-sandbox` helper binary used by its own tests |
-| `crates/saddle` | the binary: tool dispatch, model providers, the model loop, the TUI |
+| `crates/saddle` | the binary: tool dispatch, model providers, the model loop, the TUI; its build script enforces the import convention no lint covers (D148) |
 
 Inside `crates/saddle/src`:
 
@@ -379,10 +379,17 @@ nearly every module header names the ones it implements, for example:
   Where two modules bring in the same name, both are imported with an alias that says which is
   which (`Row as PermissionRow`), rather than one of them being qualified where it is used. A test
   module's imports belong at the top of that module. `#[cfg(test)]` on an import is how a
-  test-only name stays out of the binary. All crates inherit workspace Clippy denies for
-  `absolute_paths` and `items_after_statements`. These catch long qualified paths and imports
-  after statements; Clippy does not catch an import before a function's first statement, so the
-  module-level rule still applies there too. New crates must set `[lints] workspace = true`.
+  test-only name stays out of the binary. All crates inherit the workspace lints (D148): rustc's
+  `dead_code` and `unused_imports`, and Clippy's `absolute_paths`, `items_after_statements`,
+  `wildcard_imports` and `single_component_path_imports`, all denied. They catch a glob import, a
+  path qualified with a leading module name, an import after a statement, and an item nothing
+  reaches — `host_interfaces` was the last of those and its own test kept it looking maintained.
+  None of them sees `crate::`, `super::` or `self::` written inside an expression, so
+  `crates/saddle/build.rs` reads every `.rs` under `crates/` and fails the build naming the file and
+  line; that runs whenever the binary is built, which every documented command does. An
+  `#[allow(dead_code)]` is for an item that must exist without being read — a colour table, a field
+  that is there so a file parses, a fixture one of two test binaries uses — and says why. New crates
+  must set `[lints] workspace = true`.
 - Doc comments are lowercase sentences and explain intent, not mechanics. `//!` opens a module with
   its purpose and its decision numbers; `///` covers public items.
 - `anyhow` with `bail!`/`Context` in the `saddle` binary crate; typed `thiserror` errors in the

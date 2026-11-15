@@ -9,7 +9,7 @@
 //! refusals would spend the person's quota to learn the same thing twice.
 
 use crate::auth::AuthStore;
-use crate::mcp::oauth;
+use crate::mcp::oauth::{self, Flow};
 use crate::net::client as fetch;
 use saddle_cap::policy::NetGrant;
 use std::error::Error;
@@ -256,7 +256,7 @@ impl Client {
         // will never accept it (D116). A token with no refresh is left alone — the error below
         // names `saddle mcp auth`, which is the only thing that can fix it.
         if refused && let Some(held) = held.clone().filter(|t| !t.refresh.is_empty()) {
-            let mut flow = crate::mcp::oauth::Flow {
+            let mut flow = Flow {
                 session,
                 reach: self.reach.clone(),
                 label: format!("oauth:{}", self.server),
