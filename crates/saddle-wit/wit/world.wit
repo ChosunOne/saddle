@@ -6,6 +6,7 @@ world read-tool {
     import http;
     import web-search;
     import exec;
+    import exec-tasks;
     import fs-read;
     import fs-write;
     import fs-preimage;

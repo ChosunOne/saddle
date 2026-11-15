@@ -47,6 +47,7 @@ use crate::paths::{Paths, find_workspace};
 use crate::plugins::{Entry as PluginEntry, HostFailure, Registry as PluginRegistry};
 use crate::provider::ToolDef;
 use crate::store::Snapshot;
+use crate::tasks::{self, Tasks};
 
 /// The header a workspace's own grant file starts with. Empty of grants on purpose: its presence
 /// and an empty file mean the same thing, and an empty file is an invitation to write a key in it.
@@ -514,6 +515,7 @@ fn configured_tool_roots(setup: &Setup) -> Vec<ToolRoot> {
 }
 
 pub struct Session {
+    pub tasks: Tasks,
     pub file_roots: BTreeMap<RootName, Dir>,
     pub plugins: PluginRegistry,
     pub setup: Setup,
@@ -604,6 +606,7 @@ impl Session {
             Registry::new(grants, user.mcp, host_env.clone(), tmp)
         };
         let mut session = Self {
+            tasks: Tasks::default(),
             file_roots,
             plugins,
             setup,
@@ -669,6 +672,8 @@ impl Session {
             .iter()
             .map(|(name, path)| Ok((name.clone(), fs_access::root(path)?)))
             .collect::<Result<_>>()?;
+        tasks::stop_all(self)?;
+        self.tasks = Tasks::default();
         let before = self.setup.policy_sha256.clone();
         self.setup = fresh;
         search_transport::trim_cache(self);
@@ -921,6 +926,7 @@ impl Session {
     /// Closes the audit log. An allowance is *not* dropped here: it outlives the session so it can
     /// be picked again later, and is removed with `saddle session revoke` (D61).
     pub fn close(mut self) -> Result<String> {
+        tasks::stop_all(&mut self)?;
         self.mcp.close();
         Ok(self.audit.close(&self.setup.paths.sessions_index())?)
     }

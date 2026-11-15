@@ -31,6 +31,11 @@ pub enum Request<'a> {
         argv: &'a [String],
         cwd: &'a Location,
     },
+    /// session-owned process observation/control, still bounded by exec (D153).
+    ExecTask {
+        operation: &'a str,
+        id: Option<&'a str>,
+    },
     Net {
         method: &'a str,
         scheme: &'a str,
@@ -59,7 +64,7 @@ impl Request<'_> {
             Request::ToolWrite { .. } => Scope::ToolWrite,
             Request::FsRead { .. } => Scope::FsRead,
             Request::FsWrite { .. } => Scope::FsWrite,
-            Request::Exec { .. } => Scope::Exec,
+            Request::Exec { .. } | Request::ExecTask { .. } => Scope::Exec,
             Request::Net { .. } => Scope::Net,
             Request::ModelInvoke { .. } => Scope::ModelInvoke,
             Request::TranscriptQuery { .. } => Scope::TranscriptRead,
@@ -82,6 +87,7 @@ impl Request<'_> {
                 json!({ "path": loc.to_string() })
             }
             Request::Exec { argv, cwd } => json!({ "argv": argv, "cwd": cwd.to_string() }),
+            Request::ExecTask { operation, id } => json!({"operation":operation,"task":id}),
             Request::Net {
                 method,
                 scheme,
@@ -303,7 +309,7 @@ impl Engine {
                 }
                 fs_decision(who, scope, &grants.fs_write, loc)
             }
-            Request::Exec { .. } => match &grants.exec {
+            Request::Exec { .. } | Request::ExecTask { .. } => match &grants.exec {
                 Some(g) => Decision::allow(scope, &g.rule, &g.why),
                 None => Decision::deny(scope, format!("{who} has no exec grant")),
             },
@@ -455,6 +461,28 @@ model-invoke = { tokens-per-session = 100, why = "summaries" }
             headers: &[],
         };
         assert!(req.args().get("headers").is_none());
+    }
+
+    #[test]
+    fn task_control_uses_the_same_exec_grant_and_records_its_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = Roots::resolve([(RootName::workspace(), dir.path().into())], &[]).unwrap();
+        let request = Request::ExecTask {
+            operation: "task-inspect",
+            id: Some("task-123"),
+        };
+        assert_eq!(request.scope(), Scope::Exec);
+        assert_eq!(
+            request.args(),
+            json!({"operation":"task-inspect","task":"task-123"})
+        );
+        for (source, allow) in [
+            ("version=1\n[agent]\nexec={}\n", true),
+            ("version=1\n[agent]\n", false),
+        ] {
+            let engine = Engine::new(Policy::parse(source, &roots).unwrap());
+            assert_eq!(engine.decide(&Principal::Agent, &request).allow, allow);
+        }
     }
 
     #[test]

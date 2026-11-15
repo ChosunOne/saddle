@@ -113,6 +113,7 @@ macro_rules! catalogue {
 }
 catalogue!(HostInterface {
     Exec => ("saddle:host/exec", Requirement::Scope(Scope::Exec), true),
+    ExecTasks => ("saddle:host/exec-tasks", Requirement::Scope(Scope::Exec), true),
     Http => ("saddle:host/http", Requirement::Scope(Scope::Net), true),
     WebSearch => ("saddle:host/web-search", Requirement::Scope(Scope::Net), true),
     FsRead => ("saddle:host/fs-read", Requirement::AnyScope(FILESYSTEM_SCOPES), true),

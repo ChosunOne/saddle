@@ -7,7 +7,10 @@ use std::fmt::Write as _;
 
 use saddle_sdk::ExecReply;
 #[cfg(target_arch = "wasm32")]
-use saddle_sdk::{Command, Definition, Output, Tool, execute};
+use saddle_sdk::{
+    Command, Definition, Output, Task, Tool, cancel_task, execute, inspect_task, list_tasks,
+    start_task,
+};
 use serde::Deserialize;
 #[cfg(target_arch = "wasm32")]
 use serde_json::json;
@@ -17,8 +20,101 @@ pub struct Bash;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Arguments {
-    pub command: String,
+    pub command: Option<String>,
     pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub background: bool,
+    #[serde(default)]
+    pub action: Action,
+    pub task_id: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Action {
+    #[default]
+    Run,
+    Status,
+    List,
+    Cancel,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn format_task(task: &Task) -> String {
+    let status = if task.running { "running" } else { "finished" };
+    let output = format_reply(&task.output).0;
+    format!(
+        "task {}: {status}\n{}",
+        task.id,
+        if task.running {
+            output.trim_start_matches("exited\n")
+        } else {
+            &output
+        }
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn invoke_task(args: Arguments) -> Result<(String, bool), String> {
+    if !matches!(args.action, Action::Run) && (args.command.is_some() || args.background) {
+        return Err("command and background are only valid for action run".into());
+    }
+    match args.action {
+        Action::Run => {
+            if args.task_id.is_some() {
+                return Err("task_id is not valid for action run".into());
+            }
+            let command = args
+                .command
+                .filter(|command| !command.trim().is_empty())
+                .ok_or("run requires a nonempty command")?;
+            let request = Command {
+                argv: vec!["sh".into(), "-c".into(), command],
+                timeout_secs: args.timeout_secs.unwrap_or(budgets::exec_seconds() as u64),
+            };
+            if args.background {
+                start_task(&request).map(|task| (format_task(&task), true))
+            } else {
+                execute(&request).map(|reply| format_reply(&reply))
+            }
+        }
+        Action::Status | Action::Cancel => {
+            let id = args.task_id.ok_or("status/cancel requires task_id")?;
+            let task = if matches!(args.action, Action::Cancel) {
+                cancel_task(&id)?
+            } else {
+                inspect_task(&id)?
+            };
+            let ok = task.running
+                || (task.output.code == Some(0)
+                    && !task.output.timed_out
+                    && !task.output.cancelled)
+                || matches!(args.action, Action::Cancel);
+            Ok((format_task(&task), ok))
+        }
+        Action::List => {
+            if args.task_id.is_some() {
+                return Err("task_id is not valid for action list".into());
+            }
+            let tasks = list_tasks()?;
+            let text = if tasks.is_empty() {
+                "no background tasks".into()
+            } else {
+                tasks
+                    .iter()
+                    .map(|task| {
+                        format!(
+                            "{}: {}",
+                            task.id,
+                            if task.running { "running" } else { "finished" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            Ok((text, true))
+        }
+    }
 }
 
 pub fn format_reply(reply: &ExecReply) -> (String, bool) {
@@ -67,8 +163,8 @@ impl Tool for Bash {
     fn describe() -> Definition {
         Definition {
             name:"bash".into(),
-            description:"run sh -c in the workspace through the delegated exec sandbox. Filesystem/environment/net reach comes from this plugin's runtime grants and protected sandbox configuration, not the agent's broader grants. Network uses the policy proxy or falls back to none. Timeout is bounded by the grant and configured execution budget. Captures at most the configured per-stream capture budget; presentation is separately host-configurable. Cancellation kills the process group; reserved Git paths are restored.".into(),
-            input_schema:json!({"type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":"integer","minimum":1}},"required":["command"],"additionalProperties":false}).to_string(),
+            description:"run sh -c in the workspace through the delegated exec sandbox. Filesystem/environment/net reach comes from this plugin's runtime grants and protected sandbox configuration, not the agent's broader grants. Network uses the policy proxy or falls back to none. Set background=true to start a session-owned task and return its id promptly. Use action=status/list/cancel and task_id to inspect bounded live output or stop it. Only one shell command per workspace may run at a time; cancel or finish it before another. Tasks stop on session exit/reload. Timeout bounds the task lifetime, never increases grants or configured limits. Captures at most the configured per-stream capture budget; presentation is separately host-configurable. Cancellation kills the process group; reserved Git paths are restored.".into(),
+            input_schema:json!({"type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":"integer","minimum":1},"background":{"type":"boolean"},"action":{"type":"string","enum":["run","status","list","cancel"]},"task_id":{"type":"string"}},"additionalProperties":false}).to_string(),
         }
     }
     fn invoke(arguments: String) -> Output {
@@ -80,20 +176,12 @@ impl Tool for Bash {
         }
         let result = serde_json::from_str::<Arguments>(&arguments)
             .map_err(|error| format!("invalid arguments: {error}"))
-            .and_then(|args| {
-                execute(&Command {
-                    argv: vec!["sh".into(), "-c".into(), args.command],
-                    timeout_secs: args.timeout_secs.unwrap_or(budgets::exec_seconds() as u64),
-                })
-            });
+            .and_then(invoke_task);
         match result {
-            Ok(reply) => {
-                let (text, ok) = format_reply(&reply);
-                Output {
-                    text,
-                    is_error: !ok,
-                }
-            }
+            Ok((text, ok)) => Output {
+                text,
+                is_error: !ok,
+            },
             Err(text) => Output {
                 text,
                 is_error: true,

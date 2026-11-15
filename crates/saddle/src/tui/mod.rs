@@ -12,6 +12,7 @@ use crate::provider::Price;
 use crate::provider::Quota;
 use crate::session;
 use crate::skills;
+use crate::tasks;
 use crate::tui::app::Effort;
 use crate::tui::theme::Theme;
 use crate::tui::themes::ThemePicker;
@@ -123,6 +124,7 @@ enum Command {
     SessionInfo,
     /// `/mcp`: report the servers, or start one again (D118).
     Mcp(String),
+    Tasks(String),
     /// Remove a saved conversation (D55).
     Delete(String),
     /// Change the reasoning effort (D57).
@@ -293,6 +295,16 @@ fn work(
     let tick = IDLE_TICK;
     let mut last_activity = Instant::now();
     loop {
+        if let Err(error) = tasks::notices(&mut session, false).map(|notes| {
+            for note in notes {
+                let _ = events.send(AgentEvent::Note(note));
+            }
+        }) {
+            let msg = format!("{error:#}");
+            let _ = events.send(AgentEvent::Fatal(msg.clone()));
+            fatal = Some(msg);
+            break;
+        }
         let command = match commands.recv_timeout(tick) {
             Ok(command) => command,
             Err(RecvTimeoutError::Timeout) => {
@@ -536,6 +548,20 @@ fn work(
                 }
                 Err(e) => {
                     let _ = events.send(AgentEvent::Note(format!("{e:#}")));
+                }
+            },
+            Command::Tasks(arg) => match tasks::human(&mut session, &arg) {
+                Ok(note) => {
+                    let _ = events.send(AgentEvent::Note(note));
+                }
+                Err(error) if error.is::<HostFailure>() => {
+                    let msg = format!("{error:#}");
+                    let _ = events.send(AgentEvent::Fatal(msg.clone()));
+                    fatal = Some(msg);
+                    break;
+                }
+                Err(error) => {
+                    let _ = events.send(AgentEvent::Note(format!("{error:#}")));
                 }
             },
             Command::Mcp(arg) => {
@@ -1010,6 +1036,10 @@ impl Controller {
             }
             Action::SessionInfo => {
                 self.send(app, Command::SessionInfo);
+                Ok(())
+            }
+            Action::Tasks(arg) => {
+                self.send(app, Command::Tasks(arg));
                 Ok(())
             }
             Action::Mcp(arg) => {

@@ -43,7 +43,8 @@ Inside `crates/saddle/src`:
 | `session` | opening the workspace, resolving roots, the policy engine and audit log for a session |
 | `plugins` | protected/digest-pinned loading, tool registration, provenance and CLI installation (D128); worker-to-session host calls through the one engine/audit log, reload revocation and bounded reads (D129) |
 | `network`, `search_transport` | per-hop attributed HTTP and protected provider/Exa communication, bounded per-principal raw search snapshots; parsing/presentation is guest-owned (D143) |
-| `execution` | caller-attributed subprocess sandbox lowering, network bridge, bounded capture and reservation restore; native/guest shell workflows are adapters (D142) |
+| `execution` | shared foreground/background subprocess lowering, workspace execution lock, bounded capture and reservation restore (D142, D152, D153) |
+| `tasks` | session-owned background subprocess monitors, principal-isolated status/cancel, bounded retention and completion notices; proxy decisions and audit stay on the session thread (D153) |
 | `plugins/mutations` | bounded write/remove batches with all-target permission/precondition preflight, pinned staging and per-entry atomic publication under the plugin principal; not a filesystem-wide transaction (D140) |
 | `fs_access` | pinned no-follow directory/file opens for session roots and plugin artifacts/reads (D129) |
 | `transcript` | branch-only read-only SQL over messages, request usage and reasoning behind the gated SDK service; no native tool adapter or saved-database access (D92, D94, D98, D137, D147) |
@@ -121,6 +122,17 @@ including component work and host waits, without raising protected limits. The h
 execution option unless the underlying schema already declares it. Expiry stops local execution and
 returns a failed result; cleanup/restore/audit still finish, committed effects are not rolled back,
 and remote MCP work cannot be guaranteed cancelled. Omission retains existing defaults.
+
+`bash` accepts `background: true` to return a session-owned task id, then `action: "status"`,
+`"list"` or `"cancel"` with `task_id` as appropriate (D153). The guest owns these workflows; the
+additive `exec-tasks` SDK service is bounded by the existing `exec` grant and isolates principals.
+One shell command per workspace may run at a time, across cooperating Saddle processes: a pinned
+workspace-directory lock spans snapshot, process cleanup and reserved-path restoration. File tools
+can run meanwhile. `timeout_secs` on a start also caps task lifetime; polling cannot renew it.
+`/tasks` and `/tasks cancel <id>` give the person status/control in TUI and line mode. Tasks stop
+and are audited before policy replacement on reload and before session close. They do not survive
+restart/resume; `exec-tasks` in `[tool-limits]` bounds retained records (16 by default). Never give a
+monitor its own policy engine or let task ids lend another principal's output/cancellation reach.
 
 `session_query` requires `transcript-read = {}` in the agent grants. First-run defaults include it;
 existing explicit `[agent]` tables remain as written, and `--revoke transcript-read` disables it for
@@ -372,7 +384,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D152 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D153 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

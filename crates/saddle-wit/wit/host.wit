@@ -26,6 +26,16 @@ interface exec {
     run: func(request: command) -> result<reply, string>;
 }
 
+// Session-owned subprocesses; importing this service grants no resources beyond exec (D153).
+interface exec-tasks {
+    use exec.{command, reply};
+    record task { id: string, running: bool, output: reply }
+    start: func(request: command) -> result<task, string>;
+    inspect: func(id: string) -> result<task, string>;
+    %list: func() -> result<list<task>, string>;
+    cancel: func(id: string) -> result<task, string>;
+}
+
 // Independent D138 types are kept for binary compatibility.
 // Legacy D138 adapter, retained for existing components; normal filesystem services cover both
 // roots and configured external directories under per-request runtime checks (D139).

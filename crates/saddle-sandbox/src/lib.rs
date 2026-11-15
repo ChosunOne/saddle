@@ -19,6 +19,7 @@ use std::process;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -281,6 +282,38 @@ pub fn run(
     cancel: &AtomicBool,
     service: &mut dyn FnMut(),
 ) -> io::Result<Output> {
+    run_observed(
+        helper,
+        helper_args,
+        spec,
+        timeout,
+        output_limit,
+        cancel,
+        service,
+        None,
+    )
+}
+
+/// bounded live capture shared with a session-owned background task (D153).
+#[derive(Default, Clone, Debug)]
+pub struct Capture {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub truncated: bool,
+}
+
+/// the same sandbox execution with optional incremental bounded capture.
+#[allow(clippy::too_many_arguments)] // the existing execution contract plus an observer, not authority.
+pub fn run_observed(
+    helper: &Path,
+    helper_args: &[&str],
+    spec: &SandboxSpec,
+    timeout: Duration,
+    output_limit: usize,
+    cancel: &AtomicBool,
+    service: &mut dyn FnMut(),
+    capture: Option<Arc<Mutex<Capture>>>,
+) -> io::Result<Output> {
     let mut child = Command::new(helper)
         .args(helper_args)
         .env_clear()
@@ -316,8 +349,9 @@ pub fn run(
     ] {
         let Some(stream) = stream else { continue };
         let tx = tx.clone();
+        let capture = capture.clone();
         thread::spawn(move || {
-            let _ = tx.send((is_err, read_limited(stream, output_limit)));
+            let _ = tx.send((is_err, read_limited(stream, output_limit, capture, is_err)));
         });
     }
     drop(tx);
@@ -377,7 +411,12 @@ fn kill_group(pgid: libc::pid_t) {
     }
 }
 
-fn read_limited(mut stream: impl Read, limit: usize) -> (Vec<u8>, bool) {
+fn read_limited(
+    mut stream: impl Read,
+    limit: usize,
+    capture: Option<Arc<Mutex<Capture>>>,
+    is_err: bool,
+) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     let mut buf = [0u8; 8192];
     let mut truncated = false;
@@ -388,6 +427,18 @@ fn read_limited(mut stream: impl Read, limit: usize) -> (Vec<u8>, bool) {
                 let room = limit.saturating_sub(out.len());
                 out.extend_from_slice(&buf[..n.min(room)]);
                 truncated |= n > room;
+                if let Some(capture) = &capture
+                    && let Ok(mut capture) = capture.lock()
+                {
+                    let bytes = if is_err {
+                        &mut capture.stderr
+                    } else {
+                        &mut capture.stdout
+                    };
+                    let room = limit.saturating_sub(bytes.len());
+                    bytes.extend_from_slice(&buf[..n.min(room)]);
+                    capture.truncated |= n > room;
+                }
             }
         }
     }

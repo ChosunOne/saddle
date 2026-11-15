@@ -12,12 +12,14 @@ use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::tasks;
 use anyhow::{Context, Error as HostError, Result, anyhow};
 use saddle_cap::{Location, Principal, RelPath, RootName, Scope};
-use saddle_loader::{HostServices, Invocation, Prepared};
+use saddle_loader::{HostServices, Invocation, Prepared, TaskOperation};
 use saddle_policy::audit::sha256_hex;
 use saddle_policy::{Kind, Request};
 use saddle_wit::exports::saddle::plugin::tool::{Definition, Output};
+use saddle_wit::saddle::host::exec_tasks::Task;
 use saddle_wit::saddle::host::fs_list::Page as DirectoryPage;
 use saddle_wit::saddle::host::fs_read::{Failure, Path};
 use saddle_wit::saddle::host::fs_read_range::Chunk;
@@ -67,6 +69,11 @@ impl StdError for Fatal {
 type HostReply<T, E = Failure> = Result<Result<T, E>, String>;
 type FileReply = HostReply<Chunk>;
 enum Event {
+    Task {
+        who: Principal,
+        operation: TaskOperation,
+        answer: SyncSender<HostReply<Vec<Task>, String>>,
+    },
     Preimage {
         who: Principal,
         deadline: Instant,
@@ -259,6 +266,24 @@ impl HostServices for Host {
         result
             .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
             .map_err(|_| anyhow!("plugin execution request timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
+    fn task(
+        &mut self,
+        call: &Invocation,
+        operation: TaskOperation,
+    ) -> Result<Result<Vec<Task>, String>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        self.events
+            .send(Event::Task {
+                who: call.principal().clone(),
+                operation,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        result
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(|_| anyhow!("plugin task request timed out"))?
             .map_err(|why| anyhow!(why))
     }
     fn emit_diff(&mut self, call: &Invocation, text: String) -> Result<Result<(), String>> {
@@ -526,6 +551,10 @@ fn execute_inner(
         .map_err(|error| Fatal(anyhow!(error)))?;
     let mut fatal = None;
     let result = loop {
+        if let Err(error) = tasks::service(session) {
+            fatal = Some(error);
+            cancelled.store(true, Ordering::Relaxed);
+        }
         if cancel::FLAG.load(Ordering::Relaxed) || timeout::expired() {
             cancelled.store(true, Ordering::Relaxed);
         }
@@ -623,6 +652,31 @@ fn execute_inner(
                         )
                         .map(|_| Err("search is refused during describe".into()))
                         .map_err(Into::into)
+                };
+                respond(result, answer, &mut fatal, &cancelled);
+            }
+            Ok(Event::Task {
+                who,
+                operation,
+                answer,
+            }) => {
+                let result = if !invoking {
+                    Ok(Err("task operations are refused during describe".into()))
+                } else {
+                    match operation {
+                        TaskOperation::Start(request) => {
+                            execution_effects = true;
+                            tasks::start(session, &who, call, request)
+                                .map(|result| result.map(|task| vec![task]))
+                        }
+                        TaskOperation::Inspect(id) => {
+                            tasks::access(session, &who, call, Some(&id), false)
+                        }
+                        TaskOperation::List => tasks::access(session, &who, call, None, false),
+                        TaskOperation::Cancel(id) => {
+                            tasks::access(session, &who, call, Some(&id), true)
+                        }
+                    }
                 };
                 respond(result, answer, &mut fatal, &cancelled);
             }

@@ -3494,11 +3494,59 @@ operations and D19's escaped-process-group limitation still apply. The deadline 
 unwind-safe, passed explicitly to the component worker and never leaks to subsequent invocations.
 No SDK ABI, component build variant, digest or operational authority changes.
 
+**D153.** Background shell work is explicit and session-owned, not a detached `&` command or a
+persistent Wasm instance. The bash guest accepts `background: true` on its default `run` action,
+returns a host-generated task id promptly, and owns `status`, `list` and `cancel` workflows and
+formatting. `task_id` selects a task; status returns a bounded snapshot of stdout/stderr available
+so far, and cancellation requests process-group termination. Foreground behavior remains the default.
+The additive `saddle:host/exec-tasks` interface offers typed start/inspect/list/cancel effects under
+`exec`, without changing the existing exec interface, scope set or explicit delegation profiles.
+
+Task creation uses the exact foreground authorization, lowering, environment stripping, timeout and
+sandbox path. Task observation/control uses a typed `ExecTask` request over that same exec grant,
+and the core additionally isolates tasks by host-assigned principal: knowing another principal's
+id cannot expose its output or cancel it. Starts, observations, cancellation, completions and reserved
+restores remain attributable to that owner and call id in the single audit chain. A monitor owns the
+child, deadline, bounded capture, pinned workspace and reserved snapshot, never a policy engine.
+The session thread services proxy decisions during model requests, between host calls and while
+idle (TUI and line mode). Blocking native host operations can delay fresh proxy decisions; this does
+not grant bypass access. Namespace/relay failure still means no network, never unrestricted access.
+
+There is **one active shell execution per workspace**, including foreground calls and cooperating
+Saddle processes. A separately opened, pinned workspace directory holds a nonblocking exclusive
+`flock` from before snapshot through process-group cleanup and reserved-path restore. A competing
+start fails with a busy result rather than taking an overlapping snapshot or silently queueing.
+This serializes Saddle commands, not independent user programs; D20's external-writer race and
+D19's escaped-process-group limitation remain. File tools can continue to work while a task runs.
+
+The start's `timeout_secs` bounds the task lifetime, including setup, and cannot exceed the exec
+grant/configured execution budget. A timeout on a later status/list/cancel call bounds only that
+invocation and never renews the task. Capture is bounded per stream using `exec-capture-bytes`;
+`exec-tasks` (default 16) bounds retained task records, evicting the oldest finished task when full.
+Lists omit captured bodies. Polling is a snapshot, not an unbounded log or incremental storage API.
+A task's monitor restores reserved paths on completion even while the session waits for the model.
+Completion auditing is drained on the session thread; fatal monitor/restore/audit errors stay fatal.
+
+Every successful permission/settings reload cancels, joins and audits tasks under the old grants,
+then clears the task registry before replacing grants/principals. Session close does the same before
+closing the audit log; exceptional drop still cancels/joins monitors. No restart persistence,
+cross-session job lookup or automatic resurrection on resume/fork is introduced. A standalone
+`saddle tool bash` session therefore cannot leave a background job behind. Starting a fresh
+conversation in the same run does not create a new task owner or extend a deadline.
+
+The person has `/tasks` and `/tasks cancel <id>` in the TUI and line mode. Like other slash commands,
+the TUI handles them between turns. Host-owned id/state completion notices appear to the person;
+at the next model-safe request point a clearly marked `[saddle background task notification]` user
+context item records the notice. Notices contain no command output and do not themselves spend a
+model request; output must be inspected through the owning tool and retains its plugin provenance.
+A saved notice is historical context, not evidence that its task still exists after restart.
+Further concurrent shell work, streaming subscriptions and persistent jobs remain deferred.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
 | --- | --- | --- | --- |
-| `exec` | running commands | `saddle:host/exec` import | sandbox helper (D18, D19); the network it reaches is `net` (D79) |
+| `exec` | running commands and session-owned tasks | `saddle:host/exec`, `saddle:host/exec-tasks` imports | sandbox helper (D18, D19); the network it reaches is `net` (D79) |
 | `fs-read` | reading files under granted roots | `saddle:host/fs-read` import | policy per call |
 | `tool-read` | bounded reads of existing D66 tool paths under explicitly delegated read-only roles | ordinary filesystem-read imports (D139); legacy `saddle:host/tool-paths` | policy per requested/resolved location and current configuration entry (D138) |
 | `tool-write` | mutations of existing D66 tool paths under explicitly delegated write roles | ordinary `saddle:host/fs-write` import (D141) | policy per requested/resolved location, absolute reserved paths and current configuration entry |

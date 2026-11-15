@@ -8,10 +8,12 @@ mod http_fixture;
 mod plugin_fixture;
 
 use std::fs;
+use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs as unix_fs;
 use std::os::unix::fs::symlink;
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -99,6 +101,62 @@ fn serve(responses: Vec<String>) -> (String, Arc<Mutex<Vec<Seen>>>) {
         }
     });
     (base, seen)
+}
+
+/// dynamic tool ids and deliberate provider stalls exercise background work during model I/O.
+fn serve_dynamic(
+    count: usize,
+    mut respond: impl FnMut(usize, &Value) -> String + Send + 'static,
+) -> (String, Arc<Mutex<Vec<Seen>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = seen.clone();
+    thread::spawn(move || {
+        for index in 0..count {
+            let (mut stream, mut reader, head) = model_request(&listener);
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .unwrap()
+                .trim()
+                .parse::<usize>()
+                .unwrap();
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            record.lock().unwrap().push(Seen {
+                head,
+                body: body.clone(),
+            });
+            let response = respond(index, &body);
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    (base, seen)
+}
+
+fn result_text<'a>(body: &'a Value, call: &str) -> &'a str {
+    tool_text(
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["tool_call_id"] == call)
+            .unwrap()["content"]
+            .as_str()
+            .unwrap(),
+    )
+}
+
+fn background_id(body: &Value) -> String {
+    result_text(body, "start")
+        .strip_prefix("task ")
+        .unwrap()
+        .split(':')
+        .next()
+        .unwrap()
+        .to_owned()
 }
 
 fn sse_response(body: &str) -> String {
@@ -457,6 +515,457 @@ fn tool_loop(api: Api) {
     assert_eq!(denied, 1);
     let verify = env.saddle(&["audit", "verify", log.to_str().unwrap()]);
     assert!(verify.status.success(), "{}", text(&verify.stdout));
+}
+
+#[test]
+fn background_network_is_attributed_or_fails_closed_during_model_and_input_waits() {
+    if let Err(reason) = saddle_sandbox::network_availability() {
+        eprintln!("background network case unavailable on this kernel: {reason}");
+        return;
+    }
+    let source = HttpServer::new(vec![
+        http_reply(200, "", "BACKGROUND-NETWORK"),
+        http_reply(200, "", "IDLE-NETWORK"),
+    ]);
+    let url = source.url.clone();
+    let marker = Arc::new(Mutex::new(PathBuf::new()));
+    let done = marker.clone();
+    let (base, _) = serve_dynamic(2, move |index, _| {
+        if index == 0 {
+            sse_response(&openai_sse(
+                "",
+                &[(
+                    "start",
+                    "bash",
+                    json!({"command":format!("curl -fsS --max-time 5 --noproxy '' {url} > fetched 2> curl-error; printf ready > ready; while [ ! -f go ]; do sleep 0.01; done; curl -fsS --max-time 5 --noproxy '' {url} > idle-fetched 2> idle-error; printf ready > idle-ready; sleep 30"),"background":true,"timeout_secs":10}),
+                )],
+            ))
+        } else {
+            let path = done.lock().unwrap().clone();
+            let end = Instant::now() + Duration::from_secs(7);
+            while !path.exists() {
+                assert!(
+                    Instant::now() < end,
+                    "background network stalled during model request"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            sse_response(&openai_sse("started", &[]))
+        }
+    });
+    let env = Env::new(Api::Openai, &base);
+    *marker.lock().unwrap() = env.ws.path().join("ready");
+    env.write_override(&format!(
+        "[agent]\nnet=[{{host='127.0.0.1',scheme='http',port={}}}]\n",
+        source.port
+    ));
+    let mut child = env
+        .command(&["run", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"start\n").unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    while !env.ws.path().join("ready").exists() {
+        assert!(Instant::now() < end);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let reachable = match UnixListener::bind(env.ws.path().join("probe.sock")) {
+        Ok(listener) => {
+            drop(listener);
+            fs::remove_file(env.ws.path().join("probe.sock")).unwrap();
+            true
+        }
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+            eprintln!(
+                "outer exec sandbox refuses AF_UNIX listeners; validating the no-network fallback, not an allowed proxy connection"
+            );
+            false
+        }
+        Err(error) => panic!("unexpected proxy probe failure: {error}"),
+    };
+    let fetched = fs::read_to_string(env.ws.path().join("fetched")).unwrap();
+    if reachable {
+        assert_eq!(
+            fetched,
+            "BACKGROUND-NETWORK",
+            "{}",
+            fs::read_to_string(env.ws.path().join("curl-error")).unwrap()
+        );
+    } else {
+        assert!(fetched.is_empty());
+    }
+    fs::write(env.ws.path().join("go"), "continue").unwrap();
+    let end = Instant::now() + Duration::from_secs(7);
+    while !env.ws.path().join("idle-ready").exists() {
+        assert!(Instant::now() < end);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let fetched = fs::read_to_string(env.ws.path().join("idle-fetched")).unwrap();
+    if reachable {
+        assert_eq!(fetched, "IDLE-NETWORK");
+    } else {
+        assert!(fetched.is_empty());
+    }
+
+    // A separate Saddle process must not take an overlapping reserved-path snapshot.
+    let competing = env.saddle(&["tool", "bash", r#"{"command":"printf raced > raced"}"#]);
+    assert!(!competing.status.success());
+    assert!(text(&competing.stderr).contains("workspace shell execution is busy"));
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/tasks\n/tasks cancel nonexistent\n/quit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!env.ws.path().join("raced").exists());
+    let directory = env.xdg.path().join("state/saddle/audit");
+    let rows: Vec<_> = fs::read_dir(directory)
+        .unwrap()
+        .flat_map(|path| records(&path.unwrap().path()))
+        .collect();
+    assert_eq!(
+        rows.iter().any(|row| row["scope"] == "net"
+            && row["principal"] == "plugin.standard-bash"
+            && row["allow"] == true
+            && row["args"]["call_id"].is_string()),
+        reachable
+    );
+}
+
+#[test]
+fn background_output_and_completed_task_retention_are_bounded_by_runtime_budgets() {
+    let (base, _) = serve_dynamic(5, |index, body| {
+        let calls = match index {
+            0 => vec![(
+                "start",
+                "bash",
+                json!({"command":"printf 1234567890123456789012345678901234567890; printf error >&2", "background":true}),
+            )],
+            1 => {
+                thread::sleep(Duration::from_millis(150));
+                vec![(
+                    "status",
+                    "bash",
+                    json!({"action":"status","task_id":background_id(body)}),
+                )]
+            }
+            2 => {
+                let output = result_text(body, "status");
+                assert!(
+                    output.contains("1234567890123456") && !output.contains("12345678901234567"),
+                    "{output}"
+                );
+                assert!(output.contains("capture truncated"), "{output}");
+                vec![(
+                    "second",
+                    "bash",
+                    json!({"command":"printf second", "background":true}),
+                )]
+            }
+            3 => vec![(
+                "old",
+                "bash",
+                json!({"action":"status","task_id":background_id(body)}),
+            )],
+            _ => {
+                assert!(result_text(body, "old").contains("unknown task"));
+                return sse_response(&openai_sse("done", &[]));
+            }
+        };
+        sse_response(&openai_sse("", &calls))
+    });
+    let env = Env::new(Api::Openai, &base);
+    let config = env.xdg.path().join("config/saddle/config.toml");
+    let mut settings: toml::Table = fs::read_to_string(&config).unwrap().parse().unwrap();
+    settings.insert(
+        "tool-limits".into(),
+        toml::Value::Table(
+            "exec-capture-bytes=16\nexec-tasks=1\n"
+                .parse::<toml::Table>()
+                .unwrap(),
+        ),
+    );
+    fs::write(config, toml::to_string(&settings).unwrap()).unwrap();
+    let out = env.saddle(&["run", "bounded tasks"]);
+    assert!(
+        out.status.success(),
+        "{} {}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn background_shell_returns_live_output_isolates_principals_serializes_and_restores_on_cancel() {
+    let mut id = String::new();
+    let (base, seen) = serve_dynamic(6, move |index, body| {
+        let calls = match index {
+            0 => vec![(
+                "start",
+                "bash",
+                json!({"command":"printf SECRET-EARLY; printf changed > .git/config; sleep 30", "background":true, "timeout_secs":10}),
+            )],
+            1 => {
+                id = background_id(body);
+                assert!(result_text(body, "start").contains("running"));
+                thread::sleep(Duration::from_millis(200));
+                vec![
+                    ("live", "bash", json!({"action":"status","task_id":id})),
+                    (
+                        "foreign",
+                        "plugin__reader__bash",
+                        json!({"action":"status","task_id":id}),
+                    ),
+                    (
+                        "foreign-cancel",
+                        "plugin__reader__bash",
+                        json!({"action":"cancel","task_id":id}),
+                    ),
+                    (
+                        "busy",
+                        "bash",
+                        json!({"command":"printf must-not-run > forbidden"}),
+                    ),
+                ]
+            }
+            2 => {
+                assert!(result_text(body, "live").contains("SECRET-EARLY"));
+                assert!(result_text(body, "live").contains("running"));
+                assert!(result_text(body, "foreign").contains("unknown task for this principal"));
+                assert!(!result_text(body, "foreign").contains("SECRET-EARLY"));
+                assert!(result_text(body, "foreign-cancel").contains("unknown task"));
+                assert!(result_text(body, "busy").contains("workspace shell execution is busy"));
+                vec![("cancel", "bash", json!({"action":"cancel","task_id":id}))]
+            }
+            3 => {
+                thread::sleep(Duration::from_millis(150));
+                vec![("done", "bash", json!({"action":"status","task_id":id}))]
+            }
+            4 => {
+                assert!(result_text(body, "done").contains("cancelled"));
+                assert!(result_text(body, "done").contains("restored reserved path .git/config"));
+                vec![("unlocked", "bash", json!({"command":"printf unlocked"}))]
+            }
+            _ => {
+                assert!(result_text(body, "unlocked").contains("unlocked"));
+                return sse_response(&openai_sse("done", &[]));
+            }
+        };
+        sse_response(&openai_sse("", &calls))
+    });
+    let env = Env::new(Api::Openai, &base);
+    fs::write(env.ws.path().join(".git/config"), "original").unwrap();
+    let config = env.xdg.path().join("config/saddle/config.toml");
+    plugin_fixture::configure(
+        &config,
+        &standard_component("bash"),
+        "tool={}\nexec={timeout-secs=10}\nfs-read=[{root='workspace'}]\nfs-write=[{root='workspace'}]",
+    );
+    fs::write(config.parent().unwrap().join("plugins/reader/plugin.toml"), "id='reader'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes=['tool','exec','fs-read','fs-write','net']\n").unwrap();
+    let out = env.saddle(&["run", "background work"]);
+    assert!(
+        out.status.success(),
+        "{} {}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    assert_eq!(seen.lock().unwrap().len(), 6);
+    assert_eq!(
+        fs::read_to_string(env.ws.path().join(".git/config")).unwrap(),
+        "original"
+    );
+    assert!(!env.ws.path().join("forbidden").exists());
+    let rows = records(&env.audit_log());
+    assert!(
+        rows.iter()
+            .any(|row| row["args"]["operation"] == "task-start"
+                && row["principal"] == "plugin.standard-bash")
+    );
+    assert!(rows.iter().any(
+        |row| row["args"]["operation"] == "exec-completed" && row["args"]["cancelled"] == true
+    ));
+    assert!(
+        env.saddle(&["audit", "verify", env.audit_log().to_str().unwrap()])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn background_timeout_runs_during_model_wait_and_notices_do_not_expose_process_output() {
+    let (base, seen) = serve_dynamic(4, |index, body| {
+        let calls = match index {
+            0 => vec![(
+                "start",
+                "bash",
+                json!({"command":"printf OUTPUT-NOT-A-NOTICE; sleep 30", "background":true, "timeout_secs":1}),
+            )],
+            1 => {
+                thread::sleep(Duration::from_millis(1300));
+                vec![(
+                    "status",
+                    "bash",
+                    json!({"action":"status","task_id":background_id(body)}),
+                )]
+            }
+            2 => {
+                assert!(result_text(body, "status").contains("command timed out"));
+                assert!(result_text(body, "status").contains("OUTPUT-NOT-A-NOTICE"));
+                vec![("list", "bash", json!({"action":"list"}))]
+            }
+            _ => {
+                let messages = body["messages"].as_array().unwrap();
+                let notices: Vec<_> = messages
+                    .iter()
+                    .filter_map(|message| message["content"].as_str())
+                    .filter(|text| text.starts_with("[saddle background task notification]"))
+                    .collect();
+                assert_eq!(notices.len(), 1);
+                assert!(
+                    notices[0].contains("timed out") && !notices[0].contains("OUTPUT-NOT-A-NOTICE")
+                );
+                return sse_response(&openai_sse("done", &[]));
+            }
+        };
+        sse_response(&openai_sse("", &calls))
+    });
+    let env = Env::new(Api::Openai, &base);
+    let start = Instant::now();
+    let out = env.saddle(&["run", "timeout background"]);
+    assert!(
+        out.status.success(),
+        "{} {}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    assert!(start.elapsed() < Duration::from_secs(10));
+    assert_eq!(seen.lock().unwrap().len(), 4);
+}
+
+#[test]
+fn closing_a_session_cancels_background_work_and_restores_before_the_audit_closes() {
+    let (base, _) = serve_dynamic(2, |index, _| {
+        if index == 0 {
+            sse_response(&openai_sse(
+                "",
+                &[(
+                    "start",
+                    "bash",
+                    json!({"command":"printf changed > .git/config; printf ready > ready; sleep 30; printf leaked > leaked", "background":true}),
+                )],
+            ))
+        } else {
+            thread::sleep(Duration::from_millis(150));
+            sse_response(&openai_sse("leaving", &[]))
+        }
+    });
+    let env = Env::new(Api::Openai, &base);
+    fs::write(env.ws.path().join(".git/config"), "original").unwrap();
+    let start = Instant::now();
+    let out = env.saddle(&["run", "start and exit"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(env.ws.path().join("ready").exists());
+    assert!(!env.ws.path().join("leaked").exists());
+    assert_eq!(
+        fs::read_to_string(env.ws.path().join(".git/config")).unwrap(),
+        "original"
+    );
+    let rows = records(&env.audit_log());
+    assert!(rows.iter().any(
+        |row| row["args"]["operation"] == "exec-completed" && row["args"]["cancelled"] == true
+    ));
+    assert!(
+        env.saddle(&["audit", "verify", env.audit_log().to_str().unwrap()])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn background_tasks_are_cancelled_before_permission_reload_and_the_artifact_stays_pinned() {
+    let (base, seen) = serve(vec![
+        sse_response(&openai_sse(
+            "",
+            &[(
+                "start",
+                "bash",
+                json!({"command":"printf ready > ready; sleep 30; printf leaked > leaked","background":true}),
+            )],
+        )),
+        sse_response(&openai_sse("started", &[])),
+        sse_response(&openai_sse(
+            "",
+            &[("revoked", "bash", json!({"action":"list"}))],
+        )),
+        sse_response(&openai_sse("done", &[])),
+        sse_response(&openai_sse(
+            "",
+            &[("enabled", "bash", json!({"action":"list"}))],
+        )),
+        sse_response(&openai_sse("done", &[])),
+    ]);
+    let env = Env::new(Api::Openai, &base);
+    let config = env.xdg.path().join("config/saddle/config.toml");
+    let initial: toml::Table = fs::read_to_string(&config).unwrap().parse().unwrap();
+    let mut child = env
+        .command(&["run", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"first\n").unwrap();
+    let wait_for = |count| {
+        let end = Instant::now() + Duration::from_secs(15);
+        while seen.lock().unwrap().len() < count {
+            assert!(Instant::now() < end);
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    wait_for(2);
+    let mut revoked = initial.clone();
+    revoked["agent"].as_table_mut().unwrap().remove("exec");
+    fs::write(&config, toml::to_string(&revoked).unwrap()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"/reload\nsecond\n")
+        .unwrap();
+    wait_for(4);
+    fs::write(&config, toml::to_string(&initial).unwrap()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/reload\nthird\n/quit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!env.ws.path().join("leaked").exists());
+    let seen = seen.lock().unwrap();
+    assert!(result_text(&seen[3].body, "revoked").contains("denied:"));
+    assert!(result_text(&seen[5].body, "enabled").contains("no background tasks"));
+    let rows = records(&env.audit_log());
+    assert!(rows.iter().any(
+        |row| row["args"]["operation"] == "exec-completed" && row["args"]["cancelled"] == true
+    ));
+    for row in rows.iter().filter(|row| {
+        row["principal"] == "plugin.standard-bash"
+            && row["args"]["operation"] == "load"
+            && row["allow"] == true
+    }) {
+        assert_eq!(
+            row["args"]["sha256"],
+            saddle_standard::artifact("bash").unwrap().sha256
+        );
+    }
 }
 
 #[test]

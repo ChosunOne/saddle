@@ -166,6 +166,7 @@ pub enum Action {
     SessionInfo,
     /// `/mcp`: what the granted servers are doing, or `restart <name>` for one of them (D118).
     Mcp(String),
+    Tasks(String),
     /// Remove a saved conversation (D55).
     DeleteSession(String),
     /// Set the reasoning effort, or cycle to the next level (D57).
@@ -435,6 +436,11 @@ pub const COMMANDS: &[SlashCommand] = &[
         name: "/name",
         args: "[name]",
         about: "name this conversation, or show and clear its name",
+    },
+    SlashCommand {
+        name: "/tasks",
+        args: "[cancel <id>]",
+        about: "list background shell tasks or cancel one",
     },
     SlashCommand {
         name: "/session",
@@ -1638,6 +1644,7 @@ impl App {
             }
             "/session" => Some(Action::SessionInfo),
             "/mcp" => Some(Action::Mcp(text["/mcp".len()..].trim().to_owned())),
+            "/tasks" => Some(Action::Tasks(text["/tasks".len()..].trim().to_owned())),
             "/clone" if self.busy.is_some() => {
                 self.info("/clone waits for the turn to end; esc cancels it");
                 None
@@ -2688,6 +2695,15 @@ mod tests {
             matches!(a.entries.last(), Some(Entry::Note(_, t)) if t.contains("no skill `nope`") && t.contains("manim")),
             "{:?}",
             a.entries.last()
+        );
+    }
+
+    #[test]
+    fn task_slash_commands_route_to_human_controls_instead_of_the_model() {
+        let mut a = app();
+        type_text(&mut a, "/tasks cancel task-123");
+        assert!(
+            matches!(a.key(key(KeyCode::Enter)),Some(Action::Tasks(argument)) if argument=="cancel task-123")
         );
     }
 

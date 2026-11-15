@@ -32,6 +32,7 @@ mod session;
 mod skills;
 mod standard;
 mod store;
+mod tasks;
 mod term;
 mod tools;
 mod transcript;
@@ -40,6 +41,7 @@ mod tui;
 use std::io::{BufRead, IsTerminal, Write, stdin};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
@@ -53,6 +55,7 @@ use crate::config::UserConfig;
 use crate::mcp::stdio::Client;
 use crate::mcp::{McpEntry, Transport};
 use crate::net::bridge::Bridge;
+use crate::plugins::HostFailure;
 use crate::provider::Provider;
 use crate::session::{PrivateTmp, Session, Setup, session_id};
 use crate::term::Terminal;
@@ -581,13 +584,34 @@ fn converse(
             _ => ExitCode::from(1),
         });
     }
-    let stdin = io::stdin();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if stdin.lock().read_line(&mut line)? == 0 {
-            break;
+    let (lines, input) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        loop {
+            let mut line = String::new();
+            match stdin.lock().read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if lines.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = lines.send(Err(error));
+                    break;
+                }
+            }
         }
+    });
+    loop {
+        for note in tasks::notices(session, false)? {
+            out.info(&note);
+        }
+        let line = match input.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => line?,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         let text = line.trim();
         if text.is_empty() {
             continue;
@@ -625,6 +649,13 @@ fn line_turn(
                 agent::Compacted::Cancelled => End::Cancelled,
                 agent::Compacted::Failed => End::Failed,
             }
+        } else if text == "/tasks" || text.starts_with("/tasks ") {
+            match tasks::human(session, text.trim_start_matches("/tasks").trim()) {
+                Ok(note) => out.info(&note),
+                Err(error) if error.is::<HostFailure>() => return Err(error),
+                Err(error) => out.info(&format!("{error:#}")),
+            }
+            End::Answered
         } else if text == "/reload" {
             session.reload_policy()?;
             agent.refresh_extensions(session);

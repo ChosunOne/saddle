@@ -5,6 +5,7 @@ use crate::file_read;
 use crate::provider::Image;
 use crate::provider::Price;
 use crate::skills;
+use crate::tasks;
 use saddle_policy::audit;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -15,22 +16,25 @@ use std::path::PathBuf;
 use std::slice;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::TryRecvError;
-use std::thread::Builder;
+use std::thread::{self, Builder};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use saddle_cap::Principal;
 use saddle_policy::Kind;
 use serde_json::{Value, json};
+use std::sync::mpsc::RecvTimeoutError;
 
 use crate::cache;
 use crate::compact::{self, Reason};
 use crate::context::ContextFile;
 use crate::mcp;
 use crate::plugins;
+use crate::plugins::HostFailure;
 use crate::provider::{
     Cancelled, Conversation, Item, Part, Provider, Quota, Reply, Sink, Stop, ToolCall, ToolDef,
     ToolResult, Usage,
@@ -53,6 +57,96 @@ pub trait Ui: Sink {
     /// A reply, and what it cost as far as the price is known (D36).
     fn reply(&mut self, reply: &Reply, cost: f64);
     fn compaction(&mut self, event: compact::Event);
+}
+
+enum TaskStream {
+    Text(String),
+    Reasoning(String),
+    Note(String),
+    Quota(Quota),
+    Done(Result<Reply>),
+}
+struct TaskSink {
+    events: mpsc::SyncSender<TaskStream>,
+    stop: Arc<AtomicBool>,
+}
+impl Sink for TaskSink {
+    fn text(&mut self, text: &str) {
+        let _ = self.events.send(TaskStream::Text(text.into()));
+    }
+    fn reasoning(&mut self, text: &str) {
+        let _ = self.events.send(TaskStream::Reasoning(text.into()));
+    }
+    fn note(&mut self, text: &str) {
+        let _ = self.events.send(TaskStream::Note(text.into()));
+    }
+    fn quota(&mut self, quota: &Quota) {
+        let _ = self.events.send(TaskStream::Quota(quota.clone()));
+    }
+    fn cancelled(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+}
+
+/// model I/O cannot starve the background proxy's sole policy/audit owner (D153).
+fn complete_servicing_tasks(
+    provider: &Provider,
+    conversation: &Conversation<'_>,
+    session: &mut Session,
+    sink: &mut dyn Sink,
+) -> Result<Reply> {
+    if !session.tasks.active() {
+        return provider.complete(conversation, sink);
+    }
+    thread::scope(|scope| {
+        let (events, pending) = mpsc::sync_channel(64);
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        scope.spawn(move || {
+            let mut stream = TaskSink {
+                events: events.clone(),
+                stop: flag,
+            };
+            let result = provider.complete(conversation, &mut stream);
+            let _ = events.send(TaskStream::Done(result));
+        });
+        let mut fatal = None;
+        loop {
+            if let Err(error) = tasks::service(session) {
+                if fatal.is_none() {
+                    fatal = Some(error);
+                }
+                stop.store(true, Ordering::Relaxed);
+            }
+            match tasks::notices(session, false) {
+                Ok(notes) => {
+                    for note in notes {
+                        sink.note(&note);
+                    }
+                }
+                Err(error) => {
+                    if fatal.is_none() {
+                        fatal = Some(error);
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
+            if sink.cancelled() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            match pending.recv_timeout(Duration::from_millis(10)) {
+                Ok(TaskStream::Text(text)) => sink.text(&text),
+                Ok(TaskStream::Reasoning(text)) => sink.reasoning(&text),
+                Ok(TaskStream::Note(text)) => sink.note(&text),
+                Ok(TaskStream::Quota(quota)) => sink.quota(&quota),
+                Ok(TaskStream::Done(result)) => return fatal.map_or(result, Err),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(anyhow!("model worker stopped without a reply"));
+                }
+            }
+        }
+    })
 }
 
 /// Routes a summary request's stream to the UI as compaction events.
@@ -884,9 +978,11 @@ impl Agent {
             items: &request,
             session: self.saved.as_deref().unwrap_or_default(),
         };
-        let result = provider.complete(&conv, &mut CompactSink { ui: &mut *ui });
+        let result =
+            complete_servicing_tasks(provider, &conv, session, &mut CompactSink { ui: &mut *ui });
         let reply = match result {
             Ok(reply) => reply,
+            Err(e) if e.is::<HostFailure>() => return Err(e),
             Err(e) => {
                 let cancelled = e.is::<Cancelled>();
                 let msg = if cancelled {
@@ -1389,9 +1485,11 @@ impl Agent {
             items: &request,
             session: self.saved.as_deref().unwrap_or_default(),
         };
-        let result = provider.complete(&conv, &mut CompactSink { ui: &mut *ui });
+        let result =
+            complete_servicing_tasks(provider, &conv, session, &mut CompactSink { ui: &mut *ui });
         let reply = match result {
             Ok(reply) => reply,
+            Err(e) if e.is::<HostFailure>() => return Err(e),
             Err(e) => {
                 if e.is::<Cancelled>() {
                     ui.note("the branch was left without a summary: cancelled");
@@ -1533,6 +1631,13 @@ impl Agent {
             if let Some(end) = self.compact_before_request(session, ui)? {
                 return Ok(end);
             }
+            for notice in tasks::notices(session, true)? {
+                ui.note(&notice);
+                self.record(
+                    Item::User(format!("[saddle background task notification] {notice}")),
+                    ui,
+                );
+            }
             let conv = Conversation {
                 system: &self.system,
                 tools: &self.tools,
@@ -1543,8 +1648,9 @@ impl Agent {
                 .provider
                 .as_ref()
                 .expect("checked at the start of the turn");
-            let reply = match provider.complete(&conv, ui) {
+            let reply = match complete_servicing_tasks(provider, &conv, session, ui) {
                 Ok(reply) => reply,
+                Err(e) if e.is::<HostFailure>() => return Err(e),
                 Err(e) if e.is::<Cancelled>() => {
                     self.log(session, json!({}), "model request cancelled by the user")?;
                     return Ok(End::Cancelled);

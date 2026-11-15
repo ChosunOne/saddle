@@ -17,6 +17,7 @@ use saddle_wit::ReadToolPre;
 use saddle_wit::exports::saddle::plugin::tool::{Definition, Output};
 use saddle_wit::saddle::host::budgets::{self as budgets_interface, Host as BudgetsHost};
 use saddle_wit::saddle::host::exec::{self, Command, Host as ExecHost, Reply as ExecReply};
+use saddle_wit::saddle::host::exec_tasks::{self, Host as TasksHost, Task};
 use saddle_wit::saddle::host::fs_list::EntryKind;
 use saddle_wit::saddle::host::fs_list::{self, Host as ListHost, Page as DirectoryPage};
 use saddle_wit::saddle::host::fs_paths::{self, Host as PathsHost};
@@ -133,6 +134,14 @@ impl Invocation {
     }
 }
 
+/// a typed task effect, independent of shell workflow or UI presentation (D153).
+pub enum TaskOperation {
+    Start(Command),
+    Inspect(String),
+    List,
+    Cancel(String),
+}
+
 /// the binary supplies policy/audit/file operations; the loader never depends on its session.
 ///
 /// Implementations must decide and audit using `call.principal()` and `call.grants()`, validate
@@ -187,6 +196,13 @@ pub trait HostServices: Send + 'static {
         _request: Command,
     ) -> anyhow::Result<Result<ExecReply, String>> {
         Ok(Err("host does not implement execution".into()))
+    }
+    fn task(
+        &mut self,
+        _call: &Invocation,
+        _operation: TaskOperation,
+    ) -> anyhow::Result<Result<Vec<Task>, String>> {
+        Ok(Err("host does not implement background execution".into()))
     }
     fn emit_diff(
         &mut self,
@@ -385,6 +401,81 @@ impl<H: HostServices> ExecHost for State<H> {
             return Ok(Err("host error exceeds configured byte limit".into()));
         }
         Ok(result)
+    }
+}
+
+impl<H: HostServices> State<H> {
+    fn task_operation(
+        &mut self,
+        operation: TaskOperation,
+    ) -> anyhow::Result<Result<Vec<Task>, String>> {
+        if self.call.cancelled() || Instant::now() >= self.call.deadline {
+            return Err(anyhow!("plugin task request cancelled or timed out"));
+        }
+        match &operation {
+            TaskOperation::Start(command)
+                if command.argv.is_empty()
+                    || command.argv.len() > budgets::exec_arguments()
+                    || command.argv.iter().map(String::len).sum::<usize>()
+                        > budgets::exec_argument_bytes()
+                    || command.argv.iter().any(|value| value.contains('\0')) =>
+            {
+                return Ok(Err("invalid command or exceeds argument bounds".into()));
+            }
+            TaskOperation::Inspect(id) | TaskOperation::Cancel(id)
+                if id.len() > budgets::metadata_bytes() =>
+            {
+                return Ok(Err("task id exceeds byte budget".into()));
+            }
+            _ => {}
+        }
+        let result = self.host.task(&self.call, operation)?;
+        if let Ok(tasks) = &result {
+            if tasks.len() > budgets::exec_tasks()
+                || tasks.iter().any(|task| {
+                    task.id.len() > budgets::metadata_bytes()
+                        || task.output.stdout.len() > budgets::exec_capture_bytes()
+                        || task.output.stderr.len() > budgets::exec_capture_bytes()
+                        || task
+                            .output
+                            .restored
+                            .iter()
+                            .chain(&task.output.denials)
+                            .map(String::len)
+                            .sum::<usize>()
+                            > budgets::metadata_bytes()
+                })
+            {
+                return Ok(Err("task reply exceeds configured bounds".into()));
+            }
+        } else if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
+            return Ok(Err("task error exceeds configured bounds".into()));
+        }
+        Ok(result)
+    }
+    fn one_task(&mut self, operation: TaskOperation) -> anyhow::Result<Result<Task, String>> {
+        Ok(self.task_operation(operation)?.and_then(|mut tasks| {
+            if tasks.len() == 1 {
+                Ok(tasks.remove(0))
+            } else {
+                Err("task service returned the wrong number of tasks".into())
+            }
+        }))
+    }
+}
+
+impl<H: HostServices> TasksHost for State<H> {
+    fn start(&mut self, request: Command) -> anyhow::Result<Result<Task, String>> {
+        self.one_task(TaskOperation::Start(request))
+    }
+    fn inspect(&mut self, id: String) -> anyhow::Result<Result<Task, String>> {
+        self.one_task(TaskOperation::Inspect(id))
+    }
+    fn list(&mut self) -> anyhow::Result<Result<Vec<Task>, String>> {
+        self.task_operation(TaskOperation::List)
+    }
+    fn cancel(&mut self, id: String) -> anyhow::Result<Result<Task, String>> {
+        self.one_task(TaskOperation::Cancel(id))
     }
 }
 
@@ -965,6 +1056,9 @@ fn bind_host<H: HostServices>(
             web_search::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
         }
         HostInterface::Exec => exec::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
+        HostInterface::ExecTasks => {
+            exec_tasks::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
+        }
         HostInterface::FsPreimage => {
             fs_preimage::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
         }

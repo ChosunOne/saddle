@@ -88,6 +88,7 @@ budgets! {
     exec_report_paths: usize = 16,
     exec_report_denials: usize = 8,
     exec_seconds: usize = 300,
+    exec_tasks: usize = 16,
     presentation_bytes: usize = 60 * 1024,
     http_capture_bytes: usize = 100 * 1024,
     network_seconds: usize = 30,

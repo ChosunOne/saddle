@@ -61,6 +61,53 @@ replacements. Profiles enter the policy hash; reload rebuilds the catalogue and 
 views without resetting spending or changing artifact digests. Changing a profile does not change
 `[agent]`, and granting the agent more reach does not lend an omitted operation scope to a tool.
 
+## Background shell work
+
+Use the same bash tool with `background: true` (D153):
+
+```json
+{"command":"cargo nextest run", "background":true, "timeout_secs":300}
+```
+
+It returns a task id promptly. Continue working with file tools, then inspect or cancel the task:
+
+```json
+{"action":"status", "task_id":"task-<id>"}
+{"action":"list"}
+{"action":"cancel", "task_id":"task-<id>"}
+```
+
+Status returns a bounded snapshot of available stdout/stderr, exit status and timeout/cancellation
+state. Repeated polls return the captured prefix again, not an ever-growing log. Cancellation is
+requested promptly; a task may still report running until process-group cleanup and reserved-path
+restoration finish. The tool that started it is its owner: another plugin cannot read or cancel it.
+A start's timeout bounds the **task lifetime**; a timeout on a status call only bounds that call.
+
+**One shell command may be active per workspace.** Foreground and background commands, including
+other Saddle processes in that workspace, share an exclusive reservation lock. A second start
+returns a busy error; it is not queued. This restriction prevents competing Git config/hook
+snapshots. File tools remain available. Build/test tasks work well; a dev server would occupy the
+shell slot until stopped. Completed filesystem effects are not rolled back.
+
+`/tasks` lists tasks for the person; `/tasks cancel <id>` stops one. These commands also work in
+line mode and are handled between turns in the TUI. Completion notices appear without an extra
+model request, and enter the model's context at its next safe request point. Notices contain only
+host-owned identity/state, not untrusted command output. Ask the owning bash tool for output.
+
+Tasks stop on session exit or any successful permission/settings reload. Reload drains cleanup and
+audit under the old grants before replacing them. Task ids/outputs are not persisted across restarts;
+resuming a transcript never restarts its old commands. Standalone `saddle tool bash` calls close
+their session immediately, so they cannot leave a task running. Ctrl+C cancelling a model request
+alone is not a request to cancel every task; use `/tasks cancel` or exit the session.
+
+No extra delegation scope is needed: existing explicit bash `exec` delegation applies. SDK users
+can import `saddle:host/exec-tasks` under their existing `exec` ceiling/reach; the interface never
+lends a sibling's permissions. `[tool-limits] exec-tasks` defaults to 16 retained task records;
+completed records are evicted oldest-first when full. Capture and presentation use the existing
+execution budgets. Normal sandbox/no-network fallback and escaped-process-group limitations apply.
+New proxy decisions are serviced during model I/O and idle waits, but a blocking native host
+operation can delay them. There is no alternate network decision engine on the monitor thread.
+
 ## Per-call timeouts
 
 Every tool accepts optional `timeout_secs`, a positive integer number of seconds (D152):
@@ -333,6 +380,7 @@ exec-present-bytes = 24576
 exec-report-paths = 16
 exec-report-denials = 8
 exec-seconds = 300
+exec-tasks = 16
 presentation-bytes = 61440
 http-capture-bytes = 102400
 network-seconds = 30
