@@ -1,5 +1,9 @@
 //! guest tool bindings, generated from the host's canonical WIT (D12, D127, D140).
 
+use saddle::host::budgets::read as read_budgets;
+use saddle_limits::{self as limits, Budgets};
+use serde_json::{Value, from_str, from_value, to_value};
+
 wit_bindgen::generate!({
     path: "../saddle-wit/wit",
     world: "read-tool",
@@ -26,3 +30,36 @@ pub use saddle::host::transcript_read::query as query_transcript;
 pub use saddle::host::web_search::{
     Snapshot as SearchSnapshot, last as last_search, search as search_web,
 };
+
+/// read resource budgets from the host before a standard guest workflow starts (D145).
+/// fresh instances prevent cached settings from surviving a config reload.
+pub fn configure_limits() -> Result<(), String> {
+    limits::initialize(parse_budgets(&read_budgets())?);
+    Ok(())
+}
+
+fn parse_budgets(text: &str) -> Result<Budgets, String> {
+    let mut value: Value = from_str(text).map_err(|e| format!("invalid host budgets: {e}"))?;
+    // Ignore future metadata keys so a host upgrade need not rebuild a pinned guest.
+    // Protected config parsing remains strict; only this public snapshot is extensible.
+    let known = to_value(Budgets::default()).map_err(|e| e.to_string())?;
+    if let (Some(values), Some(known)) = (value.as_object_mut(), known.as_object()) {
+        values.retain(|name, _| known.contains_key(name));
+    }
+    let budgets: Budgets = from_value(value).map_err(|e| format!("invalid host budgets: {e}"))?;
+    budgets.validate()?;
+    Ok(budgets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn metadata_is_forward_compatible_but_invalid_values_are_not_accepted() {
+        let profile =
+            parse_budgets(r#"{"plugin-input-bytes":1048576,"future-budget":42}"#).unwrap();
+        assert_eq!(profile.plugin_input_bytes, 1048576);
+        assert!(parse_budgets(r#"{"range-bytes":0}"#).is_err());
+        assert!(parse_budgets("not JSON").is_err());
+    }
+}

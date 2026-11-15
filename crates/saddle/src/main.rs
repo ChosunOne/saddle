@@ -1,5 +1,6 @@
 use crate::mcp::Exposure;
 use saddle_policy::audit;
+use serde_json::to_value as json_value;
 use std::env;
 use std::fs;
 use std::io;
@@ -1006,6 +1007,12 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
             "plugin     {id} · {state} · manifest {:?} · load/status: saddle plugin list",
             entry.manifest
         );
+    }
+    println!("tool limits resource budgets, not grants ([tool-limits] in config.toml)");
+    if let Some(limits) = json_value(&setup.tool_limits)?.as_object() {
+        for (name, value) in limits {
+            println!("  {name} = {value}");
+        }
     }
     // D104: the servers a person declared, and which of them a grant enables. A server that is
     // declared and not granted, or granted and not declared, is the mistake worth seeing here.

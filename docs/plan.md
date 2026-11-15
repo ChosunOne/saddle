@@ -3239,6 +3239,38 @@ start directory remains an error. Names that WIT strings cannot represent are sk
 never lossy-renamed into ambiguous targets. Tree, result, text and file limits are the documented
 bounded standard-tool contract; they produce limits/errors/notes, not a hidden native fallback.
 
+**D145.** Resource limits are protected runtime configuration, not product requirements baked
+into component artifacts. `[tool-limits]` in user `config.toml` supplies a strictly parsed, typed
+budget profile; omitted keys retain the defaults defined once in `saddle-limits`. This supersedes
+the fixed numeric ceilings in D127–D144 with configurable defaults: guest memory/fuel/walltime and
+store quotas, artifact/count limits, argument/result sizes, long host waits/counts, filesystem
+ranges/pages/scans, mutation batches/inputs, diff/image presentation, search traversal/ignore/regex
+budgets, execution capture/presentation, HTTP deadlines/capture/headers/redirects, search responses,
+results/cache, and transcript SQL/result/execution budgets. Different stages have separate knobs:
+raising mutation bytes does not imply raising argument or memory bytes. `saddle check` prints the
+resolved values. Values must fit their ABI/backend representation; nonzero progress/timeout budgets
+are required, while zero redirect/image/optional-report counts disable those facilities.
+
+A prepared invocation carries a host-chosen immutable snapshot. The additive `saddle:host/budgets`
+metadata interface returns only that public profile under `tool`, no paths, secrets, policy handles
+or authority. Standard guests initialize their workflow/presentation budgets from it once per fresh
+instance. Host services independently enforce the same profile even if a guest ignores it. Scoped,
+unwind-safe synchronous resource contexts carry the snapshot through shared pure libraries and the
+core event pump; they are neither process-global settings nor permission sources. Reload rebuilds
+the prepared catalogue/engine and snapshots, evicts cached responses above new size/count budgets,
+and bounds cached numbered results, so one pinned artifact can raise/lower its working
+budgets without recompilation/repinning. Existing components without this import retain their own
+internal bounds; the host still applies current host limits.
+
+Budget settings never grant resources: manifest ceilings, explicit delegation, per-path/redirect
+checks, exclusions/reservations, private-address checks, credentials and transcript authorizers are
+unchanged. Native adapters use the same configurable shared-service limits; remaining native filesystem
+implementations use the applicable presentation/search settings without pretending their whole-file
+algorithms became streaming. UTF-8 WIT strings, supported formats/ABI, per-entry rather than multi-file
+atomicity, blind mutation diff semantics and inability to preempt every blocking I/O are behavioral
+contracts, not resource knobs. Chunk sizes and scheduler polling intervals are implementation choices,
+not additional ceilings. Backend/platform hard maxima can still constrain a requested budget.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

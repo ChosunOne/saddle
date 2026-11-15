@@ -1,5 +1,6 @@
 //! component host calls use the session's one engine and audit log (D129, D131).
 
+use saddle_limits as budgets;
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::io::{Read, Seek, SeekFrom};
@@ -11,9 +12,9 @@ use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Error as HostError, Result, anyhow};
+use anyhow::{Context, Error as HostError, Result, anyhow};
 use saddle_cap::{Location, Principal, RelPath, RootName, Scope};
-use saddle_loader::{HostServices, Invocation, MAX_FILE_BYTES, Prepared};
+use saddle_loader::{HostServices, Invocation, Prepared};
 use saddle_policy::audit::sha256_hex;
 use saddle_policy::{Kind, Request};
 use saddle_wit::exports::saddle::plugin::tool::{Definition, Output};
@@ -154,7 +155,7 @@ impl Host {
                 who: call.principal().clone(),
                 deadline: call
                     .deadline()
-                    .min(Instant::now() + Duration::from_secs(30)),
+                    .min(Instant::now() + Duration::from_secs(budgets::network_seconds() as u64)),
                 query,
                 answer,
             })
@@ -192,7 +193,7 @@ impl HostServices for Host {
                 who: call.principal().clone(),
                 deadline: call
                     .deadline()
-                    .min(Instant::now() + Duration::from_secs(30)),
+                    .min(Instant::now() + Duration::from_secs(budgets::network_seconds() as u64)),
                 request,
                 answer,
             })
@@ -452,6 +453,16 @@ pub fn execute(
     job: Job,
     call: &str,
 ) -> Result<Result<Reply, String>> {
+    let limits = session.setup.tool_limits.clone();
+    budgets::using(&limits, || execute_inner(prepared, session, job, call))
+}
+
+fn execute_inner(
+    prepared: Arc<Prepared<Host>>,
+    session: &mut Session,
+    job: Job,
+    call: &str,
+) -> Result<Result<Reply, String>> {
     let invoking = matches!(job, Job::Invoke(_));
     let mut filesystem_effects = false;
     let mut execution_effects = false;
@@ -464,7 +475,13 @@ pub fn execute(
     };
     let cancelled = Arc::new(AtomicBool::new(cancel::FLAG.load(Ordering::Relaxed)));
     let flag = cancelled.clone();
+    // Reserve host frames beyond Wasmtime's configured guest stack; never silently exceed the thread.
+    let stack_bytes = prepared
+        .stack_bytes()
+        .checked_add(2 * 1024 * 1024)
+        .context("plugin thread stack size overflow")?;
     let worker = thread::Builder::new()
+        .stack_size(stack_bytes)
         .name("saddle-plugin".into())
         .spawn(move || {
             let result = match job {
@@ -519,7 +536,7 @@ pub fn execute(
                             url: &request.url,
                             headers: request.headers,
                             body: "",
-                            limit: network::MAX_RESPONSE,
+                            limit: budgets::http_capture_bytes(),
                             deadline,
                             redirects: true,
                         },
@@ -605,7 +622,7 @@ pub fn execute(
                 let request = Request::Plain(Scope::Tool);
                 let decision = session.engine.decide(&who, &request);
                 let result = session.audit.decision_for_call_details(&who, &request, &decision, call, json!({"operation":"emit-diff", "bytes":text.len(), "sha256":sha256_hex(text.as_bytes())})).map(|_| {
-                    if !invoking || !decision.allow || text.len() > 65536 || diff.is_some() {
+                    if !invoking || !decision.allow || text.len() > budgets::diff_bytes() || diff.is_some() {
                         Err("diff presentation refused outside invocation or exceeds count/size/permission limit".into())
                     } else {
                         diff = Some(text.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect());
@@ -784,7 +801,18 @@ fn emit_image(
     let Some(images) = images else {
         return Ok(Err("images may only be emitted during invocation".into()));
     };
-    if !images.is_empty() || name.len() > 256 {
+    if images.len() >= budgets::image_count()
+        || name.len() > budgets::image_name_bytes()
+        || bytes.len().saturating_add(
+            images
+                .iter()
+                .map(|image| {
+                    image.data.len() / 4 * 3
+                        - image.data.chars().rev().take_while(|c| *c == '=').count()
+                })
+                .sum::<usize>(),
+        ) > budgets::image_bytes()
+    {
         return Ok(Err("image result exceeds name or count limit".into()));
     }
     let name: String = name.chars().filter(|c| !c.is_control()).collect();
@@ -859,18 +887,20 @@ fn read_file(
     managed: bool,
 ) -> Result<Result<Chunk, Failure>> {
     let (path, managed) = filesystem::decode_path(path, managed);
-    if range.is_some_and(|(_, limit)| limit == 0 || u64::from(limit) > MAX_FILE_BYTES as u64) {
+    if range
+        .is_some_and(|(_, limit)| limit == 0 || u64::from(limit) > budgets::range_bytes() as u64)
+    {
         return denied(
             session,
             who,
             call,
             &path,
             range,
-            "read range limit must be between 1 and 65536 bytes".into(),
+            "read range limit must be positive and within the configured range budget".into(),
             managed,
         );
     }
-    if path.root.len() > 64 || path.relative.len() > 4096 {
+    if path.root.len() > 64 || path.relative.len() > budgets::path_bytes() {
         return denied(
             session,
             who,
@@ -921,7 +951,7 @@ fn read_file(
         if let Some((offset, _)) = range {
             file.seek(SeekFrom::Start(offset))?;
         }
-        let max = range.map_or(MAX_FILE_BYTES, |(_, limit)| limit as usize);
+        let max = range.map_or(budgets::range_bytes(), |(_, limit)| limit as usize);
         let mut bytes = Vec::new();
         let mut chunk = [0; 8192];
         loop {

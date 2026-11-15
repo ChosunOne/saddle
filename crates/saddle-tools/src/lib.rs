@@ -12,7 +12,11 @@ pub mod transcript;
 pub mod websearch;
 pub use pagination::read_with;
 
+use saddle_limits as budgets;
 use saddle_sdk::ImageInfo;
+#[cfg(target_arch = "wasm32")]
+#[cfg(target_arch = "wasm32")]
+use saddle_sdk::configure_limits;
 use serde::Deserialize;
 
 #[cfg(target_arch = "wasm32")]
@@ -21,10 +25,6 @@ use saddle_sdk::{Definition, FilePath, Output, Tool, emit_image, read_range, res
 use serde_json::{Value, json};
 
 const CHUNK_BYTES: u32 = 8192;
-const PAGE_BYTES: usize = 50 * 1024;
-const PAGE_LINES: u64 = 2000;
-const SCAN_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
 /// a model-facing reader; importing it does not grant any filesystem access.
 pub struct Read;
@@ -58,7 +58,7 @@ fn first_line() -> u64 {
     1
 }
 fn page_lines() -> u64 {
-    PAGE_LINES
+    budgets::read_page_lines() as u64
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -66,7 +66,7 @@ impl Tool for Read {
     fn describe() -> Definition {
         Definition {
             name: "read".into(),
-            description: "read a file allowed by this plugin's runtime filesystem permissions in the explicitly selected format. Format defaults to text (UTF-8); use image for PNG/JPEG/GIF/WebP attachments. No automatic detection or fallback between modes. Path is workspace-relative, absolute or home-relative unless root is provided. Offset is a 1-based text line; text pages have at most 2000 lines and 50 KiB with total/continuation notes. Text scans are limited to 64 MiB; images to 5 MiB.".into(),
+            description: "read a file allowed by this plugin's runtime filesystem permissions in the explicitly selected format. Format defaults to text (UTF-8); use image for PNG/JPEG/GIF/WebP attachments. No automatic detection or fallback between modes. Path is workspace-relative, absolute or home-relative unless root is provided. Offset is a 1-based text line; text pages have at most the configured line and byte budgets with total/continuation notes. Text scan and image byte budgets are host-configurable.".into(),
             input_schema: json!({
                 "type":"object", "properties": {
                     "root":{"type":"string"}, "path":{"type":"string"},
@@ -79,6 +79,12 @@ impl Tool for Read {
     }
 
     fn invoke(arguments: String) -> Output {
+        if let Err(text) = configure_limits() {
+            return Output {
+                text,
+                is_error: true,
+            };
+        }
         let arguments = match normalize_path(&arguments, None) {
             Ok(arguments) => arguments,
             Err(text) => {
@@ -151,12 +157,18 @@ pub fn read_with_media(
     if args.offset == 0 || args.limit == 0 {
         return Err("offset and limit must be positive integers".into());
     }
-    let (mut bytes, mut eof) = read(&args.root, &args.path, 0, CHUNK_BYTES)?;
-    if bytes.len() > CHUNK_BYTES as usize || (bytes.is_empty() && !eof) {
+    let head_bytes = CHUNK_BYTES.min(budgets::range_bytes() as u32);
+    let (mut bytes, mut eof) = read(
+        &args.root,
+        &args.path,
+        0,
+        CHUNK_BYTES.min(budgets::range_bytes() as u32),
+    )?;
+    if bytes.len() > head_bytes as usize || (bytes.is_empty() && !eof) {
         return Err("invalid reply from range service".into());
     }
     while !eof {
-        let want = (MAX_IMAGE_BYTES - bytes.len()).min(65536) as u32;
+        let want = (budgets::image_bytes() - bytes.len()).min(budgets::range_bytes()) as u32;
         if want == 0 {
             return Err("image is over the 5120 KiB limit".into());
         }
@@ -187,6 +199,44 @@ mod tests {
             let end = (start + limit as usize).min(bytes.len());
             Ok((bytes[start..end].to_vec(), end == bytes.len()))
         })
+    }
+
+    #[test]
+    fn paging_scan_and_range_budgets_are_runtime_inputs_not_compiled_ceilings() {
+        let original = budgets::current();
+        let one = budgets::Budgets {
+            read_page_lines: 1,
+            range_bytes: 2,
+            ..original.clone()
+        };
+        budgets::using(&one, || {
+            let text = page(b"one\ntwo\n", r#"{"path":"file"}"#).unwrap();
+            assert!(text.starts_with("one\n"), "{text}");
+            assert!(text.contains("offset=2"));
+        });
+        let two = budgets::Budgets {
+            read_page_lines: 2,
+            range_bytes: 2,
+            ..original.clone()
+        };
+        budgets::using(&two, || {
+            assert_eq!(
+                page(b"one\ntwo\n", r#"{"path":"file"}"#).unwrap(),
+                "one\ntwo\n"
+            )
+        });
+        let small_scan = budgets::Budgets {
+            read_scan_bytes: 5,
+            ..original.clone()
+        };
+        budgets::using(&small_scan, || {
+            assert!(
+                page(b"one\ntwo\n", r#"{"path":"file"}"#)
+                    .unwrap_err()
+                    .contains("configured scan limit")
+            )
+        });
+        assert_eq!(budgets::current(), original);
     }
 
     #[test]
@@ -228,7 +278,11 @@ mod tests {
 
     #[test]
     fn bounds_binary_errors_empty_files_and_invalid_arguments() {
-        let text = page("é".repeat(PAGE_BYTES).as_bytes(), r#"{"path":"file"}"#).unwrap();
+        let text = page(
+            "é".repeat(budgets::read_page_bytes()).as_bytes(),
+            r#"{"path":"file"}"#,
+        )
+        .unwrap();
         assert!(text.len() < 64 * 1024);
         assert!(text.contains("bytes; the first"));
         assert!(page(b"\xff", r#"{"path":"file"}"#).is_err());
@@ -249,7 +303,7 @@ mod tests {
 
     #[test]
     fn exact_byte_and_line_caps_do_not_skip_the_next_line() {
-        let text = format!("{}\ntail\n", "a".repeat(PAGE_BYTES - 1));
+        let text = format!("{}\ntail\n", "a".repeat(budgets::read_page_bytes() - 1));
         let out = page(text.as_bytes(), r#"{"path":"file"}"#).unwrap();
         assert!(out.contains("offset=2"));
         assert!(!out.contains("truncated"));
@@ -264,10 +318,10 @@ mod tests {
     #[test]
     fn scanning_and_host_replies_are_bounded_and_failures_are_preserved() {
         let out = page(
-            &vec![b'x'; SCAN_BYTES as usize + 1],
+            &vec![b'x'; budgets::read_scan_bytes() as usize + 1],
             r#"{"path":"file","offset":2}"#,
         );
-        assert!(out.unwrap_err().contains("scan more than 64 MiB"));
+        assert!(out.unwrap_err().contains("configured scan limit"));
         assert!(read_with(r#"{"path":"file"}"#, |_, _, _, _| Ok((Vec::new(), false))).is_err());
         assert!(
             read_with(r#"{"path":"file"}"#, |_, _, _, _| Ok((

@@ -12,8 +12,10 @@ use saddle_cap::component::{Direction, check_component};
 use saddle_cap::delegate::{self, DelegationError};
 use saddle_cap::manifest::{Manifest, above_ceiling};
 use saddle_cap::{Grants, Principal, Scope};
+use saddle_limits::{self as budgets, Budgets};
 use saddle_wit::ReadToolPre;
 use saddle_wit::exports::saddle::plugin::tool::{Definition, Output};
+use saddle_wit::saddle::host::budgets::{self as budgets_interface, Host as BudgetsHost};
 use saddle_wit::saddle::host::exec::{self, Command, Host as ExecHost, Reply as ExecReply};
 use saddle_wit::saddle::host::fs_list::EntryKind;
 use saddle_wit::saddle::host::fs_list::{self, Host as ListHost, Page as DirectoryPage};
@@ -38,14 +40,13 @@ use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDea
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 /// native I/O must enforce this cap before allocating or reading the entire source.
-pub const MAX_FILE_BYTES: usize = 64 * 1024;
-pub const MAX_MUTATION_BYTES: usize = 1024 * 1024;
-pub const MAX_MUTATIONS: usize = 32;
-pub const MAX_DIRECTORY_ENTRIES: usize = 128;
-pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
-pub const MAX_QUERY_BYTES: usize = 16 * 1024;
-pub const MAX_QUERY_RESULT_BYTES: usize = 50 * 1024;
-const MAX_COMPONENT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_FILE_BYTES: usize = budgets::DEFAULTS.range_bytes;
+pub const MAX_MUTATION_BYTES: usize = budgets::DEFAULTS.mutation_bytes;
+pub const MAX_MUTATIONS: usize = budgets::DEFAULTS.mutation_changes;
+pub const MAX_DIRECTORY_ENTRIES: usize = budgets::DEFAULTS.directory_page_entries;
+pub const MAX_IMAGE_BYTES: usize = budgets::DEFAULTS.image_bytes;
+pub const MAX_QUERY_BYTES: usize = budgets::DEFAULTS.query_bytes;
+pub const MAX_QUERY_RESULT_BYTES: usize = budgets::DEFAULTS.query_result_bytes;
 const TICK: Duration = Duration::from_millis(10);
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +75,7 @@ fn runtime(stage: &'static str) -> impl FnOnce(anyhow::Error) -> Error {
 /// host-chosen bounds; callers may lower them, never let the guest choose them.
 #[derive(Clone, Debug)]
 pub struct Limits {
+    pub budgets: Budgets,
     pub memory_bytes: usize,
     pub fuel: u64,
     pub timeout: Duration,
@@ -83,12 +85,20 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
+        Self::from_budgets(Budgets::default())
+    }
+}
+
+impl Limits {
+    /// construct an envelope and its SDK-visible profile from one configuration.
+    pub fn from_budgets(budgets: Budgets) -> Self {
         Self {
-            memory_bytes: 16 * 1024 * 1024,
-            fuel: 100_000_000,
-            timeout: Duration::from_secs(2),
-            input_bytes: 64 * 1024,
-            output_bytes: 64 * 1024,
+            memory_bytes: budgets.plugin_memory_bytes,
+            fuel: budgets.plugin_fuel,
+            timeout: Duration::from_millis(budgets.plugin_timeout_ms as u64),
+            input_bytes: budgets.plugin_input_bytes,
+            output_bytes: budgets.plugin_output_bytes,
+            budgets,
         }
     }
 }
@@ -96,6 +106,7 @@ impl Default for Limits {
 /// identity and effective reach assigned by the host, never by guest arguments.
 pub struct Invocation {
     principal: Principal,
+    budgets: Budgets,
     id: u64,
     grants: Arc<Grants>,
     cancelled: Arc<AtomicBool>,
@@ -274,6 +285,7 @@ struct State<H> {
     wasi: WasiCtx,
     resources: ResourceTable,
     emitted_images: usize,
+    emitted_image_bytes: usize,
     host_time_left: Duration,
     host_calls: usize,
 }
@@ -284,9 +296,12 @@ impl<H: HostServices> State<H> {
         allowance: Duration,
         operation: impl FnOnce(&mut H, &Invocation, Duration) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        if self.call.cancelled() || Instant::now() >= self.call.deadline || self.host_calls >= 16 {
+        if self.call.cancelled()
+            || Instant::now() >= self.call.deadline
+            || self.host_calls >= budgets::host_calls()
+        {
             return Err(anyhow!(
-                "plugin call cancelled, timed out or exceeds 16 long host calls"
+                "plugin call cancelled, timed out or exceeds configured host call limit"
             ));
         }
         let allowance = allowance.min(self.host_time_left);
@@ -309,11 +324,17 @@ impl<H: HostServices> State<H> {
     }
 }
 
+impl<H: HostServices> BudgetsHost for State<H> {
+    fn read(&mut self) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(&self.call.budgets)?)
+    }
+}
+
 impl<H: HostServices> ExecHost for State<H> {
     fn run(&mut self, mut request: Command) -> anyhow::Result<Result<ExecReply, String>> {
         if request.argv.is_empty()
-            || request.argv.len() > 128
-            || request.argv.iter().map(String::len).sum::<usize>() > MAX_FILE_BYTES
+            || request.argv.len() > budgets::exec_arguments()
+            || request.argv.iter().map(String::len).sum::<usize>() > budgets::exec_argument_bytes()
             || request.argv.iter().any(|s| s.contains('\0'))
         {
             return Ok(Err("invalid command or exceeds argument bounds".into()));
@@ -324,17 +345,22 @@ impl<H: HostServices> ExecHost for State<H> {
             .exec
             .as_ref()
             .map_or(Duration::ZERO, |grant| grant.timeout);
-        let timeout = Duration::from_secs(request.timeout_secs.clamp(1, 300)).min(granted);
+        let timeout = Duration::from_secs(
+            request
+                .timeout_secs
+                .clamp(1, budgets::exec_seconds() as u64),
+        )
+        .min(granted);
         let result = self.host_wait(timeout, |host, call, allowance| {
             request.timeout_secs = allowance.as_secs().max(1);
             host.execute(call, request)
         })?;
-        if matches!(&result, Ok(reply) if reply.stdout.len() > 256*1024 || reply.stderr.len() > 256*1024 || reply.denials.iter().chain(&reply.restored).map(String::len).sum::<usize>() > MAX_FILE_BYTES)
+        if matches!(&result, Ok(reply) if reply.stdout.len() > budgets::exec_capture_bytes() || reply.stderr.len() > budgets::exec_capture_bytes() || reply.denials.iter().chain(&reply.restored).map(String::len).sum::<usize>() > budgets::metadata_bytes())
         {
             return Ok(Err("execution reply exceeds bounds".into()));
         }
-        if matches!(&result, Err(why) if why.len() > MAX_FILE_BYTES) {
-            return Ok(Err("host error exceeds 64 KiB".into()));
+        if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
+            return Ok(Err("host error exceeds configured byte limit".into()));
         }
         Ok(result)
     }
@@ -342,26 +368,27 @@ impl<H: HostServices> ExecHost for State<H> {
 
 impl<H: HostServices> HttpHost for State<H> {
     fn get(&mut self, request: HttpRequest) -> anyhow::Result<Result<HttpResponse, String>> {
-        if request.url.len() > 8192
-            || request.headers.len() > 64
+        if request.url.len() > budgets::url_bytes()
+            || request.headers.len() > budgets::http_headers()
             || request
                 .headers
                 .iter()
                 .map(|h| h.name.len() + h.value.len())
                 .sum::<usize>()
-                > MAX_FILE_BYTES
+                > budgets::http_header_bytes()
         {
             return Ok(Err("HTTP request exceeds bounds".into()));
         }
-        let result = self.host_wait(Duration::from_secs(30), |host, call, _| {
-            host.http_get(call, request)
-        })?;
-        if matches!(&result, Ok(reply) if reply.body.len() > 100*1024 || reply.headers.len() > 64 || reply.headers.iter().map(|h|h.name.len()+h.value.len()).sum::<usize>() > MAX_FILE_BYTES)
+        let result = self.host_wait(
+            Duration::from_secs(budgets::network_seconds() as u64),
+            |host, call, _| host.http_get(call, request),
+        )?;
+        if matches!(&result, Ok(reply) if reply.body.len() > budgets::http_capture_bytes() || reply.headers.len() > budgets::http_headers() || reply.headers.iter().map(|h|h.name.len()+h.value.len()).sum::<usize>() > budgets::http_header_bytes())
         {
             return Ok(Err("HTTP response exceeds bounds".into()));
         }
-        if matches!(&result, Err(why) if why.len() > MAX_FILE_BYTES) {
-            return Ok(Err("host error exceeds 64 KiB".into()));
+        if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
+            return Ok(Err("host error exceeds configured byte limit".into()));
         }
         Ok(result)
     }
@@ -373,18 +400,21 @@ impl<H: HostServices> SearchHost for State<H> {
         query: String,
         count: u32,
     ) -> anyhow::Result<Result<SearchSnapshot, String>> {
-        if query.len() > 16384 || !(1..=100).contains(&count) {
+        if query.len() > budgets::web_query_bytes()
+            || !(1..=budgets::web_results() as u32).contains(&count)
+        {
             return Ok(Err("invalid search query/count or exceeds 16 KiB".into()));
         }
-        let result = self.host_wait(Duration::from_secs(30), |host, call, _| {
-            host.search_web(call, query, count)
-        })?;
-        if matches!(&result, Ok(snapshot) if snapshot.body.len() > 1024*1024 || snapshot.query.len() > 16384 || snapshot.provider.len() > 1024 || snapshot.via.len() > 64)
+        let result = self.host_wait(
+            Duration::from_secs(budgets::network_seconds() as u64),
+            |host, call, _| host.search_web(call, query, count),
+        )?;
+        if matches!(&result, Ok(snapshot) if snapshot.body.len() > budgets::search_response_bytes() || snapshot.query.len() > budgets::web_query_bytes() || snapshot.provider.len() > budgets::metadata_bytes() || snapshot.via.len() > budgets::metadata_bytes())
         {
             return Ok(Err("search response exceeds bounds".into()));
         }
-        if matches!(&result, Err(why) if why.len() > MAX_FILE_BYTES) {
-            return Ok(Err("host error exceeds 64 KiB".into()));
+        if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
+            return Ok(Err("host error exceeds configured byte limit".into()));
         }
         Ok(result)
     }
@@ -392,12 +422,12 @@ impl<H: HostServices> SearchHost for State<H> {
         let result = self.host_wait(Duration::from_secs(1), |host, call, _| {
             host.last_search(call)
         })?;
-        if matches!(&result, Ok(Some(snapshot)) if snapshot.body.len() > 1024*1024 || snapshot.query.len() > 16384 || snapshot.provider.len() > 1024 || snapshot.via.len() > 64)
+        if matches!(&result, Ok(Some(snapshot)) if snapshot.body.len() > budgets::search_response_bytes() || snapshot.query.len() > budgets::web_query_bytes() || snapshot.provider.len() > budgets::metadata_bytes() || snapshot.via.len() > budgets::metadata_bytes())
         {
             return Ok(Err("search snapshot exceeds bounds".into()));
         }
-        if matches!(&result, Err(why) if why.len() > MAX_FILE_BYTES) {
-            return Ok(Err("host error exceeds 64 KiB".into()));
+        if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
+            return Ok(Err("host error exceeds configured byte limit".into()));
         }
         Ok(result)
     }
@@ -418,7 +448,7 @@ impl<H: HostServices> Host for State<H> {
             return Err(anyhow!("plugin call cancelled or timed out"));
         }
         let result = self.host.read_file(&self.call, path)?;
-        if matches!(&result, Ok(bytes) if bytes.len() > MAX_FILE_BYTES) {
+        if matches!(&result, Ok(bytes) if bytes.len() > budgets::range_bytes()) {
             return Ok(Err(Failure::TooLarge));
         }
         Ok(result)
@@ -430,11 +460,12 @@ impl<H: HostServices> TranscriptHost for State<H> {
         if self.call.cancelled() || Instant::now() >= self.call.deadline {
             return Err(anyhow!("plugin call cancelled or timed out"));
         }
-        if sql.len() > MAX_QUERY_BYTES {
+        if sql.len() > budgets::query_bytes() {
             return Ok(Err("transcript SQL exceeds 16 KiB".into()));
         }
         let result = self.host.query_transcript(&self.call, sql)?;
-        if matches!(&result, Ok(value) | Err(value) if value.len() > MAX_QUERY_RESULT_BYTES) {
+        if matches!(&result, Ok(value) | Err(value) if value.len() > budgets::query_result_bytes())
+        {
             return Ok(Err("transcript result exceeds 50 KiB".into()));
         }
         Ok(result)
@@ -446,13 +477,13 @@ impl<H: HostServices> WriteHost for State<H> {
         if self.call.cancelled() || Instant::now() >= self.call.deadline {
             return Err(anyhow!("plugin call cancelled or timed out"));
         }
-        if changes.is_empty() || changes.len() > MAX_MUTATIONS
-            || changes.iter().any(|change| change.path.len() > 4096 || matches!(&change.expected, Expectation::Sha256(hash) if hash.len() != 64 || !hash.bytes().all(|c| c.is_ascii_hexdigit())))
-            || changes.iter().map(|change| change.content.as_ref().map_or(0, Vec::len)).sum::<usize>() > MAX_MUTATION_BYTES {
-            return Ok(Err("invalid mutation batch or exceeds 32 paths/1 MiB".into()));
+        if changes.is_empty() || changes.len() > budgets::mutation_changes()
+            || changes.iter().any(|change| change.path.len() > budgets::path_bytes() || matches!(&change.expected, Expectation::Sha256(hash) if hash.len() != 64 || !hash.bytes().all(|c| c.is_ascii_hexdigit())))
+            || changes.iter().map(|change| change.content.as_ref().map_or(0, Vec::len)).sum::<usize>() > budgets::mutation_bytes() {
+            return Ok(Err("invalid mutation batch or exceeds configured path/byte limit".into()));
         }
         let result = self.host.apply_changes(&self.call, changes)?;
-        if matches!(&result, Err(why) if why.len() > MAX_FILE_BYTES) {
+        if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
             return Ok(Err("mutation error exceeds host result limit".into()));
         }
         Ok(result)
@@ -470,7 +501,7 @@ impl<H: HostServices> RangeHost for State<H> {
             return Err(anyhow!("plugin call cancelled or timed out"));
         }
         let result = self.host.read_range(&self.call, path, offset, limit)?;
-        if matches!(&result, Ok(chunk) if chunk.bytes.len() > MAX_FILE_BYTES || chunk.bytes.len() as u64 > u64::from(limit))
+        if matches!(&result, Ok(chunk) if chunk.bytes.len() > budgets::range_bytes() || chunk.bytes.len() as u64 > u64::from(limit))
         {
             return Ok(Err(Failure::TooLarge));
         }
@@ -486,7 +517,7 @@ impl<H: HostServices> PathsHost for State<H> {
             )));
         }
         let result = self.host.label_root(&self.call, root)?;
-        if matches!(&result,Ok(label) if label.len() > 8192) {
+        if matches!(&result,Ok(label) if label.len() > budgets::metadata_bytes()) {
             return Ok(Err(Failure::TooLarge));
         }
         Ok(result)
@@ -496,7 +527,8 @@ impl<H: HostServices> PathsHost for State<H> {
             return Err(anyhow!("plugin call cancelled or timed out"));
         }
         let result = self.host.resolve_path(&self.call, value)?;
-        if matches!(&result, Ok(path) if path.root.len() > 64 || path.relative.len() > 4096) {
+        if matches!(&result, Ok(path) if path.root.len() > 64 || path.relative.len() > budgets::path_bytes())
+        {
             return Ok(Err(Failure::TooLarge));
         }
         Ok(result)
@@ -514,7 +546,7 @@ impl<H: HostServices> ListHost for State<H> {
             return Err(anyhow!("plugin call cancelled or timed out"));
         }
         let result = self.host.read_directory(&self.call, path, after, limit)?;
-        if matches!(&result, Ok(page) if page.entries.len() > MAX_DIRECTORY_ENTRIES || page.entries.len() as u64 > u64::from(limit) || page.entries.iter().map(|entry| entry.name.len()).sum::<usize>() > MAX_FILE_BYTES)
+        if matches!(&result, Ok(page) if page.entries.len() > budgets::directory_page_entries() || page.entries.len() as u64 > u64::from(limit) || page.entries.iter().map(|entry| entry.name.len()).sum::<usize>() > budgets::metadata_bytes())
         {
             return Ok(Err(Failure::TooLarge));
         }
@@ -536,13 +568,13 @@ impl<H: HostServices> ToolPathsHost for State<H> {
         if self.call.cancelled() || Instant::now() >= self.call.deadline {
             return Err(anyhow!("plugin call cancelled or timed out"));
         }
-        if value.len() > 4096 {
+        if value.len() > budgets::path_bytes() {
             return Ok(Err(ToolFailure::TooLarge));
         }
         let result = self.host.resolve_tool_path(&self.call, value)?;
         Ok(result
             .and_then(|path| {
-                if path.root.len() > 64 || path.relative.len() > 4096 {
+                if path.root.len() > 64 || path.relative.len() > budgets::path_bytes() {
                     return Err(Failure::TooLarge);
                 }
                 Ok(ToolPath {
@@ -562,9 +594,9 @@ impl<H: HostServices> ToolPathsHost for State<H> {
             return Err(anyhow!("plugin call cancelled or timed out"));
         }
         if limit == 0
-            || limit as usize > MAX_FILE_BYTES
+            || limit as usize > budgets::range_bytes()
             || path.root.len() > 64
-            || path.relative.len() > 4096
+            || path.relative.len() > budgets::path_bytes()
         {
             return Ok(Err(ToolFailure::TooLarge));
         }
@@ -599,10 +631,10 @@ impl<H: HostServices> ToolPathsHost for State<H> {
             return Err(anyhow!("plugin call cancelled or timed out"));
         }
         if limit == 0
-            || limit as usize > MAX_DIRECTORY_ENTRIES
-            || after.len() > 1024
+            || limit as usize > budgets::directory_page_entries()
+            || after.len() > budgets::directory_name_bytes()
             || path.root.len() > 64
-            || path.relative.len() > 4096
+            || path.relative.len() > budgets::path_bytes()
         {
             return Ok(Err(ToolFailure::TooLarge));
         }
@@ -623,7 +655,7 @@ impl<H: HostServices> ToolPathsHost for State<H> {
                         .iter()
                         .map(|entry| entry.name.len())
                         .sum::<usize>()
-                        > MAX_FILE_BYTES
+                        > budgets::metadata_bytes()
                 {
                     return Err(Failure::TooLarge);
                 }
@@ -655,8 +687,8 @@ impl<H: HostServices> ResultHost for State<H> {
         if self.call.cancelled() || Instant::now() >= self.call.deadline {
             return Err(anyhow!("plugin call cancelled or timed out"));
         }
-        if text.len() > MAX_FILE_BYTES {
-            return Ok(Err("diff exceeds 64 KiB".into()));
+        if text.len() > budgets::diff_bytes() {
+            return Ok(Err("diff exceeds configured byte limit".into()));
         }
         self.host.emit_diff(&self.call, text)
     }
@@ -668,21 +700,27 @@ impl<H: HostServices> ResultHost for State<H> {
         if self.call.cancelled() || Instant::now() >= self.call.deadline {
             return Err(anyhow!("plugin call cancelled or timed out"));
         }
-        if name.len() > 256 || bytes.len() > MAX_IMAGE_BYTES || self.emitted_images != 0 {
+        if name.len() > budgets::image_name_bytes()
+            || bytes.len().saturating_add(self.emitted_image_bytes) > budgets::image_bytes()
+            || self.emitted_images >= budgets::image_count()
+        {
             return Ok(Err("image result exceeds name, byte or count limit".into()));
         }
+        let byte_count = bytes.len();
         let result = self.host.emit_image(&self.call, name, bytes)?;
         if let Ok(info) = &result {
             if info.media_type.len() > 64 {
                 return Ok(Err("invalid image metadata".into()));
             }
             self.emitted_images += 1;
+            self.emitted_image_bytes += byte_count;
         }
         Ok(result)
     }
 }
 
 struct Runtime {
+    stack_bytes: usize,
     engine: Engine,
     stop: Arc<AtomicBool>,
     ticker: Option<JoinHandle<()>>,
@@ -704,12 +742,18 @@ pub struct Loader(Arc<Runtime>);
 
 impl Loader {
     pub fn new() -> Result<Self, Error> {
+        Self::with_budgets(&Budgets::default())
+    }
+
+    /// construct the engine with a protected stack budget; callers must provide sufficient native stack.
+    pub fn with_budgets(budgets: &Budgets) -> Result<Self, Error> {
+        budgets.validate().map_err(Error::Refused)?;
         let mut config = Config::new();
         config
             .wasm_component_model(true)
             .consume_fuel(true)
             .epoch_interruption(true);
-        config.max_wasm_stack(512 * 1024);
+        config.max_wasm_stack(budgets.plugin_stack_bytes);
         let engine = Engine::new(&config).map_err(runtime("creating component engine"))?;
         let stop = Arc::new(AtomicBool::new(false));
         let clock_stop = stop.clone();
@@ -727,6 +771,7 @@ impl Loader {
                 detail: e.to_string(),
             })?;
         Ok(Self(Arc::new(Runtime {
+            stack_bytes: budgets.plugin_stack_bytes,
             engine,
             stop,
             ticker: Some(ticker),
@@ -744,10 +789,23 @@ impl Loader {
         agent: &Grants,
         requested: &Grants,
         bytes: &[u8],
-        limits: Limits,
+        mut limits: Limits,
     ) -> Result<Prepared<H>, Error> {
-        if bytes.len() > MAX_COMPONENT_BYTES {
-            return Err(Error::Size(MAX_COMPONENT_BYTES));
+        // Compatibility envelope fields are normalized into the public per-call snapshot.
+        limits.budgets.plugin_memory_bytes = limits.memory_bytes;
+        limits.budgets.plugin_fuel = limits.fuel;
+        limits.budgets.plugin_timeout_ms = usize::try_from(limits.timeout.as_millis())
+            .map_err(|_| Error::Refused("plugin timeout does not fit the ABI".into()))?;
+        limits.budgets.plugin_input_bytes = limits.input_bytes;
+        limits.budgets.plugin_output_bytes = limits.output_bytes;
+        if limits.budgets.plugin_stack_bytes != self.0.stack_bytes {
+            return Err(Error::Refused(
+                "stack budget must match the loader engine".into(),
+            ));
+        }
+        limits.budgets.validate().map_err(Error::Refused)?;
+        if bytes.len() > limits.budgets.plugin_component_bytes {
+            return Err(Error::Size(limits.budgets.plugin_component_bytes));
         }
         let above = above_ceiling(manifest, requested);
         if !above.is_empty() {
@@ -781,6 +839,7 @@ impl Loader {
             if !matches!(
                 name.as_str(),
                 "saddle:host/fs-read@0.1.0"
+                    | "saddle:host/budgets@0.1.0"
                     | "saddle:host/exec@0.1.0"
                     | "saddle:host/http@0.1.0"
                     | "saddle:host/web-search@0.1.0"
@@ -831,6 +890,10 @@ impl Loader {
                 .map_err(runtime("linking tool-paths"))?;
         }
         if scopes.contains(&Scope::Tool) {
+            budgets_interface::add_to_linker::<State<H>, HasSelf<State<H>>>(&mut linker, |state| {
+                state
+            })
+            .map_err(runtime("linking resource budgets"))?;
             tool_result::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
                 .map_err(runtime("linking tool-result"))?;
         }
@@ -927,6 +990,11 @@ impl<H: HostServices> Prepared<H> {
         Ok(())
     }
 
+    /// native stack the caller must reserve in addition to its own host frame allowance.
+    pub fn stack_bytes(&self) -> usize {
+        self.limits.budgets.plugin_stack_bytes
+    }
+
     pub fn hash(&self) -> &[u8; 32] {
         &self.hash
     }
@@ -945,6 +1013,7 @@ impl<H: HostServices> Prepared<H> {
             host,
             call: Invocation {
                 principal: self.principal.clone(),
+                budgets: self.limits.budgets.clone(),
                 id: self.runtime.next_call.fetch_add(1, Ordering::Relaxed),
                 grants: self.grants.clone(),
                 cancelled,
@@ -952,22 +1021,23 @@ impl<H: HostServices> Prepared<H> {
             },
             limits: StoreLimitsBuilder::new()
                 .memory_size(self.limits.memory_bytes)
-                .table_elements(10_000)
-                .instances(32)
-                .memories(4)
-                .tables(8)
+                .table_elements(self.limits.budgets.plugin_table_elements)
+                .instances(self.limits.budgets.plugin_instances)
+                .memories(self.limits.budgets.plugin_memories)
+                .tables(self.limits.budgets.plugin_tables)
                 .trap_on_grow_failure(true)
                 .build(),
             wasi: WasiCtx::builder()
-                .max_random_size(MAX_FILE_BYTES as u64)
+                .max_random_size(self.limits.budgets.plugin_random_bytes as u64)
                 .build(),
             resources: {
                 let mut table = ResourceTable::new();
-                table.set_max_capacity(128);
+                table.set_max_capacity(self.limits.budgets.plugin_resources);
                 table
             },
             emitted_images: 0,
-            host_time_left: Duration::from_secs(300),
+            emitted_image_bytes: 0,
+            host_time_left: Duration::from_secs(self.limits.budgets.host_wait_seconds as u64),
             host_calls: 0,
         };
         let mut store = Store::new(&self.runtime.engine, state);
@@ -988,6 +1058,12 @@ impl<H: HostServices> Prepared<H> {
     }
 
     pub fn describe(&self, host: H, cancelled: Arc<AtomicBool>) -> Result<Definition, Error> {
+        budgets::using(&self.limits.budgets, || {
+            self.describe_inner(host, cancelled)
+        })
+    }
+
+    fn describe_inner(&self, host: H, cancelled: Arc<AtomicBool>) -> Result<Definition, Error> {
         let mut store = self.store(host, cancelled)?;
         let guest = self
             .pre
@@ -1010,6 +1086,17 @@ impl<H: HostServices> Prepared<H> {
     }
 
     pub fn invoke(
+        &self,
+        host: H,
+        arguments: &str,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Output, Error> {
+        budgets::using(&self.limits.budgets, || {
+            self.invoke_inner(host, arguments, cancelled)
+        })
+    }
+
+    fn invoke_inner(
         &self,
         host: H,
         arguments: &str,
@@ -1681,7 +1768,7 @@ mod tests {
                 &bytes,
                 Limits {
                     fuel: u64::MAX,
-                    timeout: Duration::from_secs(30),
+                    timeout: Duration::from_secs(budgets::network_seconds() as u64),
                     ..Limits::default()
                 },
             )
@@ -1913,8 +2000,16 @@ mod tests {
         let bytes = fs::read(component)
             .expect("build and componentize the SDK example first; see docs/plugins.md");
         let loader = Loader::new().unwrap();
+        // Debug DWARF can exceed the shipping-component default; exercise the configurable cap.
+        let limits = Limits {
+            budgets: Budgets {
+                plugin_component_bytes: bytes.len().max(budgets::DEFAULTS.plugin_component_bytes),
+                ..Budgets::default()
+            },
+            ..Limits::default()
+        };
         let prepared = loader
-            .prepare::<Files>(&manifest(), &agent, &plugin, &bytes, Limits::default())
+            .prepare::<Files>(&manifest(), &agent, &plugin, &bytes, limits)
             .unwrap();
         let host = files(&dir, prepared.grants());
         assert_eq!(

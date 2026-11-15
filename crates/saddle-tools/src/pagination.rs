@@ -3,9 +3,8 @@
 use memchr::memchr_iter;
 use std::str;
 
-use crate::{Arguments, PAGE_BYTES, PAGE_LINES, ReadFormat, SCAN_BYTES};
-
-const RANGE_BYTES: u32 = 65536;
+use crate::{Arguments, ReadFormat};
+use saddle_limits as budgets;
 
 struct Page {
     first: u64,
@@ -27,7 +26,7 @@ impl Page {
             self.line_last = Some(*last);
         }
         if !self.stopped && self.total + 1 >= self.first {
-            let room = (PAGE_BYTES + 1).saturating_sub(self.prefix.len());
+            let room = ((budgets::read_page_bytes()) + 1).saturating_sub(self.prefix.len());
             self.prefix
                 .extend_from_slice(&bytes[..bytes.len().min(room)]);
         }
@@ -38,10 +37,11 @@ impl Page {
         if !self.stopped && self.total >= self.first {
             if self.selected >= self.want {
                 self.stopped = true;
-            } else if self.body.len() as u64 + len + 1 > PAGE_BYTES as u64 {
+            } else if self.body.len() as u64 + len + 1 > (budgets::read_page_bytes()) as u64 {
                 self.stopped = true;
                 if self.selected == 0 {
-                    self.prefix.truncate(PAGE_BYTES.min(len as usize));
+                    self.prefix
+                        .truncate((budgets::read_page_bytes()).min(len as usize));
                     let valid = match str::from_utf8(&self.prefix) {
                         Ok(_) => self.prefix.len(),
                         Err(error) if error.error_len().is_none() => error.valid_up_to(),
@@ -90,7 +90,7 @@ pub fn read_with(
     }
     let mut page = Page {
         first: args.offset,
-        want: args.limit.min(PAGE_LINES),
+        want: args.limit.min(budgets::read_page_lines() as u64),
         total: 0,
         selected: 0,
         last: args.offset - 1,
@@ -107,12 +107,14 @@ pub fn read_with(
     let mut pending = Vec::new();
     let mut ended_newline = false;
     loop {
-        if offset >= SCAN_BYTES {
+        if offset >= (budgets::read_scan_bytes() as u64) {
             return Err(
-                "read would scan more than 64 MiB; use a narrower file or byte-range reader".into(),
+                "read exceeds configured scan limit; use a narrower file or byte-range reader"
+                    .into(),
             );
         }
-        let want = RANGE_BYTES.min((SCAN_BYTES - offset) as u32);
+        let want = (budgets::range_bytes() as u32)
+            .min(((budgets::read_scan_bytes() as u64) - offset) as u32);
         let (bytes, eof) = read(&args.root, &args.path, offset, want)?;
         if bytes.len() > want as usize || (bytes.is_empty() && !eof) {
             return Err("invalid reply from range service".into());
@@ -132,7 +134,7 @@ pub fn read_with(
             }
             Err(_) => return Err("file is not UTF-8".into()),
         }
-        let room = PAGE_BYTES.saturating_sub(original.len());
+        let room = (budgets::read_page_bytes()).saturating_sub(original.len());
         original.extend_from_slice(&bytes[..bytes.len().min(room)]);
         let mut start = 0;
         for newline in memchr_iter(b'\n', &bytes) {
@@ -164,7 +166,8 @@ pub fn read_with(
         ));
     }
     let more = page.last < page.total;
-    if !more && page.first == 1 && !page.truncated && offset <= PAGE_BYTES as u64 {
+    if !more && page.first == 1 && !page.truncated && offset <= (budgets::read_page_bytes()) as u64
+    {
         return String::from_utf8(original).map_err(|_| "file is not UTF-8".into());
     }
     if !more && ended_newline {

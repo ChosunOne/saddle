@@ -3,6 +3,10 @@
 use globset::{GlobBuilder, GlobMatcher};
 use regex::RegexBuilder;
 use saddle_ignore::{FILES, Rules};
+use saddle_limits as budgets;
+#[cfg(target_arch = "wasm32")]
+#[cfg(target_arch = "wasm32")]
+use saddle_sdk::configure_limits;
 use saddle_sdk::{DirectoryPage, EntryKind};
 use serde::Deserialize;
 
@@ -13,15 +17,6 @@ use crate::workspace;
 use saddle_sdk::{Definition, FilePath, Output, Tool, label_root, read_directory, read_range};
 #[cfg(target_arch = "wasm32")]
 use serde_json::{Value, json};
-
-const MAX_VISITED: usize = 100_000;
-const MAX_PENDING: usize = 2048;
-const MAX_PATH_BYTES: usize = 1024 * 1024;
-const MAX_TEXT: usize = 50 * 1024;
-const MAX_FILE: usize = 4 * 1024 * 1024;
-const MAX_IGNORES: usize = 128 * 1024;
-const MAX_FOUND: usize = 1000;
-const MAX_MATCHES: usize = 200;
 
 pub struct Find;
 pub struct Grep;
@@ -49,7 +44,7 @@ impl Filesystem for HostFilesystem {
                 relative: path.into(),
             },
             after,
-            128,
+            budgets::directory_page_entries() as u32,
         )
         .map_err(|error| format!("directory read failed: {error:?}"))
     }
@@ -60,7 +55,7 @@ impl Filesystem for HostFilesystem {
         };
         let mut bytes = Vec::new();
         loop {
-            let limit = (maximum - bytes.len()).min(65536) as u32;
+            let limit = (maximum - bytes.len()).min(budgets::range_bytes()) as u32;
             if limit == 0 {
                 return Ok(FileRead::TooLarge);
             }
@@ -125,9 +120,15 @@ fn output(result: Result<String, String>) -> Output {
 #[cfg(target_arch = "wasm32")]
 impl Tool for Find {
     fn describe() -> Definition {
-        Definition { name: "find".into(), description: "find files using a glob under a granted directory. A glob without / matches filenames at any depth; one with / matches paths from the search directory. Honors .gitignore, .ignore and .fdignore; never follows symlinks. At most 1000 results and 50 KiB.".into(), input_schema: json!({"type":"object","properties":{"root":{"type":"string"},"path":{"type":"string"},"pattern":{"type":"string"}},"required":["pattern"],"additionalProperties":false}).to_string() }
+        Definition { name: "find".into(), description: "find files using a glob under a granted directory. A glob without / matches filenames at any depth; one with / matches paths from the search directory. Honors .gitignore, .ignore and .fdignore; never follows symlinks. Result and text budgets are host-configurable.".into(), input_schema: json!({"type":"object","properties":{"root":{"type":"string"},"path":{"type":"string"},"pattern":{"type":"string"}},"required":["pattern"],"additionalProperties":false}).to_string() }
     }
     fn invoke(arguments: String) -> Output {
+        if let Err(text) = configure_limits() {
+            return Output {
+                text,
+                is_error: true,
+            };
+        }
         output(
             normalize_search_path(&arguments)
                 .and_then(|arguments| find_with(&arguments, &mut HostFilesystem)),
@@ -137,9 +138,15 @@ impl Tool for Find {
 #[cfg(target_arch = "wasm32")]
 impl Tool for Grep {
     fn describe() -> Definition {
-        Definition { name: "grep".into(), description: "search UTF-8 files with a regular expression, optional filename/path glob and ignore_case. Returns path:line: text. Honors ignore files, skips .git, symlinks, binary/unreadable files and files above 4 MiB. At most 200 matches and 50 KiB; search a subdirectory for large trees.".into(), input_schema: json!({"type":"object","properties":{"root":{"type":"string"},"path":{"type":"string"},"pattern":{"type":"string"},"glob":{"type":"string"},"ignore_case":{"type":"boolean"}},"required":["pattern"],"additionalProperties":false}).to_string() }
+        Definition { name: "grep".into(), description: "search UTF-8 files with a regular expression, optional filename/path glob and ignore_case. Returns path:line: text. Honors ignore files, skips .git, symlinks, binary/unreadable files and files above the configured size budget. Match and text budgets are host-configurable; search a subdirectory for large trees.".into(), input_schema: json!({"type":"object","properties":{"root":{"type":"string"},"path":{"type":"string"},"pattern":{"type":"string"},"glob":{"type":"string"},"ignore_case":{"type":"boolean"}},"required":["pattern"],"additionalProperties":false}).to_string() }
     }
     fn invoke(arguments: String) -> Output {
+        if let Err(text) = configure_limits() {
+            return Output {
+                text,
+                is_error: true,
+            };
+        }
         output(
             normalize_search_path(&arguments)
                 .and_then(|arguments| grep_with(&arguments, &mut HostFilesystem)),
@@ -234,12 +241,12 @@ fn ignores(
     budget: &mut usize,
 ) -> Result<(), String> {
     for name in FILES {
-        match fs.file(root, &join(base, name), 65536)? {
+        match fs.file(root, &join(base, name), budgets::search_ignore_file_bytes())? {
             FileRead::Bytes(bytes) => {
                 *budget += bytes.len();
-                if *budget > MAX_IGNORES {
+                if *budget > budgets::search_ignore_bytes() {
                     return Err(
-                        "ignore files exceed the 128 KiB parsing budget; search a subdirectory"
+                        "ignore files exceed the configured parsing budget; search a subdirectory"
                             .into(),
                     );
                 }
@@ -248,7 +255,9 @@ fn ignores(
                 }
             }
             FileRead::TooLarge => {
-                return Err("an ignore file exceeds 64 KiB; narrow the search".into());
+                return Err(
+                    "an ignore file exceeds the configured byte limit; narrow the search".into(),
+                );
             }
             FileRead::Unavailable => {}
         }
@@ -293,7 +302,9 @@ fn walk<F: Filesystem>(
                     break;
                 }
             };
-            if page.entries.len() > 128 || (page.more && page.entries.is_empty()) {
+            if page.entries.len() > budgets::directory_page_entries()
+                || (page.more && page.entries.is_empty())
+            {
                 return Err("invalid directory page".into());
             }
             result.skipped = result
@@ -304,13 +315,13 @@ fn walk<F: Filesystem>(
                 if entry.name <= after
                     || entry.name.contains(['/', '\0'])
                     || matches!(entry.name.as_str(), "." | "..")
-                    || entry.name.len() > 1024
+                    || entry.name.len() > budgets::directory_name_bytes()
                 {
                     return Err("invalid directory cursor or entry".into());
                 }
                 after = entry.name;
                 visited += 1;
-                if visited > MAX_VISITED {
+                if visited > budgets::search_visited() {
                     result.tree_limit = true;
                     return Ok(result);
                 }
@@ -323,8 +334,8 @@ fn walk<F: Filesystem>(
                     continue;
                 }
                 if is_dir {
-                    if stack.len() + children.len() >= MAX_PENDING
-                        || queued_bytes + child_bytes + path.len() > MAX_PATH_BYTES
+                    if stack.len() + children.len() >= budgets::search_pending()
+                        || queued_bytes + child_bytes + path.len() > budgets::search_path_bytes()
                     {
                         result.tree_limit = true;
                         return Ok(result);
@@ -373,7 +384,7 @@ pub fn find_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, St
             return Ok(true);
         }
         let path = shown(&args.root, path, args.display_root.as_deref());
-        if found >= MAX_FOUND || text.len() + path.len() + 1 > MAX_TEXT {
+        if found >= budgets::find_results() || text.len() + path.len() + 1 > budgets::text_bytes() {
             return Ok(false);
         }
         if found > 0 {
@@ -403,7 +414,7 @@ pub fn grep_with<F: Filesystem>(arguments: &str, fs: &mut F) -> Result<String, S
     let start = relative(&args.path)?;
     let regex = RegexBuilder::new(&args.pattern)
         .case_insensitive(args.ignore_case)
-        .size_limit(1 << 20)
+        .size_limit(budgets::search_regex_bytes())
         .dfa_size_limit(1 << 20)
         .build()
         .map_err(|error| format!("bad pattern: {error}"))?;
@@ -421,12 +432,14 @@ pub fn grep_with<F: Filesystem>(arguments: &str, fs: &mut F) -> Result<String, S
             }
             let contents = match contents {
                 Some(contents) => contents,
-                None => fs.file(&args.root, path, MAX_FILE)?,
+                None => fs.file(&args.root, path, budgets::search_file_bytes())?,
             };
             let FileRead::Bytes(bytes) = contents else {
                 return Ok(true);
             };
-            if bytes.len() > MAX_FILE || bytes.iter().take(8192).any(|byte| *byte == 0) {
+            if bytes.len() > budgets::search_file_bytes()
+                || bytes.iter().take(8192).any(|byte| *byte == 0)
+            {
                 return Ok(true);
             }
             let Ok(contents) = String::from_utf8(bytes) else {
@@ -438,7 +451,7 @@ pub fn grep_with<F: Filesystem>(arguments: &str, fs: &mut F) -> Result<String, S
                     continue;
                 }
                 let line = line.trim_end();
-                let mut end = line.len().min(300);
+                let mut end = line.len().min(budgets::grep_line_bytes());
                 while !line.is_char_boundary(end) {
                     end -= 1;
                 }
@@ -449,7 +462,9 @@ pub fn grep_with<F: Filesystem>(arguments: &str, fs: &mut F) -> Result<String, S
                     number + 1,
                     &line[..end]
                 );
-                if count >= MAX_MATCHES || text.len() + row.len() + 1 > MAX_TEXT {
+                if count >= budgets::grep_matches()
+                    || text.len() + row.len() + 1 > budgets::text_bytes()
+                {
                     return Ok(false);
                 }
                 if count > 0 {
@@ -465,7 +480,7 @@ pub fn grep_with<F: Filesystem>(arguments: &str, fs: &mut F) -> Result<String, S
     let direct = if start.is_empty() {
         FileRead::Unavailable
     } else {
-        fs.file(&args.root, &start, MAX_FILE)?
+        fs.file(&args.root, &start, budgets::search_file_bytes())?
     };
     let walked = match direct {
         FileRead::Bytes(_) | FileRead::TooLarge => Walk {
@@ -667,7 +682,8 @@ mod tests {
         let mut fs = Memory::default();
         fs.files.insert("binary".into(), b"hit\0".to_vec());
         fs.files.insert("invalid".into(), vec![255]);
-        fs.files.insert("large".into(), vec![b'x'; MAX_FILE + 1]);
+        fs.files
+            .insert("large".into(), vec![b'x'; budgets::search_file_bytes() + 1]);
         assert!(
             grep_with(r#"{"pattern":"hit"}"#, &mut fs)
                 .unwrap()

@@ -1436,6 +1436,143 @@ fn standard_search_keeps_credentials_private_and_snapshots_principal_scoped_acro
 
 #[test]
 #[ignore = "build the standard write component first; see docs/plugins.md"]
+fn one_writer_artifact_changes_resource_budgets_on_reload_without_changing_authority() {
+    let content = "x".repeat(70 * 1024);
+    let mut responses = Vec::new();
+    for turn in 0..3 {
+        responses.push(sse_response(&openai_sse(
+            "",
+            &[(
+                &format!("budget-{turn}"),
+                "plugin__reader__write",
+                json!({"path":"large", "content":content}),
+            )],
+        )));
+        responses.push(sse_response(&openai_sse("done", &[])));
+    }
+    let (base, seen) = serve(responses);
+    let env = Env::new(Api::Openai, &base);
+    let config = env.xdg.path().join("config/saddle/config.toml");
+    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/write-plugin/write.component.wasm");
+    let bytes = fs::read(component).expect("build the standard write component first");
+    plugin_fixture::configure(
+        &config,
+        &bytes,
+        "tool={}\nfs-write=[{root='workspace',exclude=['private']}]\n",
+    );
+    fs::write(
+        config.parent().unwrap().join("plugins/reader/plugin.toml"),
+        "id='reader'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes=['tool','fs-write']\n",
+    )
+    .unwrap();
+    let original = format!(
+        "{}\n[compaction]\nauto=false\nbackground=false\nidle=false\n",
+        fs::read_to_string(&config).unwrap()
+    );
+    fs::write(
+        &config,
+        format!("{original}\n[tool-limits]\ndiff-present-bytes=1024\n"),
+    )
+    .unwrap();
+    let pin = sha256_hex(&bytes);
+    let mut child = env
+        .command(&["run", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Tool-call events include the large arguments: drain pipes while waiting for model POSTs.
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let output_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let error_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let wait_for = |count| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while seen.lock().unwrap().len() < count {
+            assert!(Instant::now() < deadline, "turn did not finish");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    child.stdin.as_mut().unwrap().write_all(b"first\n").unwrap();
+    wait_for(2);
+    assert!(!env.ws.path().join("large").exists());
+    fs::write(&config, format!("{original}\n[tool-limits]\nplugin-input-bytes=131072\nmutation-bytes=131072\ndiff-present-bytes=1024\n")).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"/reload\nsecond\n")
+        .unwrap();
+    wait_for(4);
+    assert_eq!(
+        fs::read_to_string(env.ws.path().join("large")).unwrap(),
+        content
+    );
+    fs::remove_file(env.ws.path().join("large")).unwrap();
+    fs::write(&config, format!("{original}\n[tool-limits]\nplugin-input-bytes=131072\nmutation-bytes=65536\ndiff-present-bytes=1024\n")).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/reload\nthird\n/quit\n")
+        .unwrap();
+    let status = child.wait().unwrap();
+    let out = Output {
+        status,
+        stdout: output_reader.join().unwrap(),
+        stderr: error_reader.join().unwrap(),
+    };
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!env.ws.path().join("large").exists());
+    assert_eq!(
+        fs::read(
+            config
+                .parent()
+                .unwrap()
+                .join("plugins/reader/component.wasm")
+        )
+        .unwrap(),
+        bytes
+    );
+    let final_config: toml::Table = fs::read_to_string(config).unwrap().parse().unwrap();
+    assert_eq!(
+        final_config["plugins"]["reader"]["sha256"]
+            .as_str()
+            .unwrap(),
+        pin
+    );
+    let seen = seen.lock().unwrap();
+    for turn in 0..3 {
+        let result = seen[turn * 2 + 1].body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["tool_call_id"] == format!("budget-{turn}"))
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(result.contains("wrote large"), turn == 1, "{result}");
+        if turn == 0 {
+            assert!(result.contains("65536"), "{result}");
+        }
+        if turn == 2 {
+            assert!(result.contains("configured"), "{result}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "build the standard write component first; see docs/plugins.md"]
 fn one_compiled_writer_changes_write_permissions_at_runtime_without_repinning() {
     writer_runtime_case(false);
     writer_runtime_case(true);

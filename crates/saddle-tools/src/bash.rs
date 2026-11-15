@@ -1,5 +1,8 @@
 //! shell workflow and bounded presentation over the delegated exec SDK (D142).
 
+use saddle_limits as budgets;
+#[cfg(target_arch = "wasm32")]
+use saddle_sdk::configure_limits;
 use std::fmt::Write as _;
 
 use saddle_sdk::ExecReply;
@@ -29,26 +32,26 @@ pub fn format_reply(reply: &ExecReply) -> (String, bool) {
     for (label, bytes) in [("stdout", &reply.stdout), ("stderr", &reply.stderr)] {
         if !bytes.is_empty() {
             let body = String::from_utf8_lossy(bytes);
-            let mut end = body.len().min(24 * 1024);
+            let mut end = body.len().min(budgets::exec_present_bytes());
             while !body.is_char_boundary(end) {
                 end -= 1;
             }
             let _ = writeln!(text, "--- {label} ---\n{}", body[..end].trim_end());
             if end < body.len() {
-                let _ = writeln!(text, "({label} presentation truncated at 24 KiB)");
+                let _ = writeln!(text, "({label} presentation truncated at configured limit)");
             }
         }
     }
     if reply.truncated {
-        text.push_str("(capture truncated at 256 KiB per stream)\n");
+        text.push_str("(capture truncated at configured per-stream limit)\n");
     }
-    for path in reply.restored.iter().take(16) {
+    for path in reply.restored.iter().take(budgets::exec_report_paths()) {
         let _ = writeln!(text, "restored reserved path {path}");
     }
-    for why in reply.denials.iter().take(8) {
+    for why in reply.denials.iter().take(budgets::exec_report_denials()) {
         let _ = writeln!(text, "--- net ---\n{why}");
     }
-    let mut end = text.len().min(60 * 1024);
+    let mut end = text.len().min(budgets::presentation_bytes());
     while !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -64,17 +67,23 @@ impl Tool for Bash {
     fn describe() -> Definition {
         Definition {
             name:"bash".into(),
-            description:"run sh -c in the workspace through the delegated exec sandbox. Filesystem/environment/net reach comes from this plugin's runtime grants and protected sandbox configuration, not the agent's broader grants. Network uses the policy proxy or falls back to none. Timeout is bounded by the grant and 300 seconds. Captures at most 256 KiB per stream; presents at most 24 KiB each. Cancellation kills the process group; reserved Git paths are restored.".into(),
-            input_schema:json!({"type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":"integer","minimum":1,"maximum":300}},"required":["command"],"additionalProperties":false}).to_string(),
+            description:"run sh -c in the workspace through the delegated exec sandbox. Filesystem/environment/net reach comes from this plugin's runtime grants and protected sandbox configuration, not the agent's broader grants. Network uses the policy proxy or falls back to none. Timeout is bounded by the grant and configured execution budget. Captures at most the configured per-stream capture budget; presentation is separately host-configurable. Cancellation kills the process group; reserved Git paths are restored.".into(),
+            input_schema:json!({"type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":"integer","minimum":1}},"required":["command"],"additionalProperties":false}).to_string(),
         }
     }
     fn invoke(arguments: String) -> Output {
+        if let Err(text) = configure_limits() {
+            return Output {
+                text,
+                is_error: true,
+            };
+        }
         let result = serde_json::from_str::<Arguments>(&arguments)
             .map_err(|error| format!("invalid arguments: {error}"))
             .and_then(|args| {
                 execute(&Command {
                     argv: vec!["sh".into(), "-c".into(), args.command],
-                    timeout_secs: args.timeout_secs.unwrap_or(300),
+                    timeout_secs: args.timeout_secs.unwrap_or(budgets::exec_seconds() as u64),
                 })
             });
         match result {

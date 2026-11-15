@@ -1,5 +1,9 @@
 //! mutable tool workflows over the same runtime-gated filesystem SDK (D140).
 
+use saddle_limits as budgets;
+#[cfg(target_arch = "wasm32")]
+#[cfg(target_arch = "wasm32")]
+use saddle_sdk::configure_limits;
 use saddle_sdk::{Change, Expectation};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -13,9 +17,6 @@ use serde_json::json;
 
 use crate::diff;
 use crate::patch::{self, Op};
-
-const MAX_BYTES: usize = 1024 * 1024;
-const MAX_CHANGES: usize = 32;
 
 pub struct Write;
 pub struct Edit;
@@ -32,7 +33,7 @@ struct HostFilesystem;
 #[cfg(target_arch = "wasm32")]
 impl Filesystem for HostFilesystem {
     fn present_diff(&mut self, text: &str) {
-        let mut end = text.len().min(60 * 1024);
+        let mut end = text.len().min(budgets::diff_present_bytes());
         while !text.is_char_boundary(end) {
             end -= 1;
         }
@@ -46,9 +47,9 @@ impl Filesystem for HostFilesystem {
         };
         let mut bytes = Vec::new();
         loop {
-            let want = (MAX_BYTES - bytes.len()).min(65536) as u32;
+            let want = (budgets::mutation_bytes() - bytes.len()).min(budgets::range_bytes()) as u32;
             if want == 0 {
-                return Err("mutation input file exceeds 1 MiB".into());
+                return Err("mutation input file exceeds configured limit".into());
             }
             let chunk = read_range(&path, bytes.len() as u64, want)
                 .map_err(|error| format!("read failed: {error:?}"))?;
@@ -91,17 +92,17 @@ fn hash(bytes: &[u8]) -> String {
 
 fn submit(fs: &mut impl Filesystem, changes: &[Change]) -> Result<(), String> {
     if changes.is_empty()
-        || changes.len() > MAX_CHANGES
+        || changes.len() > budgets::mutation_changes()
         || changes
             .iter()
-            .any(|change| change.path.is_empty() || change.path.len() > 4096)
+            .any(|change| change.path.is_empty() || change.path.len() > budgets::path_bytes())
         || changes
             .iter()
             .map(|change| change.content.as_ref().map_or(0, Vec::len))
             .sum::<usize>()
-            > MAX_BYTES
+            > budgets::mutation_bytes()
     {
-        return Err("mutation exceeds 32 paths/1 MiB or has an invalid path".into());
+        return Err("mutation exceeds configured paths/bytes limit or has an invalid path".into());
     }
     fs.apply(changes)
 }
@@ -134,8 +135,8 @@ pub fn edit_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, St
         return Err("old must not be empty".into());
     }
     let bytes = fs.read(&args.path)?;
-    if bytes.len() > MAX_BYTES {
-        return Err("mutation input file exceeds 1 MiB".into());
+    if bytes.len() > budgets::mutation_bytes() {
+        return Err("mutation input file exceeds configured limit".into());
     }
     let text = String::from_utf8(bytes).map_err(|_| "edit requires UTF-8 text")?;
     match text.matches(&args.old).count() {
@@ -174,7 +175,7 @@ pub fn patch_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, S
     for op in ops {
         match op {
             Op::Add { path, text } => {
-                if presentation.len() < 60 * 1024 {
+                if presentation.len() < budgets::diff_present_bytes() {
                     presentation.push_str(&diff::lines(&path, Some(""), &text));
                 }
                 report.push(format!("added {path}"));
@@ -185,7 +186,7 @@ pub fn patch_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, S
                 });
             }
             Op::Delete { path } => {
-                if presentation.len() < 60 * 1024 {
+                if presentation.len() < budgets::diff_present_bytes() {
                     presentation.push_str(&format!(" 0 {path} (deleted; preimage not read)\n"));
                 }
                 report.push(format!("deleted {path}"));
@@ -201,14 +202,14 @@ pub fn patch_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, S
                 hunks,
             } => {
                 let bytes = fs.read(&path)?;
-                if bytes.len() > MAX_BYTES {
-                    return Err("mutation input file exceeds 1 MiB".into());
+                if bytes.len() > budgets::mutation_bytes() {
+                    return Err("mutation input file exceeds configured limit".into());
                 }
                 let text = String::from_utf8(bytes).map_err(|_| "patch requires UTF-8 text")?;
                 let updated = patch::apply(&text, &hunks)
                     .map_err(|error| format!("{path}: {error}; nothing was written"))?;
                 let expected = Expectation::Sha256(hash(text.as_bytes()));
-                if presentation.len() < 60 * 1024 {
+                if presentation.len() < budgets::diff_present_bytes() {
                     presentation.push_str(&diff::lines(&path, Some(&text), &updated));
                 }
                 if let Some(destination) = destination {
@@ -247,6 +248,7 @@ macro_rules! tool {
                 Definition { name: $name.into(), description: $description.into(), input_schema: json!({"type":"object","properties":$properties,"required":$required,"additionalProperties":false}).to_string() }
             }
             fn invoke(arguments: String) -> Output {
+        if let Err(text) = configure_limits() { return Output { text, is_error: true }; }
                 match $run(&arguments, &mut HostFilesystem) {
                     Ok(text) => Output { text, is_error: false },
                     Err(text) => Output { text, is_error: true },
@@ -259,7 +261,7 @@ macro_rules! tool {
 tool!(
     Write,
     "write",
-    "write UTF-8 content, creating parent directories or replacing a file. Requires runtime write permission, not read permission. Paths are workspace-relative, absolute or home-relative. A batch is limited to 1 MiB; tool arguments to 64 KiB. Protected paths and exclusions remain enforced.",
+    "write UTF-8 content, creating parent directories or replacing a file. Requires runtime write permission, not read permission. Paths are workspace-relative, absolute or home-relative. Batch and argument byte limits are host-configurable. Protected paths and exclusions remain enforced.",
     json!({"path":{"type":"string"},"content":{"type":"string"}}),
     ["path", "content"],
     write_with
@@ -268,7 +270,7 @@ tool!(
 tool!(
     Edit,
     "edit",
-    "replace exactly one occurrence of old with new in a UTF-8 file. Read the file first; include enough context to make old unique. Requires runtime read and write permissions. Refuses stale contents. Input/result files are limited to 1 MiB; arguments to 64 KiB.",
+    "replace exactly one occurrence of old with new in a UTF-8 file. Read the file first; include enough context to make old unique. Requires runtime read and write permissions. Refuses stale contents. Input, result and argument limits are host-configurable.",
     json!({"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}}),
     ["path", "old", "new"],
     edit_with
@@ -277,7 +279,7 @@ tool!(
 tool!(
     Patch,
     "patch",
-    "apply an apply-patch document across files: Begin Patch, Add File, Update File with @@ hunks and optional Move to, Delete File, End Patch. Every hunk must match exactly once. Add/move destinations must be absent. Updates require read and write; additions/deletions require write only. All targets and preconditions are checked before publication. One denial refuses the whole batch. At most 32 paths and 1 MiB of resulting contents. I/O failure during publication may partially apply; reported explicitly.",
+    "apply an apply-patch document across files: Begin Patch, Add File, Update File with @@ hunks and optional Move to, Delete File, End Patch. Every hunk must match exactly once. Add/move destinations must be absent. Updates require read and write; additions/deletions require write only. All targets and preconditions are checked before publication. One denial refuses the whole batch. Path count and resulting-content byte budgets are host-configurable. I/O failure during publication may partially apply; reported explicitly.",
     json!({"patch":{"type":"string"}}),
     ["patch"],
     patch_with

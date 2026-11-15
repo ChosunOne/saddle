@@ -206,6 +206,42 @@ fn standard_mutation_components_write_edit_and_patch_through_the_production_host
     }
 }
 
+#[test]
+fn resource_settings_do_not_let_guests_override_host_batch_bounds() {
+    let env = mutation_env(
+        &[("one", Some("a"), "any"), ("two", Some("b"), "any")],
+        WRITE_GRANTS,
+    );
+    let original = fs::read_to_string(env.config()).unwrap();
+    fs::write(
+        env.config(),
+        format!("{original}\n[tool-limits]\nmutation-changes=1\n"),
+    )
+    .unwrap();
+    let out = call(&env);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(!env.ws().join("one").exists());
+    fs::write(
+        env.config(),
+        format!("{original}\n[tool-limits]\nmutation-changes=2\n"),
+    )
+    .unwrap();
+    let out = call(&env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(env.ws().join("two")).unwrap(), "b");
+    // Higher resource ceilings are not grants: excluded paths stay excluded.
+    let excluded = mutation_env(&[("private/file", Some("a"), "any")], WRITE_GRANTS);
+    let config = fs::read_to_string(excluded.config()).unwrap();
+    fs::write(
+        excluded.config(),
+        format!("{config}\n[tool-limits]\nmutation-changes=100\nmutation-bytes=8388608\n"),
+    )
+    .unwrap();
+    let out = call(&excluded);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(!excluded.ws().join("private").exists());
+}
+
 const WRITE_GRANTS: &str = "tool={}\nfs-write=[{root='workspace',exclude=['private']}]";
 
 fn mutation_env(changes: &[(&str, Option<&str>, &str)], grants: &str) -> Env {

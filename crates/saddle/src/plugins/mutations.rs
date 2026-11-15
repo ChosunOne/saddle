@@ -1,5 +1,6 @@
 //! bounded, attributed mutation batches; guests supply plans, never authority (D140).
 
+use saddle_limits as budgets;
 use std::env;
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Component, Path as NativePath};
@@ -12,7 +13,6 @@ use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt, Permissions, PermissionsExt}
 use libc::{O_NOFOLLOW, O_NONBLOCK};
 use saddle_cap::roots::normalize;
 use saddle_cap::{Location, Principal, RelPath, Scope};
-use saddle_loader::{MAX_MUTATION_BYTES, MAX_MUTATIONS};
 use saddle_policy::audit::sha256_hex;
 use saddle_policy::{Kind, Request};
 use saddle_wit::saddle::host::fs_write::{Change, Expectation};
@@ -154,7 +154,7 @@ fn expected(plan: &Planned, deadline: Instant) -> Result<()> {
                     break;
                 }
                 total += n;
-                if total > MAX_MUTATION_BYTES {
+                if total > budgets::mutation_bytes() {
                     return Err(anyhow!("conditional mutation target exceeds 1 MiB"));
                 }
                 hash.update(&bytes[..n]);
@@ -241,9 +241,9 @@ pub fn apply(
     changes: Vec<Change>,
     effects: &mut bool,
 ) -> Result<Result<(), String>> {
-    if changes.is_empty() || changes.len() > MAX_MUTATIONS || changes.iter().any(|change| change.path.len() > 4096
+    if changes.is_empty() || changes.len() > budgets::mutation_changes() || changes.iter().any(|change| change.path.len() > budgets::path_bytes()
         || matches!(&change.expected, Expectation::Sha256(hash) if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())))
-        || changes.iter().map(|change| change.content.as_ref().map_or(0, Vec::len)).sum::<usize>() > MAX_MUTATION_BYTES {
+        || changes.iter().map(|change| change.content.as_ref().map_or(0, Vec::len)).sum::<usize>() > budgets::mutation_bytes() {
         session.audit.event(Kind::Decision, Some(who), Some(Scope::FsWrite), Some(false), json!({"call_id":call,"operation":"apply"}), "invalid mutation batch or exceeds 32 paths/1 MiB")?;
         return Ok(Err("invalid mutation batch or exceeds 32 paths/1 MiB".into()));
     }

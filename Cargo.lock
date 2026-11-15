@@ -2464,6 +2464,7 @@ dependencies = [
  "rusqlite",
  "saddle-cap",
  "saddle-ignore",
+ "saddle-limits",
  "saddle-loader",
  "saddle-policy",
  "saddle-sandbox",
@@ -2506,12 +2507,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "saddle-limits"
+version = "0.0.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "saddle-loader"
 version = "0.0.1"
 dependencies = [
  "anyhow",
  "cap-std 4.0.3",
  "saddle-cap",
+ "saddle-limits",
  "saddle-policy",
  "saddle-wit",
  "serde_json",
@@ -2555,6 +2564,7 @@ dependencies = [
 name = "saddle-sdk"
 version = "0.0.1"
 dependencies = [
+ "saddle-limits",
  "serde_json",
  "wit-bindgen 0.45.0",
 ]
@@ -2567,6 +2577,7 @@ dependencies = [
  "memchr",
  "regex",
  "saddle-ignore",
+ "saddle-limits",
  "saddle-sdk",
  "serde",
  "serde_json",

@@ -1,5 +1,8 @@
 package saddle:host@0.1.0;
 
+// Public resource settings, not operational authority (D145).
+interface budgets { read: func() -> string; }
+
 interface http {
     record header { name: string, value: string }
     record request { url: string, headers: list<header> }

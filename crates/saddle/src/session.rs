@@ -10,11 +10,13 @@ use crate::mcp::registry::Registry;
 use crate::paths;
 use crate::provider;
 use crate::provider::SearchTarget;
+use crate::search_transport;
 use crate::search_transport::CachedSearch;
 use crate::skills;
 use crate::skills::Skill;
 use saddle_cap::policy;
 use saddle_cap::roots;
+use saddle_limits::Budgets;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -87,6 +89,7 @@ pub fn roots_for_validation() -> Result<Roots> {
 /// Everything needed to parse the policy. `check` stops here; a session goes on to open the audit
 /// log.
 pub struct Setup {
+    pub tool_limits: Budgets,
     pub plugins: BTreeMap<PluginId, PluginEntry>,
     pub paths: Paths,
     pub workspace: PathBuf,
@@ -311,6 +314,7 @@ impl Setup {
         // The hash names the grants, not the file: a provider change is not a policy change.
         let policy_sha256 = sha256_hex(format!("{global_text}\n---\n{policy_text}").as_bytes());
         Ok(Self {
+            tool_limits: user.tool_limits,
             plugins: user.plugins,
             paths,
             start: start.clone(),
@@ -658,6 +662,7 @@ impl Session {
             .collect::<Result<_>>()?;
         let before = self.setup.policy_sha256.clone();
         self.setup = fresh;
+        search_transport::trim_cache(self);
         self.tool_roots = configured_tool_roots(&self.setup);
         self.file_roots = file_roots;
         self.engine.replace_policy(policy);

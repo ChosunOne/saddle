@@ -1,5 +1,9 @@
 //! directory listing presentation over a bounded, policy-filtered metadata service (D132).
 
+use saddle_limits as budgets;
+#[cfg(target_arch = "wasm32")]
+#[cfg(target_arch = "wasm32")]
+use saddle_sdk::configure_limits;
 use saddle_sdk::{DirectoryPage, EntryKind};
 use serde::Deserialize;
 
@@ -11,10 +15,6 @@ use serde_json::json;
 #[cfg(target_arch = "wasm32")]
 use crate::normalize_path;
 use crate::workspace;
-
-const MAX_LIST: usize = 500;
-const PAGE_ENTRIES: u32 = 128;
-const MAX_TEXT: usize = 50 * 1024;
 
 /// the standard listing tool; all names come from the host's filtered directory pages.
 pub struct Ls;
@@ -36,11 +36,17 @@ impl Tool for Ls {
     fn describe() -> Definition {
         Definition {
             name: "ls".into(),
-            description: "list a directory, sorted by name, with / for directories and @ for symlinks. Path defaults to workspace; accepts absolute or home-relative paths allowed by runtime filesystem permissions, or explicit root-relative paths. At most 500 entries and 50 KiB. Excluded names are filtered by the host.".into(),
+            description: "list a directory, sorted by name, with / for directories and @ for symlinks. Path defaults to workspace; accepts absolute or home-relative paths allowed by runtime filesystem permissions, or explicit root-relative paths. Entry and text budgets are host-configurable. Excluded names are filtered by the host.".into(),
             input_schema: json!({"type":"object","properties":{"root":{"type":"string"},"path":{"type":"string"}},"additionalProperties":false}).to_string(),
         }
     }
     fn invoke(arguments: String) -> Output {
+        if let Err(text) = configure_limits() {
+            return Output {
+                text,
+                is_error: true,
+            };
+        }
         let result = normalize_path(&arguments, Some(".")).and_then(|arguments| {
             list_with(&arguments, |root, path, after, limit| {
                 read_directory(
@@ -78,16 +84,23 @@ pub fn list_with(
     let mut names = Vec::new();
     let mut total = 0;
     let mut skipped = 0;
-    while names.len() < MAX_LIST {
-        let page = read(&args.root, &args.path, &after, PAGE_ENTRIES)?;
-        if page.entries.len() > PAGE_ENTRIES as usize || (page.more && page.entries.is_empty()) {
+    while names.len() < budgets::list_entries() {
+        let page = read(
+            &args.root,
+            &args.path,
+            &after,
+            budgets::directory_page_entries() as u32,
+        )?;
+        if page.entries.len() > budgets::directory_page_entries() as usize
+            || (page.more && page.entries.is_empty())
+        {
             return Err("invalid reply from directory service".into());
         }
         total = page.total;
         skipped = page.skipped;
         for entry in page.entries {
             if entry.name <= after
-                || entry.name.len() > 1024
+                || entry.name.len() > budgets::directory_name_bytes()
                 || entry.name.contains(['/', '\0'])
                 || matches!(entry.name.as_str(), "." | "..")
             {
@@ -99,7 +112,7 @@ pub fn list_with(
                 EntryKind::Symlink => "@",
                 _ => "",
             };
-            if names.len() < MAX_LIST {
+            if names.len() < budgets::list_entries() {
                 names.push(format!("{after}{suffix}"));
             }
         }
@@ -111,7 +124,7 @@ pub fn list_with(
     let mut text = String::new();
     let mut shown = 0;
     for name in names {
-        if text.len() + name.len() + 1 > MAX_TEXT {
+        if text.len() + name.len() + 1 > budgets::text_bytes() {
             break;
         }
         if shown != 0 {

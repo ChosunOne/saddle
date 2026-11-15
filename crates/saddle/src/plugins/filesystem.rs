@@ -1,5 +1,6 @@
 //! core-owned filesystem resolution and per-plugin runtime path authority (D132, D138, D139).
 
+use saddle_limits as budgets;
 use std::collections::BTreeMap;
 use std::env;
 use std::path::Path as NativePath;
@@ -10,7 +11,6 @@ use anyhow::{Context, Result};
 use cap_std::fs::Dir;
 use saddle_cap::roots::normalize;
 use saddle_cap::{Location, Principal, RelPath, RootName, Scope};
-use saddle_loader::MAX_DIRECTORY_ENTRIES;
 use saddle_policy::audit::sha256_hex;
 use saddle_policy::{Decision, Kind, Request};
 use saddle_wit::saddle::host::fs_list::{Entry, EntryKind, Page};
@@ -21,7 +21,6 @@ use crate::session::Session;
 use crate::tools::fs::resolve_beneath;
 use crate::{cancel, fs_access};
 
-const MAX_VISITED: usize = 100_000;
 const TOOL_PATH_PREFIX: &str = "@tool:";
 
 /// opaque path routing is core-owned, not selected by guest SDK features (D139).
@@ -251,7 +250,7 @@ pub fn resolve_path(
     managed: bool,
 ) -> Result<Result<Path, Failure>> {
     let details = json!({"operation":"resolve-path", "path_sha256":sha256_hex(value.as_bytes())});
-    if value.len() > 4096 || expired(deadline) {
+    if value.len() > budgets::path_bytes() || expired(deadline) {
         return refuse(
             session,
             who,
@@ -336,10 +335,10 @@ pub fn read_directory(
     let (after, limit) = page;
     let details = json!({"operation":"read-directory", "after":after, "limit":limit});
     if path.root.len() > 64
-        || path.relative.len() > 4096
-        || after.len() > 1024
+        || path.relative.len() > budgets::path_bytes()
+        || after.len() > budgets::directory_name_bytes()
         || limit == 0
-        || limit as usize > MAX_DIRECTORY_ENTRIES
+        || limit as usize > budgets::directory_page_entries()
         || expired(deadline)
     {
         return refuse(
@@ -375,7 +374,7 @@ pub fn read_directory(
         let mut total = 0;
         let mut skipped = 0;
         for (visited, entry) in directory.entries()?.enumerate() {
-            if visited >= MAX_VISITED {
+            if visited >= budgets::directory_scan_entries() {
                 return Ok(Err(Failure::TooLarge));
             }
             if expired(deadline) {
@@ -388,7 +387,7 @@ pub fn read_directory(
                 skipped += 1;
                 continue;
             };
-            if name.len() > 1024 {
+            if name.len() > budgets::directory_name_bytes() {
                 skipped += 1;
                 continue;
             }

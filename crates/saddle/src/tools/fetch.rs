@@ -9,6 +9,7 @@
 //! that address itself. ureq receives checked addresses rather than resolving the name again, so
 //! DNS rebinding cannot swap one underneath.
 
+use saddle_limits as budgets;
 use std::net::Ipv4Addr;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::result::Result as StdResult;
@@ -120,7 +121,7 @@ pub fn fetch(session: &mut Session, input: &Value) -> Result<ToolOutput> {
                 url: &request.url,
                 headers,
                 body: "",
-                limit: network::MAX_RESPONSE,
+                limit: budgets::http_capture_bytes(),
                 deadline: Instant::now() + Duration::from_secs(30),
                 redirects: true,
             },

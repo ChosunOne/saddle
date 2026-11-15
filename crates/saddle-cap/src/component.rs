@@ -101,7 +101,7 @@ pub fn classify(direction: Direction, name: &str) -> Requirement {
                     Scope::ToolWrite,
                 ])
             }
-            "tool-result" => scope(Scope::Tool),
+            "tool-result" | "budgets" => scope(Scope::Tool),
             "transcript-read" => scope(Scope::TranscriptRead),
             "context-contribute" => scope(Scope::ContextContribute),
             "model-invoke" => scope(Scope::ModelInvoke),

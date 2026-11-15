@@ -4,6 +4,7 @@
 use crate::mcp::registry;
 use crate::plugins;
 use crate::provider::Image;
+use saddle_limits as budgets;
 use std::mem;
 mod bash;
 mod diff;
@@ -102,7 +103,7 @@ pub fn definitions() -> Vec<ToolDef> {
                 message's parts, text what it says when the block is prose at all (an encrypted \
                 or redacted block has no row). \
                 No other conversations, images, internal tables or files are accessible. Requires \
-                transcript-read. Results are capped at 100 rows and 50 KiB; use WHERE, ORDER BY \
+                transcript-read. Results use configured row and byte budgets; use WHERE, ORDER BY \
                 ordinal and LIMIT/OFFSET to search and page. Examples: \
                 SELECT ordinal, role, text FROM messages WHERE text LIKE '%decision%' LIMIT 10; \
                 SELECT provider, model, sum(cache_read), sum(input + cache_read) FROM requests \
@@ -139,7 +140,7 @@ pub fn definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "read".into(),
             description: "Read a UTF-8 text file, or a PNG, JPEG, GIF or WebP image. Text comes \
-                          back at most 2000 lines and 50 KiB at a time, and says so when there is \
+                          back a page within configured line and byte budgets, and says so when there is \
                           more, so a large file cannot fill the context; an image is handed over \
                           as a picture for you to look at. Use this rather than `cat` in bash."
                 .into(),
@@ -285,7 +286,7 @@ pub fn definitions() -> Vec<ToolDef> {
                           command runs in a sandbox: filesystem access is restricted, network \
                           requests go through a proxy checked against the same net grants as \
                           fetch, a time limit applies, and background \
-                          processes are killed when it exits. Output past 256 KiB per stream is \
+                          processes are killed when it exits. Output past the configured per-stream byte budget is \
                           cut. Builds may download dependencies where the net grants allow it. \
                           If the network namespace or relay cannot start, the command runs \
                           with no network instead."
@@ -308,7 +309,7 @@ pub fn definitions() -> Vec<ToolDef> {
             description: "Fetch one http or https URL and return its status, content type and \
                           body as text. The host makes the request, so it needs a net grant for \
                           that host. Use this for a known URL; bash networking is governed by \
-                          the same net grants. Only GET, and the body is cut at 100 KiB. A key \
+                          the same net grants. Only GET, with configured capture/presentation budgets. A key \
                           or other secret belongs in `headers`; it is never written to the \
                           audit log or shown back to you."
                 .into(),
@@ -369,6 +370,11 @@ pub fn definitions() -> Vec<ToolDef> {
 /// Runs one tool as the agent. `Err` means the host itself failed (for example, the audit log
 /// could not be written) and the session must stop.
 pub fn call(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutput> {
+    let limits = session.setup.tool_limits.clone();
+    budgets::using(&limits, || call_inner(session, name, input))
+}
+
+fn call_inner(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutput> {
     match name {
         "read" => fs::read(session, input),
         "write" => fs::write(session, input),

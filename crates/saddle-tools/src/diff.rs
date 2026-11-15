@@ -1,8 +1,7 @@
 //! bounded human-only line presentation, computed before effects in guest code (D141).
 
+use saddle_limits as budgets;
 use std::fmt::Write as _;
-
-const LIMIT: usize = 60 * 1024;
 
 pub fn lines(path: &str, old: Option<&str>, new: &str) -> String {
     let mut out = format!(
@@ -61,17 +60,17 @@ pub fn lines(path: &str, old: Option<&str>, new: &str) -> String {
     {
         append(&mut out, ' ', i, text);
     }
-    if end < after.len() || out.len() >= LIMIT {
+    if end < after.len() || out.len() >= budgets::diff_present_bytes() {
         out.push_str("~\n");
     }
     out
 }
 
 fn append(out: &mut String, tag: char, index: usize, text: &str) {
-    if out.len() >= LIMIT {
+    if out.len() >= budgets::diff_present_bytes() {
         return;
     }
-    let remaining = LIMIT.saturating_sub(out.len() + 32);
+    let remaining = budgets::diff_present_bytes().saturating_sub(out.len() + 32);
     let mut end = text.len().min(remaining);
     while !text.is_char_boundary(end) {
         end -= 1;

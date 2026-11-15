@@ -1,5 +1,6 @@
 //! bounded HTTP effects with per-hop caller authority and checked DNS, never guest sockets (D143).
 
+use saddle_limits as budgets;
 use std::io::Read;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -15,11 +16,8 @@ use crate::cancel;
 use crate::session::Session;
 use crate::tools::fetch::{self, Target};
 
-pub const MAX_RESPONSE: usize = 100 * 1024;
-pub const MAX_SEARCH_RESPONSE: usize = 1024 * 1024;
-
 pub fn target(raw: &str) -> Result<(Url, Target), String> {
-    if raw.len() > 8192 {
+    if raw.len() > budgets::url_bytes() {
         return Err("URL exceeds 8 KiB".into());
     }
     let mut url = Url::parse(raw).map_err(|_| "invalid absolute HTTP URL")?;
@@ -51,12 +49,12 @@ pub fn target(raw: &str) -> Result<(Url, Target), String> {
 }
 
 pub fn valid_headers(headers: &[Header]) -> Result<(), String> {
-    if headers.len() > 64
+    if headers.len() > budgets::http_headers()
         || headers
             .iter()
             .map(|h| h.name.len() + h.value.len())
             .sum::<usize>()
-            > 65536
+            > budgets::http_header_bytes()
     {
         return Err("headers exceed count/size limit".into());
     }
@@ -66,7 +64,7 @@ pub fn valid_headers(headers: &[Header]) -> Result<(), String> {
             || !name
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"-_!#$%&'*+.^`|~".contains(&c))
-            || header.value.len() > 8192
+            || header.value.len() > budgets::header_value_bytes()
             || header.value.chars().any(char::is_control)
         {
             return Err("invalid HTTP header name/value".into());
@@ -169,7 +167,7 @@ pub fn request(
         return Ok(Err(why));
     }
     let mut current = raw.to_owned();
-    for hop in 0..=5 {
+    for hop in 0..=budgets::http_redirects() {
         if cancel::FLAG.load(Ordering::Relaxed) || Instant::now() >= deadline {
             return Ok(Err("network request cancelled or timed out".into()));
         }
@@ -212,7 +210,7 @@ pub fn request(
             && matches!(status, 301 | 302 | 303 | 307 | 308)
             && let Some(location) = redirect
         {
-            if hop == 5 {
+            if hop == budgets::http_redirects() {
                 return Ok(Err("HTTP redirect limit exceeded".into()));
             }
             let next = match url.join(&location) {
@@ -230,7 +228,9 @@ pub fn request(
         for (name, value) in response.headers() {
             if let Ok(value) = value.to_str() {
                 header_bytes += name.as_str().len() + value.len();
-                if returned_headers.len() >= 64 || header_bytes > 65536 {
+                if returned_headers.len() >= budgets::http_headers()
+                    || header_bytes > budgets::http_header_bytes()
+                {
                     return Ok(Err("response headers exceed bounds".into()));
                 }
                 returned_headers.push(Header {

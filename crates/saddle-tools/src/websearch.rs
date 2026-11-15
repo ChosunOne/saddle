@@ -1,19 +1,16 @@
 //! web search workflows, response parsing, excerpt/full-page presentation in the guest (D143).
 
+use saddle_limits as budgets;
 use saddle_sdk::SearchSnapshot;
+#[cfg(target_arch = "wasm32")]
+#[cfg(target_arch = "wasm32")]
+use saddle_sdk::configure_limits;
 #[cfg(target_arch = "wasm32")]
 use saddle_sdk::{Definition, Output, Tool, last_search, search_web};
 use serde::Deserialize;
 use serde_json::Value;
 #[cfg(target_arch = "wasm32")]
 use serde_json::json;
-
-const DEFAULT_RESULTS: u64 = 5;
-const MAX_RESULTS: u64 = 100;
-const MAX_BYTES: usize = 60 * 1024;
-const MAX_FULL: usize = 60 * 1024;
-const MAX_QUOTE: usize = 1000;
-const MAX_QUOTES: usize = 3;
 
 pub struct Websearch;
 pub trait Transport {
@@ -38,12 +35,14 @@ pub fn search_with(arguments: &str, transport: &mut impl Transport) -> Result<St
     let query = args.query.unwrap_or_default().trim().to_owned();
     let count = args
         .num_results
-        .unwrap_or(DEFAULT_RESULTS)
-        .clamp(1, MAX_RESULTS) as u32;
+        .unwrap_or(budgets::web_default_results() as u64)
+        .clamp(1, budgets::web_results() as u64) as u32;
     let snapshot = if args.result.is_some() {
         match transport.last()? {
             Some(last) if query.is_empty() || last.query == query => last,
-            _ if !query.is_empty() => transport.search(&query, DEFAULT_RESULTS as u32)?,
+            _ if !query.is_empty() => {
+                transport.search(&query, budgets::web_default_results() as u32)?
+            }
             _ => {
                 return Err(
                     "no search to expand in this session; call websearch with a `query` first"
@@ -107,11 +106,11 @@ pub fn search_with(arguments: &str, transport: &mut impl Transport) -> Result<St
         return Ok(one_in_full(hit, index, last.hits.len(), &last));
     }
     if snapshot.via == "provider" {
-        let asked = if count > DEFAULT_RESULTS as u32 {
+        let asked = if count > budgets::web_default_results() as u32 {
             format!(
                 " ({count} asked, {} returned: the endpoint answers {})",
                 last.hits.len(),
-                DEFAULT_RESULTS
+                budgets::web_default_results()
             )
         } else {
             String::new()
@@ -146,9 +145,15 @@ impl Transport for HostTransport {
 #[cfg(target_arch = "wasm32")]
 impl Tool for Websearch {
     fn describe() -> Definition {
-        Definition {name:"websearch".into(),description:"search the web with the configured provider or Exa fallback, under this plugin's delegated net grants. Returns numbered excerpts; pass result to read a page from this plugin's last search without another network request. Query with result searches only if it differs from the cached query. Credentials stay in the core. Responses are bounded to 1 MiB and presentation to approximately 60 KiB. Anonymous MCP answers may be unstructured.".into(),input_schema:json!({"type":"object","properties":{"query":{"type":"string"},"num_results":{"type":"integer","minimum":1,"maximum":100},"result":{"type":"integer","minimum":1}},"additionalProperties":false}).to_string()}
+        Definition {name:"websearch".into(),description:"search the web with the configured provider or Exa fallback, under this plugin's delegated net grants. Returns numbered excerpts; pass result to read a page from this plugin's last search without another network request. Query with result searches only if it differs from the cached query. Credentials stay in the core. Response and presentation byte budgets are host-configurable. Anonymous MCP answers may be unstructured.".into(),input_schema:json!({"type":"object","properties":{"query":{"type":"string"},"num_results":{"type":"integer","minimum":1},"result":{"type":"integer","minimum":1}},"additionalProperties":false}).to_string()}
     }
     fn invoke(arguments: String) -> Output {
+        if let Err(text) = configure_limits() {
+            return Output {
+                text,
+                is_error: true,
+            };
+        }
         match search_with(&arguments, &mut HostTransport) {
             Ok(text) => Output {
                 text,
@@ -233,10 +238,10 @@ fn one_in_full(hit: &Hit, index: u64, of: usize, last: &LastSearch) -> String {
 }
 
 fn whole_text(text: &str, url: &str) -> String {
-    if text.len() <= MAX_FULL {
+    if text.len() <= budgets::presentation_bytes() {
         return text.to_owned();
     }
-    let mut end = MAX_FULL;
+    let mut end = budgets::presentation_bytes();
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -324,7 +329,7 @@ pub fn format_hits(hits: &[Hit]) -> String {
         if !line.is_empty() {
             out.push_str(&format!("   {}\n", line.join(", ")));
         }
-        for passage in h.excerpts().iter().take(MAX_QUOTES) {
+        for passage in h.excerpts().iter().take(budgets::web_quotes()) {
             out.push_str(&format!("   > {}\n", passage_for_model(passage)));
         }
     }
@@ -333,16 +338,16 @@ pub fn format_hits(hits: &[Hit]) -> String {
     cut(out.trim_end())
 }
 
-/// One quoted passage as a single line, cut to [`MAX_QUOTE`] characters.
+/// One quoted passage as a single line, cut to [`budgets::web_quote_chars()`] characters.
 ///
 /// Cuts on a character boundary and says so, because half a word at the end of an excerpt reads as
 /// a typo rather than as an excerpt.
 fn passage_for_model(text: &str) -> String {
     let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() <= MAX_QUOTE {
+    if one_line.chars().count() <= budgets::web_quote_chars() {
         return one_line;
     }
-    let kept: String = one_line.chars().take(MAX_QUOTE).collect();
+    let kept: String = one_line.chars().take(budgets::web_quote_chars()).collect();
     format!("{kept}…")
 }
 
@@ -390,14 +395,18 @@ fn title_of(hit: &Hit) -> &str {
 
 /// A reply cut to what a tool result may carry, saying so rather than ending mid-word.
 fn cut(text: &str) -> String {
-    if text.len() <= MAX_BYTES {
+    if text.len() <= budgets::presentation_bytes() {
         return text.to_owned();
     }
-    let mut end = MAX_BYTES;
+    let mut end = budgets::presentation_bytes();
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}\n\n(cut at {MAX_BYTES} bytes)", &text[..end])
+    format!(
+        "{}\n\n(cut at {} bytes)",
+        &text[..end],
+        budgets::presentation_bytes()
+    )
 }
 
 /// `x-request-id`, `costDollars` and `searchTime`, when the answer says: enough for a record to be
@@ -629,11 +638,15 @@ mod tests {
             text.contains("https://example.test/"),
             "no address to fetch the rest"
         );
-        assert!(text.len() <= MAX_FULL + 200, "{} bytes", text.len());
+        assert!(
+            text.len() <= budgets::presentation_bytes() + 200,
+            "{} bytes",
+            text.len()
+        );
         // Short text is passed through.
         assert_eq!(whole_text("short", "https://x/"), "short");
         // A cut never splits a character.
-        let multibyte = "é".repeat(MAX_FULL);
+        let multibyte = "é".repeat(budgets::presentation_bytes());
         assert!(str::from_utf8(whole_text(&multibyte, "https://x/").as_bytes()).is_ok());
     }
 
@@ -756,7 +769,7 @@ mod tests {
         let quoted = passage_for_model(&page);
         assert_eq!(
             quoted.chars().count(),
-            MAX_QUOTE + 1,
+            budgets::web_quote_chars() + 1,
             "kept or ellipsis wrong"
         );
         assert!(quoted.ends_with('…'), "{quoted:.20}");
@@ -770,7 +783,11 @@ mod tests {
             ..Hit::default()
         };
         let text = format_hits(&[hit]);
-        assert_eq!(text.matches("   > ").count(), MAX_QUOTES, "{text}");
+        assert_eq!(
+            text.matches("   > ").count(),
+            budgets::web_quotes(),
+            "{text}"
+        );
         // Five whole pages still fit in one answer.
         let hits: Vec<Hit> = (0..5)
             .map(|i| Hit {
@@ -780,19 +797,25 @@ mod tests {
                 ..Hit::default()
             })
             .collect();
-        assert!(format_hits(&hits).len() < MAX_BYTES, "not bounded");
+        assert!(
+            format_hits(&hits).len() < budgets::presentation_bytes(),
+            "not bounded"
+        );
     }
 
     #[test]
     fn a_reply_is_cut_to_what_a_tool_result_may_carry() {
-        let long = "x".repeat(MAX_BYTES + 100);
+        let long = "x".repeat(budgets::presentation_bytes() + 100);
         let shortened = cut(&long);
-        assert!(shortened.len() < MAX_BYTES + 100, "not cut");
+        assert!(
+            shortened.len() < budgets::presentation_bytes() + 100,
+            "not cut"
+        );
         assert!(shortened.ends_with("bytes)"), "{shortened:?}");
         // Short text is untouched.
         assert_eq!(cut("short"), "short");
         // A cut never splits a character.
-        let multibyte = "é".repeat(MAX_BYTES);
+        let multibyte = "é".repeat(budgets::presentation_bytes());
         assert!(str::from_utf8(cut(&multibyte).as_bytes()).is_ok());
     }
 }

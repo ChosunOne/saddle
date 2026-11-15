@@ -1,5 +1,8 @@
 //! transcript tool schema and presentation; the gated core service owns SQL execution (D137).
 
+use saddle_limits as budgets;
+#[cfg(target_arch = "wasm32")]
+use saddle_sdk::configure_limits;
 use serde::Deserialize;
 
 #[cfg(target_arch = "wasm32")]
@@ -21,8 +24,8 @@ pub fn query_with(
 ) -> Result<String, String> {
     let args: Arguments =
         serde_json::from_str(arguments).map_err(|error| format!("invalid arguments: {error}"))?;
-    if args.sql.len() > 16 * 1024 {
-        return Err("transcript SQL exceeds 16 KiB".into());
+    if args.sql.len() > budgets::query_bytes() {
+        return Err("transcript SQL exceeds configured byte limit".into());
     }
     query(&args.sql)
 }
@@ -35,13 +38,19 @@ impl Tool for SessionQuery {
             description: "read-only SQL over the current conversation branch, including pre-compaction history. Views: messages(ordinal,id,role,text); requests(ordinal,node,kind,provider,model,input,output,cache_read,cache_write,cached,cost,reasoning_dropped,reasoning_tokens,at,after); reasoning(ordinal,node,part,text). Ordinals start at 1; join reasoning to messages on ordinal. Request kind is reply or summary; after is the preceding message ordinal. Cached is 1 for a cache hit. Only prose reasoning is readable. No other conversations, images, internal tables or files are accessible. Requires transcript-read. Results are JSON with columns, rows, truncated; capped at 100 rows and 50 KiB. Use WHERE, ORDER BY ordinal and LIMIT/OFFSET to search and page. Example: SELECT ordinal,role,text FROM messages WHERE text LIKE '%decision%' LIMIT 10".into(),
             input_schema: json!({
                 "type":"object",
-                "properties":{"sql":{"type":"string","maxLength":16384}},
+                "properties":{"sql":{"type":"string"}},
                 "required":["sql"], "additionalProperties":false
             }).to_string(),
         }
     }
 
     fn invoke(arguments: String) -> Output {
+        if let Err(text) = configure_limits() {
+            return Output {
+                text,
+                is_error: true,
+            };
+        }
         match query_with(&arguments, query_transcript) {
             Ok(text) => Output {
                 text,

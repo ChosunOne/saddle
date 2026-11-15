@@ -1,10 +1,11 @@
 //! shell tool adapter; privileged execution lives in the shared service (D142).
 
 use super::{ToolOutput, str_field};
-use crate::execution::{self, OUTPUT_LIMIT};
+use crate::execution;
 use crate::session::Session;
 use anyhow::Result;
 use saddle_cap::Principal;
+use saddle_limits as budgets;
 use serde_json::Value;
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -52,7 +53,8 @@ pub fn run(session: &mut Session, input: &Value) -> Result<ToolOutput> {
     if out.truncated {
         writeln!(
             text,
-            "(output truncated at {OUTPUT_LIMIT} bytes per stream)"
+            "(output truncated at {} bytes per stream)",
+            budgets::exec_capture_bytes()
         )?;
     }
     for path in &out.restored {

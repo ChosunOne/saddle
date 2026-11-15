@@ -10,6 +10,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+saddle-limits.workspace = true
 saddle-tools.workspace = true
 saddle-sdk.workspace = true
 url.workspace = true

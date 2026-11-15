@@ -1,5 +1,8 @@
 //! fetch schema, UTF-8 interpretation and bounded presentation belong to the guest (D143).
 
+use saddle_limits as budgets;
+#[cfg(target_arch = "wasm32")]
+use saddle_sdk::configure_limits;
 #[cfg(target_arch = "wasm32")]
 use saddle_sdk::{Definition, Output, Tool, http_get};
 use saddle_sdk::{Header, HttpRequest, HttpResponse};
@@ -46,7 +49,7 @@ pub fn fetch_with(
         }
         Err(_) => return Err("HTTP body is not UTF-8 text".into()),
     };
-    let mut end = bytes.len().min(60 * 1024);
+    let mut end = bytes.len().min(budgets::presentation_bytes());
     while !bytes.is_char_boundary(end) {
         end -= 1;
     }
@@ -61,9 +64,9 @@ pub fn fetch_with(
         &bytes[..end]
     );
     if reply.truncated || end < bytes.len() {
-        text.push_str("\n\n(body truncated; capture limit 100 KiB, presentation 60 KiB)");
+        text.push_str("\n\n(body truncated at configured capture/presentation limit)");
     }
-    if text.len() > 65536 {
+    if text.len() > budgets::plugin_output_bytes() {
         return Err("HTTP presentation exceeds limit".into());
     }
     Ok(text)
@@ -72,9 +75,15 @@ pub fn fetch_with(
 #[cfg(target_arch = "wasm32")]
 impl Tool for Fetch {
     fn describe() -> Definition {
-        Definition {name:"fetch".into(),description:"GET a known HTTP(S) URL through delegated net grants. Every redirect is independently authorized; headers are removed on cross-origin redirects. Secrets belong in headers, never query strings; only header names are audited. Returns status, content type and UTF-8 text. Captures 100 KiB, presents 60 KiB; labels truncation. Private addresses require explicit reach in both parent and plugin grants. Use websearch to discover URLs.".into(),input_schema:json!({"type":"object","properties":{"url":{"type":"string"},"headers":{"type":"object","additionalProperties":{"type":"string"}}},"required":["url"],"additionalProperties":false}).to_string()}
+        Definition {name:"fetch".into(),description:"GET a known HTTP(S) URL through delegated net grants. Every redirect is independently authorized; headers are removed on cross-origin redirects. Secrets belong in headers, never query strings; only header names are audited. Returns status, content type and UTF-8 text. Capture and presentation budgets are host-configurable; labels truncation. Private addresses require explicit reach in both parent and plugin grants. Use websearch to discover URLs.".into(),input_schema:json!({"type":"object","properties":{"url":{"type":"string"},"headers":{"type":"object","additionalProperties":{"type":"string"}}},"required":["url"],"additionalProperties":false}).to_string()}
     }
     fn invoke(arguments: String) -> Output {
+        if let Err(text) = configure_limits() {
+            return Output {
+                text,
+                is_error: true,
+            };
+        }
         match fetch_with(&arguments, |request| http_get(&request)) {
             Ok(text) => Output {
                 text,

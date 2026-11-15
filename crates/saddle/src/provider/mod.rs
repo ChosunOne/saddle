@@ -7,6 +7,7 @@
 
 use crate::provider::oauth::Flow;
 use base64::engine::general_purpose;
+use saddle_limits as budgets;
 use std::env;
 use std::error::Error;
 use std::fmt::Display;
@@ -150,7 +151,8 @@ pub struct Image {
 
 /// The largest image saddle will attach, before base64. Base64 is a third larger again, and both
 /// APIs limit a request.
-pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+#[cfg(test)]
+const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 impl Image {
     /// Reads an image file, deciding the media type from the bytes themselves (D58).
@@ -158,11 +160,11 @@ impl Image {
     /// The extension is not trusted: a `.png` that is really a JPEG is sent as a JPEG, which is what
     /// makes it render rather than fail at the provider.
     pub fn read(path: &Path, data: Vec<u8>) -> Result<Self, String> {
-        if data.len() as u64 > MAX_IMAGE_BYTES {
+        if data.len() > budgets::image_bytes() {
             return Err(format!(
                 "{} KiB is over the {} KiB limit for one image",
                 data.len() / 1024,
-                MAX_IMAGE_BYTES / 1024
+                budgets::image_bytes() / 1024
             ));
         }
         let Some((media_type, width, height)) = sniff(&data) else {

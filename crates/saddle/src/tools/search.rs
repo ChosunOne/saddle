@@ -6,6 +6,7 @@
 //! and grep also skip `.git` and whatever `.gitignore` files list.
 
 use crate::ignore;
+use saddle_limits as budgets;
 use std::io::Read as _;
 use std::path::Path;
 
@@ -22,15 +23,6 @@ use super::fs::{gate, open_root};
 use crate::ignore::Rules;
 use crate::session::Session;
 
-pub const MAX_LIST: usize = 500;
-pub const MAX_FOUND: usize = 1000;
-pub const MAX_MATCHES: usize = 200;
-const MAX_LINE: usize = 300;
-const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
-/// Entries visited before a walk gives up, so a huge tree cannot stall a call.
-const MAX_VISITED: usize = 100_000;
-
-/// One `.gitignore` line, matched against paths relative to the root.
 /// A file found by a walk: its path relative to the root.
 struct Found {
     rel: String,
@@ -106,7 +98,7 @@ fn walk(
         let mut subdirs = Vec::new();
         for (name, is_dir) in names {
             visited += 1;
-            if visited > MAX_VISITED {
+            if visited > budgets::search_visited() {
                 out.cut_short = true;
                 return out;
             }
@@ -238,14 +230,17 @@ pub fn ls(session: &mut Session, input: &Value) -> Result<ToolOutput> {
     }
     names.sort();
     let total = names.len();
-    names.truncate(MAX_LIST);
+    names.truncate(budgets::list_entries());
     let mut text = if names.is_empty() {
         "(empty)".to_owned()
     } else {
         names.join("\n")
     };
-    if total > MAX_LIST {
-        text.push_str(&format!("\n(first {MAX_LIST} of {total} entries)"));
+    if total > budgets::list_entries() {
+        text.push_str(&format!(
+            "\n(first {} of {total} entries)",
+            budgets::list_entries()
+        ));
     }
     text.push_str(&skipped_note(skipped));
     Ok(ToolOutput::ok(text))
@@ -303,15 +298,16 @@ pub fn find(session: &mut Session, input: &Value) -> Result<ToolOutput> {
         .map(|f| shown(session, &loc.root, &f.rel))
         .collect();
     let total = hits.len();
-    hits.truncate(MAX_FOUND);
+    hits.truncate(budgets::find_results());
     let mut text = if hits.is_empty() {
         format!("no files match `{pattern}`")
     } else {
         hits.join("\n")
     };
-    if total > MAX_FOUND {
+    if total > budgets::find_results() {
         text.push_str(&format!(
-            "\n(first {MAX_FOUND} of {total}; narrow the pattern or path)"
+            "\n(first {} of {total}; narrow the pattern or path)",
+            budgets::find_results()
         ));
     }
     if walked.cut_short {
@@ -325,11 +321,13 @@ pub fn find(session: &mut Session, input: &Value) -> Result<ToolOutput> {
 /// UTF-8, and files over the size limit.
 fn searchable(root: &Dir, rel: &str) -> Option<String> {
     let file = root.open(rel).ok()?;
-    if file.metadata().ok()?.len() > MAX_FILE_BYTES {
+    if file.metadata().ok()?.len() > budgets::search_file_bytes() as u64 {
         return None;
     }
     let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES).read_to_end(&mut bytes).ok()?;
+    file.take(budgets::search_file_bytes() as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
     if bytes.iter().take(8192).any(|b| *b == 0) {
         return None;
     }
@@ -346,7 +344,7 @@ pub fn grep(session: &mut Session, input: &Value) -> Result<ToolOutput> {
         .unwrap_or(false);
     let regex = match RegexBuilder::new(pattern)
         .case_insensitive(ignore_case)
-        .size_limit(1 << 20)
+        .size_limit(budgets::search_regex_bytes())
         .build()
     {
         Ok(r) => r,
@@ -398,14 +396,14 @@ pub fn grep(session: &mut Session, input: &Value) -> Result<ToolOutput> {
             if !regex.is_match(line) {
                 continue;
             }
-            if lines.len() >= MAX_MATCHES {
+            if lines.len() >= budgets::grep_matches() {
                 more = true;
                 break 'files;
             }
             matched = true;
             let mut line = line.trim_end().to_owned();
-            if line.len() > MAX_LINE {
-                let mut cut = MAX_LINE;
+            if line.len() > budgets::grep_line_bytes() {
+                let mut cut = budgets::grep_line_bytes();
                 while !line.is_char_boundary(cut) {
                     cut -= 1;
                 }
@@ -427,7 +425,8 @@ pub fn grep(session: &mut Session, input: &Value) -> Result<ToolOutput> {
     };
     if more {
         text.push_str(&format!(
-            "\n(stopped at {MAX_MATCHES} matches; narrow the pattern, path or glob)"
+            "\n(stopped at {} matches; narrow the pattern, path or glob)",
+            budgets::grep_matches()
         ));
     } else if !lines.is_empty() {
         let plural = if files_with_matches == 1 { "" } else { "s" };

@@ -3,6 +3,7 @@
 //! Each line starts with a tag: ' ' context, '-' removed, '+' added, '~' a gap between hunks.
 //! Then the line number (old for removed lines, new otherwise), a space, and the text.
 
+use saddle_limits as budgets;
 use std::fmt::Write as _;
 use std::time::Duration;
 
@@ -10,11 +11,9 @@ use similar::{ChangeTag, TextDiffConfig};
 
 /// Context lines around each change.
 const CONTEXT: usize = 3;
-/// Beyond this much text, no diff is made.
-const MAX_BYTES: usize = 2 * 1024 * 1024;
-
+/// compute a human diff within the configured native input budget (D145).
 pub fn lines(old: &str, new: &str) -> Option<String> {
-    if old.len() + new.len() > MAX_BYTES {
+    if old.len() + new.len() > budgets::native_diff_input_bytes() {
         return None;
     }
     let diff = TextDiffConfig::default()

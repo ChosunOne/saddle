@@ -1,5 +1,6 @@
 //! attributed subprocess effects, lowered from the caller's grants, not tool workflows (D142).
 
+use saddle_limits as budgets;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -16,7 +17,6 @@ use crate::net::bridge::Bridge;
 use crate::session::Session;
 use crate::{cancel, reserved};
 
-pub const OUTPUT_LIMIT: usize = 256 * 1024;
 pub const HELPER_ARG: &str = "__sandbox";
 
 pub fn execute(
@@ -28,8 +28,8 @@ pub fn execute(
     effects: &mut bool,
 ) -> Result<Result<Reply, String>> {
     if argv.is_empty()
-        || argv.len() > 128
-        || argv.iter().map(String::len).sum::<usize>() > 65536
+        || argv.len() > budgets::exec_arguments()
+        || argv.iter().map(String::len).sum::<usize>() > budgets::exec_argument_bytes()
         || argv.iter().any(|value| value.contains('\0'))
     {
         return Ok(Err("invalid command or exceeds argument bounds".into()));
@@ -69,6 +69,7 @@ pub fn execute(
         },
     )?;
     let timeout = requested_timeout
+        .min(Duration::from_secs(budgets::exec_seconds() as u64))
         .max(Duration::from_secs(1))
         .min(lowered.timeout);
     let tmp = session
@@ -96,7 +97,7 @@ pub fn execute(
         &[HELPER_ARG],
         &lowered.spec,
         timeout,
-        OUTPUT_LIMIT,
+        budgets::exec_capture_bytes(),
         &stop,
         &mut || {
             if cancel::FLAG.load(Ordering::Relaxed) {

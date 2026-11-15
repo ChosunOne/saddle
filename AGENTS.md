@@ -2,7 +2,7 @@
 
 Saddle is a coding-agent harness in Rust. Its plugin boundary is WASI components whose
 authority is a *declared* scope set, checked before instantiation and bounded by the agent's reach.
-The binary supports explicitly installed, digest-pinned capability-gated tool plugins (D126–D144), alongside
+The binary supports explicitly installed, digest-pinned capability-gated tool plugins (D126–D145), alongside
 built-in tools and MCP; the loader, canonical WIT and SDK are separate library crates.
 `docs/plan.md` is the specification; read it before changing behaviour in the policy, sandbox or tool
 layer.
@@ -17,6 +17,7 @@ because it is followed.
 
 | crate | owns |
 | --- | --- |
+| `crates/saddle-limits` | typed runtime resource/presentation budgets shared by host, loader and guests; no authority, filesystem or Wasmtime dependency (D145) |
 | `crates/saddle-cap` | scopes, roots, grants, policy and manifest parsing, the component import check, the exec lowering, and the narrowing of a delegated principal's reach (D105, D126). No wasmtime dependency. |
 | `crates/saddle-policy` | per-call decisions (`engine`) and the hash-chained audit log (`audit`) |
 | `crates/saddle-wit` | canonical read-tool WIT and generated host bindings (D127) |
@@ -86,6 +87,11 @@ config and catalogue state none (D93); compatible servers do not inherit them. C
 its subscription quota instead, not a fabricated API bill: `{quota}` shows each reported window's
 remaining percentage and reset countdown (`5h`, `weekly`). `saddle check` includes absolute reset
 timestamps. Usage GETs use refreshed OAuth and the same account headers as model requests.
+
+Resource/presentation budgets are `[tool-limits]` in the protected user config (D145), not component
+constants or grants. `saddle check` prints them and `/reload` updates host/guest snapshots without
+repinning. `docs/plugins.md` lists every key/default. Keep budget defaults in `saddle-limits`; keep
+permission checks independent, and do not add a hard-coded second ceiling in a guest or adapter.
 
 `session_query` requires `transcript-read = {}` in the agent grants. First-run defaults include it;
 existing explicit `[agent]` tables remain as written, and `--revoke transcript-read` disables it for
@@ -321,7 +327,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D144 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D145 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

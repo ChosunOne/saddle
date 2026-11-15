@@ -30,6 +30,7 @@ use crate::tools;
 use crate::tui::theme::ThemeTables;
 use saddle_cap::sandbox;
 use saddle_cap::sandbox::Include;
+use saddle_limits::Budgets;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -37,7 +38,7 @@ use std::io::ErrorKind;
 use std::iter;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Error as AnyError, Result, bail};
 use saddle_cap::sandbox::SandboxExtras;
 use saddle_cap::{PluginId, RootName, Roots};
 use serde::Deserialize;
@@ -48,6 +49,8 @@ use crate::provider::ProviderEntry;
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {
+    #[serde(default, rename = "tool-limits")]
+    pub tool_limits: Budgets,
     /// explicit plugin grants, separate from installed/enabled artifact configuration (D128).
     #[serde(default)]
     pub plugin: BTreeMap<PluginId, toml::Value>,
@@ -455,9 +458,10 @@ impl UserConfig {
             Err(e) if e.kind() == ErrorKind::NotFound => Self::default(),
             Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
         };
+        config.tool_limits.validate().map_err(AnyError::msg)?;
         mcp::validate(&config.mcp).with_context(|| format!("{}", path.display()))?;
-        if config.plugins.len() > 16 {
-            bail!("at most 16 plugins may be configured in one session");
+        if config.plugins.len() > config.tool_limits.plugin_count {
+            bail!("configured plugin count limit exceeded");
         }
         Ok(config)
     }
@@ -714,6 +718,36 @@ impl UserConfig {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn resource_overrides_are_strict_validated_and_do_not_create_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[agent]\n[tool-limits]\nplugin-input-bytes=1048576\nplugin-fuel=10000000000\nhttp-redirects=0\n").unwrap();
+        let config = UserConfig::load(&path).unwrap();
+        assert_eq!(config.tool_limits.plugin_input_bytes, 1048576);
+        assert_eq!(config.tool_limits.plugin_fuel, 10_000_000_000);
+        assert_eq!(config.tool_limits.http_redirects, 0);
+        assert_eq!(
+            config.tool_limits.mutation_bytes,
+            Budgets::default().mutation_bytes
+        );
+        assert!(
+            config.global_policy()["agent"]
+                .as_table()
+                .unwrap()
+                .is_empty()
+        );
+        for bad in [
+            "plugin-input-bytes=0",
+            "plugin-input-bytes=-1",
+            "plugin-input-bytes=4294967296",
+            "plugin-inpt-bytes=1024",
+        ] {
+            fs::write(&path, format!("[tool-limits]\n{bad}\n")).unwrap();
+            assert!(UserConfig::load(&path).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn an_old_percent_grants_file_is_renamed_and_stamped_in_one_pass() {

@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde_json.workspace = true
+saddle-limits.workspace = true
 anyhow.workspace = true
 saddle-cap.workspace = true
 saddle-wit.workspace = true
@@ -17,7 +19,6 @@ wasmtime-wasi.workspace = true
 [dev-dependencies]
 cap-std.workspace = true
 saddle-policy.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true
 wat.workspace = true
 wit-component.workspace = true

@@ -1,7 +1,7 @@
 # WASI tool plugins
 
 Saddle loads explicitly installed, digest-pinned WASI components as model-callable tools
-(D126–D144). The runtime supports bounded filesystem and transcript services, not arbitrary extensions. A manifest
+(D126–D145). The runtime supports bounded filesystem and transcript services, not arbitrary extensions. A manifest
 in a repository never executes automatically. Installation, enablement and grants are separate steps
 performed by a person; an agent cannot write its own protected configuration.
 
@@ -496,6 +496,137 @@ results are workspace-relative, external/named-root results are usable absolute 
 routing identifiers. Unreadable descendants are skipped with a note; an unreadable requested start
 is an error. Non-UTF-8 names are counted as unrepresentable rather than lossy-renamed. Tree/file/page
 limits are intentional standard-tool bounds, not native fallbacks.
+
+## Runtime resource budgets (D145)
+
+All resource/presentation ceilings below are **defaults**, not constants a plugin must be rebuilt
+to change. Set `[tool-limits]` in the protected user `config.toml`, then `/reload` (or start a new
+session). `saddle check` prints the resolved profile. No workspace file or tool argument can change
+it. The guest receives a public immutable profile via the SDK; the host independently enforces it.
+No grant, path, credential or transcript-authorizer rule is widened by increasing a budget.
+
+For example, a larger ordinary write needs enough serialized argument space as well as mutation
+space; JSON escaping counts toward the former:
+
+```toml
+[tool-limits]
+plugin-input-bytes = 4194304
+plugin-memory-bytes = 67108864
+mutation-bytes = 8388608
+mutation-changes = 128
+exec-capture-bytes = 1048576
+exec-present-bytes = 262144
+plugin-output-bytes = 1048576
+presentation-bytes = 786432
+```
+
+All available keys and defaults (bytes unless a key names another unit):
+
+```toml
+[tool-limits]
+plugin-component-bytes = 4194304
+plugin-manifest-bytes = 16384
+plugin-count = 16
+plugin-description-chars = 1000
+plugin-schema-bytes = 16384
+plugin-version-bytes = 64
+plugin-stack-bytes = 524288
+plugin-table-elements = 10000
+plugin-instances = 32
+plugin-memories = 4
+plugin-tables = 8
+plugin-resources = 128
+plugin-random-bytes = 65536
+plugin-memory-bytes = 16777216
+plugin-fuel = 100000000
+plugin-timeout-ms = 2000
+plugin-input-bytes = 65536
+plugin-output-bytes = 65536
+host-wait-seconds = 300
+host-calls = 16
+metadata-bytes = 65536
+path-bytes = 4096
+directory-name-bytes = 1024
+url-bytes = 8192
+header-value-bytes = 8192
+exec-arguments = 128
+exec-argument-bytes = 65536
+range-bytes = 65536
+directory-page-entries = 128
+directory-scan-entries = 100000
+mutation-bytes = 1048576
+mutation-changes = 32
+diff-bytes = 65536
+diff-present-bytes = 61440
+native-diff-input-bytes = 2097152
+image-bytes = 5242880
+image-count = 1
+image-name-bytes = 256
+read-page-bytes = 51200
+read-page-lines = 2000
+read-scan-bytes = 67108864
+list-entries = 500
+search-visited = 100000
+search-pending = 2048
+search-path-bytes = 1048576
+search-file-bytes = 4194304
+search-ignore-file-bytes = 65536
+search-ignore-bytes = 131072
+find-results = 1000
+grep-matches = 200
+grep-line-bytes = 300
+search-regex-bytes = 1048576
+text-bytes = 51200
+exec-capture-bytes = 262144
+exec-present-bytes = 24576
+exec-report-paths = 16
+exec-report-denials = 8
+exec-seconds = 300
+presentation-bytes = 61440
+http-capture-bytes = 102400
+network-seconds = 30
+http-redirects = 5
+http-headers = 64
+http-header-bytes = 65536
+search-response-bytes = 1048576
+web-query-bytes = 16384
+web-results = 100
+web-default-results = 5
+web-quote-chars = 1000
+web-quotes = 3
+search-cache-entries = 17
+query-bytes = 16384
+query-result-bytes = 51200
+query-rows = 100
+query-value-bytes = 1048576
+query-columns = 32
+query-expr-depth = 100
+query-program-ops = 100000
+query-steps = 1000000
+```
+
+Positive finite values are required, except that `http-redirects`, `image-count`, `exec-report-paths`,
+`exec-report-denials` and `web-quotes` may be zero. Size/count fields must fit the 32-bit guest ABI;
+fuel uses a 64-bit counter. Backend/platform maxima still apply. Set matching stage limits deliberately:
+for example a large presentation also needs a large plugin output envelope and sufficient guest memory.
+`image-bytes` is both a per-image and aggregate emitted-image budget. `query-steps` is checked at SQLite
+progress callbacks (1000 instructions), not an exact single-instruction cutoff.
+
+The profile covers runtime store quotas, artifacts, host-service safety budgets and guest-owned workflow
+and presentation budgets. It is public numeric metadata only. A plugin cannot override host enforcement;
+raising bytes/counts/time does not raise its delegated exec timeout or its filesystem/network reach.
+Resource contexts are scoped per operation and restored; they do not leak settings across sessions or
+siblings. Fresh instances and a rebuilt catalogue on reload prevent a cached guest profile from surviving
+reload. Lowered cache budgets evict excess/oversized retained responses and reduce cached numbered
+result counts immediately. Unknown future snapshot keys are ignored by the SDK so adding a budget does not break
+older guests; the protected config still rejects typos. Older third-party artifacts can of course retain their own internal hard-coded limits.
+
+These settings do **not** make WIT strings represent arbitrary filenames, add image formats, make
+multi-file publication transactional, compute a preimage that a blind writer did not read, or immediately
+interrupt synchronous blocking I/O. Those are semantic/implementation differences, not adjustable quotas.
+The worker reserves native host stack beyond the configured Wasm stack. Library embedders using
+`Loader::with_budgets` must likewise provide sufficient native stack. The SDK debug reader fixture can exceed the default artifact budget because of DWARF; its runtime test
+explicitly increases that budget. Standard shipping components are built in release mode.
 
 ## Built-in migration tracking
 

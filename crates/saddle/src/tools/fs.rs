@@ -3,6 +3,7 @@
 //! is decided on the requested path and, when it differs, on the path the symlinks resolve to.
 
 use crate::provider::Image;
+use saddle_limits as budgets;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -27,12 +28,7 @@ macro_rules! field {
 }
 
 /// A page of at most this many lines: enough for a whole source file, small enough that a log or
-/// a generated table cannot swallow the context (D51).
-pub const MAX_READ_LINES: usize = 2_000;
-
-/// And at most this many bytes, because one line can be a minified bundle.
-pub const MAX_READ_BYTES: usize = 50 * 1024;
-
+/// a generated table cannot swallow the context (D51, D145).
 pub fn read(session: &mut Session, input: &Value) -> Result<ToolOutput> {
     let path = field!(input, "path");
     let offset = match num_field(input, "offset") {
@@ -110,14 +106,17 @@ fn page(text: &str, offset: Option<u64>, limit: Option<u64>) -> (String, Option<
         );
     }
     // A page ends on whichever comes first: the line cap, the caller's limit, or the byte budget.
-    let want = limit.map_or(MAX_READ_LINES, |n| (n as usize).min(MAX_READ_LINES));
+    let want = limit.map_or(budgets::read_page_lines(), |n| {
+        (n as usize).min(budgets::read_page_lines())
+    });
     let mut out = String::new();
     let mut last = first - 1;
     let mut cut_short = false;
     // Whether the page holds a line that was too long to hand over in full.
     let mut truncated = false;
     for (i, line) in lines.iter().enumerate().skip(first - 1) {
-        if last - (first - 1) + 1 > want || out.len() + line.len() + 1 > MAX_READ_BYTES {
+        if last - (first - 1) + 1 > want || out.len() + line.len() + 1 > budgets::read_page_bytes()
+        {
             cut_short = true;
             break;
         }
@@ -131,7 +130,7 @@ fn page(text: &str, offset: Option<u64>, limit: Option<u64>) -> (String, Option<
     // of the page is to bound the context, and a minified file still has an answer in it.
     if last == first - 1 {
         let line = lines[first - 1];
-        let at = floor_boundary(line, MAX_READ_BYTES.min(line.len()));
+        let at = floor_boundary(line, budgets::read_page_bytes().min(line.len()));
         out = format!(
             "{}\n[line {first} is {} bytes; the first {at} are shown]",
             &line[..at],
@@ -154,7 +153,7 @@ fn page(text: &str, offset: Option<u64>, limit: Option<u64>) -> (String, Option<
     // A file that fits on one page is returned exactly as it is on disk. Splitting it into lines
     // would drop a trailing newline, and `edit` matches text exactly, so a file would be read
     // without the newline it ends with and then never match (D51).
-    if note.is_none() && first == 1 && !truncated && text.len() <= MAX_READ_BYTES {
+    if note.is_none() && first == 1 && !truncated && text.len() <= budgets::read_page_bytes() {
         return (text.to_owned(), None);
     }
     // A page that ends with the file keeps the newline the file ends with, for the same reason.
@@ -483,8 +482,8 @@ mod tests {
             "αβ\r\nlast\r\n".into(),
             format!("{}é\r\nlast\n", "x".repeat(65535)),
             format!("{}\r\n", "x".repeat(24)).repeat(2000),
-            "é".repeat(MAX_READ_BYTES),
-            format!("{}\nlast\n", "a".repeat(MAX_READ_BYTES - 1)),
+            "é".repeat(budgets::read_page_bytes()),
+            format!("{}\nlast\n", "a".repeat(budgets::read_page_bytes() - 1)),
             "hello\n".repeat(220_000),
         ];
         for text in &cases {
@@ -524,7 +523,7 @@ mod tests {
     fn a_long_file_is_cut_at_the_line_cap_and_offers_the_next_offset() {
         let text: String = (1..=5_000).map(|n| format!("line {n}\n")).collect();
         let (body, note) = page(&text, None, None);
-        assert_eq!(body.lines().count(), MAX_READ_LINES);
+        assert_eq!(body.lines().count(), budgets::read_page_lines());
         assert_eq!(body.lines().next(), Some("line 1"));
         assert_eq!(body.lines().last(), Some("line 2000"));
         // The note names the next line and the argument that asks for it (D51).
@@ -548,7 +547,7 @@ mod tests {
         // A limit larger than the page cap is the cap, not the caller's number.
         let text: String = (1..=5_000).map(|n| format!("line {n}\n")).collect();
         let (body, _) = page(&text, None, Some(1_000_000));
-        assert_eq!(body.lines().count(), MAX_READ_LINES);
+        assert_eq!(body.lines().count(), budgets::read_page_lines());
 
         // The last page carries no note, because there is nothing after it.
         let (_, note) = page(&text, Some(4_990), Some(20));
@@ -561,17 +560,25 @@ mod tests {
         let line = "x".repeat(1024);
         let text = vec![line.clone(); 100].join("\n");
         let (body, note) = page(&text, None, None);
-        assert!(body.len() <= MAX_READ_BYTES, "{} bytes", body.len());
-        assert!(body.lines().count() < MAX_READ_LINES);
+        assert!(
+            body.len() <= budgets::read_page_bytes(),
+            "{} bytes",
+            body.len()
+        );
+        assert!(body.lines().count() < budgets::read_page_lines());
         assert!(note.unwrap().contains("for more"));
     }
 
     #[test]
     fn one_line_over_the_budget_is_shown_truncated_rather_than_refused() {
         // A minified bundle: a single line far past the budget.
-        let text = "y".repeat(MAX_READ_BYTES * 3);
+        let text = "y".repeat(budgets::read_page_bytes() * 3);
         let (body, note) = page(&text, None, None);
-        assert!(body.len() < MAX_READ_BYTES + 200, "{} bytes", body.len());
+        assert!(
+            body.len() < budgets::read_page_bytes() + 200,
+            "{} bytes",
+            body.len()
+        );
         assert!(body.contains("is"), "{body}");
         assert!(body.contains("bytes; the first"), "{body}");
         assert_eq!(note, None, "there is no next line to offer");

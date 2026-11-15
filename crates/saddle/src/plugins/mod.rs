@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 
 pub use self::host::Fatal as HostFailure;
 use self::host::{Host, Job, Reply, execute};
+use crate::config::UserConfig;
 use crate::fs_access;
 use crate::paths::Paths;
 use crate::provider::{Provenance, ToolDef};
@@ -29,8 +30,6 @@ use crate::session::{Session, session_id};
 use crate::tools::ToolOutput;
 
 pub const PREFIX: &str = "plugin__";
-const MAX_MANIFEST: usize = 16 * 1024;
-const MAX_COMPONENT: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -109,8 +108,8 @@ impl Registry {
     }
 
     pub fn load(&mut self, session: &mut Session) -> Result<()> {
-        if self.entries.len() > 16 {
-            bail!("at most 16 plugins may be configured in one session");
+        if self.entries.len() > session.setup.tool_limits.plugin_count {
+            bail!("configured plugin count limit exceeded");
         }
         for (id, entry) in self.entries.clone() {
             if !entry.enabled {
@@ -184,7 +183,11 @@ impl Registry {
         let root_path = session.setup.paths.config.canonicalize()?.join("plugins");
         let root = fs_access::root(&root_path)?;
         let manifest_rel = RelPath::new(&entry.manifest)?;
-        let text = String::from_utf8(read_bounded(&root, &manifest_rel, MAX_MANIFEST)?)?;
+        let text = String::from_utf8(read_bounded(
+            &root,
+            &manifest_rel,
+            session.setup.tool_limits.plugin_manifest_bytes,
+        )?)?;
         let manifest = Manifest::parse(&text)?;
         if manifest.id != *id {
             bail!(
@@ -193,7 +196,7 @@ impl Registry {
             );
         }
         if manifest.version.is_empty()
-            || manifest.version.len() > 64
+            || manifest.version.len() > session.setup.tool_limits.plugin_version_bytes
             || !manifest
                 .version
                 .bytes()
@@ -208,7 +211,11 @@ impl Registry {
             .map(Path::to_path_buf)
             .unwrap_or_default();
         let component_rel = RelPath::new(parent.join(component_rel.to_path()))?;
-        let bytes = read_bounded(&root, &component_rel, MAX_COMPONENT)?;
+        let bytes = read_bounded(
+            &root,
+            &component_rel,
+            session.setup.tool_limits.plugin_component_bytes,
+        )?;
         let hash = sha256_hex(&bytes);
         if !hash.eq_ignore_ascii_case(&entry.sha256) {
             bail!("component digest does not match plugins.{id}.sha256");
@@ -227,7 +234,7 @@ impl Registry {
             .cloned()
             .unwrap_or_default();
         if self.loader.is_none() {
-            self.loader = Some(Loader::new()?);
+            self.loader = Some(Loader::with_budgets(&session.setup.tool_limits)?);
         }
         let loader = self.loader.as_ref().context("no component engine")?;
         let prepared = Arc::new(loader.prepare::<Host>(
@@ -235,7 +242,7 @@ impl Registry {
             &agent,
             &requested,
             &bytes,
-            Limits::default(),
+            Limits::from_budgets(session.setup.tool_limits.clone()),
         )?);
         // There is only one engine. Its operational grants are the same bounded grants the
         // prepared component carries; the raw request is never used by a plugin host operation.
@@ -253,11 +260,13 @@ impl Registry {
         if !valid_tool_name(&description.name) {
             bail!("invalid plugin tool name");
         }
-        if description.description.chars().count() > 1000 {
-            bail!("plugin description exceeds 1000 characters");
+        if description.description.chars().count()
+            > session.setup.tool_limits.plugin_description_chars
+        {
+            bail!("plugin description exceeds configured character limit");
         }
-        if description.input_schema.len() > 16 * 1024 {
-            bail!("plugin schema exceeds 16 KiB");
+        if description.input_schema.len() > session.setup.tool_limits.plugin_schema_bytes {
+            bail!("plugin schema exceeds configured byte limit");
         }
         let mut schema: Value = serde_json::from_str(&description.input_schema)
             .context("invalid plugin JSON schema")?;
@@ -423,6 +432,7 @@ fn read_bounded(root: &Dir, rel: &RelPath, limit: usize) -> Result<Vec<u8>> {
 
 /// installs artifacts only; enablement and grants remain a person's separate decisions.
 pub fn install(manifest_path: &Path, paths: &Paths) -> Result<String> {
+    let limits = UserConfig::load(&paths.user_config())?.tool_limits;
     let parent = manifest_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -432,9 +442,17 @@ pub fn install(manifest_path: &Path, paths: &Paths) -> Result<String> {
     let name = manifest_path
         .file_name()
         .context("manifest path has no filename")?;
-    let text = String::from_utf8(read_bounded(&root, &RelPath::new(name)?, MAX_MANIFEST)?)?;
+    let text = String::from_utf8(read_bounded(
+        &root,
+        &RelPath::new(name)?,
+        limits.plugin_manifest_bytes,
+    )?)?;
     let mut manifest = Manifest::parse(&text)?;
-    let bytes = read_bounded(&root, &RelPath::new(&manifest.component)?, MAX_COMPONENT)?;
+    let bytes = read_bounded(
+        &root,
+        &RelPath::new(&manifest.component)?,
+        limits.plugin_component_bytes,
+    )?;
     if !bytes.starts_with(b"\0asm\x0d\0\x01\0") {
         bail!("artifact must be a binary component; componentize a core module first");
     }

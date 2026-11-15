@@ -1,5 +1,8 @@
 //! protected search-provider communication and per-principal bounded response snapshots (D143).
 
+use saddle_limits as budgets;
+use saddle_limits::Budgets;
+use std::collections::BTreeMap;
 use std::env;
 use std::time::Instant;
 
@@ -11,7 +14,7 @@ use saddle_wit::saddle::host::web_search::Snapshot;
 use serde_json::{Value, json};
 
 use crate::auth::AuthStore;
-use crate::network::{self, MAX_SEARCH_RESPONSE, Operation};
+use crate::network::{self, Operation};
 use crate::provider::SearchTarget;
 use crate::session::Session;
 
@@ -19,6 +22,24 @@ use crate::session::Session;
 pub struct CachedSearch {
     pub snapshot: Snapshot,
     pub source: String,
+}
+
+/// apply narrower cache budgets immediately on reload, not just on the next insertion (D145).
+pub fn trim_cache(session: &mut Session) {
+    trim_snapshots(&mut session.search_snapshots, &session.setup.tool_limits);
+}
+
+fn trim_snapshots(snapshots: &mut BTreeMap<Principal, CachedSearch>, limits: &Budgets) {
+    snapshots.retain(|_, cached| {
+        cached.snapshot.body.len() <= limits.search_response_bytes
+            && cached.snapshot.query.len() <= limits.web_query_bytes
+    });
+    for cached in snapshots.values_mut() {
+        cached.snapshot.count = cached.snapshot.count.min(limits.web_results as u32);
+    }
+    while snapshots.len() > limits.search_cache_entries {
+        snapshots.pop_first();
+    }
 }
 
 fn key(session: &Session, provider: &str, variable: Option<&str>) -> Option<String> {
@@ -45,7 +66,10 @@ pub fn search(
     count: u32,
     deadline: Instant,
 ) -> Result<Result<Snapshot, String>> {
-    if query.trim().is_empty() || query.len() > 16384 || !(1..=100).contains(&count) {
+    if query.trim().is_empty()
+        || query.len() > budgets::web_query_bytes()
+        || !(1..=budgets::web_results() as u32).contains(&count)
+    {
         return Ok(Err("invalid search query/count or exceeds 16 KiB".into()));
     }
     let provider = session.search.clone();
@@ -148,7 +172,7 @@ pub fn search(
         };
     }
     if response.truncated {
-        return Ok(Err("search response exceeds 1 MiB".into()));
+        return Ok(Err("search response exceeds configured byte limit".into()));
     }
     let mut body = match String::from_utf8(response.body) {
         Ok(body) => body,
@@ -157,8 +181,8 @@ pub fn search(
     if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
         body = body.replace(&secret, "[redacted credential]");
     }
-    if body.len() > MAX_SEARCH_RESPONSE {
-        return Ok(Err("search response exceeds 1 MiB".into()));
+    if body.len() > budgets::search_response_bytes() {
+        return Ok(Err("search response exceeds configured byte limit".into()));
     }
     let snapshot = Snapshot {
         query,
@@ -169,7 +193,7 @@ pub fn search(
         body,
     };
     if response.status == 200 {
-        if session.search_snapshots.len() >= 17
+        if session.search_snapshots.len() >= budgets::search_cache_entries()
             && !session.search_snapshots.contains_key(who)
             && let Some(oldest) = session.search_snapshots.keys().next().cloned()
         {
@@ -204,7 +228,7 @@ fn post(
             url,
             headers,
             body: &payload.to_string(),
-            limit: MAX_SEARCH_RESPONSE,
+            limit: budgets::search_response_bytes(),
             deadline,
             redirects: false,
         },
@@ -229,4 +253,46 @@ pub fn last(
         }
     }
     Ok(Ok(Some(cached.snapshot)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use saddle_cap::PluginId;
+
+    #[test]
+    fn lower_cache_limits_evict_retained_data_and_bound_numbered_results() {
+        let cached = |body: &str| CachedSearch {
+            source: "https://search.example".into(),
+            snapshot: Snapshot {
+                query: "q".into(),
+                count: 5,
+                via: "rest".into(),
+                provider: "mock".into(),
+                status: 200,
+                body: body.into(),
+            },
+        };
+        let mut snapshots = BTreeMap::from([
+            (Principal::Agent, cached("large body")),
+            (
+                Principal::Plugin(PluginId::new("one").unwrap()),
+                cached("a"),
+            ),
+            (
+                Principal::Plugin(PluginId::new("two").unwrap()),
+                cached("b"),
+            ),
+        ]);
+        let limits = Budgets {
+            search_cache_entries: 1,
+            search_response_bytes: 1,
+            web_results: 1,
+            ..Budgets::default()
+        };
+        trim_snapshots(&mut snapshots, &limits);
+        assert_eq!(snapshots.len(), 1);
+        assert!(!snapshots.contains_key(&Principal::Agent));
+        assert_eq!(snapshots.values().next().unwrap().snapshot.count, 1);
+    }
 }

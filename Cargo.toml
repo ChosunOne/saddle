@@ -15,6 +15,7 @@ absolute_paths = "deny"
 items_after_statements = "deny"
 
 [workspace.dependencies]
+saddle-limits = { path = "crates/saddle-limits" }
 saddle-cap = { path = "crates/saddle-cap" }
 saddle-policy = { path = "crates/saddle-policy" }
 saddle-sandbox = { path = "crates/saddle-sandbox" }

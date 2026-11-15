@@ -1,5 +1,6 @@
 //! temporary native adapter to the guest-owned search workflow and protected transport (D143).
 
+use saddle_limits as budgets;
 use std::time::{Duration, Instant};
 
 use anyhow::{Error, Result};
@@ -37,7 +38,7 @@ impl Transport for NativeTransport<'_> {
             "native-websearch",
             query.into(),
             count,
-            Instant::now() + Duration::from_secs(30),
+            Instant::now() + Duration::from_secs(budgets::network_seconds() as u64),
         ) {
             Ok(result) => result.map(snapshot),
             Err(error) => {

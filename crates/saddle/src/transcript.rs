@@ -3,6 +3,7 @@
 //! Three views: the branch's messages, one row per model request with what it used and what
 //! answered it (D94), and the reasoning behind those messages (D98).
 
+use saddle_limits as budgets;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -86,8 +87,8 @@ fn check_deadline(deadline: Option<Instant>) -> Result<()> {
 
 fn query_bounded(snapshot: &Snapshot, sql: &str, deadline: Option<Instant>) -> Result<Value> {
     check_deadline(deadline)?;
-    if sql.len() > 16 * 1024 {
-        bail!("SQL exceeds 16 KiB");
+    if sql.len() > budgets::query_bytes() {
+        bail!("SQL exceeds configured byte limit");
     }
     let mut conn = Connection::open_in_memory()?;
     conn.execute_batch(
@@ -151,16 +152,32 @@ fn query_bounded(snapshot: &Snapshot, sql: &str, deadline: Option<Instant>) -> R
         }
     }
     conn.pragma_update(None, "query_only", true)?;
-    conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, 1024 * 1024)?;
-    conn.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 16 * 1024)?;
-    conn.set_limit(Limit::SQLITE_LIMIT_COLUMN, 32)?;
-    conn.set_limit(Limit::SQLITE_LIMIT_EXPR_DEPTH, 100)?;
-    conn.set_limit(Limit::SQLITE_LIMIT_VDBE_OP, 100_000)?;
+    conn.set_limit(
+        Limit::SQLITE_LIMIT_LENGTH,
+        budgets::query_value_bytes().min(i32::MAX as usize) as i32,
+    )?;
+    conn.set_limit(
+        Limit::SQLITE_LIMIT_SQL_LENGTH,
+        budgets::query_bytes().min(i32::MAX as usize) as i32,
+    )?;
+    conn.set_limit(
+        Limit::SQLITE_LIMIT_COLUMN,
+        budgets::query_columns().min(i32::MAX as usize) as i32,
+    )?;
+    conn.set_limit(
+        Limit::SQLITE_LIMIT_EXPR_DEPTH,
+        budgets::query_expr_depth().min(i32::MAX as usize) as i32,
+    )?;
+    conn.set_limit(
+        Limit::SQLITE_LIMIT_VDBE_OP,
+        budgets::query_program_ops().min(i32::MAX as usize) as i32,
+    )?;
     let steps = AtomicUsize::new(0);
     conn.progress_handler(
         1000,
         Some(move || {
-            steps.fetch_add(1, Ordering::Relaxed) >= 1000 || check_deadline(deadline).is_err()
+            steps.fetch_add(1000, Ordering::Relaxed) >= budgets::query_steps()
+                || check_deadline(deadline).is_err()
         }),
     )?;
     conn.authorizer(Some(authorize))?;
@@ -173,15 +190,15 @@ fn query_bounded(snapshot: &Snapshot, sql: &str, deadline: Option<Instant>) -> R
     }
     let columns: Vec<String> = statement.column_names().map(String::from).collect();
     let mut bytes = serde_json::to_vec(&columns)?.len() + 64;
-    if bytes > 50 * 1024 {
-        bail!("query column names exceed the 50 KiB result limit");
+    if bytes > budgets::query_result_bytes() {
+        bail!("query column names exceed configured result limit");
     }
     let mut cursor = statement.query([])?;
     let mut rows = Vec::new();
     let mut truncated = false;
     while let Some(row) = cursor.next()? {
         check_deadline(deadline)?;
-        if rows.len() == 100 {
+        if rows.len() == budgets::query_rows() {
             truncated = true;
             break;
         }
@@ -196,7 +213,7 @@ fn query_bounded(snapshot: &Snapshot, sql: &str, deadline: Option<Instant>) -> R
             });
         }
         let size = serde_json::to_vec(&values)?.len() + 1;
-        if bytes + size > 50 * 1024 {
+        if bytes + size > budgets::query_result_bytes() {
             truncated = true;
             break;
         }
@@ -436,7 +453,7 @@ mod tests {
         };
         let out = query(&snapshot, "SELECT text FROM messages").unwrap();
         assert_eq!(out["truncated"], true);
-        assert!(out.to_string().len() <= 50 * 1024);
+        assert!(out.to_string().len() <= budgets::query_result_bytes());
         assert!(query(&Snapshot::default(), &" ".repeat(16 * 1024 + 1)).is_err());
     }
 }
