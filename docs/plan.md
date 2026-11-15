@@ -3557,10 +3557,22 @@ read bindings under a write capability must never let that principal read a file
 ## 9. Known risks
 
 - The policy engine and the WIT world are one design. Getting them out of step produces a system that
-  looks enforced and is not. The live form of this today: `saddle_cap::component::host_interfaces`
-  computes the interfaces a grant permits (and names several that have no WIT), while `saddle-loader`
-  keeps its own list of the imports it implements. The two agree by hand; deriving one from the other
-  is the fix, and until then a change to either must be mirrored.
+  looks enforced and is not. The same fact is written down in four places today and cross-checked by
+  nothing: `saddle_cap::component::classify` gives each interface name the scope that permits it;
+  `saddle-loader` keeps a literal list of the imports it implements, and the sentence it refuses the
+  rest with; the same loader registers the host adapters in `add_to_linker` behind
+  `scopes.contains(..)` conditions that repeat the scope mapping; and
+  `crates/saddle-wit/wit/host.wit` holds the names and signatures themselves. They agree because
+  every change so far has touched all four, which is a habit rather than a guarantee. The deleted
+  `host_interfaces` is what a fifth copy looked like after it drifted. Naming interfaces the runtime
+  does not implement is deliberate (section 6): the refusal is the point, and it names what is
+  missing. What is not deliberate is that the naming, the implementation list, the registration and
+  the WIT can disagree without anything noticing. The fix is one table in `saddle-cap` giving each
+  interface its direction, the scope it needs, and whether the runtime implements it, with
+  `classify`, the load-time refusal and the linker registration all reading from it, plus a test that
+  the table covers exactly the interfaces the WIT defines. Until then a change to any of the four
+  must be mirrored in the other three, and the hook surface (section 7, v3) is where that is easiest
+  to get wrong.
 - Building an argv matcher for `exec` first is the tempting shortcut. It works until a plugin writes a
   Makefile.
 - Parity pressure will pull toward extension points that have no scope yet, and the easy answer will be
