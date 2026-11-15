@@ -282,6 +282,41 @@ fn existing_configs_need_explicit_standard_profiles_and_omitted_scopes_never_inh
 }
 
 #[test]
+fn first_run_includes_and_enables_shipped_tools_without_manual_configuration() {
+    let env = Env::new();
+    // Remove the helper's explicit configuration so the real first-run path supplies everything.
+    fs::remove_file(env.policy_path()).unwrap();
+    let (ok, text) = env.tool("read", serde_json::json!({"path":"README"}));
+    assert!(ok && text.trim_end() == "hello", "{text}");
+
+    let config: toml::Table = env.policy().parse().unwrap();
+    let recommended: toml::Table = saddle_standard::DEFAULT_PROFILES.parse().unwrap();
+    assert_eq!(config["standard-tools"], recommended["standard-tools"]);
+    assert_eq!(
+        config["standard-tools"].as_table().unwrap().len(),
+        saddle_standard::ARTIFACTS.len()
+    );
+    assert!(config["agent"].get("net").is_none());
+
+    let listing = env.saddle(&["plugin", "list"]);
+    assert!(listing.status.success(), "{}", stderr(&listing));
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    for artifact in saddle_standard::ARTIFACTS {
+        assert!(config["standard-tools"].get(artifact.name).is_some());
+        let status = if matches!(artifact.name, "fetch" | "websearch") {
+            // Enabled profiles never invent the network reach absent from first-run grants.
+            "standard tool unavailable:"
+        } else {
+            "ready: shipped standard tool"
+        };
+        assert!(
+            listing.contains(&format!("{} · {status}", artifact.id)),
+            "{listing}"
+        );
+    }
+}
+
+#[test]
 fn shipped_tool_inventory_and_delegation_template_do_not_modify_existing_config() {
     let env = Env::new();
     let before = fs::read(env.policy_path()).unwrap();
