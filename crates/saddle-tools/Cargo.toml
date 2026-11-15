@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+similar.workspace = true
 saddle-limits.workspace = true
 saddle-ignore.workspace = true
 globset.workspace = true

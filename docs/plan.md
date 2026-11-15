@@ -3271,6 +3271,59 @@ atomicity, blind mutation diff semantics and inability to preempt every blocking
 contracts, not resource knobs. Chunk sizes and scheduler polling intervals are implementation choices,
 not additional ceilings. Backend/platform hard maxima can still constrain a requested budget.
 
+**D146.** Standard mutation guests produce native-style minimal line hunks with Myers diff,
+three context lines, old/new line numbers and gap markers. Presentation is prepared and accepted
+before mutation effects, staged by the host and published only on successful completion. A diff
+adapter failure cannot silently turn a successful edit into an edit with no diff. Configurable
+presentation budgets, guest fuel and memory remain independent bounds; no native clock is required
+by the guest diff algorithm.
+
+Standard `write` reads its preimage (including positively observed absence), then submits a SHA-256
+or missing precondition. Standard patch deletions read and hash the deleted text too. Errors or
+permission refusals are never treated as absence. The additive `fs-preimage` service returns an
+optional bounded byte snapshot after ordinary requested/resolved read checks and audit; only a
+real not-found error yields absence. It uses the existing mutation byte budget, pinned no-follow
+regular-file opens and cancellation/deadlines. It adds neither read reach nor an existence oracle
+for write-only principals. New patch additions still use `missing`, not a blind overwrite. This
+supersedes blind write/delete workflows in D140/D141/D145 for standard tools. The low-level SDK's
+`any` expectation remains binary-compatible for explicitly configured third-party plugins, not an
+option offered by standard tool schemas. Publication still has D140's documented race/partial-effect
+limits; this is not a filesystem-wide compare-and-swap transaction.
+
+**D147.** Standard-tool delivery is part of the executable, not runtime repository discovery or
+manual artifacts under `target`. `saddle-standard` builds the eleven guest sources with the same
+locked dependencies in an independent Cargo target directory, componentizes them and embeds both
+the raw components/digests and build-produced native Wasmtime artifacts. This requires the Rust
+`wasm32-unknown-unknown` target for developers/package builders, not end users. Cargo tracks SDK,
+WIT, tool, limits and ignore sources; normal build/test produces current artifacts automatically.
+
+The pinned Wasmtime compiler uses an explicit baseline target ISA for package and runtime engines.
+Loading native artifacts is unsafe in general: the new embedded loader path accepts only immutable
+artifacts compiled by the trusted package build from those exact embedded component bytes. No
+runtime-writable serialized-code cache, native plugin library or downloaded artifact can use it.
+Ordinary third-party plugins still compile only digest-checked raw components. Both paths inspect
+actual types, check scope ceilings/delegation and pre-link against granted services before init.
+This supersedes D127's absence of build-produced native delivery, not its refusal of runtime native
+plugin artifacts. Runtime budgets and grant/directory changes do not require recompilation.
+
+`[standard-tools]` in protected user config explicitly selects each shipped tool and the operation
+scopes to delegate from the agent's current reach. Presence grants registration only; listed scopes
+select existing resources, never add them. Root exclusions, exec env/timeouts, private-network
+exemptions, managed-path roles and transcript reach remain bounded by the same D126 narrowing.
+Managed roles are restricted to that standard tool's role (read for mutation preimages). Omitted
+entries/scopes mean none. First-run config writes the explicit recommended table alongside its
+existing agent defaults; an existing config missing it remains undelegated and gets migration
+instructions, never an automatic grant. `standard-*` identities are reserved, profiles enter the
+policy hash, and load records name scopes, component digests and caller identity.
+
+Ordinary tool names resolve to these components and their guest-owned schemas, retaining plugin
+provenance/framing and human diffs/images through replay. Human line/TUI display removes only a
+matching outer frame with host provenance; provider and stored content remain framed. `saddle tools`
+reports shipped digests and `saddle tools --config` prints the explicit profile without editing config. There is no native fallback or implementation
+picker. Missing/ineligible components return ordinary audited denials. Core retains only privileged
+filesystem/exec/network/transcript effects and harness/human-UI helpers; third-party plugins and MCP
+retain their existing names and explicit grants. `tool_search` remains the MCP catalogue operation.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

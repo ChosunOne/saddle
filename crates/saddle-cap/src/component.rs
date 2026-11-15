@@ -93,14 +93,13 @@ pub fn classify(direction: Direction, name: &str) -> Requirement {
         (Import, "saddle", "host", i) => match i {
             "exec" => scope(Scope::Exec),
             "http" | "web-search" => scope(Scope::Net),
-            "fs-read" | "fs-read-range" | "fs-paths" | "fs-list" | "tool-paths" | "fs-write" => {
-                Requirement::AnyScope(&[
-                    Scope::FsRead,
-                    Scope::ToolRead,
-                    Scope::FsWrite,
-                    Scope::ToolWrite,
-                ])
-            }
+            "fs-read" | "fs-read-range" | "fs-paths" | "fs-list" | "tool-paths" | "fs-write"
+            | "fs-preimage" => Requirement::AnyScope(&[
+                Scope::FsRead,
+                Scope::ToolRead,
+                Scope::FsWrite,
+                Scope::ToolWrite,
+            ]),
             "tool-result" | "budgets" => scope(Scope::Tool),
             "transcript-read" => scope(Scope::TranscriptRead),
             "context-contribute" => scope(Scope::ContextContribute),

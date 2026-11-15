@@ -3,7 +3,6 @@
 use saddle_limits as budgets;
 use saddle_sdk::SearchSnapshot;
 #[cfg(target_arch = "wasm32")]
-#[cfg(target_arch = "wasm32")]
 use saddle_sdk::configure_limits;
 #[cfg(target_arch = "wasm32")]
 use saddle_sdk::{Definition, Output, Tool, last_search, search_web};

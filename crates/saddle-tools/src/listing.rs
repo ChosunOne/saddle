@@ -2,8 +2,9 @@
 
 use saddle_limits as budgets;
 #[cfg(target_arch = "wasm32")]
-#[cfg(target_arch = "wasm32")]
 use saddle_sdk::configure_limits;
+#[cfg(target_arch = "wasm32")]
+use saddle_sdk::failure_message;
 use saddle_sdk::{DirectoryPage, EntryKind};
 use serde::Deserialize;
 
@@ -57,7 +58,7 @@ impl Tool for Ls {
                     after,
                     limit,
                 )
-                .map_err(|error| format!("listing failed: {error:?}"))
+                .map_err(failure_message)
             })
         });
         match result {

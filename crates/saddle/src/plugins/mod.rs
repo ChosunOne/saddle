@@ -1,4 +1,4 @@
-//! explicit, protected, digest-pinned read-tool plugins (D25, D26, D128, D129).
+//! protected plugins and shipped tools share bounded dispatch, provenance and audit (D25, D128, D129, D147).
 
 mod filesystem;
 mod host;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use cap_std::fs::Dir;
 use saddle_cap::manifest::Manifest;
-use saddle_cap::{PluginId, Principal, RelPath, Scope};
+use saddle_cap::{Grants, PluginId, Principal, RelPath, Scope};
 use saddle_loader::{Limits, Loader, Prepared};
 use saddle_policy::audit::sha256_hex;
 use saddle_policy::{Kind, Request};
@@ -27,7 +27,9 @@ use crate::fs_access;
 use crate::paths::Paths;
 use crate::provider::{Provenance, ToolDef};
 use crate::session::{Session, session_id};
+use crate::standard;
 use crate::tools::ToolOutput;
+use saddle_standard::{ARTIFACTS, Artifact, artifact};
 
 pub const PREFIX: &str = "plugin__";
 
@@ -40,6 +42,14 @@ pub struct Entry {
     pub manifest: String,
     #[serde(default)]
     pub sha256: String,
+}
+
+struct Source<'a> {
+    manifest: Manifest,
+    bytes: &'a [u8],
+    bundled: Option<&'static Artifact>,
+    public_name: Option<&'static str>,
+    manifest_hash: String,
 }
 
 struct Loaded {
@@ -158,10 +168,45 @@ impl Registry {
                 }
             }
         }
+        for (name, scopes) in session.setup.standard_tools.clone() {
+            let bundle = artifact(&name).context("unknown shipped tool")?;
+            let id = PluginId::new(bundle.id).context("invalid shipped identity")?;
+            let parent = session
+                .engine
+                .policy()
+                .grants(&Principal::Agent)
+                .cloned()
+                .unwrap_or_default();
+            let requested = standard::delegate(&parent, &name, &scopes);
+            let manifest = Manifest::parse(bundle.manifest)?;
+            match self.prepare_one(
+                session,
+                &requested,
+                Source {
+                    manifest,
+                    bytes: bundle.wasm,
+                    bundled: Some(bundle),
+                    public_name: Some(bundle.name),
+                    manifest_hash: sha256_hex(bundle.manifest.as_bytes()),
+                },
+            ) {
+                Ok(loaded) => {
+                    self.loaded.insert(id.clone(), loaded);
+                    self.status
+                        .insert(id, "ready: shipped standard tool".into());
+                }
+                Err(error) if error.is::<HostFailure>() => return Err(error),
+                Err(error) => {
+                    let why = format!("standard tool unavailable: {error:#}");
+                    session.audit.event(Kind::Decision,Some(&Principal::Plugin(id.clone())),Some(Scope::Tool),Some(false),json!({"via":"standard", "operation":"load", "sha256":bundle.sha256,"profile":scopes}),&why).map_err(|error|HostFailure(error.into()))?;
+                    self.status.insert(id, why);
+                }
+            }
+        }
         let mut policy = session.engine.policy().clone();
         for (principal, grants) in &mut policy.principals {
             if let Principal::Plugin(id) = principal {
-                if !self.entries.contains_key(id) {
+                if !self.entries.contains_key(id) && !id.as_str().starts_with("standard-") {
                     self.status.insert(
                         id.clone(),
                         "granted, but no plugins table declares it".into(),
@@ -227,6 +272,38 @@ impl Registry {
             .grants(&who)
             .cloned()
             .unwrap_or_default();
+        let code = ARTIFACTS
+            .iter()
+            .find(|artifact| artifact.sha256 == hash && artifact.wasm == bytes);
+        self.prepare_one(
+            session,
+            &requested,
+            Source {
+                manifest,
+                bytes: &bytes,
+                bundled: code,
+                public_name: None,
+                manifest_hash: sha256_hex(text.as_bytes()),
+            },
+        )
+    }
+
+    fn prepare_one(
+        &mut self,
+        session: &mut Session,
+        requested: &Grants,
+        source: Source<'_>,
+    ) -> Result<Loaded> {
+        let Source {
+            manifest,
+            bytes,
+            bundled,
+            public_name,
+            manifest_hash,
+        } = source;
+        let id = &manifest.id;
+        let who = Principal::Plugin(id.clone());
+        let hash = sha256_hex(bytes);
         let agent = session
             .engine
             .policy()
@@ -237,13 +314,26 @@ impl Registry {
             self.loader = Some(Loader::with_budgets(&session.setup.tool_limits)?);
         }
         let loader = self.loader.as_ref().context("no component engine")?;
-        let prepared = Arc::new(loader.prepare::<Host>(
-            &manifest,
-            &agent,
-            &requested,
-            &bytes,
-            Limits::from_budgets(session.setup.tool_limits.clone()),
-        )?);
+        let limits = Limits::from_budgets(session.setup.tool_limits.clone());
+        let prepared = Arc::new(if let Some(artifact) = bundled {
+            if artifact.wasm != bytes {
+                bail!("bundled code does not match the raw component");
+            }
+            // SAFETY: both byte arrays are immutable includes generated together by the package
+            // compiler, not selected from runtime files or supplied by configuration/plugin input.
+            unsafe {
+                loader.prepare_embedded::<Host>(
+                    &manifest,
+                    &agent,
+                    requested,
+                    bytes,
+                    artifact.native,
+                    limits,
+                )
+            }?
+        } else {
+            loader.prepare::<Host>(&manifest, &agent, requested, bytes, limits)?
+        });
         // There is only one engine. Its operational grants are the same bounded grants the
         // prepared component carries; the raw request is never used by a plugin host operation.
         let mut policy = session.engine.policy().clone();
@@ -251,6 +341,12 @@ impl Registry {
             .principals
             .insert(who.clone(), prepared.grants().clone());
         session.engine.replace_policy(policy);
+        let registration = session
+            .decide(&who, &Request::Plain(Scope::Tool))
+            .map_err(HostFailure)?;
+        if !registration.allow {
+            bail!("registration refused: {}", registration.explanation);
+        }
         let call = self.next_call();
         let description = match execute(prepared.clone(), session, Job::Describe, &call)? {
             Ok(Reply::Description(d)) => d,
@@ -280,12 +376,19 @@ impl Registry {
             Some(Value::String(t)) if t == "object" => {}
             _ => bail!("plugin input schema must describe an object"),
         }
-        let tool_name = format!("{PREFIX}{id}__{}", description.name);
+        let tool_name = if let Some(name) = public_name {
+            if description.name != name {
+                bail!("shipped tool name does not match bundle");
+            }
+            name.to_owned()
+        } else {
+            format!("{PREFIX}{id}__{}", description.name)
+        };
         if tool_name.len() > 64 {
             bail!("namespaced plugin tool name exceeds 64 bytes");
         }
         let description = self.wrap(id, &description.description);
-        session.audit.event(Kind::Decision, Some(&who), Some(Scope::Tool), Some(true), json!({"via":"plugin", "operation":"load", "sha256":hash, "manifest_sha256":sha256_hex(text.as_bytes()), "call_id":call}), "plugin prepared and described").map_err(|error| HostFailure(error.into()))?;
+        session.audit.event(Kind::Decision, Some(&who), Some(Scope::Tool), Some(true), json!({"via":"plugin", "operation":"load", "sha256":hash, "manifest_sha256":manifest_hash, "requested_scopes":requested.scopes().iter().map(ToString::to_string).collect::<Vec<_>>(), "call_id":call}), "plugin prepared and described").map_err(|error| HostFailure(error.into()))?;
         Ok(Loaded {
             prepared,
             definition: ToolDef {
@@ -348,15 +451,20 @@ impl Registry {
             .find(|(_, l)| l.definition.name == name)
             .map(|(id, _)| id.clone());
         let Some(id) = owner else {
+            let status = artifact(name)
+                .and_then(|artifact| PluginId::new(artifact.id))
+                .and_then(|id| self.status.get(&id))
+                .map(String::as_str)
+                .unwrap_or("no explicit [standard-tools] entry or plugin enablement");
             let why = format!(
-                "plugin tool {name:?} is not enabled, granted and loaded; use saddle plugin list"
+                "tool {name:?} is not enabled, granted and loaded: {status}; use saddle plugin list (no native fallback)"
             );
             session.audit.event(
                 Kind::Decision,
                 Some(&Principal::Agent),
                 Some(Scope::Tool),
                 Some(false),
-                json!({"via":"plugin", "tool":name, "call_id":call}),
+                json!({"via":"plugin", "tool":name, "input_sha256":sha256_hex(input.to_string().as_bytes()), "call_id":call}),
                 &why,
             )?;
             return Ok(ToolOutput::denied(&why));

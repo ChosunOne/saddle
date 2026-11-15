@@ -17,9 +17,9 @@ use saddle_policy::audit::sha256_hex;
 use serde_json::json;
 
 use crate::config::ContextConfig;
+use crate::file_read::read_text;
 use crate::paths::Paths;
 use crate::session::Session;
-use crate::tools::fs::read_text;
 
 /// Bytes of one file that go into the prompt; the rest is cut with a note.
 pub const MAX_FILE_BYTES: usize = 64 * 1024;

@@ -3,7 +3,7 @@
 use saddle_limits as budgets;
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::mem;
 use std::path::Path as NativePath;
 use std::sync::Arc;
@@ -66,6 +66,12 @@ impl StdError for Fatal {
 type HostReply<T, E = Failure> = Result<Result<T, E>, String>;
 type FileReply = HostReply<Chunk>;
 enum Event {
+    Preimage {
+        who: Principal,
+        deadline: Instant,
+        path: Path,
+        answer: SyncSender<HostReply<Option<Vec<u8>>>>,
+    },
     Label {
         who: Principal,
         deadline: Instant,
@@ -167,6 +173,24 @@ impl Host {
     }
 }
 impl HostServices for Host {
+    fn read_preimage(
+        &mut self,
+        call: &Invocation,
+        path: Path,
+    ) -> Result<Result<Option<Vec<u8>>, Failure>> {
+        let (answer, reply) = mpsc::sync_channel(1);
+        self.events.send(Event::Preimage {
+            who: call.principal().clone(),
+            deadline: call.deadline(),
+            path,
+            answer,
+        })?;
+        reply
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(HostError::from)?
+            .map_err(HostError::msg)
+    }
+
     fn label_root(&mut self, call: &Invocation, root: String) -> Result<Result<String, Failure>> {
         let (answer, result) = mpsc::sync_channel(1);
         self.events
@@ -506,6 +530,20 @@ fn execute_inner(
             cancelled.store(true, Ordering::Relaxed);
         }
         match pending.recv_timeout(Duration::from_millis(10)) {
+            Ok(Event::Preimage {
+                who,
+                deadline,
+                path,
+                answer,
+            }) => {
+                respond(
+                    read_preimage(session, &who, call, deadline, path),
+                    answer,
+                    &mut fatal,
+                    &cancelled,
+                );
+            }
+
             Ok(Event::Label {
                 who,
                 deadline,
@@ -886,6 +924,11 @@ fn read_file(
     range: Option<(u64, u32)>,
     managed: bool,
 ) -> Result<Result<Chunk, Failure>> {
+    if cancel::FLAG.load(Ordering::Relaxed) || Instant::now() >= deadline {
+        return Ok(Err(Failure::Io(
+            "preimage read cancelled or timed out".into(),
+        )));
+    }
     let (path, managed) = filesystem::decode_path(path, managed);
     if range
         .is_some_and(|(_, limit)| limit == 0 || u64::from(limit) > budgets::range_bytes() as u64)
@@ -979,4 +1022,61 @@ fn read_file(
         Ok(result) => result,
         Err(error) => Err(Failure::Io(error.to_string())),
     })
+}
+
+fn read_preimage(
+    session: &mut Session,
+    who: &Principal,
+    call: &str,
+    deadline: Instant,
+    path: Path,
+) -> Result<Result<Option<Vec<u8>>, Failure>> {
+    let (path, managed) = filesystem::decode_path(path, false);
+    let (root, relative) = match (RootName::new(&path.root), RelPath::new(&path.relative)) {
+        (Ok(root), Ok(relative)) if path.relative.len() <= budgets::path_bytes() => {
+            (root, relative)
+        }
+        _ => return Ok(Err(Failure::InvalidPath("invalid preimage path".into()))),
+    };
+    let loc = Location::new(root, relative);
+    let (dir, real) = match filesystem::open_read_path(
+        session,
+        who,
+        call,
+        &loc,
+        json!({"operation":"read-preimage"}),
+        managed,
+    )? {
+        Ok(opened) => opened,
+        Err(failure) => return Ok(Err(failure)),
+    };
+    let mut file = match fs_access::file(&dir, &real.rel) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(Ok(None));
+        }
+        Err(error) => return Ok(Err(Failure::Io(error.to_string()))),
+    };
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 8192];
+    loop {
+        if cancel::FLAG.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            return Ok(Err(Failure::Io(
+                "preimage read cancelled or timed out".into(),
+            )));
+        }
+        let want = chunk.len().min(
+            budgets::mutation_bytes()
+                .saturating_add(1)
+                .saturating_sub(bytes.len()),
+        );
+        match file.read(&mut chunk[..want]) {
+            Ok(0) => return Ok(Ok(Some(bytes))),
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Err(error) => return Ok(Err(Failure::Io(error.to_string()))),
+        }
+        if bytes.len() > budgets::mutation_bytes() {
+            return Ok(Err(Failure::TooLarge));
+        }
+    }
 }

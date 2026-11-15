@@ -23,9 +23,9 @@ use std::thread;
 
 use saddle_policy::Request;
 
+use crate::net::client::Target;
 use crate::net::head::{self, Route};
 use crate::net::hello::{self, Peek};
-use crate::tools::fetch::Target;
 
 /// Bytes buffered while waiting for a request's first decision.
 const MAX_HEAD: usize = head::MAX_HEAD;

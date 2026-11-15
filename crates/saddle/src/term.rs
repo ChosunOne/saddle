@@ -136,7 +136,7 @@ impl Ui for Terminal {
         eprintln!(
             "{}  {mark} {}{}",
             self.dim,
-            one_line(&clean(&out.content), 160),
+            one_line(&clean(out.visible_content()), 160),
             self.reset
         );
     }

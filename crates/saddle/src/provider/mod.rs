@@ -135,6 +135,31 @@ pub enum Item {
     Summary(String),
 }
 
+/// human-only removal of the authenticated outer plugin frame; stored/model content stays framed.
+pub fn visible_tool_text<'a>(text: &'a str, provenance: Option<&Provenance>) -> &'a str {
+    let Some(origin) = provenance else {
+        return text;
+    };
+    let Some(id) = origin.principal.strip_prefix("plugin.") else {
+        return text;
+    };
+    let Some((header, body)) = text.split_once('\n') else {
+        return text;
+    };
+    let Some(header) = header.strip_prefix("<plugin-output-") else {
+        return text;
+    };
+    let suffix = format!(" plugin=\"{id}\">");
+    let Some(nonce) = header.strip_suffix(suffix.as_str()) else {
+        return text;
+    };
+    if nonce.is_empty() || !nonce.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+        return text;
+    }
+    body.strip_suffix(&format!("\n</plugin-output-{nonce}>"))
+        .unwrap_or(text)
+}
+
 /// One image, ready for the wire (D58).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Image {
@@ -1416,6 +1441,23 @@ mod tests {
     use crate::provider::http::ModelInfo;
     use serde_json::json;
     use std::path::Path;
+
+    #[test]
+    fn human_tool_rendering_unframes_only_with_matching_host_provenance() {
+        let framed =
+            "<plugin-output-ab12 plugin=\"standard-edit\">\nchanged\n</plugin-output-ab12>";
+        let mut origin = Provenance {
+            principal: "plugin.standard-edit".into(),
+            scope: Scope::Tool,
+            call_id: "c".into(),
+            component_sha256: "hash".into(),
+            version: "v".into(),
+        };
+        assert_eq!(visible_tool_text(framed, Some(&origin)), "changed");
+        assert_eq!(visible_tool_text(framed, None), framed);
+        origin.principal = "plugin.other".into();
+        assert_eq!(visible_tool_text(framed, Some(&origin)), framed);
+    }
 
     #[test]
     fn the_prose_in_a_reasoning_block_depends_on_the_surface_that_sent_it() {

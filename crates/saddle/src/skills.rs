@@ -31,9 +31,9 @@ use serde_json::json;
 
 use crate::config::SkillsConfig;
 use crate::context::{cap, home, label_of};
+use crate::file_read::read_text;
 use crate::ignore::Rules;
 use crate::session::Session;
-use crate::tools::fs::read_text;
 
 /// The file that makes a directory a skill, and the only one discovery reads.
 pub const FILE: &str = "SKILL.md";

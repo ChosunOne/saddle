@@ -2468,13 +2468,11 @@ dependencies = [
  "saddle-loader",
  "saddle-policy",
  "saddle-sandbox",
- "saddle-sdk",
- "saddle-tools",
+ "saddle-standard",
  "saddle-wit",
  "serde",
  "serde_json",
  "sha2",
- "similar",
  "syntect",
  "tempfile",
  "toml",
@@ -2522,6 +2520,7 @@ dependencies = [
  "saddle-cap",
  "saddle-limits",
  "saddle-policy",
+ "saddle-standard",
  "saddle-wit",
  "serde_json",
  "sha2",
@@ -2570,6 +2569,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "saddle-standard"
+version = "0.0.1"
+dependencies = [
+ "saddle-cap",
+ "saddle-loader",
+ "sha2",
+ "wit-component",
+]
+
+[[package]]
 name = "saddle-tools"
 version = "0.0.1"
 dependencies = [
@@ -2582,6 +2591,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "similar",
 ]
 
 [[package]]

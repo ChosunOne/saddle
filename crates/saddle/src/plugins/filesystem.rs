@@ -17,8 +17,8 @@ use saddle_wit::saddle::host::fs_list::{Entry, EntryKind, Page};
 use saddle_wit::saddle::host::fs_read::{Failure, Path};
 use serde_json::{Value, json};
 
+use crate::file_read::resolve_beneath;
 use crate::session::Session;
-use crate::tools::fs::resolve_beneath;
 use crate::{cancel, fs_access};
 
 const TOOL_PATH_PREFIX: &str = "@tool:";

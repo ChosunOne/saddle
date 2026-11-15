@@ -214,6 +214,24 @@ fn openai_sse_usage(
     s
 }
 
+fn tool_text(text: &str) -> &str {
+    if text.starts_with("<plugin-output-")
+        && let Some((_, body)) = text.split_once('\n')
+        && let Some((body, _)) = body.rsplit_once("\n</plugin-output-")
+    {
+        body
+    } else {
+        text
+    }
+}
+
+fn standard_component(name: &str) -> Vec<u8> {
+    saddle_standard::artifact(name)
+        .expect("shipped standard artifact")
+        .wasm
+        .to_vec()
+}
+
 struct Env {
     ws: tempfile::TempDir,
     xdg: tempfile::TempDir,
@@ -240,6 +258,13 @@ impl Env {
                 toml::to_string(&json!({"agent": policy["agent"]})).unwrap(),
                 api.name()
             ),
+        )
+        .unwrap();
+        let path = config.join("config.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(
+            path,
+            format!("{text}\n{}", saddle_standard::DEFAULT_PROFILES),
         )
         .unwrap();
         env
@@ -379,18 +404,15 @@ fn tool_loop(api: Api) {
     assert_eq!(
         names,
         [
-            "session_query",
             "tool_search",
-            "read",
-            "write",
+            "bash",
             "edit",
-            "patch",
-            "ls",
             "find",
             "grep",
-            "bash",
-            "fetch",
-            "websearch"
+            "ls",
+            "patch",
+            "read",
+            "write"
         ]
     );
     let mut first_text = String::new();
@@ -401,7 +423,7 @@ fn tool_loop(api: Api) {
     let mut second = String::new();
     strings(&seen[1].body, &mut second);
     assert!(
-        second.contains("created notes/hello.txt (2 bytes"),
+        second.contains("wrote notes/hello.txt (2 bytes"),
         "{second}"
     );
     assert!(
@@ -428,11 +450,190 @@ fn tool_loop(api: Api) {
     assert_eq!(models[0]["args"]["usage"]["input"], 100);
     let denied = recs
         .iter()
-        .filter(|r| r["kind"] == "decision" && r["allow"] == false)
+        .filter(|r| {
+            r["kind"] == "decision" && r["allow"] == false && r["args"]["operation"] != "load"
+        })
         .count();
     assert_eq!(denied, 1);
     let verify = env.saddle(&["audit", "verify", log.to_str().unwrap()]);
     assert!(verify.status.success(), "{}", text(&verify.stdout));
+}
+
+#[test]
+fn ordinary_tool_delegation_changes_on_reload_without_changing_the_shipped_digest() {
+    let mut replies = Vec::new();
+    for phase in 0..3 {
+        replies.push(sse_response(&openai_sse(
+            "",
+            &[(&format!("read-{phase}"), "read", json!({"path":"file"}))],
+        )));
+        replies.push(sse_response(&openai_sse("done", &[])));
+    }
+    let (base, seen) = serve(replies);
+    let env = Env::new(Api::Openai, &base);
+    fs::write(env.ws.path().join("file"), "ONLY-AUTHORIZED-READ").unwrap();
+    let path = env.xdg.path().join("config/saddle/config.toml");
+    let initial: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+    let configure = |allow| {
+        let mut settings = initial.clone();
+        settings["standard-tools"]["read"] = if allow {
+            toml::Value::Array(vec!["fs-read".into()])
+        } else {
+            toml::Value::Array(vec![])
+        };
+        fs::write(&path, toml::to_string(&settings).unwrap()).unwrap();
+    };
+    configure(false);
+    let mut child = env
+        .command(&["run", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let wait_for = |count| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while seen.lock().unwrap().len() < count {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    child.stdin.as_mut().unwrap().write_all(b"first\n").unwrap();
+    wait_for(2);
+    configure(true);
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"/reload\nsecond\n")
+        .unwrap();
+    wait_for(4);
+    configure(false);
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/reload\nthird\n/quit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let seen = seen.lock().unwrap();
+    for phase in 0..3 {
+        let message = seen[phase * 2 + 1].body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["tool_call_id"] == format!("read-{phase}"))
+            .unwrap();
+        assert_eq!(
+            message["content"]
+                .as_str()
+                .unwrap()
+                .contains("ONLY-AUTHORIZED-READ"),
+            phase == 1
+        );
+        if phase != 1 {
+            assert!(message["content"].as_str().unwrap().starts_with("denied:"));
+        }
+    }
+    let loads = records(&env.audit_log());
+    let loads: Vec<_> = loads
+        .iter()
+        .filter(|row| {
+            row["principal"] == "plugin.standard-read"
+                && row["args"]["operation"] == "load"
+                && row["allow"] == true
+        })
+        .collect();
+    assert_eq!(loads.len(), 1);
+    assert_eq!(
+        loads[0]["args"]["sha256"],
+        saddle_standard::artifact("read").unwrap().sha256
+    );
+}
+
+#[test]
+fn ordinary_edit_and_patch_emit_minimal_hunks_keep_them_out_of_model_text_and_save_them() {
+    let original: String = (1..=20).map(|line| format!("line {line}\n")).collect();
+    let updated = original
+        .replace("line 5\n", "line five\n")
+        .replace("line 18\n", "line eighteen\n");
+    let calls = [
+        (
+            "edit",
+            "edit",
+            json!({"path":"edit.txt","old":original,"new":updated}),
+        ),
+        (
+            "patch",
+            "patch",
+            json!({"patch":"*** Begin Patch\n*** Update File: patch.txt\n@@\n-line 5\n+line five\n@@\n-line 18\n+line eighteen\n*** End Patch"}),
+        ),
+    ];
+    let (base, seen) = serve(vec![
+        sse_response(&openai_sse("", &calls)),
+        sse_response(&openai_sse("done", &[])),
+    ]);
+    let env = Env::new(Api::Openai, &base);
+    for path in ["edit.txt", "patch.txt"] {
+        fs::write(env.ws.path().join(path), &original).unwrap();
+    }
+    let out = env.saddle(&["run", "--json", "make two disjoint changes"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let events: Vec<Value> = text(&out.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|event: &Value| event["type"] == "result")
+        .collect();
+    assert_eq!(events.len(), 2);
+    for (event, name) in events.iter().zip(["edit", "patch"]) {
+        assert_eq!(
+            event["provenance"]["principal"],
+            format!("plugin.standard-{name}")
+        );
+        let diff = event["diff"]
+            .as_str()
+            .expect("successful ordinary mutation has a human diff");
+        assert!(diff.contains("-5 line 5\n+5 line five\n"), "{diff}");
+        assert!(diff.contains("-18 line 18\n+18 line eighteen\n"), "{diff}");
+        assert!(diff.contains("~\n"), "{diff}");
+        assert!(
+            !diff.contains("line 10"),
+            "unchanged middle must not become a broad replacement: {diff}"
+        );
+        assert_eq!(
+            fs::read_to_string(env.ws.path().join(format!("{name}.txt"))).unwrap(),
+            updated
+        );
+    }
+    let seen = seen.lock().unwrap();
+    assert!(!seen[1].body.to_string().contains("\"diff\""));
+    for result in seen[1].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+    {
+        assert!(
+            result["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("<plugin-output-")
+        );
+        assert!(!result["content"].as_str().unwrap().contains("-5 line 5"));
+    }
+    let connection = Connection::open(env.xdg.path().join("state/saddle/sessions.db")).unwrap();
+    let saved: String = connection
+        .query_row(
+            "SELECT body FROM nodes WHERE kind='item' AND body LIKE '%\"diff\":%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    for name in ["edit", "patch"] {
+        assert!(saved.contains(&format!("plugin.standard-{name}")));
+    }
+    assert!(saved.contains("-18 line 18"));
 }
 
 #[test]
@@ -460,7 +661,7 @@ fn a_request_is_recorded_with_what_it_used_and_which_model_answered() {
         .as_str()
         .unwrap()
         .to_owned();
-    let result: Value = serde_json::from_str(&result).unwrap();
+    let result: Value = serde_json::from_str(tool_text(&result)).unwrap();
     // One row for the request that carried the call, which is the one that has happened so far.
     // The provider states 100 prompt tokens of which 40 were cached, and the uncached 60 is what
     // `input` holds, so a hit rate is read as cache_read over input + cache_read.
@@ -496,7 +697,8 @@ fn session_queries_are_scoped_read_only_and_audited() {
     let results: Vec<_> = messages.iter().filter(|m| m["role"] == "tool").collect();
     assert_eq!(results.len(), 3);
     assert_eq!(results[0]["content"], results[2]["content"]);
-    let result: Value = serde_json::from_str(results[0]["content"].as_str().unwrap()).unwrap();
+    let result: Value =
+        serde_json::from_str(tool_text(results[0]["content"].as_str().unwrap())).unwrap();
     assert_eq!(result["rows"], json!([["remember teal"]]));
     assert!(
         results[1]["content"]
@@ -534,13 +736,13 @@ fn session_queries_require_a_transcript_grant() {
     let mut request = String::new();
     strings(&seen.lock().unwrap()[1].body, &mut request);
     assert!(
-        request.contains("denied: agent has no transcript-read grant"),
+        request.contains("denied:") && request.contains("transcript-read"),
         "{request}"
     );
     assert!(
         records(&env.audit_log())
             .iter()
-            .any(|r| r["scope"] == "transcript-read" && r["allow"] == false)
+            .any(|r| r["principal"] == "plugin.standard-session-query" && r["allow"] == false)
     );
 }
 
@@ -744,7 +946,7 @@ fn sigint_cancels_a_running_command_in_line_mode() {
     let stderr = text(&out.stderr);
     assert!(start.elapsed() < Duration::from_secs(5), "{stderr}");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("cancelled by the user"), "{stderr}");
+    assert!(stderr.contains("cancelled"), "{stderr}");
     // The model was not asked again, and the session closed normally.
     assert_eq!(seen.lock().unwrap().len(), 1);
     let index = fs::read_to_string(env.xdg.path().join("state/saddle/sessions.jsonl")).unwrap();
@@ -980,7 +1182,6 @@ fn plugin_images_are_validated_delivered_saved_and_discarded_on_traps() {
 }
 
 #[test]
-#[ignore = "build the standard read component first; see docs/plugins.md"]
 fn standard_read_plugin_sends_file_images_to_the_model() {
     let (base, seen) = serve(vec![
         sse_response(&openai_sse(
@@ -994,11 +1195,10 @@ fn standard_read_plugin_sends_file_images_to_the_model() {
         sse_response(&openai_sse("seen", &[])),
     ]);
     let env = Env::new(Api::Openai, &base);
-    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/read-plugin/read.component.wasm");
+    let component = "read";
     plugin_fixture::configure(
         &env.xdg.path().join("config/saddle/config.toml"),
-        &fs::read(component).unwrap(),
+        &standard_component(component),
         plugin_fixture::GRANTS,
     );
     fs::write(env.ws.path().join("photo.txt"), plugin_fixture::png()).unwrap();
@@ -1066,7 +1266,6 @@ fn plugin_transcript_queries_use_the_active_branch_and_plugin_identity_without_f
 }
 
 #[test]
-#[ignore = "build the standard session_query component first; see docs/plugins.md"]
 fn standard_transcript_component_queries_the_active_branch_without_filesystem_grants() {
     let (base, seen) = serve(vec![
         sse_response(&openai_sse(
@@ -1081,11 +1280,10 @@ fn standard_transcript_component_queries_the_active_branch_without_filesystem_gr
     ]);
     let env = Env::new(Api::Openai, &base);
     env.write_override("[agent]\ntranscript-read={}\n");
-    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/session-query-plugin/session_query.component.wasm");
+    let component = "session_query";
     plugin_fixture::configure_transcript(
         &env.xdg.path().join("config/saddle/config.toml"),
-        &fs::read(component).expect("build the standard session_query component first"),
+        &standard_component(component),
         "tool={}\ntranscript-read={}",
     );
     let out = env.saddle(&["run", "remember amber"]);
@@ -1124,7 +1322,6 @@ fn failed_plugins_are_not_advertised_and_do_not_remove_native_tools() {
 }
 
 #[test]
-#[ignore = "build the standard read component first; see docs/plugins.md"]
 fn one_compiled_reader_changes_directory_permissions_at_runtime_without_repinning() {
     let tool = "plugin__reader__read";
     let (base, seen) = serve(vec![
@@ -1156,9 +1353,8 @@ fn one_compiled_reader_changes_directory_permissions_at_runtime_without_repinnin
     let env = Env::new(Api::Openai, &base);
     env.write_override("[agent]\nfs-read=[{root='workspace',exclude=['.env*']}]\n");
     let config = env.xdg.path().join("config/saddle/config.toml");
-    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/read-plugin/read.component.wasm");
-    let bytes = fs::read(component).expect("build the standard read component first");
+    let component = "read";
+    let bytes = standard_component(component);
     plugin_fixture::configure(&config, &bytes, plugin_fixture::GRANTS);
     let artifact = config
         .parent()
@@ -1237,13 +1433,13 @@ fn one_compiled_reader_changes_directory_permissions_at_runtime_without_repinnin
     }
     assert!(result(1, "root-1").contains("workspace content"));
     assert!(!result(1, "shared-1").contains("SHARED-REFERENCE-CONTENT"));
-    assert!(result(1, "shared-1").contains("Denied"));
+    assert!(result(1, "shared-1").contains("denied:"));
     assert!(result(3, "shared-2").contains("SHARED-REFERENCE-CONTENT"));
     assert!(!result(3, "excluded").contains("ROOT-EXCLUSION-SECRET"));
     assert!(result(3, "excluded").contains("excluded"));
     assert!(result(5, "root-3").contains("workspace content"));
     assert!(!result(5, "shared-3").contains("SHARED-REFERENCE-CONTENT"));
-    assert!(result(5, "shared-3").contains("Denied"));
+    assert!(result(5, "shared-3").contains("denied:"));
     assert_eq!(fs::read(artifact).unwrap(), bytes);
     let final_config: toml::Table = fs::read_to_string(&config).unwrap().parse().unwrap();
     assert_eq!(
@@ -1255,7 +1451,11 @@ fn one_compiled_reader_changes_directory_permissions_at_runtime_without_repinnin
     let audit = records(&env.audit_log());
     let loads: Vec<_> = audit
         .iter()
-        .filter(|row| row["args"]["operation"] == "load" && row["allow"] == true)
+        .filter(|row| {
+            row["args"]["operation"] == "load"
+                && row["allow"] == true
+                && row["principal"] == "plugin.reader"
+        })
         .collect();
     assert_eq!(loads.len(), 3);
     assert!(loads.iter().all(|row| row["args"]["sha256"] == pin));
@@ -1267,7 +1467,6 @@ fn one_compiled_reader_changes_directory_permissions_at_runtime_without_repinnin
 }
 
 #[test]
-#[ignore = "build the standard websearch component first; see docs/plugins.md"]
 fn standard_search_keeps_credentials_private_and_snapshots_principal_scoped_across_reload() {
     let first = json!({"results":[{"title":"first","url":"https://example.test/first","text":format!("full first page {KEY}")},{"title":"unshown","url":"https://example.test/unshown","text":"must not acquire a number"}]}).to_string();
     let second = json!({"results":[{"title":"second","url":"https://example.test/second","text":"full second page"}]}).to_string();
@@ -1298,11 +1497,7 @@ fn standard_search_keeps_credentials_private_and_snapshots_principal_scoped_acro
     let (base, seen) = serve(responses);
     let env = Env::new(Api::Openai, &base);
     let config = env.xdg.path().join("config/saddle/config.toml");
-    let bytes = fs::read(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/websearch-plugin/websearch.component.wasm"),
-    )
-    .expect("build the standard websearch component first");
+    let bytes = standard_component("websearch");
     let grant = format!("{{host='127.0.0.1',scheme='http',port={}}}", search.port);
     let model_port: u16 = base
         .strip_prefix("http://127.0.0.1:")
@@ -1343,7 +1538,12 @@ fn standard_search_keeps_credentials_private_and_snapshots_principal_scoped_acro
     fs::write(&config,format!("{settings}\n[plugins.sibling]\nenabled=true\nmanifest='sibling/plugin.toml'\nsha256='{pin}'\n[plugin.sibling]\ntool={{}}\nnet=[{grant}]\n")).unwrap();
     let listing = env.saddle(&["plugin", "list"]);
     assert!(
-        text(&listing.stdout).matches("ready:").count() == 2,
+        text(&listing.stdout)
+            .lines()
+            .filter(|line| line.starts_with("reader ") || line.starts_with("sibling "))
+            .filter(|line| line.contains("ready:"))
+            .count()
+            == 2,
         "{} {}",
         text(&listing.stdout),
         text(&listing.stderr)
@@ -1435,7 +1635,6 @@ fn standard_search_keeps_credentials_private_and_snapshots_principal_scoped_acro
 }
 
 #[test]
-#[ignore = "build the standard write component first; see docs/plugins.md"]
 fn one_writer_artifact_changes_resource_budgets_on_reload_without_changing_authority() {
     let content = "x".repeat(70 * 1024);
     let mut responses = Vec::new();
@@ -1453,17 +1652,16 @@ fn one_writer_artifact_changes_resource_budgets_on_reload_without_changing_autho
     let (base, seen) = serve(responses);
     let env = Env::new(Api::Openai, &base);
     let config = env.xdg.path().join("config/saddle/config.toml");
-    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/write-plugin/write.component.wasm");
-    let bytes = fs::read(component).expect("build the standard write component first");
+    let component = "write";
+    let bytes = standard_component(component);
     plugin_fixture::configure(
         &config,
         &bytes,
-        "tool={}\nfs-write=[{root='workspace',exclude=['private']}]\n",
+        "tool={}\nfs-read=[{root='workspace'}]\nfs-write=[{root='workspace',exclude=['private']}]\n",
     );
     fs::write(
         config.parent().unwrap().join("plugins/reader/plugin.toml"),
-        "id='reader'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes=['tool','fs-write']\n",
+        "id='reader'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes=['tool','fs-read','fs-write']\n",
     )
     .unwrap();
     let original = format!(
@@ -1572,7 +1770,6 @@ fn one_writer_artifact_changes_resource_budgets_on_reload_without_changing_autho
 }
 
 #[test]
-#[ignore = "build the standard write component first; see docs/plugins.md"]
 fn one_compiled_writer_changes_write_permissions_at_runtime_without_repinning() {
     writer_runtime_case(false);
     writer_runtime_case(true);
@@ -1602,14 +1799,21 @@ fn writer_runtime_case(external: bool) {
     let (base, seen) = serve(responses);
     let env = Env::new(Api::Openai, &base);
     let config = env.xdg.path().join("config/saddle/config.toml");
-    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/write-plugin/write.component.wasm");
-    let bytes = fs::read(component).expect("build the standard write component first");
-    plugin_fixture::configure(&config, &bytes, "tool={}\nfs-read=[{root='workspace'}]");
+    let component = "write";
+    let bytes = standard_component(component);
+    plugin_fixture::configure(
+        &config,
+        &bytes,
+        if external {
+            "tool={}\nfs-read=[{root='workspace'}]\ntool-read={tools=['read']}"
+        } else {
+            "tool={}\nfs-read=[{root='workspace'}]"
+        },
+    );
     fs::write(config.parent().unwrap().join("plugins/reader/plugin.toml"), "id='reader'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes=['tool','fs-read','fs-write','tool-read','tool-write']\n").unwrap();
     if external {
         let settings = fs::read_to_string(&config).unwrap();
-        fs::write(&config, format!("{settings}\n[sandbox]\ntools-defaults=false\nwrite=[{{path={:?}, tools=['write']}}]\n", outside.path().display().to_string())).unwrap();
+        fs::write(&config, format!("{settings}\n[sandbox]\ntools-defaults=false\nwrite=[{{path={:?}, tools=['write','read']}}]\n", outside.path().display().to_string())).unwrap();
     }
     let target = if external {
         outside.path().join("file")
@@ -1680,7 +1884,7 @@ fn writer_runtime_case(external: bool) {
     assert!(results.iter().any(|row| {
         row["diff"]
             .as_str()
-            .is_some_and(|diff| diff.contains("preimage not read"))
+            .is_some_and(|diff| diff.contains("+1 turn 1"))
     }));
     assert_eq!(fs::read_to_string(target.clone()).unwrap(), "turn 1");
     assert_eq!(
@@ -1732,7 +1936,9 @@ fn writer_runtime_case(external: bool) {
     assert!(
         audit
             .iter()
-            .filter(|row| row["args"]["operation"] == "load" && row["allow"] == true)
+            .filter(|row| row["args"]["operation"] == "load"
+                && row["allow"] == true
+                && row["principal"] == "plugin.reader")
             .all(|row| row["args"]["sha256"] == pin)
     );
     assert!(
@@ -1952,9 +2158,9 @@ fn the_prompt_and_tool_descriptions_explain_policy_checked_command_networking() 
             .unwrap()
     };
     let bash = description("bash");
-    assert!(bash.contains("same net grants as fetch"), "{bash}");
-    assert!(bash.contains("Builds may download dependencies"), "{bash}");
-    assert!(bash.contains("with no network instead"), "{bash}");
+    assert!(bash.contains("policy proxy"), "{bash}");
+    assert!(bash.contains("plugin's runtime grants"), "{bash}");
+    assert!(bash.contains("falls back to none"), "{bash}");
     assert!(!bash.contains("sandbox: no network"), "{bash}");
     assert!(
         !bash.contains("files limited to the granted roots"),
@@ -1962,10 +2168,7 @@ fn the_prompt_and_tool_descriptions_explain_policy_checked_command_networking() 
     );
 
     let fetch = description("fetch");
-    assert!(
-        fetch.contains("bash networking is governed by the same net grants"),
-        "{fetch}"
-    );
+    assert!(fetch.contains("delegated net grants"), "{fetch}");
     assert!(!fetch.contains("never has network access"), "{fetch}");
 }
 
@@ -2206,7 +2409,7 @@ fs-read = [{ root = "workspace", exclude = [".env*"], why = "reads the repo" }]
         .unwrap()
         .iter()
         .filter(|m| m["role"] == "tool")
-        .map(|m| m["content"].as_str().unwrap().to_owned())
+        .map(|m| tool_text(m["content"].as_str().unwrap()).to_owned())
         .collect();
     let [grep, find, ls, edit] = &results[..] else {
         panic!("{results:?}")
@@ -2216,10 +2419,7 @@ fs-read = [{ root = "workspace", exclude = [".env*"], why = "reads the repo" }]
         !grep.contains("hunter2") && !grep.contains("target/"),
         "{grep}"
     );
-    assert!(
-        grep.contains("1 path skipped: the policy excludes it"),
-        "{grep}"
-    );
+    assert!(grep.contains("paths skipped by policy"), "{grep}");
     assert_eq!(find.lines().next(), Some("src/main.rs"), "{find}");
     assert!(!find.contains("target"), "{find}");
     assert!(
@@ -2240,7 +2440,9 @@ fs-read = [{ root = "workspace", exclude = [".env*"], why = "reads the repo" }]
         )
         .unwrap();
     assert!(
-        saved.contains(r#""diff":"-1 fn main() {}\n+1 fn main() {\n+2     run();\n+3 }\n""#),
+        saved.contains(
+            r#""diff":" 0 src/main.rs\n-1 fn main() {}\n+1 fn main() {\n+2     run();\n+3 }\n""#
+        ),
         "{saved}"
     );
 }

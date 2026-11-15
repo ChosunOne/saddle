@@ -1,15 +1,6 @@
-//! `fetch`: one HTTP GET, made by the host rather than by a child process (D39).
-//!
-//! The host makes the connection, checks the grant against the URL and logs the decision (D10).
-//! `websearch` also makes host-side requests (D82); commands reach the host's policy-checking proxy
-//! through their own network namespace (D79), never through unrestricted host sockets.
-//!
-//! D28's address rules are shared with the command network bridge: loopback, RFC 1918,
-//! link-local, unique-local, CGNAT and the cloud metadata address are refused unless a grant names
-//! that address itself. ureq receives checked addresses rather than resolving the name again, so
-//! DNS rebinding cannot swap one underneath.
+//! checked URL targets, public-address validation and pinned HTTP clients (D28, D79, D143, D147).
+//! callers decide/audit authority; these helpers never provide a native fetch tool or raw bypass.
 
-use saddle_limits as budgets;
 use std::net::Ipv4Addr;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::result::Result as StdResult;
@@ -17,22 +8,10 @@ use std::time::Duration;
 use ureq::config::Config;
 
 use anyhow::Result;
-use saddle_cap::Principal;
-use serde_json::Value;
 
-#[cfg(test)]
-use serde_json::json;
 use ureq::http::Uri;
 use ureq::unversioned::resolver::{ArrayVec, DefaultResolver, ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
-
-use super::ToolOutput;
-use crate::network::{self, Operation};
-use crate::session::Session;
-use saddle_sdk::{Header as SdkHeader, HttpResponse};
-use saddle_tools::fetch::fetch_with;
-use saddle_wit::saddle::host::http::Header as HttpHeader;
-use std::time::Instant;
 
 /// A URL as the policy and the request need it: the parts are separate because a grant matches on
 /// scheme, host and port rather than on the whole string.
@@ -101,115 +80,6 @@ impl Target {
     }
 }
 
-pub fn fetch(session: &mut Session, input: &Value) -> Result<ToolOutput> {
-    let mut fatal = None;
-    let result = fetch_with(&input.to_string(), |request| {
-        let headers = request
-            .headers
-            .into_iter()
-            .map(|header| HttpHeader {
-                name: header.name,
-                value: header.value,
-            })
-            .collect();
-        match network::request(
-            session,
-            &Principal::Agent,
-            "native-fetch",
-            Operation {
-                method: "GET",
-                url: &request.url,
-                headers,
-                body: "",
-                limit: budgets::http_capture_bytes(),
-                deadline: Instant::now() + Duration::from_secs(30),
-                redirects: true,
-            },
-        ) {
-            Ok(result) => result.map(|response| HttpResponse {
-                status: response.status,
-                headers: response
-                    .headers
-                    .into_iter()
-                    .map(|header| SdkHeader {
-                        name: header.name,
-                        value: header.value,
-                    })
-                    .collect(),
-                body: response.body,
-                truncated: response.truncated,
-            }),
-            Err(error) => {
-                fatal = Some(error);
-                Err("network host failure".into())
-            }
-        }
-    });
-    if let Some(error) = fatal {
-        return Err(error);
-    }
-    Ok(match result {
-        Ok(text) => ToolOutput::ok(text),
-        Err(why) => ToolOutput::err(why),
-    })
-}
-
-/// The `headers` object, checked: a name is a token, and a value is opaque but bounded. A header
-/// that would let the request reach somewhere else (`host`, and the proxy headers) is refused,
-/// since a grant is checked against the URL and a header must not be able to change what that URL
-/// means (D48).
-#[cfg(test)]
-fn headers_field(input: &Value) -> Result<Vec<(String, String)>, ToolOutput> {
-    let Some(value) = input.get("headers") else {
-        return Ok(Vec::new());
-    };
-    let Some(object) = value.as_object() else {
-        return Err(ToolOutput::err(
-            "`headers` must be an object of name to value",
-        ));
-    };
-    let mut out = Vec::with_capacity(object.len());
-    for (name, value) in object {
-        let Some(value) = value.as_str() else {
-            return Err(ToolOutput::err(format!("header `{name}` is not a string")));
-        };
-        let lower = name.to_ascii_lowercase();
-        if !lower
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        {
-            return Err(ToolOutput::err(format!("`{name}` is not a header name")));
-        }
-        if matches!(
-            lower.as_str(),
-            "host" | "x-forwarded-for" | "x-forwarded-host" | "x-real-ip" | "forwarded" | "via"
-        ) {
-            return Err(ToolOutput::err(format!(
-                "`{name}` is refused: a header may not change which host the request reaches, and \
-                 the grant was checked against the URL"
-            )));
-        }
-        if value.chars().any(|c| c.is_control()) {
-            return Err(ToolOutput::err(format!(
-                "header `{name}` carries a control character"
-            )));
-        }
-        if value.len() > 8192 {
-            return Err(ToolOutput::err(format!(
-                "header `{name}` is longer than 8 KiB"
-            )));
-        }
-        out.push((name.clone(), value.to_owned()));
-    }
-    Ok(out)
-}
-
-/// Refuses a target that is this machine or the network behind it, saying which grant would let it
-/// through (D40).
-///
-/// The answer names the address rather than the name that resolved to it, because that is what the
-/// grant has to say: `{ host = "127.0.0.1", port = 8080 }`. A wildcard cannot stand in, since it
-/// covers only public space.
 pub(crate) fn local(target: &Target) -> Option<String> {
     // `localhost` is loopback by definition (RFC 6761), so it is recognised without a lookup.
     // Anything else is decided after the address is resolved, and only once the policy has allowed
@@ -498,34 +368,6 @@ mod tests {
 
         // A public host is not this function's business.
         assert_eq!(local(&Target::parse("https://example.com/").unwrap()), None);
-    }
-
-    #[test]
-    fn headers_are_checked_and_a_value_is_carried_but_a_host_cannot_be() {
-        let parse = |v: Value| headers_field(&v);
-        // A key goes in a header, and it is carried as written.
-        let headers = parse(json!({"headers": {"authorization": "Bearer sk-1"}})).unwrap();
-        assert_eq!(
-            headers,
-            [("authorization".to_owned(), "Bearer sk-1".to_owned())]
-        );
-        assert_eq!(parse(json!({"url": "https://x/"})).unwrap(), vec![]);
-
-        // What a header may not do is change where the request goes.
-        for name in ["host", "Host", "x-forwarded-for", "forwarded"] {
-            let e = parse(json!({"headers": {name: "evil.test"}})).unwrap_err();
-            assert!(
-                e.content.contains("may not change which host"),
-                "{name}: {}",
-                e.content
-            );
-        }
-        // A name that is not a name, a value with a newline, and an oversized value.
-        assert!(parse(json!({"headers": {"bad name": "v"}})).is_err());
-        assert!(parse(json!({"headers": {"x": "a\r\nInjected: 1"}})).is_err());
-        assert!(parse(json!({"headers": {"x": "a".repeat(9000)}})).is_err());
-        assert!(parse(json!({"headers": "not an object"})).is_err());
-        assert!(parse(json!({"headers": {"x": 1}})).is_err());
     }
 
     #[test]

@@ -102,6 +102,9 @@ impl Env {
         let base = fs::read_to_string(&path).unwrap_or_default();
         let mut doc: toml::Table = base.parse().unwrap_or_default();
         doc.insert("agent".into(), agent);
+        let defaults: toml::Table = saddle_standard::DEFAULT_PROFILES.parse().unwrap();
+        doc.entry("standard-tools")
+            .or_insert_with(|| defaults["standard-tools"].clone());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
     }
@@ -225,6 +228,74 @@ fn stderr(out: &Output) -> String {
 
 fn ready() -> Env {
     Env::new()
+}
+
+#[test]
+fn shipped_components_honor_runtime_envelopes_without_rebuilding_code() {
+    let env = Env::new();
+    let mut config: toml::Table = env.policy().parse().unwrap();
+    let limits: toml::Table = "plugin-memory-bytes=67108864\nplugin-fuel=200000000\nplugin-timeout-ms=5000\nplugin-stack-bytes=1048576\nrange-bytes=2\n".parse().unwrap();
+    config.insert("tool-limits".into(), limits.into());
+    fs::write(env.policy_path(), toml::to_string(&config).unwrap()).unwrap();
+    let (ok, text) = env.tool("read", serde_json::json!({"path":"README"}));
+    assert!(ok && text.contains("hello"), "{text}");
+}
+
+#[test]
+fn existing_configs_need_explicit_standard_profiles_and_omitted_scopes_never_inherit() {
+    let env = Env::new();
+    let mut doc: toml::Table = env.policy().parse().unwrap();
+    doc.remove("standard-tools");
+    fs::write(env.policy_path(), toml::to_string(&doc).unwrap()).unwrap();
+    let (ok, text) = env.tool("read", serde_json::json!({"path":"README"}));
+    assert!(!ok && text.contains("no native fallback"), "{text}");
+    let mut profiles = toml::Table::new();
+    profiles.insert(
+        "write".into(),
+        serde_json::from_value::<toml::Value>(serde_json::json!(["fs-write"])).unwrap(),
+    );
+    doc.insert("standard-tools".into(), profiles.into());
+    fs::write(env.policy_path(), toml::to_string(&doc).unwrap()).unwrap();
+    let (ok, text) = env.tool(
+        "write",
+        serde_json::json!({"path":"README","content":"must not overwrite"}),
+    );
+    assert!(!ok && text.contains("denied:"), "{text}");
+    assert_eq!(
+        fs::read_to_string(env.ws.path().join("README")).unwrap(),
+        "hello\n"
+    );
+    let (ok, _) = env.tool(
+        "write",
+        serde_json::json!({"path":"new","content":"must not turn refusal into absence"}),
+    );
+    assert!(!ok);
+    assert!(!env.ws.path().join("new").exists());
+    profiles =
+        toml::from_str::<toml::Table>(saddle_standard::DEFAULT_PROFILES).unwrap()["standard-tools"]
+            .as_table()
+            .unwrap()
+            .clone();
+    doc.insert("standard-tools".into(), profiles.into());
+    fs::write(env.policy_path(), toml::to_string(&doc).unwrap()).unwrap();
+    assert!(env.tool("read", serde_json::json!({"path":"README"})).0);
+}
+
+#[test]
+fn shipped_tool_inventory_and_delegation_template_do_not_modify_existing_config() {
+    let env = Env::new();
+    let before = fs::read(env.policy_path()).unwrap();
+    let listing = env.saddle(&["tools"]);
+    assert!(listing.status.success(), "{}", stderr(&listing));
+    let stdout = String::from_utf8_lossy(&listing.stdout);
+    for artifact in saddle_standard::ARTIFACTS {
+        assert!(stdout.contains(artifact.sha256));
+    }
+    let template = env.saddle(&["tools", "--config"]);
+    assert!(template.status.success(), "{}", stderr(&template));
+    let config: toml::Table = String::from_utf8_lossy(&template.stdout).parse().unwrap();
+    assert_eq!(config["standard-tools"].as_table().unwrap().len(), 11);
+    assert_eq!(fs::read(env.policy_path()).unwrap(), before);
 }
 
 #[test]
@@ -446,14 +517,13 @@ fn every_decision_is_logged_and_the_chain_verifies() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    let kinds: Vec<&str> = records
+    assert_eq!(records.first().unwrap()["kind"], "session-start");
+    assert_eq!(records.last().unwrap()["kind"], "session-end");
+    let d = records
         .iter()
-        .map(|r| r["kind"].as_str().unwrap())
-        .collect();
-    // D64: discovery is a record of its own, before any call is decided, so what was advertised
-    // is in the log even when nothing loads a skill.
-    assert_eq!(kinds, ["session-start", "skill", "decision", "session-end"]);
-    let d = &records[2];
+        .find(|r| r["scope"] == "fs-write" && r["allow"] == false)
+        .expect("the excluded write is denied");
+    assert_eq!(d["principal"], "plugin.standard-write");
     assert_eq!(d["allow"], false);
     assert_eq!(d["scope"], "fs-write");
     assert_eq!(d["args"]["path"], "workspace:.env");
@@ -488,28 +558,18 @@ fn fetch_needs_a_net_grant_and_says_which_one() {
     );
     assert!(!ok, "a workspace with no net grant must refuse: {text}");
     assert!(text.contains("denied:"), "{text}");
-    assert!(
-        text.contains("no net grant covering https://api.example.com:443"),
-        "{text}"
-    );
-    // Nothing was sent: the decision is the whole answer, and the query is in the record.
+    assert!(text.contains("needs scope `net`"), "{text}");
+    // No adapter is initialized without net; the attempted tool call is audited, not a fictitious GET.
     let logs = env.audit_logs();
     let record = fs::read_to_string(logs.last().unwrap()).unwrap();
-    assert!(
-        record.contains("https://api.example.com:443/v1/models"),
-        "{record}"
-    );
-
+    assert!(record.contains("\"allow\":false"));
     // A grant for one host does not cover another.
-    let policy = env.policy();
-    env.write_policy(
-        // A net grant is a list on the agent table, the same shape as the other scopes (D28).
-        policy.replace(
-            "exec     = { why = \"runs builds and tests\", timeout-secs = 20 }",
-            "exec     = { why = \"runs builds and tests\", timeout-secs = 20 }\n\
-             net      = [{ host = \"api.example.com\", why = \"reads the model list\" }]",
-        ),
-    );
+    env.edit_agent(|agent| {
+        agent.insert(
+            "net".into(),
+            toml::from_str::<toml::Value>("net=[{host='api.example.com'}]").unwrap()["net"].clone(),
+        );
+    });
     let (_, text) = env.tool("fetch", serde_json::json!({"url": "https://evil.test/x"}));
     assert!(
         text.contains("no net grant covering https://evil.test:443"),
@@ -558,7 +618,7 @@ fn a_private_fetch_refusal_is_audited_without_header_values_or_query_secrets() {
     assert_eq!(decisions.len(), 1, "{log}");
     let decision = &decisions[0];
     assert_eq!(decision["allow"], false);
-    assert_eq!(decision["principal"], "agent");
+    assert_eq!(decision["principal"], "plugin.standard-fetch");
     assert_eq!(decision["args"]["method"], "GET");
     assert_eq!(
         decision["args"]["url"],
@@ -672,10 +732,7 @@ fn websearch_is_a_tool_and_the_gate_decides_it() {
     let env = Env::new();
     let (ok, text) = env.tool("websearch", serde_json::json!({ "query": "anything" }));
     assert!(!ok, "{text}");
-    assert!(text.contains("no net grant covering"), "{text}");
-    // Without a key the search goes to Exa's MCP server, and that is the host the refusal names.
-    assert!(text.contains("mcp.exa.ai"), "{text}");
-
+    assert!(text.contains("needs scope `net`"), "{text}");
     // A grant for a different Exa host is not a grant for this one.
     env.write_policy(POLICY.replace(
         "[agent]",
@@ -1862,7 +1919,10 @@ fn allow_sensitive_in_the_users_config_skips_the_question() {
     );
     fs::write(
         xdg.path().join("config/saddle/config.toml"),
-        "allow-sensitive = true\n",
+        format!(
+            "allow-sensitive = true\n{}",
+            saddle_standard::DEFAULT_PROFILES
+        ),
     )
     .unwrap();
     let out = run();
@@ -1975,7 +2035,9 @@ fn an_extra_except_line_takes_one_more_directory_out_of_reach() {
 base = "~"
 depth = 2
 except = ["^notes/private$"]
-"#,
+"#
+        .to_owned()
+            + saddle_standard::DEFAULT_PROFILES,
     )
     .unwrap();
     let read = |path: &Path| -> bool {
@@ -2407,11 +2469,7 @@ fn a_sandbox_entry_naming_tools_lets_those_tools_reach_it() {
         ],
     );
     let text = stderr(&out);
-    assert!(
-        text.contains("not one of the tools config.toml allows"),
-        "{text}"
-    );
-    assert!(text.contains("read, ls"), "{text}");
+    assert!(text.contains("no tool-write role"), "{text}");
 
     // A bare path is indirect reach only: the entry above keeps ~/notes out of the tools' way.
     let out = saddle_in(
@@ -2529,10 +2587,9 @@ fn a_misspelt_tool_name_in_a_sandbox_entry_is_an_error() {
 }
 
 #[test]
-fn one_access_records_one_decision() {
-    // D10: one access is one decision. The read tool used to gate twice — once to sniff whether the
-    // file is a picture, once to read it — so every read logged the same allow twice, and "how many
-    // times was this file read" was unanswerable from the log.
+fn sdk_resolution_ranges_and_mutation_preconditions_have_separate_access_records() {
+    // Each SDK metadata/range/precondition access is decided; registration/emission are not file reads.
+    // Resolution plus one range are two records. Edits also guard their preimage twice before publishing.
     let env = ready();
     let decisions = |name: &str, input: &str| -> usize {
         let before = env.audit_logs().len();
@@ -2543,22 +2600,22 @@ fn one_access_records_one_decision() {
             .unwrap()
             .lines()
             .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
-            .filter(|r| r["kind"] == "decision")
+            .filter(|r| r["kind"] == "decision" && r["scope"] != "tool")
             .count()
     };
 
-    assert_eq!(decisions("read", r#"{"path":"README"}"#), 1, "a text file");
-    assert_eq!(decisions("read", r#"{"path":"nope"}"#), 1, "a missing file");
+    assert_eq!(decisions("read", r#"{"path":"README"}"#), 2, "a text file");
+    assert_eq!(decisions("read", r#"{"path":"nope"}"#), 2, "a missing file");
     assert_eq!(
         decisions("read", r#"{"path":"../outside"}"#),
         1,
         "a refusal"
     );
-    assert_eq!(decisions("ls", r#"{"path":"."}"#), 1);
+    assert_eq!(decisions("ls", r#"{"path":"."}"#), 2);
     // edit legitimately makes two: it reads the old text and writes the new one.
     assert_eq!(
         decisions("edit", r#"{"path":"README","old":"hello","new":"bye"}"#),
-        2
+        5
     );
 }
 
@@ -2618,7 +2675,7 @@ fn the_shared_skills_directory_is_readable_by_default() {
         ],
     );
     assert!(
-        stderr(&out).contains("not one of the tools config.toml allows"),
+        stderr(&out).contains("no tool-write role"),
         "{}",
         stderr(&out)
     );

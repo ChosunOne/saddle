@@ -2,15 +2,16 @@
 
 use saddle_limits as budgets;
 #[cfg(target_arch = "wasm32")]
-#[cfg(target_arch = "wasm32")]
 use saddle_sdk::configure_limits;
+#[cfg(target_arch = "wasm32")]
+use saddle_sdk::failure_message;
 use saddle_sdk::{Change, Expectation};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 #[cfg(target_arch = "wasm32")]
 use saddle_sdk::{
-    Definition, FilePath, Output, Tool, apply_changes, emit_diff, read_range, resolve_path,
+    Definition, FilePath, Output, Tool, apply_changes, emit_diff, read_preimage, resolve_path,
 };
 #[cfg(target_arch = "wasm32")]
 use serde_json::json;
@@ -23,44 +24,34 @@ pub struct Edit;
 pub struct Patch;
 
 pub trait Filesystem {
-    fn read(&mut self, path: &str) -> Result<Vec<u8>, String>;
+    fn read_optional(&mut self, path: &str) -> Result<Option<Vec<u8>>, String>;
+    fn read(&mut self, path: &str) -> Result<Vec<u8>, String> {
+        self.read_optional(path)?
+            .ok_or_else(|| format!("{path}: file does not exist"))
+    }
     fn apply(&mut self, changes: &[Change]) -> Result<(), String>;
-    fn present_diff(&mut self, _text: &str) {}
+    fn present_diff(&mut self, _text: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
 struct HostFilesystem;
 #[cfg(target_arch = "wasm32")]
 impl Filesystem for HostFilesystem {
-    fn present_diff(&mut self, text: &str) {
-        let mut end = text.len().min(budgets::diff_present_bytes());
-        while !text.is_char_boundary(end) {
-            end -= 1;
+    fn present_diff(&mut self, text: &str) -> Result<(), String> {
+        if text.is_empty() {
+            return Ok(());
         }
-        let _ = emit_diff(&text[..end]);
+        emit_diff(text)
     }
-    fn read(&mut self, path: &str) -> Result<Vec<u8>, String> {
-        let path = resolve_path(path).map_err(|error| format!("resolve failed: {error:?}"))?;
-        let path = FilePath {
+    fn read_optional(&mut self, path: &str) -> Result<Option<Vec<u8>>, String> {
+        let path = resolve_path(path).map_err(failure_message)?;
+        read_preimage(&FilePath {
             root: path.root,
             relative: path.relative,
-        };
-        let mut bytes = Vec::new();
-        loop {
-            let want = (budgets::mutation_bytes() - bytes.len()).min(budgets::range_bytes()) as u32;
-            if want == 0 {
-                return Err("mutation input file exceeds configured limit".into());
-            }
-            let chunk = read_range(&path, bytes.len() as u64, want)
-                .map_err(|error| format!("read failed: {error:?}"))?;
-            if chunk.bytes.len() > want as usize || (chunk.bytes.is_empty() && !chunk.eof) {
-                return Err("invalid range reply".into());
-            }
-            bytes.extend_from_slice(&chunk.bytes);
-            if chunk.eof {
-                return Ok(bytes);
-            }
-        }
+        })
+        .map_err(failure_message)
     }
     fn apply(&mut self, changes: &[Change]) -> Result<(), String> {
         apply_changes(changes)
@@ -112,16 +103,25 @@ pub fn write_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, S
         serde_json::from_str(arguments).map_err(|error| format!("invalid arguments: {error}"))?;
     let lines = args.content.lines().count();
     let bytes = args.content.len();
-    let presentation = diff::lines(&args.path, None, &args.content);
+    let before = fs.read_optional(&args.path)?;
+    let expected = before.as_ref().map_or(Expectation::Missing, |bytes| {
+        Expectation::Sha256(hash(bytes))
+    });
+    let before = before
+        .map(String::from_utf8)
+        .transpose()
+        .map_err(|_| "write requires a UTF-8 preimage")?
+        .unwrap_or_default();
+    let presentation = diff::lines(&args.path, &before, &args.content);
+    fs.present_diff(&presentation)?;
     submit(
         fs,
         &[Change {
             path: args.path.clone(),
             content: Some(args.content.into_bytes()),
-            expected: Expectation::Any,
+            expected,
         }],
     )?;
-    fs.present_diff(&presentation);
     Ok(format!(
         "wrote {} ({bytes} bytes, {lines} lines)",
         args.path
@@ -152,7 +152,8 @@ pub fn edit_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, St
     let at = text.find(&args.old).ok_or("old does not occur")?;
     let line = text[..at].bytes().filter(|byte| *byte == b'\n').count() + 1;
     let updated = text.replacen(&args.old, &args.new, 1);
-    let presentation = diff::lines(&args.path, Some(&text), &updated);
+    let presentation = diff::lines(&args.path, &text, &updated);
+    fs.present_diff(&presentation)?;
     submit(
         fs,
         &[Change {
@@ -161,7 +162,6 @@ pub fn edit_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, St
             expected: Expectation::Sha256(hash(text.as_bytes())),
         }],
     )?;
-    fs.present_diff(&presentation);
     Ok(format!("edited {} at line {line}", args.path))
 }
 
@@ -176,7 +176,7 @@ pub fn patch_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, S
         match op {
             Op::Add { path, text } => {
                 if presentation.len() < budgets::diff_present_bytes() {
-                    presentation.push_str(&diff::lines(&path, Some(""), &text));
+                    presentation.push_str(&diff::lines(&path, "", &text));
                 }
                 report.push(format!("added {path}"));
                 changes.push(Change {
@@ -186,14 +186,18 @@ pub fn patch_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, S
                 });
             }
             Op::Delete { path } => {
+                let bytes = fs.read(&path)?;
+                let expected = Expectation::Sha256(hash(&bytes));
+                let text =
+                    String::from_utf8(bytes).map_err(|_| "patch deletion requires UTF-8 text")?;
                 if presentation.len() < budgets::diff_present_bytes() {
-                    presentation.push_str(&format!(" 0 {path} (deleted; preimage not read)\n"));
+                    presentation.push_str(&diff::lines(&path, &text, ""));
                 }
                 report.push(format!("deleted {path}"));
                 changes.push(Change {
                     path,
                     content: None,
-                    expected: Expectation::Any,
+                    expected,
                 });
             }
             Op::Update {
@@ -210,7 +214,7 @@ pub fn patch_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, S
                     .map_err(|error| format!("{path}: {error}; nothing was written"))?;
                 let expected = Expectation::Sha256(hash(text.as_bytes()));
                 if presentation.len() < budgets::diff_present_bytes() {
-                    presentation.push_str(&diff::lines(&path, Some(&text), &updated));
+                    presentation.push_str(&diff::lines(&path, &text, &updated));
                 }
                 if let Some(destination) = destination {
                     report.push(format!("moved {path} to {destination}"));
@@ -235,8 +239,13 @@ pub fn patch_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, S
             }
         }
     }
+    let mut end = presentation.len().min(budgets::diff_present_bytes());
+    while !presentation.is_char_boundary(end) {
+        end -= 1;
+    }
+    presentation.truncate(end);
+    fs.present_diff(&presentation)?;
     submit(fs, &changes)?;
-    fs.present_diff(&presentation);
     Ok(report.join(", "))
 }
 
@@ -261,7 +270,7 @@ macro_rules! tool {
 tool!(
     Write,
     "write",
-    "write UTF-8 content, creating parent directories or replacing a file. Requires runtime write permission, not read permission. Paths are workspace-relative, absolute or home-relative. Batch and argument byte limits are host-configurable. Protected paths and exclusions remain enforced.",
+    "write UTF-8 content, creating parent directories or replacing a file. Requires runtime read and write permission; reads and guards the preimage, including absence. Paths are workspace-relative, absolute or home-relative. Batch and argument byte limits are host-configurable. Protected paths and exclusions remain enforced.",
     json!({"path":{"type":"string"},"content":{"type":"string"}}),
     ["path", "content"],
     write_with
@@ -279,7 +288,7 @@ tool!(
 tool!(
     Patch,
     "patch",
-    "apply an apply-patch document across files: Begin Patch, Add File, Update File with @@ hunks and optional Move to, Delete File, End Patch. Every hunk must match exactly once. Add/move destinations must be absent. Updates require read and write; additions/deletions require write only. All targets and preconditions are checked before publication. One denial refuses the whole batch. Path count and resulting-content byte budgets are host-configurable. I/O failure during publication may partially apply; reported explicitly.",
+    "apply an apply-patch document across files: Begin Patch, Add File, Update File with @@ hunks and optional Move to, Delete File, End Patch. Every hunk must match exactly once. Add/move destinations must be absent. Updates, moves and deletions require read and write and guard the read preimage; additions require write and an absent destination. All targets and preconditions are checked before publication. One denial refuses the whole batch. Path count and resulting-content byte budgets are host-configurable. I/O failure during publication may partially apply; reported explicitly.",
     json!({"patch":{"type":"string"}}),
     ["patch"],
     patch_with
@@ -297,8 +306,8 @@ mod tests {
         stale: bool,
     }
     impl Filesystem for Memory {
-        fn read(&mut self, path: &str) -> Result<Vec<u8>, String> {
-            self.files.get(path).cloned().ok_or("missing file".into())
+        fn read_optional(&mut self, path: &str) -> Result<Option<Vec<u8>>, String> {
+            Ok(self.files.get(path).cloned())
         }
         fn apply(&mut self, changes: &[Change]) -> Result<(), String> {
             for change in changes {
@@ -335,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn write_is_blind_and_edit_matches_exactly_once_and_guards_stale_contents() {
+    fn writes_and_edits_guard_preimages_and_edits_match_exactly_once() {
         let mut fs = Memory::default();
         write_with(r#"{"path":"file","content":"first\nold\n"}"#, &mut fs).unwrap();
         assert!(

@@ -1,512 +1,232 @@
-# WASI tool plugins
+# WASI tools and plugins
 
-Saddle loads explicitly installed, digest-pinned WASI components as model-callable tools
-(D126–D145). The runtime supports bounded filesystem and transcript services, not arbitrary extensions. A manifest
-in a repository never executes automatically. Installation, enablement and grants are separate steps
-performed by a person; an agent cannot write its own protected configuration.
+Saddle's eleven ordinary tools run shipped WASI components (D146–D147). There is no native fallback
+or native/plugin implementation picker. `tool_search` remains a host MCP catalogue operation.
+Filesystem effects, path resolution, permissions, audit, sandbox execution, HTTP/credentials and
+branch-only transcript SQL remain privileged core services. Guests own schemas, workflows, parsing,
+matching/traversal, pagination, minimal diffs and presentation.
 
-## Build and install the example
+## Using the shipped tools
 
-From this repository, with `wasm32-unknown-unknown` installed:
+No separate plugin installation, componentizer command or files under `target/*-plugin` are needed
+at runtime. Components and their digests ship inside the executable. Inspect them with:
 
 ```sh
-cargo build -p saddle-sdk --example reader --target wasm32-unknown-unknown
-cargo run -p saddle-loader --example componentize -- \
-  target/wasm32-unknown-unknown/debug/examples/reader.wasm target/reader.component.wasm
+saddle tools
+saddle tools --config     # prints recommended delegation; does not edit existing config
+saddle check              # configured profiles, parent reach, budgets and diagnostics
+saddle plugin list        # loaded components and any refusal
 ```
 
-Create `target/reader.plugin.toml`:
+### Existing-configuration migration
+
+An existing config is **not silently changed** to grant components the agent's reach. Add the desired
+entries from `saddle tools --config` to the protected user `config.toml`, then `/reload`. Missing
+entries/scopes mean none, and an unavailable tool returns an audited denial, never native execution.
+First-run defaults write this explicit table alongside the existing `[agent]` defaults:
+
+```toml
+[standard-tools]
+read = ["fs-read", "tool-read"]
+ls = ["fs-read", "tool-read"]
+find = ["fs-read", "tool-read"]
+grep = ["fs-read", "tool-read"]
+write = ["fs-read", "fs-write", "tool-read", "tool-write"]
+edit = ["fs-read", "fs-write", "tool-read", "tool-write"]
+patch = ["fs-read", "fs-write", "tool-read", "tool-write"]
+bash = ["exec", "fs-read", "fs-write", "net"]
+fetch = ["net"]
+websearch = ["net"]
+session_query = ["transcript-read"]
+```
+
+Presence authorizes registration of that fixed shipped component only. Each listed operation scope
+selects the agent's **current** resources, not new resources: filesystem roots/exclusions, exec env
+and timeout, network hosts/schemes/ports and private-address exemptions, managed-path roles, or
+transcript reach. The manifest ceiling and D126 delegation check independently bound the result.
+For example `write = ["fs-write"]` does not inherit read permission even if the agent holds it;
+ordinary write will refuse its preimage read. A missing parent scope selects no resources; a component
+whose imports cannot link is unavailable and is not advertised to the model. Thus fetch/search need
+actual delegated network reach, not simply a table entry saying `net`.
+
+Managed directory roles remain those in D66's protected `[sandbox]` declarations. Readers/listing/
+search receive only their matching role; mutation preimages use the `read` role, and mutation writes
+use their own `write`, `edit` or `patch` role. Existing-file mutation of an external directory therefore
+needs both a configured read role and the corresponding write role. This is not another directory
+allowlist and never converts a directory into a policy root. Bare sandbox paths and include rules
+remain child-process reach only.
+
+`standard-*` plugin identities are reserved for the shipped components, not configurable third-party
+replacements. Profiles enter the policy hash; reload rebuilds the catalogue and bounded principal
+views without resetting spending or changing artifact digests. Changing a profile does not change
+`[agent]`, and granting the agent more reach does not lend an omitted operation scope to a tool.
+
+## Build and delivery
+
+Developers/package builders need Rust's `wasm32-unknown-unknown` target. Normal `cargo build` and
+`cargo nextest run` build the guest sources automatically using the workspace lockfile in a separate
+Cargo target directory, componentize them and precompile target-specific Wasmtime artifacts. Cargo
+tracks SDK, WIT, tools, limits and ignore sources. End users need neither the Rust guest toolchain
+nor a repository checkout. Standard-component tests consume the packaged bytes, not manually built
+files under `target`. The SDK reader compatibility fixture is built and componentized alongside
+them too, so the full test suite needs no manual fixture preparation or ignored-test opt-in.
+
+The bundle contains raw WASM, component digests, manifests and matching precompiled bytes generated
+together by the trusted package compiler. Package/runtime engines use the same explicit baseline
+ISA and pinned Wasmtime line. Deserialization of arbitrary native code is unsafe; the embedded
+loader path is used only for immutable build-produced bytes inside the executable, followed by
+actual type/scope/signature checks and grant-shaped pre-linking before any initialization. There is
+no runtime-writable serialized-code cache or native-library plugin path. An installed third-party
+raw component may reuse the immutable packaged compilation only when both its digest and exact raw
+bytes match; its own identity, explicit grants, ceiling checks and namespace remain unchanged.
+Other third-party components compile from checked raw WASM as before.
+
+Guest execution uses fresh bounded stores/instances with fuel, epochs and cancellation, empty args/
+environment/streams, no preopens and no ambient sockets. SDK availability never implies permission
+to perform an operation. Each SDK effect is decided and audited by the session's one engine under
+the host-assigned principal and call id. Fatal host/audit failures stop the session, not merely a tool.
+
+## Mutation behavior and diffs
+
+Ordinary `write`, `edit` and patch updates/deletions read and guard preimages. The additive
+`fs-preimage` SDK service returns a bounded optional byte snapshot after ordinary requested/resolved
+read checks. **Only actual not-found means absence**; a refusal, unreadable file or other I/O error
+is never interpreted as a new file. Write requires a readable UTF-8 preimage or positively observed
+absence and submits a hash or missing precondition. Updates/deletions require an existing UTF-8
+preimage. A new patch addition or move destination must be absent and cannot overwrite an existing
+file. Patch additions can therefore safely create files with write-only authority; this is not a
+blind existing-file overwrite. Standard schemas offer no blind overwrite/delete mode.
+
+The low-level SDK `any` expectation remains for binary compatibility with explicitly configured
+third-party plugins. It is not used by ordinary standard mutations. Hash expectations independently
+require read permission in the host, so they cannot become an oracle for write-only principals.
+
+Diffs use the native-style Myers line algorithm: minimal hunks, three context lines, old line numbers
+for removals, new numbers otherwise, and gap markers between distant changes. Multi-file output labels
+the paths. Presentation is accepted and staged **before effects**; a diff refusal leaves files untouched.
+It is published only on successful completion and retained through saving/replay. Guest fuel, memory
+and configurable presentation bytes bound diff computation/output; no unsupported native clock is
+needed. Very large diffs can still be cut at the configured presentation budget.
+
+Mutation batches preflight all permissions, reservations, target conflicts and preconditions before
+staging/publishing. Replacement is atomic per entry, not across the whole batch. I/O publication
+failures can partially apply and say so. Empty created parents may remain. Final precondition checks
+are not a race-free filesystem compare-and-swap against independent writers. Cancellation/traps do
+not undo committed effects and are reported accordingly. No command- or plugin-supplied path can
+steer publication through a swapped symlink or multiply-linked inode outside its granted reach.
+
+## Other tool contracts
+
+- **read:** default UTF-8 text, explicit `format: "image"` for PNG/JPEG/GIF/WebP. No automatic image
+  detection or binary fallback. Text pages preserve whole-file bytes when they fit, otherwise return
+  line/continuation notes and bounded long-line prefixes. Entire scans validate UTF-8, not just the
+  displayed page. Deep offsets are scanned, not guessed. Images use bounded ranges and real provider/
+  UI image attachments, not base64 in model text.
+- **ls/find/grep:** host-filtered lexical metadata pages; guest sorting, traversal, shared ignore
+  syntax and glob/regex matching. They skip `.git`, symlinks, special files and ignored paths.
+  Unreadable child directories are skipped with a note; an unreadable requested start fails. Invalid
+  UTF-8 names are counted as unrepresentable rather than lossy-renamed into ambiguous targets.
+  Workspace-contained results are relative; other roots/external directories yield usable absolute
+  paths via the permission-gated `label-root` operation, never opaque routing identifiers.
+- **bash:** guest-owned `sh -c`, schema and formatting over the delegated core exec service. Sandbox,
+  filtered environment, reservation restore, network proxy, capture, cancellation and process-group
+  cleanup use the actual bounded caller. Its filesystem/net view can be narrower than the agent's.
+  Network namespace failure gives no network, never unrestricted sockets.
+- **fetch/websearch:** guest schemas/parsing/presentation over core HTTP or fixed protected search
+  transports. Every redirect is independently authorized and cross-origin redirects strip supplied
+  headers. Credentials stay in core and only reach the configured provider/fixed Exa endpoints.
+  Search snapshots are principal-scoped, not shared with siblings; expansion rechecks current endpoint
+  reach and reload evicts data above narrowed cache budgets.
+- **session_query:** read-only branch snapshots, including pre-compaction messages, request usage and
+  prose reasoning. No saved-database handle, session selector, writes or arbitrary SQL functions.
+  Parent and delegate both need transcript-read. Standalone calls report no active conversation.
+
+Numeric bounds in these contracts are protected runtime settings, not component build variants.
+UTF-8 WIT strings, supported image formats, partial multi-file effects, process-group limitations
+(`setsid`) and inability to immediately interrupt every blocking resolver/filesystem read are separate
+semantic/platform limits. Fuel cannot preempt synchronous native I/O; transport deadlines bound
+network waiting. Directory pages/range reads are not snapshots against concurrent filesystem changes.
+
+## Result provenance and presentation
+
+Ordinary tool names run bounded standard principals; third-party names are
+`plugin__<id>__<tool>`. Descriptions and model-visible outputs retain D25's random delimiter framing.
+Host-owned provenance records principal, scope, call id, version and source component digest; guest
+text cannot provide or forge it. Saved results keep their original metadata/framing after reload,
+disable, resume or branching. Human diffs are never model text.
+
+Human line/TUI rendering removes only a matching outer frame authenticated by host provenance.
+It does not mutate stored/provider content. Thus normal CLI tool text and resumed tool cards do not
+show framing noise, while `run --json` result events retain framed `content`, `provenance` and separate
+`diff` for programs. Explicit third-party `plugin call` output retains its existing framing.
+
+## Explicit third-party plugins
+
+Third-party installation remains separate from enablement and grants:
+
+```sh
+cargo build -p saddle-tools --example read --target wasm32-unknown-unknown --release
+# Componentize the module using the canonical example:
+cargo run -p saddle-loader --example componentize -- module.wasm reader.component.wasm
+saddle plugin install /path/to/plugin.toml
+```
+
+A manifest identifies a raw component relative to itself and declares a scope ceiling:
 
 ```toml
 id = "reader"
 version = "0.1.0"
 component = "reader.component.wasm"
-scopes = ["tool", "fs-read"]
+scopes = ["tool", "fs-read", "tool-read"]
 ```
 
-Then, from your own terminal:
-
-```sh
-cargo run --bin saddle -- plugin install target/reader.plugin.toml
-```
-
-Installation copies the manifest and component into
-`$XDG_CONFIG_HOME/saddle/plugins/reader/` (normally `~/.config/saddle/plugins/reader/`). It refuses
-replacement of an existing installation, does not compile or execute the component, and does not
-enable it or change grants. It prints a configuration block containing the component's SHA-256.
-Add that block to your protected `config.toml`, using the actual printed digest:
+Installation copies bounded, no-follow checked artifacts to protected `$XDG_CONFIG_HOME/saddle/plugins`;
+it neither enables them nor writes grants. It prints the pin for the user to configure:
 
 ```toml
 [plugins.reader]
 enabled = true
 manifest = "reader/plugin.toml"
-sha256 = "<64 hexadecimal digits printed by install>"
-```
+sha256 = "<printed component SHA-256>"
 
-Grant the plugin only what it needs, separately:
-
-```toml
 [plugin.reader]
 tool = {}
-fs-read = [{ root = "workspace", exclude = [".env*", "private/**"] }]
+fs-read = [{ root = "workspace" }]
+tool-read = { tools = ["read"] } # only existing D66 directory reach, bounded by the parent
 ```
 
-These grants can live in the base `config.toml`, or only in a workspace's protected policy file
-under `policies/` beside it. Base grants apply in every workspace; use the workspace policy for a
-workspace-specific delegation. Its existing `workspace = "<absolute path>"` header must remain.
-The `[plugins.reader]` installation/enablement table belongs in the base configuration, not in a
-repository manifest or a workspace policy. The agent's effective grants must also permit the
-requested reads. `tool` permits registration, not additional operational authority.
-
-## Use and inspect
+For a custom writer/update tool add the corresponding explicit fs-write/tool-write grants and manifest
+ceilings; read access is independent. Omitted grants inherit nothing. The ceiling chain is agent
+current reach → manifest scopes → explicit plugin grants. Parent/child exclusions both apply; a sibling
+or registration grant cannot supply missing operational reach. No repository auto-discovery, automatic
+updates or plugin-to-MCP adapter exists.
 
 ```sh
 saddle plugin list
-saddle check
-saddle plugin call reader '{"root":"workspace","relative":"Cargo.toml"}'
-saddle tool plugin__reader__read-file '{"root":"workspace","relative":"Cargo.toml"}'
+saddle plugin call reader '{"path":"src/main.rs"}'
+saddle tool plugin__reader__read '{"path":"src/main.rs"}'
 ```
 
-The SDK example requires `root` and `relative` string arguments. These
-CLI calls and model calls use the same dispatch, policy engine and audit log. An enabled, granted,
-valid plugin contributes one namespaced tool, `plugin__<id>__<tool>`, to the model's catalogue.
-`plugin list` reports disabled, ungranted, failed and ready plugins. Bad digests, unsupported imports,
-traps and bad descriptions leave native tools available; host or audit failures stop the operation.
-
-After changing configuration, grants or artifacts, use `/reload` in an active session, or open a
-new one. Reload discards old prepared components and catalogues, rechecks digests and both authority
-ceilings, and refreshes the next model request. A stale tool name is denied. To disable a plugin,
-set its entry's `enabled = false` and reload. Installation never replaces an existing directory;
-updating requires explicitly removing the old installation, reinstalling, and reviewing the new pin.
-There is no downloader, signing service, registry or automatic update mechanism.
-
-## Standard text-read plugin
-
-`saddle-tools` is the home for tool implementations rather than host services. Its first component
-is `files`, exporting `plugin__files__read`. Unlike the minimal SDK reader above, it handles source
-files larger than 64 KiB by requesting bounded byte ranges, selects line pages in guest code, and
-keeps the host independent of line formatting:
-
-```sh
-cargo build -p saddle-tools --example read --target wasm32-unknown-unknown --release
-mkdir -p target/read-plugin
-cargo run -p saddle-loader --example componentize -- \
-  target/wasm32-unknown-unknown/release/examples/read.wasm target/read-plugin/read.component.wasm
-cp crates/saddle-tools/plugins/read/plugin.toml target/read-plugin/plugin.toml
-saddle plugin install target/read-plugin/plugin.toml
-```
-
-The opt-in production-host test uses that built artifact:
-
-```sh
-cargo nextest run --test plugins --run-ignored only \
-  -E 'test(standard_read_component_paginates_large_files_through_the_production_host)'
-```
-
-Enable the printed `[plugins.files]` block and grant `[plugin.files]` the same `tool`/`fs-read`
-permissions shown for the reader example. Then:
-
-```sh
-saddle plugin call files '{"path":"src/lib.rs","offset":100,"limit":40}'
-saddle tool plugin__files__read '{"root":"workspace","path":"src/lib.rs"}'
-```
-
-Without `root`, `path` may be workspace-relative, absolute or home-relative, but must map to an
-explicitly granted true root. With `root`, `path` is root-relative. `offset` is a positive 1-based line number.
-Pages have at most 2,000 lines and 50 KiB of text plus a bounded continuation/truncation note. Plain
-text, CRLF and trailing newlines are preserved, without line-number prefixes that could interfere
-with exact edits. Oversized lines may be truncated; continuation advances past the truncated line.
-UTF-8 validation covers the entire scan, including characters split across range boundaries.
-Binary/NUL-containing files are refused.
-
-Each invocation scans at most 64 MiB from the beginning, using ranges up to 64 KiB and bounded guest memory.
-The normal fuel/deadline still applies and may stop it earlier. Release builds are recommended;
-debug guest code can consume substantially more fuel. Total line counts and native-style continuation
-notes are reported, including for offsets beyond 1 MiB. A scan exceeding the bound is refused rather
-than reading indefinitely. Ranges are individually authorized, reopened and audited with offset,
-limit and call identity; they are not a snapshot if the file changes concurrently.
-
-The original `read-file` interface and its 64 KiB limit remain unchanged. The new additive
-`saddle:host/fs-read-range@0.1.0` uses the same `fs-read` grant and returns bytes plus an observed EOF
-flag. Each range is limited to 1–65,536 bytes; the host may read one extra byte to establish EOF.
-SDK hosts other than Saddle must implement `HostServices::read_range` to support it; its default
-returns an unsupported-operation error. Existing compiled reader components remain compatible.
-
-The reader's `format` argument explicitly selects the operation (D136). It defaults to `"text"`:
-`{"path":"notes.png"}` reads UTF-8 text regardless of extension or signature. Use
-`{"path":"screenshot","format":"image"}` for a PNG, JPEG, GIF or WebP attachment. There is no
-automatic mode detection or fallback: invalid UTF-8 fails in text mode, and invalid image metadata
-fails in image mode. `offset` and `limit` select text lines only. The native reader is unchanged.
-
-In image mode, bytes are assembled from bounded ranges (at most 5 MiB) and attached as real image
-results through the existing provider/UI/store pipeline. The additive `tool-result.emit-image`
-service determines media type and dimensions from image headers; this does not select the read mode,
-open the supplied name or perform image decoding/recompression. Only one image per invocation is
-accepted. Failed/trapped calls publish no images, and saved image data/provenance survives replay.
-The 64 KiB text result limit is not enlarged to accommodate image bytes.
-
-This is an incremental migration toward replacing built-in `read`, not a permanent implementation
-picker. Shared tool-visible directories use the same SDK with runtime permissions as described below;
-standard-component delivery still needs work. Standard
-plugins are not silently enabled or given the agent's authority merely because their source ships
-in the repository.
-
-## Standard directory listing plugin
-
-`listing` exports `plugin__listing__ls`, implemented in `saddle-tools`:
-
-```sh
-cargo build -p saddle-tools --example ls --target wasm32-unknown-unknown --release
-mkdir -p target/ls-plugin
-cargo run -p saddle-loader --example componentize -- \
-  target/wasm32-unknown-unknown/release/examples/ls.wasm target/ls-plugin/ls.component.wasm
-cp crates/saddle-tools/plugins/ls/plugin.toml target/ls-plugin/plugin.toml
-saddle plugin install target/ls-plugin/plugin.toml
-```
-
-Enable the printed `[plugins.listing]` entry and separately grant `[plugin.listing]` `tool` and the
-needed `fs-read` roots. `saddle plugin call listing '{"path":"src"}'` lists a directory; omitting
-`path` lists the workspace. Path resolution follows the read plugin's rules. Results are sorted,
-with `/` for directories and `@` for symlinks, at most 500 entries/50 KiB plus summary notes.
-
-The guest requests lexical pages of at most 128 entries via `fs-list`. The core checks and audits
-the start directory and filters both agent/plugin exclusions on every child before returning names.
-Symlinks are identified but not followed; a subsequent call targeting an escaping link is refused.
-Each page scans at most 100,000 entries; larger directories fail rather than silently missing names.
-Non-UTF-8 names are skipped, not converted to potentially ambiguous paths. Names in concurrently
-modified directories are not a snapshot. The guest owns suffixes, sorting and output truncation.
-
-The additive `fs-paths` service maps paths to real roots under the same `fs-read` permission. It
-never lets a guest select a native tool identity or access D66 tool-visible directories merely
-because native `read` can. The core also resolves configured external directories through this same
-SDK function, but checks their distinct runtime permissions as described below; they are not new
-grantable roots or automatically accessible to every filesystem plugin.
-
-```sh
-cargo nextest run --test plugins --run-ignored only \
-  -E 'test(standard_ls_component_lists_filtered_pages_and_never_follows_entry_links)'
-```
-
-## Standard find and grep plugins
-
-`finder` exports `plugin__finder__find`; `search` exports `plugin__search__grep`. Both implement
-traversal and matching in the guest. The core supplies only policy-filtered directory pages and
-bounded reads; it does not run native `find` or `grep` on their behalf. Ignore parsing is shared
-with native tools and skill discovery through the authority-free `saddle-ignore` crate.
-
-Build each component, then install, enable and grant it independently:
-
-```sh
-cargo build -p saddle-tools --examples --target wasm32-unknown-unknown --release
-mkdir -p target/find-plugin target/grep-plugin
-cargo run -p saddle-loader --example componentize -- \
-  target/wasm32-unknown-unknown/release/examples/find.wasm target/find-plugin/find.component.wasm
-cargo run -p saddle-loader --example componentize -- \
-  target/wasm32-unknown-unknown/release/examples/grep.wasm target/grep-plugin/grep.component.wasm
-cp crates/saddle-tools/plugins/find/plugin.toml target/find-plugin/plugin.toml
-cp crates/saddle-tools/plugins/grep/plugin.toml target/grep-plugin/plugin.toml
-saddle plugin install target/find-plugin/plugin.toml
-saddle plugin install target/grep-plugin/plugin.toml
-```
-
-Use the printed `[plugins.finder]`/`[plugins.search]` entries, with corresponding explicit
-`[plugin.finder]`/`[plugin.search]` `tool` and `fs-read` grants. Example calls:
-
-```sh
-saddle plugin call finder '{"path":"src","pattern":"*.rs"}'
-saddle plugin call search '{"path":"src","pattern":"TODO|FIXME","glob":"*.rs","ignore_case":true}'
-```
-
-Globs without `/` match filenames at any depth; those with `/` match paths from the search
-directory. Both honor `.gitignore`, `.ignore` and `.fdignore`, skip `.git`, and do not follow
-symlinks or read special files. Parent ignore files apply when starting in a subdirectory. Regex
-search returns `path:line: text`, supports explicit readable file targets and case-insensitive
-matching, and skips binary, invalid UTF-8, oversized and unreadable content. All permission checks
-remain independent of ignore rules. Files larger than 64 KiB are searched through bounded ranges.
-
-Limits: 1,000 find results, 200 grep matches, 50 KiB result text, 300-byte UTF-8-safe line previews,
-4 MiB per searched file, 100,000 visited entries, 2,048 pending directories/1 MiB of queued paths,
-128 KiB aggregate ignore text (64 KiB per file), plus normal fuel/memory/deadline bounds. Large
-ignore data fails explicitly. Other limits produce narrowing notes; the runtime can interrupt
-earlier. These are incremental replacements: other roots display `root:relative` rather than
-absolute host paths, and an explicitly requested unreadable file may report a directory error.
-Cold compilation of regex-bearing components is substantial; it happens once per loaded component
-in a running session, but standalone CLI calls each start a new process. Compilation caching and
-independent compilation resource limits remain work, not execution-fuel guarantees.
-
-```sh
-cargo nextest run --test plugins --run-ignored only \
-  -E 'test(standard_search_components_walk_and_match_without_bypassing_exclusions)'
-```
-
-## Runtime access to configured external directories
-
-The same compiled filesystem plugin and SDK functions handle workspace paths and D66 directories
-such as `~/.agents` (D139). The core resolves the path and checks the calling plugin's runtime
-permissions. There is no `tool-paths` Cargo feature, alternate guest artifact or guest-side choice
-of permission mechanism. D138's feature-based routing was superseded, not retained as an option.
-
-Directory authority remains the existing user-owned `[sandbox]` declarations and default read-only
-`~/.agents` entry. No directory is declared again. Bare sandbox paths and include rules do not become
-host-tool access. A plugin may hold root access, external-directory access, or both:
-
-```toml
-[plugin.files]
-tool = {}
-fs-read = [{ root = "workspace" }]
-# Optional runtime permission; add/remove and reload without rebuilding or repinning:
-tool-read = { tools = ["read"] }
-```
-
-With only `fs-read`, this reader remains loaded and reads the workspace, but is denied `~/.agents`.
-Adding the `tool-read` grant and reloading enables that existing configured reach for the exact same
-artifact. Removing it and reloading denies external reads again while workspace reads still work.
-A custom external-only reader can omit `fs-read` entirely and use the same SDK calls.
-
-The filesystem interfaces are linked with any filesystem capability; interface availability never
-supplies permission for a path or operation (D140). With no filesystem capability, filesystem imports
-are refused before initialization. Other SDK services keep their own capability requirements. Manifest ceilings and
-agent reach still bound every plugin grant. Standard manifests allow the optional runtime scope but
-never grant it.
-
-Use `ls`, `find` or `grep` for the corresponding component's external-directory role. Roles select
-configured directory reach, not the guest's name or implementation. The parent ceiling is derived
-from current D66 declarations; no extra agent grant or new directory list is needed. An explicit
-agent `tool-read` table may narrow that ceiling, never add directories. A sibling's grant, `tool`
-registration and root grants cannot supply external-directory access.
-
-The core retains true-root precedence: root exclusions cannot be bypassed by treating a root path
-as an external directory. Requested paths and linked targets must both be allowed. Protected
-config/state overlaps, undeclared targets and special-file reads remain refused. Metadata filtering,
-bounded ranges, deadlines, pinned handles and per-plugin audit/call identity are unchanged. Reload
-also rebuilds directory mappings and pins. Opaque path identifiers are handled by the core; plugins
-use `resolve_path`, `read_range` and `read_directory` without routing between implementations.
-
-Build standard components using the ordinary commands above, with no feature flags. The old
-D138-specific host interface is retained for binary compatibility, not used by the standard helpers.
-The acceptance test exercises one artifact and digest in one running harness across grant/revoke:
-
-```sh
-cargo nextest run --test agent --run-ignored all -E 'test(one_compiled_reader)'
-cargo nextest run --test plugins --run-ignored all -E 'test(managed_)'
-```
-
-## Standard transcript-query component
-
-The `session_query` guest owns the schema and presentation; core `transcript` services own the
-active-branch snapshot, SQL authorizer, execution and bounds (D137). The plugin has no database or
-filesystem access. Build it with:
-
-```sh
-cargo build -p saddle-tools --example session_query --target wasm32-unknown-unknown --release
-mkdir -p target/session-query-plugin
-cargo run -p saddle-loader --example componentize -- \
-  target/wasm32-unknown-unknown/release/examples/session_query.wasm \
-  target/session-query-plugin/session_query.component.wasm
-cp crates/saddle-tools/plugins/session_query/plugin.toml target/session-query-plugin/plugin.toml
-cargo run --bin saddle -- plugin install target/session-query-plugin/plugin.toml
-```
-
-Enable and pin it as above under `[plugins.transcript]`, and explicitly grant its services:
-
-```toml
-[plugin.transcript]
-tool = {}
-transcript-read = {}
-```
-
-The agent must also hold `transcript-read = {}`. No `fs-read` grant is needed. Its namespaced tool
-is `plugin__transcript__session_query`, taking `{"sql":"SELECT ordinal,role,text FROM messages LIMIT 10"}`.
-The SDK entry point is `query_transcript(sql)`: SQL is capped at 16 KiB, results at 100 rows/50 KiB,
-with `columns`, `rows` and `truncated` fields. Only `messages`, `requests` and `reasoning` views of
-the active branch are queryable. Saved-database tables, other sessions, writes and file functions
-remain inaccessible. With no active conversation, it returns an error instead of choosing one.
-
-Unrelated services are independently linked by each plugin's bounded grants. Enabling transcript
-access does not enable filesystem access or vice versa. The filesystem family is available under
-any filesystem capability, but each operation/path still needs its own grant; one plugin's grants
-never supply another's. Compiling against SDK bindings does not grant their authority.
-
-## Standard mutable filesystem components
-
-The `writer`, `editor` and `patcher` components implement `write`, `edit` and `patch` in guest code
-(D140). Their SDK primitive is `apply_changes(&[Change])`, a bounded batch of writes/removals with
-`Any`, `Missing` or SHA-256 preconditions. The core does not parse patches or choose text matches.
-
-```sh
-cargo build -p saddle-tools --examples --target wasm32-unknown-unknown --release
-for name in write edit patch; do
-  mkdir -p target/$name-plugin
-  cargo run -p saddle-loader --example componentize -- \
-    target/wasm32-unknown-unknown/release/examples/$name.wasm \
-    target/$name-plugin/$name.component.wasm
-  cp crates/saddle-tools/plugins/$name/plugin.toml target/$name-plugin/plugin.toml
-done
-saddle plugin install target/write-plugin/plugin.toml
-# Likewise install edit-plugin/patch-plugin, then enable and pin each printed entry.
-```
-
-Permissions are runtime configuration of those same artifacts:
-
-```toml
-[plugin.writer]
-tool = {}
-fs-write = [{ root = "workspace", exclude = [".env*", "private/**"] }]
-
-[plugin.editor]
-tool = {}
-fs-read = [{ root = "workspace" }]
-fs-write = [{ root = "workspace" }]
-
-[plugin.patcher]
-tool = {}
-fs-read = [{ root = "workspace" }]
-fs-write = [{ root = "workspace" }]
-```
-
-The agent must hold the corresponding grants too; both principals' exclusions apply. The tools
-are `plugin__writer__write`, `plugin__editor__edit` and `plugin__patcher__patch`. Arguments match
-native `write` (`path`, `content`), `edit` (`path`, `old`, `new`) and `patch` (`patch`). Writers do
-not need read authority. A write-only patcher can add/delete; updating/moving requires actual read
-permission. SDK service availability is not permission to read or write a path: the filesystem
-service family can link under any filesystem capability, while each operation checks its own grant.
-Adding/removing write permission and reloading does not rebuild or repin the plugin.
-
-The core preflights every requested/resolved target and precondition before publication, rejects
-reserved paths and overlapping/aliased targets, stages only supplied bytes through pinned parent
-handles, and replaces entries by rename rather than truncating an existing inode. File payloads
-are not logged: audit records paths, operation, size, hash, principal and call id. Mutations during
-`describe` are refused. A guest trap after committed effects does not roll them back and is reported
-as such. Staging files use exclusive creation and are cleaned after failure; empty created parents can remain.
-SHA-256 preconditions independently require read authority on both requested and resolved paths;
-write-only callers cannot probe existing hashes.
-
-Bounds are 32 paths and 1 MiB of aggregate resulting content per batch, 1 MiB per conditional input
-file, plus the normal 64 KiB tool-argument and fuel/deadline limits. Add/move destinations must be
-absent; deletes are idempotent. Edits/hunks must match exactly once. Source hashes detect stale
-preimages before publication, but are not an OS-level atomic compare-and-swap against independent
-writers. Publication is atomic per entry, **not** a multi-file transaction or crash-durability
-promise: I/O errors during publication may partially apply and are explicitly reported.
-
-The same artifacts support D66 configured external directories (D141): add
-`tool-write = { tools = ["write"] }` to the writer's runtime grants (use `edit`/`patch` for those
-components). The protected `[sandbox]` entry must independently name that role. Updates also need
-`tool-read = { tools = ["read"] }` and a configured read role. True roots retain precedence;
-external links must land in independently permitted declared directories, and protected/reserved
-paths remain refused. No new allowlist, root, build variant or repinning is involved.
-
-Guests emit bounded human-only line diffs through `tool-result.emit-diff`. They are retained in
-saved/replayed tool results, not model text. Blind writes/deletes label unavailable preimages rather
-than acquiring read access implicitly. Diffs are bounded, may summarize a changed span rather than
-produce minimal hunks, and are discarded on guest error/trap. Native tools have not been removed yet.
-
-```sh
-cargo nextest run --test plugins --run-ignored all -E 'test(mutation)'
-cargo nextest run --test agent --run-ignored all -E 'test(one_compiled_writer)'
-```
-
-## Standard shell component
-
-The `shell` component exports `plugin__shell__bash` (D142). Build/componentize the `bash` example
-with the same commands as the filesystem examples. Its SDK accepts an argv and bounded timeout;
-the guest chooses `sh -c`, owns its schema and formats captured streams/status. The core execution
-service is shared with the temporary native adapter, but always uses the actual caller's grants.
-
-```toml
-[plugin.shell]
-tool = {}
-exec = { timeout-secs = 120 }
-fs-read = [{ root = "workspace" }]
-fs-write = [{ root = "workspace" }]
-# Optional; omission means commands cannot borrow the agent's network grants:
-net = [{ host = "crates.io" }]
-```
-
-The parent must hold the corresponding reach. Exec environment names cannot exceed its grant,
-timeouts are narrowed, and filesystem exclusions still do not bind exec (the existing sandbox
-contract). Protected sandbox read/write/include configuration supplies the same enumerated runtime
-and toolchain paths as native execution, not additional file-tool roots. Credentials are stripped.
-Network decisions and reserved-path restores retain the plugin principal and call id; audit failures
-are fatal. Namespace failure falls back to no network. Cancellation/timeout kills the process group,
-with the existing `setsid` escape limitation unchanged.
-
-Commands may wait beyond the guest's two-second CPU deadline: long SDK calls suspend that wall
-accounting only for actual bounded host waiting, with 300 seconds cumulative wait and 16 long calls
-per invocation. Fuel and guest computation deadlines remain enforced. Commands capture at most
-256 KiB per stream; the standard guest presents at most 24 KiB each and labels truncation. There is
-no interactive terminal or ambient guest subprocess access. Description-time execution is refused;
-a trap after execution warns that effects may already have happened.
-
-```sh
-cargo nextest run --test plugins --run-ignored all -E 'test(standard_shell)'
-```
-
-## Standard network/search components
-
-The `http` and `web` components export `plugin__http__fetch` and `plugin__web__websearch` (D143).
-Build/componentize the `fetch`/`websearch` examples using the filesystem workflow. Native entry points
-now use the same guest-owned parsing/presentation library through temporary adapters; they do not
-supply agent authority to plugin calls.
-
-```toml
-[plugin.http]
-tool = {}
-net = [{ host = "docs.rs" }, { host = "*.rust-lang.org" }]
-
-[plugin.web]
-tool = {}
-# Grant the configured provider's search host, or the selected Exa fallback:
-net = [{ host = "api.synthetic.new" }, { host = "api.exa.ai" }, { host = "mcp.exa.ai" }]
-```
-
-Parent grants must cover every requested scheme/host/port. Narrowing a wildcard to an exact name
-cannot acquire private-network exemptions the parent lacks. SDK filesystem authority is unrelated.
-The host canonicalizes HTTP(S) URLs, rejects userinfo and routing/framing override headers, checks
-DNS addresses through the shared resolver, independently gates each redirect (five maximum), and
-removes all caller headers on cross-origin redirects. Responses capture at most 100 KiB; the guest
-validates UTF-8 and presents about 60 KiB with truncation labelled. Header names are audited, values
-never are; query values are redacted. Headers must fit 64 entries/64 KiB.
-
-The search SDK accepts only query/count, not an endpoint or protected credential selector. The core
-uses the configured provider, keyed Exa REST or anonymous Exa MCP, and sends credentials only through
-those fixed protocol paths. Credential-bearing requests do not follow redirects. Protected search
-responses are capped at 1 MiB and cleartext key echoes are redacted. The guest parses backend results,
-selects excerpts, numbers the originally returned set, formats full pages and chooses whether a new
-query requires another search. Anonymous MCP text is not falsely presented as numbered full pages.
-
-The session retains at most 17 bounded response snapshots, keyed by principal. A sibling cannot
-expand another plugin's search. Expansions make no HTTP request, and plugin snapshot access rechecks
-the original endpoint's current reach, so revocation cannot leave a cache-reading bypass. Search
-queries are bounded to 16 KiB and results to 100. Raw responses remain core-managed data, not plugin
-persistent storage. Reload needs no rebuild or repinning.
-
-Network calls use the cumulative host-wait budget from D142, with 30 seconds per call. Cancellation
-is checked around I/O; it cannot immediately interrupt a blocked resolver/read. Description-time
-HTTP, search and cache access are refused; audit failures are fatal. Raw WASI outgoing HTTP, sockets
-and poll remain unavailable. Standard delivery and native-entry-point removal are still separate.
-
-```sh
-cargo nextest run --test plugins --run-ignored all -E 'test(standard_fetch)'
-cargo nextest run --test agent --run-ignored all -E 'test(standard_search)'
-```
-
-Search path presentation uses the permission-gated `fs-paths.label-root` metadata operation (D144).
-The core supplies a display prefix once; guests join result paths themselves. Workspace-contained
-results are workspace-relative, external/named-root results are usable absolute paths, never opaque
-routing identifiers. Unreadable descendants are skipped with a note; an unreadable requested start
-is an error. Non-UTF-8 names are counted as unrepresentable rather than lossy-renamed. Tree/file/page
-limits are intentional standard-tool bounds, not native fallbacks.
+SDK worlds and generated bindings share `crates/saddle-wit/wit`. The historical world name
+`read-tool` remains for compatibility. Additive filesystem, mutation, preimage, presentation, exec,
+HTTP/search and transcript interfaces are linked only under eligible grants and typed before init.
+Filesystem imports may link with any eligible filesystem scope; each read/write still independently
+requires its own per-resource permission. The old `tool-paths` interface remains for D138 binary
+compatibility; standard code uses one ordinary filesystem SDK for roots and D66 paths, with no Cargo
+permission features. Raw sockets, ambient outgoing HTTP, synchronous WASI poll and arbitrary native
+plugins remain unavailable even if a component imports them unused.
 
 ## Runtime resource budgets (D145)
 
-All resource/presentation ceilings below are **defaults**, not constants a plugin must be rebuilt
-to change. Set `[tool-limits]` in the protected user `config.toml`, then `/reload` (or start a new
-session). `saddle check` prints the resolved profile. No workspace file or tool argument can change
-it. The guest receives a public immutable profile via the SDK; the host independently enforces it.
-No grant, path, credential or transcript-authorizer rule is widened by increasing a budget.
+Set `[tool-limits]` in protected config, then `/reload`; `saddle check` prints the resolved profile.
+Defaults live once in `saddle-limits`, shared by host/loader/guests. The immutable invocation profile
+is public numeric metadata only; the host independently enforces it if a guest ignores it. Size/count
+settings fit the 32-bit guest ABI, fuel a 64-bit counter. Positive values are required except optional
+redirect/image/report/quote counts, which may be zero. Backend/platform maxima still apply.
 
-For example, a larger ordinary write needs enough serialized argument space as well as mutation
-space; JSON escaping counts toward the former:
+Different stages have distinct limits. A large ordinary write needs sufficient serialized JSON input
+space as well as mutation space and guest memory. JSON escaping counts. A large presentation also
+needs enough plugin output space. For example:
 
 ```toml
 [tool-limits]
@@ -605,130 +325,33 @@ query-program-ops = 100000
 query-steps = 1000000
 ```
 
-Positive finite values are required, except that `http-redirects`, `image-count`, `exec-report-paths`,
-`exec-report-denials` and `web-quotes` may be zero. Size/count fields must fit the 32-bit guest ABI;
-fuel uses a 64-bit counter. Backend/platform maxima still apply. Set matching stage limits deliberately:
-for example a large presentation also needs a large plugin output envelope and sufficient guest memory.
-`image-bytes` is both a per-image and aggregate emitted-image budget. `query-steps` is checked at SQLite
-progress callbacks (1000 instructions), not an exact single-instruction cutoff.
 
-The profile covers runtime store quotas, artifacts, host-service safety budgets and guest-owned workflow
-and presentation budgets. It is public numeric metadata only. A plugin cannot override host enforcement;
-raising bytes/counts/time does not raise its delegated exec timeout or its filesystem/network reach.
-Resource contexts are scoped per operation and restored; they do not leak settings across sessions or
-siblings. Fresh instances and a rebuilt catalogue on reload prevent a cached guest profile from surviving
-reload. Lowered cache budgets evict excess/oversized retained responses and reduce cached numbered
-result counts immediately. Unknown future snapshot keys are ignored by the SDK so adding a budget does not break
-older guests; the protected config still rejects typos. Older third-party artifacts can of course retain their own internal hard-coded limits.
+`image-bytes` bounds each image and aggregate emitted image bytes. SQL instruction work is checked
+at 1000-instruction progress callbacks, not an exact single-instruction boundary. Native thread stack
+includes a host allowance beyond the Wasm stack; library embedders must reserve adequate native stack.
+Unknown future SDK metadata keys are ignored for forward compatibility; protected config still rejects
+typos. Older third-party artifacts may retain their own internal limits. Changing resource settings
+never widens manifest ceilings, delegated grants, exec env/timeouts, exclusions/reservations, credential
+handling, private-network checks or SQL authorizers.
 
-These settings do **not** make WIT strings represent arbitrary filenames, add image formats, make
-multi-file publication transactional, compute a preimage that a blind writer did not read, or immediately
-interrupt synchronous blocking I/O. Those are semantic/implementation differences, not adjustable quotas.
-The worker reserves native host stack beyond the configured Wasm stack. Library embedders using
-`Loader::with_budgets` must likewise provide sufficient native stack. The SDK debug reader fixture can exceed the default artifact budget because of DWARF; its runtime test
-explicitly increases that budget. Standard shipping components are built in release mode.
-
-## Built-in migration tracking
-
-No standard component is silently aliased over a built-in or given implicit grants.
-
-| Tool | Guest implementation | Remaining parity/adapters |
-| --- | --- | --- |
-| `read` | native-style text pagination/totals, deep offsets, bounded range reads, explicit image mode and optional managed paths | scans beyond resource bounds, standard-component delivery |
-| `ls` | filtered directory pages, suffixes, sorted output, optional managed paths | standard delivery; explicit listing bounds and counted non-UTF-8 name skips |
-| `find`, `grep` | guest traversal, shared ignore syntax, glob/regex matching, usable external paths and unreadable-child handling | standard delivery; explicit tree/file/result bounds |
-| `write`, `edit`, `patch` | guest workflows over bounded, preflight-all mutation batches and optimistic preconditions | standard delivery; documented size/atomicity and bounded diff presentation differences |
-| `bash` | guest shell workflow over delegated sandbox execution, bounded capture, timeout/cancellation and reservation restore | standard delivery; documented capture/presentation and process-group limitations |
-| `fetch`, `websearch` | guest schemas/workflows/parsing/presentation over attributed HTTP and protected search services | standard delivery; bounded presentation and blocking-I/O cancellation limits |
-| `session_query` | guest schema/presentation over branch-only, bounded transcript SQL under delegated `transcript-read` | standard-component delivery and native-entry-point removal |
-
-The target is replacement, not parallel selectable implementations: native entry points go away as
-parity and standard-component delivery land. Remaining adapters must act as the plugin principal,
-not reuse a built-in's hard-coded agent identity. D65/D66 tool-visible paths remain distinct from
-roots; their SDK adapter reuses the existing configuration rather than requiring another directory
-declaration.
-
-## Authority and provenance
-
-Operational authority is bounded by the agent, then the manifest's scope ceiling, then the plugin's
-explicit grants. An omitted plugin grant means none, not inheritance. An above-ceiling request is a
-load error. Both principals' filesystem exclusions apply; sibling plugins cannot supply missing reach.
-Native tools do not require an explicit `agent.tool` grant to use their host-managed dispatch surface.
-
-The session assigns the plugin principal and a unique call id; guest JSON cannot select them.
-Filesystem imports decide and audit both requested and resolved names with that principal. Directory
-descriptors are pinned with no-follow opens; final reads require a regular file, use nonblocking and
-no-follow flags, and cap bytes during I/O. Normal roots refuse absolute symlinks, root escapes and
-excluded targets. Managed tool paths permit links only into other declared, independently allowed
-tool paths. A FIFO, socket, device or oversized file is not a way around the boundary.
-
-Plugin descriptions and results are untrusted data. Results are wrapped with a random session
-delimiter, embedded delimiter prefixes are neutralized and terminal controls removed. Host metadata
-records principal, scope, call id, version and component digest beside the result. Saving, resuming,
-forking and replay retain the original wrapper and metadata; native results remain unwrapped.
-These labels are provenance, not permission to follow instructions found in a plugin response.
-
-## Runtime and SDK
-
-- `saddle-wit/wit` owns the canonical `saddle:host/fs-read@0.1.0`,
-  `saddle:plugin/tool@0.1.0` and `read-tool` world. Host and guest bindings use the same files.
-- `saddle-loader` hashes and compiles the supplied binary bytes, checks actual imports, export
-  signatures and capabilities before initialization, and creates a fresh bounded instance for each
-  `describe` or `invoke`. Native serialized Wasmtime code is not accepted.
-- `saddle-sdk` provides bindings/exports and typed filesystem, execution, HTTP and transcript/search
-  services; guests receive no ambient `std::fs`, subprocess or socket authority.
-- `saddle::plugins` owns protected artifact loading, registration, provenance and the production
-  filesystem adapter. Its worker asks the session thread over a bounded channel; the loader does
-  not own a second policy engine or depend on `Session`.
-
-Only `fs-read`, `fs-write`, `tool-read`, `tool-write`, `exec`, `net`, `transcript-read` and `tool` grants are supported by this runtime. Other scopes fail closed. The
-component classifier describes a wider planned ABI; that does not make its adapters available.
-Descriptions are capped at 1,000 characters, schemas at 16 KiB and configured plugins at 16.
-Schemas must parse as JSON objects with an object input type; the provider may enforce further
-JSON Schema restrictions. Saddle does not execute schema references or guarantee every provider
-accepts every schema.
-Manifests are capped at 16 KiB and component artifacts at 4 MiB. Artifact paths must stay under
-the protected plugin directory without symlinks; manifest identity and the configured digest must match.
-
-Defaults per invocation are 100 million fuel units, a two-second deadline, 16 MiB per linear memory
-(at most four), 10,000 elements per table (at most eight), at most 32 core instances, and 64 KiB
-input/output/file-read limits. Image emission has a separate one-image/5 MiB cap. Initialization and `describe` share the execution bounds. The epoch clock
-runs every 10 ms while any prepared plugin needs it.
-
-WASI starts with empty environment/arguments, no working directory or preopened descriptors, closed
-stdin, discarded stdout/stderr, a 128-entry host resource table and 64 KiB random-byte request
-limits. No terminal, sockets or credentials are inherited. Raw filesystem access, sockets, outgoing
-HTTP and synchronous `wasi:io/poll` are not linked. Poll could block in native code beyond epoch or
-fuel interruption; general `wasm32-wasip2` Rust components importing it are therefore unsupported.
-The example's `wasm32-unknown-unknown` target avoids these ambient adapters. The development-only
-componentizer encodes the embedded WIT metadata; it does not install or grant anything. The SDK's
-WIT path currently assumes this monorepo layout; separately published packages are not implemented.
-
-Cancellation and deadlines are checked while serving host reads, but cannot preempt a kernel
-filesystem operation already in progress. A stuck remote filesystem remains a limitation. Fuel and
-epochs bound guest execution, not compilation: independent compiler time/memory isolation is still
-deferred. Only explicitly installed, digest-pinned local artifacts are automatically loaded; do not
-treat the compiler as a resource-isolated processor for arbitrary untrusted downloads.
-
-Other deferred work includes remaining host interfaces, persistent instances/storage, observers,
-veto/UI hooks, a bounded debug-log sink, packaged SDK distribution and artifact update tooling.
-
-## Test the boundary
+## Validation and remaining boundaries
 
 ```sh
-cargo nextest run -p saddle-cap -p saddle-loader --no-fail-fast
-cargo nextest run --test plugins
-cargo nextest run --test agent -E 'test(plugin)'
-cargo nextest run -p saddle-loader --run-ignored only \
-  -E 'test(sdk_reader_component_round_trips_through_the_runtime)'
+cargo build
+cargo nextest run --no-fail-fast
 cargo fmt --all --check
-cargo clippy --all-targets
+cargo clippy --workspace --all-targets --all-features
 ```
 
-Ordinary tests compile checked-in WAT into real components; they need no guest Rust target. The
-opt-in SDK test builds the example and checks allowed reads, exclusions and audit-chain integrity.
-CLI/model tests use isolated home/config/state directories and cover installation, pinning, import
-refusal before initialization, agent/plugin/sibling boundaries, symlinks, special/large files,
-registration, reload revocation, saved provenance and replay. Loader tests additionally exercise
-fresh-instance state, resource limits, deadlines/cancellation, signatures, host failures and empty
-ambient authority.
+All standard-component tests are active and consume packaged bytes automatically. They cover ordinary
+name dispatch, minimal edit/patch diffs and save/model separation, no blind preimage fallback, refusal
+before effects, explicit enablement/delegation, grant/budget reload without repinning, managed paths,
+symlinks/reservations, delegated execution/networking, credential isolation, sibling caches, images and
+branch SQL. TUI rendering/replay retains human diffs and strips only authenticated display frames.
+The optional library SDK-reader tutorial test is separate and still documents its manual build step.
+
+Third-party compilation remains an explicit local operation: input bytes are bounded but execution
+fuel/epochs are not independent compiler CPU/memory limits. Compilation isolation, persistent instances,
+plugin storage/observers/vetoes, richer host adapters and MCP resources/prompts/codemode remain deferred.
+This migration does not introduce automatic plugin updates, an authority picker, ambient native access
+or a second policy engine.

@@ -20,8 +20,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::filesystem;
+use crate::file_read::resolve_beneath;
 use crate::session::{Session, session_id};
-use crate::tools::fs::resolve_beneath;
 use crate::{cancel, fs_access};
 
 struct Planned {

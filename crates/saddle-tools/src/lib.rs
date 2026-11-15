@@ -15,8 +15,9 @@ pub use pagination::read_with;
 use saddle_limits as budgets;
 use saddle_sdk::ImageInfo;
 #[cfg(target_arch = "wasm32")]
-#[cfg(target_arch = "wasm32")]
 use saddle_sdk::configure_limits;
+#[cfg(target_arch = "wasm32")]
+use saddle_sdk::failure_message;
 use serde::Deserialize;
 
 #[cfg(target_arch = "wasm32")]
@@ -106,7 +107,7 @@ impl Tool for Read {
                     limit,
                 )
                 .map(|chunk| (chunk.bytes, chunk.eof))
-                .map_err(|error| format!("read failed: {error:?}"))
+                .map_err(failure_message)
             },
             |name, bytes| emit_image(name, bytes),
         );
@@ -136,7 +137,7 @@ fn normalize_path(arguments: &str, default: Option<&str>) -> Result<String, Stri
             .and_then(Value::as_str)
             .or(default)
             .ok_or("missing string field `path`")?;
-        let path = resolve_path(path).map_err(|error| format!("resolve failed: {error:?}"))?;
+        let path = resolve_path(path).map_err(failure_message)?;
         object.insert("root".into(), json!(path.root));
         object.insert("path".into(), json!(path.relative));
     }

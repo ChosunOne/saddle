@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::paths::Paths;
+use crate::standard::DEFAULT_PROFILES;
 
 /// The grants applied when a config has no `[agent]` table at all. A present table, even an empty
 /// one, is taken as written: that is how a person says "no grants" rather than "not yet" (D63).
@@ -200,8 +201,13 @@ write = [{write}]
 # input = 3.00                          # add `unit = "token"` if the table is priced per token
 # output = 15.00
 # cache-read = 0.30
+
+# Explicit delegation for the shipped WASI implementations. Removing an entry disables that tool.
+# Scopes select only the agent's current reach, never new paths/hosts/permissions.
+{standard}
 "##,
         write = write,
+        standard = DEFAULT_PROFILES,
     )
 }
 

@@ -296,6 +296,16 @@ pub struct PlainGrant {
     pub why: String,
 }
 
+impl PlainGrant {
+    /// registration metadata compiled from an explicit protected host-tool selection (D147).
+    pub fn registration(source: String, why: String) -> Self {
+        Self {
+            rule: RuleId(source),
+            why,
+        }
+    }
+}
+
 /// read-only roles D66 can delegate through its SDK service (D138).
 pub const TOOL_READ_ROLES: &[&str] = &["read", "ls", "find", "grep"];
 pub const TOOL_WRITE_ROLES: &[&str] = &["write", "edit", "patch"];

@@ -8,6 +8,7 @@ world read-tool {
     import exec;
     import fs-read;
     import fs-write;
+    import fs-preimage;
     import fs-read-range;
     import fs-paths;
     import fs-list;

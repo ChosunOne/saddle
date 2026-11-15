@@ -112,3 +112,9 @@ interface tool-result {
     }
     emit-image: func(name: string, bytes: list<u8>) -> result<image-info, string>;
 }
+
+// Optional preimages distinguish absence from refusal without altering the legacy failure variant.
+interface fs-preimage {
+    use fs-read.{path, failure};
+    read: func(path: path) -> result<option<list<u8>>, failure>;
+}

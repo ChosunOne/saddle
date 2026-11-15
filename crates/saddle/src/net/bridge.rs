@@ -31,8 +31,8 @@ use saddle_cap::{Principal, Scope};
 use saddle_policy::{Kind, Request};
 
 use super::proxy::{self, Mode, Peer, Upstream};
+use crate::net::client::{self as fetch, Target};
 use crate::session::Session;
-use crate::tools::fetch::{self, Target};
 
 /// What the proxy thread wants from the session thread.
 enum Ask {

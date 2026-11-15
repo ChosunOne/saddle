@@ -15,6 +15,7 @@ absolute_paths = "deny"
 items_after_statements = "deny"
 
 [workspace.dependencies]
+saddle-standard = { path = "crates/saddle-standard" }
 saddle-limits = { path = "crates/saddle-limits" }
 saddle-cap = { path = "crates/saddle-cap" }
 saddle-policy = { path = "crates/saddle-policy" }
@@ -22,7 +23,6 @@ saddle-sandbox = { path = "crates/saddle-sandbox" }
 saddle-wit = { path = "crates/saddle-wit" }
 saddle-loader = { path = "crates/saddle-loader" }
 saddle-sdk = { path = "crates/saddle-sdk" }
-saddle-tools = { path = "crates/saddle-tools" }
 saddle-ignore = { path = "crates/saddle-ignore" }
 
 # D14, D127: one deliberately pinned runtime line; 36 supports the workspace's Rust 1.88 MSRV.

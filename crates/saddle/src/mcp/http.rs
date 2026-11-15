@@ -10,7 +10,7 @@
 
 use crate::auth::AuthStore;
 use crate::mcp::oauth;
-use crate::tools::fetch;
+use crate::net::client as fetch;
 use saddle_cap::policy::NetGrant;
 use std::error::Error;
 use std::fmt::Display;
@@ -26,8 +26,8 @@ use saddle_policy::Request;
 
 use crate::mcp::protocol::{Reply, notification, reply, request};
 use crate::mcp::stdio::Tool;
+use crate::net::client::{Target, authority, resolve_public};
 use crate::session::Session;
-use crate::tools::fetch::{Target, authority, resolve_public};
 
 /// What the server said about one call, once it answered.
 pub enum Outcome {

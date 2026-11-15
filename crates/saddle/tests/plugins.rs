@@ -16,6 +16,13 @@ use saddle_policy::audit::sha256_hex;
 use serde_json::Value;
 use tempfile::TempDir;
 
+fn standard_component(name: &str) -> Vec<u8> {
+    saddle_standard::artifact(name)
+        .expect("shipped standard artifact")
+        .wasm
+        .to_vec()
+}
+
 struct Env(TempDir);
 impl Env {
     fn new(bytes: &[u8], grants: &str) -> Self {
@@ -26,6 +33,12 @@ impl Env {
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, "[agent]\nfs-read=[{root='workspace',exclude=['.env*']}]\nfs-write=[{root='workspace'}]\n").unwrap();
         fixture::configure(&config, bytes, grants);
+        let text = fs::read_to_string(&config).unwrap();
+        fs::write(
+            &config,
+            format!("{text}\n{}", saddle_standard::DEFAULT_PROFILES),
+        )
+        .unwrap();
         env
     }
     fn ws(&self) -> PathBuf {
@@ -127,12 +140,11 @@ fn generic_filesystem_imports_never_substitute_for_per_path_permissions() {
 }
 
 #[test]
-#[ignore = "build standard write/edit/patch components first; see docs/plugins.md"]
 fn standard_mutation_components_write_edit_and_patch_through_the_production_host() {
     for (name, grants, arguments) in [
         (
             "write",
-            WRITE_GRANTS,
+            "tool={}\nfs-read=[{root='workspace'}]\nfs-write=[{root='workspace',exclude=['private']}]",
             r#"{"path":"newdir/file","content":"created\n"}"#,
         ),
         (
@@ -146,9 +158,8 @@ fn standard_mutation_components_write_edit_and_patch_through_the_production_host
             r#"{"patch":"*** Begin Patch\n*** Update File: file\n*** Move to: moved\n@@\n-old\n+new\n*** Add File: added\n+created\n*** Delete File: gone\n*** End Patch"}"#,
         ),
     ] {
-        let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join(format!("../../target/{name}-plugin/{name}.component.wasm"));
-        let bytes = fs::read(component).expect("build standard mutation components first");
+        let component = name;
+        let bytes = standard_component(component);
         let env = Env::new(&bytes, grants);
         managed_manifest(&env, "['tool','fs-read','fs-write']");
         fs::write(env.ws().join("file"), "old\n").unwrap();
@@ -172,7 +183,7 @@ fn standard_mutation_components_write_edit_and_patch_through_the_production_host
                 let out = env.run(&["plugin", "call", "reader", r#"{"patch":"*** Add File: first\n+ok\n*** Add File: .git/config\n+blocked\n"}"#]);
                 assert_eq!(out.status.code(), Some(1), "{}", text(&out));
                 assert!(!env.ws().join("first").exists());
-                // The same compiled patcher supports blind additions/deletions without read authority.
+                // Additions are guarded by absence; deletion now requires a readable preimage.
                 env.edit(
                     "[plugin.reader]\ntool={}\nfs-read=[{root='workspace'}]\n",
                     "[plugin.reader]\ntool={}\nfs-read=[]\n",
@@ -181,11 +192,11 @@ fn standard_mutation_components_write_edit_and_patch_through_the_production_host
                     "plugin",
                     "call",
                     "reader",
-                    r#"{"patch":"*** Add File: blind\n+ok\n*** Delete File: added\n"}"#,
+                    r#"{"patch":"*** Add File: blind\n+ok\n"}"#,
                 ]);
                 assert!(out.status.success(), "{}", text(&out));
                 assert_eq!(fs::read_to_string(env.ws().join("blind")).unwrap(), "ok\n");
-                assert!(!env.ws().join("added").exists());
+                assert!(env.ws().join("added").exists());
                 let out = env.run(&[
                     "plugin",
                     "call",
@@ -240,6 +251,45 @@ fn resource_settings_do_not_let_guests_override_host_batch_bounds() {
     let out = call(&excluded);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     assert!(!excluded.ws().join("private").exists());
+}
+
+#[test]
+fn standard_mutations_refuse_unreadable_preimages_and_refused_diffs_before_effects() {
+    for name in ["write", "patch"] {
+        let bytes = standard_component(name);
+        let env = Env::new(&bytes, WRITE_GRANTS);
+        managed_manifest(&env, "['tool','fs-read','fs-write']");
+        fs::write(env.ws().join("file"), "before\n").unwrap();
+        let args = if name == "write" {
+            r#"{"path":"file","content":"after\n"}"#
+        } else {
+            r#"{"patch":"*** Add File: new\n+ok\n*** Delete File: file\n"}"#
+        };
+        let out = env.run(&["plugin", "call", "reader", args]);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert_eq!(
+            fs::read_to_string(env.ws().join("file")).unwrap(),
+            "before\n"
+        );
+        assert!(!env.ws().join("new").exists());
+        env.edit(
+            "[plugin.reader]\n",
+            "[plugin.reader]\nfs-read=[{root='workspace'}]\n",
+        );
+        let config = fs::read_to_string(env.config()).unwrap();
+        fs::write(
+            env.config(),
+            format!("{config}\n[tool-limits]\ndiff-bytes=1\n"),
+        )
+        .unwrap();
+        let out = env.run(&["plugin", "call", "reader", args]);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert_eq!(
+            fs::read_to_string(env.ws().join("file")).unwrap(),
+            "before\n"
+        );
+        assert!(!env.ws().join("new").exists());
+    }
 }
 
 const WRITE_GRANTS: &str = "tool={}\nfs-write=[{root='workspace',exclude=['private']}]";
@@ -530,7 +580,6 @@ fn managed_manifest(env: &Env, scopes: &str) {
 }
 
 #[test]
-#[ignore = "build the standard fetch component first; see docs/plugins.md"]
 fn standard_fetch_checks_redirect_grants_strips_cross_origin_headers_and_bounds_private_reach() {
     let target = HttpServer::new(vec![http_reply(
         200,
@@ -539,11 +588,7 @@ fn standard_fetch_checks_redirect_grants_strips_cross_origin_headers_and_bounds_
     )]);
     let redirect = http_reply(302, &format!("Location: {}/page\r\n", target.url), "");
     let source = HttpServer::new(vec![redirect.clone(), redirect]);
-    let bytes = fs::read(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/fetch-plugin/fetch.component.wasm"),
-    )
-    .expect("build the standard fetch component first");
+    let bytes = standard_component("fetch");
     let source_grant = format!("{{host='127.0.0.1',scheme='http',port={}}}", source.port);
     let target_grant = format!("{{host='127.0.0.1',scheme='http',port={}}}", target.port);
     let env = Env::new(&bytes, &format!("tool={{}}\nnet=[{source_grant}]"));
@@ -597,11 +642,9 @@ fn standard_fetch_checks_redirect_grants_strips_cross_origin_headers_and_bounds_
 }
 
 #[test]
-#[ignore = "build the standard bash component first; see docs/plugins.md"]
 fn standard_shell_uses_delegated_grants_waits_beyond_guest_deadlines_and_restores_reserved_paths() {
-    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/bash-plugin/bash.component.wasm");
-    let bytes = fs::read(component).expect("build the standard bash component first");
+    let component = "bash";
+    let bytes = standard_component(component);
     let env = Env::new(
         &bytes,
         "tool={}\nexec={timeout-secs=10}\nfs-read=[{root='workspace'}]",
@@ -800,7 +843,6 @@ fn managed_reads_reuse_declared_paths_without_any_root_grant_and_check_link_targ
 }
 
 #[test]
-#[ignore = "build the standard filesystem components first; see docs/plugins.md"]
 fn managed_standard_components_read_list_find_and_grep_shared_files_through_the_sdk() {
     for (name, arguments, expected) in [
         ("read", r#"{"path":"~/.agents/file.txt"}"#, "needle"),
@@ -816,9 +858,8 @@ fn managed_standard_components_read_list_find_and_grep_shared_files_through_the_
             "file.txt:2: needle",
         ),
     ] {
-        let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join(format!("../../target/{name}-plugin/{name}.component.wasm"));
-        let bytes = fs::read(component).expect("build the standard filesystem components first");
+        let component = name;
+        let bytes = standard_component(component);
         let env = Env::new(
             &bytes,
             &format!("tool={{}}\nfs-read=[{{root='workspace'}}]\ntool-read={{tools=['{name}']}}"),
@@ -939,7 +980,10 @@ fn managed_imports_cannot_borrow_other_roles_roots_or_sibling_grants() {
         // A role absent from the parent's configured reach is refused at load time.
         let ready = expected_ready && !grants.contains("tools=['ls']");
         assert_eq!(
-            text(&listing).contains("ready:"),
+            text(&listing)
+                .lines()
+                .find(|line| line.starts_with("reader "))
+                .is_some_and(|line| line.contains("ready:")),
             ready,
             "{}",
             text(&listing)
@@ -1188,7 +1232,7 @@ fn digest_identity_and_artifact_symlink_mismatches_fail_before_guest_execution()
 }
 
 #[test]
-fn forbidden_interfaces_do_not_initialize_and_native_tools_stay_available() {
+fn forbidden_interfaces_do_not_initialize_and_shipped_tools_stay_available() {
     let env = Env::new(&fixture::forbidden(), fixture::GRANTS);
     let listing = env.run(&["plugin", "list"]);
     assert!(text(&listing).contains("raw sockets"), "{}", text(&listing));
@@ -1328,12 +1372,9 @@ fn ranged_reads_are_bounded_audited_and_cannot_bypass_existing_read_policy() {
 }
 
 #[test]
-#[ignore = "build the standard read component first; see docs/plugins.md"]
 fn standard_read_component_paginates_large_files_through_the_production_host() {
-    let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/read-plugin/read.component.wasm");
-    let bytes =
-        fs::read(component).expect("build the standard read component first; see docs/plugins.md");
+    let component = "read";
+    let bytes = standard_component(component);
     let env = Env::new(&bytes, fixture::GRANTS);
     fs::write(env.ws().join("file"), "hello\n".repeat(20_000)).unwrap();
     let out = env.run(&[
@@ -1428,12 +1469,9 @@ fn standard_read_component_paginates_large_files_through_the_production_host() {
 }
 
 #[test]
-#[ignore = "build the standard ls component first; see docs/plugins.md"]
 fn standard_ls_component_lists_filtered_pages_and_never_follows_entry_links() {
-    let component =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/ls-plugin/ls.component.wasm");
-    let bytes =
-        fs::read(component).expect("build the standard ls component first; see docs/plugins.md");
+    let component = "ls";
+    let bytes = standard_component(component);
     let env = Env::new(&bytes, fixture::GRANTS);
     fs::create_dir(env.ws().join("dir")).unwrap();
     for n in 0..600 {
@@ -1472,17 +1510,9 @@ fn standard_ls_component_lists_filtered_pages_and_never_follows_entry_links() {
 }
 
 #[test]
-#[ignore = "build standard find/grep components first; see docs/plugins.md"]
 fn standard_search_components_walk_and_match_without_bypassing_exclusions() {
-    for (tool, filename) in [
-        ("find", "find-plugin/find.component.wasm"),
-        ("grep", "grep-plugin/grep.component.wasm"),
-    ] {
-        let component = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
-            .join(filename);
-        let bytes = fs::read(component)
-            .expect("build standard find/grep components first; see docs/plugins.md");
+    for tool in ["find", "grep"] {
+        let bytes = standard_component(tool);
         let env = Env::new(&bytes, fixture::GRANTS);
         fs::create_dir_all(env.ws().join("src")).unwrap();
         fs::create_dir_all(env.ws().join(".git")).unwrap();

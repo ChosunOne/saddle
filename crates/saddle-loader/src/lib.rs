@@ -20,6 +20,7 @@ use saddle_wit::saddle::host::exec::{self, Command, Host as ExecHost, Reply as E
 use saddle_wit::saddle::host::fs_list::EntryKind;
 use saddle_wit::saddle::host::fs_list::{self, Host as ListHost, Page as DirectoryPage};
 use saddle_wit::saddle::host::fs_paths::{self, Host as PathsHost};
+use saddle_wit::saddle::host::fs_preimage::{self, Host as PreimageHost};
 use saddle_wit::saddle::host::fs_read::{self, Failure, Host, Path};
 use saddle_wit::saddle::host::fs_read_range::{self, Chunk, Host as RangeHost};
 use saddle_wit::saddle::host::fs_write::{self, Change, Expectation, Host as WriteHost};
@@ -139,6 +140,16 @@ impl Invocation {
 /// filesystem callbacks may hold any filesystem capability; determine authority per operation/path,
 /// never from the existence of a linked interface (D139, D140).
 pub trait HostServices: Send + 'static {
+    fn read_preimage(
+        &mut self,
+        _call: &Invocation,
+        _path: Path,
+    ) -> anyhow::Result<Result<Option<Vec<u8>>, Failure>> {
+        Ok(Err(Failure::Denied(
+            "host does not implement optional preimages".into(),
+        )))
+    }
+
     fn label_root(
         &mut self,
         _call: &Invocation,
@@ -509,6 +520,24 @@ impl<H: HostServices> RangeHost for State<H> {
     }
 }
 
+impl<H: HostServices> PreimageHost for State<H> {
+    fn read(&mut self, path: Path) -> anyhow::Result<Result<Option<Vec<u8>>, Failure>> {
+        if self.call.cancelled() || Instant::now() >= self.call.deadline {
+            return Err(anyhow!("preimage read cancelled or timed out"));
+        }
+        if path.root.len() > 64 || path.relative.len() > budgets::path_bytes() {
+            return Ok(Err(Failure::InvalidPath(
+                "preimage path exceeds limits".into(),
+            )));
+        }
+        let result = self.host.read_preimage(&self.call, path)?;
+        if matches!(&result, Ok(Some(bytes)) if bytes.len() > budgets::mutation_bytes()) {
+            return Ok(Err(Failure::TooLarge));
+        }
+        Ok(result)
+    }
+}
+
 impl<H: HostServices> PathsHost for State<H> {
     fn label_root(&mut self, root: String) -> anyhow::Result<Result<String, Failure>> {
         if root.len() > 128 || self.call.cancelled() || Instant::now() >= self.call.deadline {
@@ -740,7 +769,53 @@ impl Drop for Runtime {
 #[derive(Clone)]
 pub struct Loader(Arc<Runtime>);
 
+fn compiler_config(budgets: &Budgets, target: &str) -> Result<Config, Error> {
+    let mut config = Config::new();
+    config
+        .wasm_component_model(true)
+        .consume_fuel(true)
+        .epoch_interruption(true);
+    config.max_wasm_stack(budgets.plugin_stack_bytes);
+    config
+        .target(target)
+        .map_err(runtime("selecting target ISA"))?;
+    Ok(config)
+}
+
 impl Loader {
+    /// package-build compilation, not a runtime native-code cache or tool entry point (D147).
+    pub fn precompile_for_target(bytes: &[u8], target: &str) -> Result<Vec<u8>, Error> {
+        let engine = Engine::new(&compiler_config(&Budgets::default(), target)?)
+            .map_err(runtime("creating package compiler"))?;
+        engine
+            .precompile_component(bytes)
+            .map_err(runtime("compiling bundled component"))
+    }
+
+    /// prepare an immutable component shipped as part of the trusted executable (D147).
+    ///
+    /// # Safety
+    /// `native` must be produced by this Wasmtime version from exactly `bytes`, embedded with
+    /// the executable by its trusted build pipeline, never read from a runtime-writable source.
+    /// both sources still undergo scope, signature and grant-shaped pre-link checks before init.
+    pub unsafe fn prepare_embedded<H: HostServices>(
+        &self,
+        manifest: &Manifest,
+        agent: &Grants,
+        requested: &Grants,
+        bytes: &[u8],
+        native: &[u8],
+        limits: Limits,
+    ) -> Result<Prepared<H>, Error> {
+        if bytes.len() > limits.budgets.plugin_component_bytes {
+            return Err(Error::Size(limits.budgets.plugin_component_bytes));
+        }
+        // SAFETY: the caller guarantees immutable build-produced native code, not plugin input.
+        let component = unsafe { Component::deserialize(&self.0.engine, native) }
+            .map_err(runtime("loading bundled component"))?;
+        self.prepare_component(manifest, agent, requested, bytes, limits, Some(component))
+    }
+
     pub fn new() -> Result<Self, Error> {
         Self::with_budgets(&Budgets::default())
     }
@@ -748,12 +823,7 @@ impl Loader {
     /// construct the engine with a protected stack budget; callers must provide sufficient native stack.
     pub fn with_budgets(budgets: &Budgets) -> Result<Self, Error> {
         budgets.validate().map_err(Error::Refused)?;
-        let mut config = Config::new();
-        config
-            .wasm_component_model(true)
-            .consume_fuel(true)
-            .epoch_interruption(true);
-        config.max_wasm_stack(budgets.plugin_stack_bytes);
+        let config = compiler_config(budgets, env!("SADDLE_BUILD_TARGET"))?;
         let engine = Engine::new(&config).map_err(runtime("creating component engine"))?;
         let stop = Arc::new(AtomicBool::new(false));
         let clock_stop = stop.clone();
@@ -789,7 +859,19 @@ impl Loader {
         agent: &Grants,
         requested: &Grants,
         bytes: &[u8],
+        limits: Limits,
+    ) -> Result<Prepared<H>, Error> {
+        self.prepare_component(manifest, agent, requested, bytes, limits, None)
+    }
+
+    fn prepare_component<H: HostServices>(
+        &self,
+        manifest: &Manifest,
+        agent: &Grants,
+        requested: &Grants,
+        bytes: &[u8],
         mut limits: Limits,
+        compiled: Option<Component>,
     ) -> Result<Prepared<H>, Error> {
         // Compatibility envelope fields are normalized into the public per-call snapshot.
         limits.budgets.plugin_memory_bytes = limits.memory_bytes;
@@ -814,8 +896,12 @@ impl Loader {
         let grants = delegate::read_tool(agent, requested)?;
         let scopes = grants.scopes();
         let engine = &self.0.engine;
-        let component =
-            Component::from_binary(engine, bytes).map_err(runtime("compiling component"))?;
+        let component = match compiled {
+            Some(component) => component,
+            None => {
+                Component::from_binary(engine, bytes).map_err(runtime("compiling component"))?
+            }
+        };
         let ty = component.component_type();
         let imports = interfaces(Direction::Import, ty.imports(engine))?;
         let exports = interfaces(Direction::Export, ty.exports(engine))?;
@@ -845,6 +931,7 @@ impl Loader {
                     | "saddle:host/web-search@0.1.0"
                     | "saddle:host/fs-read-range@0.1.0"
                     | "saddle:host/fs-write@0.1.0"
+                    | "saddle:host/fs-preimage@0.1.0"
                     | "saddle:host/fs-paths@0.1.0"
                     | "saddle:host/fs-list@0.1.0"
                     | "saddle:host/tool-result@0.1.0"
@@ -875,6 +962,8 @@ impl Loader {
             || scopes.contains(&Scope::FsWrite)
             || scopes.contains(&Scope::ToolWrite)
         {
+            fs_preimage::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+                .map_err(runtime("linking preimages"))?;
             fs_write::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
                 .map_err(runtime("linking fs-write"))?;
             fs_read::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
@@ -1127,7 +1216,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Read;
-    use std::path::PathBuf;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
@@ -1135,6 +1223,7 @@ mod tests {
     use saddle_cap::{Location, PluginId, Policy, RelPath, RootName, Roots};
     use saddle_policy::audit::{self, AuditLog};
     use saddle_policy::{Engine as PolicyEngine, Request};
+    use saddle_standard::SDK_READER;
     use serde_json::Value;
     use tempfile::TempDir;
     use wasmtime_wasi::p2::bindings::cli::environment::Host as EnvironmentHost;
@@ -1990,26 +2079,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "build and componentize the SDK example first; see docs/plugins.md"]
     fn sdk_reader_component_round_trips_through_the_runtime() {
         let (dir, agent, plugin) = grants(GRANTS);
         fs::write(dir.path().join("file"), "SDK round trip").unwrap();
         fs::write(dir.path().join(".env"), "secret").unwrap();
-        let component =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/reader.component.wasm");
-        let bytes = fs::read(component)
-            .expect("build and componentize the SDK example first; see docs/plugins.md");
+        let bytes = SDK_READER;
         let loader = Loader::new().unwrap();
-        // Debug DWARF can exceed the shipping-component default; exercise the configurable cap.
-        let limits = Limits {
-            budgets: Budgets {
-                plugin_component_bytes: bytes.len().max(budgets::DEFAULTS.plugin_component_bytes),
-                ..Budgets::default()
-            },
-            ..Limits::default()
-        };
+        let limits = Limits::default();
         let prepared = loader
-            .prepare::<Files>(&manifest(), &agent, &plugin, &bytes, limits)
+            .prepare::<Files>(&manifest(), &agent, &plugin, bytes, limits)
             .unwrap();
         let host = files(&dir, prepared.grants());
         assert_eq!(

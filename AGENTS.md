@@ -2,8 +2,8 @@
 
 Saddle is a coding-agent harness in Rust. Its plugin boundary is WASI components whose
 authority is a *declared* scope set, checked before instantiation and bounded by the agent's reach.
-The binary supports explicitly installed, digest-pinned capability-gated tool plugins (D126–D145), alongside
-built-in tools and MCP; the loader, canonical WIT and SDK are separate library crates.
+The binary supports explicitly installed, digest-pinned capability-gated tool plugins (D126–D147), alongside
+shipped standard tools and MCP; the loader, canonical WIT and SDK are separate library crates.
 `docs/plan.md` is the specification; read it before changing behaviour in the policy, sandbox or tool
 layer.
 
@@ -17,13 +17,14 @@ because it is followed.
 
 | crate | owns |
 | --- | --- |
+| `crates/saddle-standard` | automatically builds, componentizes and precompiles immutable shipped WASI tools; embeds source/digests and matching native artifacts, with no runtime authority or writable native cache (D147) |
 | `crates/saddle-limits` | typed runtime resource/presentation budgets shared by host, loader and guests; no authority, filesystem or Wasmtime dependency (D145) |
 | `crates/saddle-cap` | scopes, roots, grants, policy and manifest parsing, the component import check, the exec lowering, and the narrowing of a delegated principal's reach (D105, D126). No wasmtime dependency. |
 | `crates/saddle-policy` | per-call decisions (`engine`) and the hash-chained audit log (`audit`) |
 | `crates/saddle-wit` | canonical read-tool WIT and generated host bindings (D127) |
 | `crates/saddle-loader` | actual component inspection, bounded delegation, grant-shaped pre-linking, fresh bounded instances and a narrow host-services trait, without a dependency on the binary's session (D126, D127) |
 | `crates/saddle-sdk` | guest bindings from the same WIT and a read-only example; no `std::fs` authority (D12, D127) |
-| `crates/saddle-tools` | standard guest tools: text/image reads, pagination, listing, traversal/search, transcript queries, write/edit/patch, shell and HTTP/search workflows; uses runtime-gated SDK services, not native filesystem/database access. Mutations and reads cover policy roots and delegated D66 directories; guests emit human-only diffs (D131–D141) |
+| `crates/saddle-tools` | standard guest tools: text/image reads, pagination, listing, traversal/search, transcript queries, write/edit/patch, shell and HTTP/search workflows; uses runtime-gated SDK services, not native filesystem/database access. Mutations and reads cover policy roots and delegated D66 directories; guests emit minimal human-only hunks and guarded preimages (D131–D147) |
 | `crates/saddle-ignore` | authority-free ignore-file parsing, shared by native search/skill discovery and guest search components (D68, D133) |
 | `crates/saddle-sandbox` | applies a sandbox spec to the current process and execs the target, including the command's own network namespace and the relay in it (D79); starts a long-lived child whose stdin and stdout belong to the caller, with the spec on fd 3 (D106); also builds the `saddle-sandbox` helper binary used by its own tests |
 | `crates/saddle` | the binary: built-in tools, model providers, the model loop, the TUI |
@@ -40,9 +41,10 @@ Inside `crates/saddle/src`:
 | `plugins/mutations` | bounded write/remove batches with all-target permission/precondition preflight, pinned staging and per-entry atomic publication under the plugin principal; not a filesystem-wide transaction (D140) |
 | `fs_access` | pinned no-follow directory/file opens for session roots and plugin artifacts/reads (D129) |
 | `transcript` | branch-only read-only SQL over messages, request usage and reasoning, shared by the gated SDK service and temporary native adapter; no saved-database access (D92, D94, D98, D137) |
-| `tools/fs`, `tools/search`, `tools/bash`, `tools/fetch`, `tools/patch`, `tools/websearch`, `tools/session_query` | the eleven built-in tools (`fetch` is host-side network, D39; `patch` is D56; `websearch` asks the provider, or Exa, D82; `session_query` is branch-only read-only SQL over messages, request usage and reasoning, D92, D94, D98) |
+| `tools` | dispatches ordinary names to shipped WASI components and third-party names to their loaded plugins; owns tool results, not native implementations. `tool_search` remains host MCP discovery (D147) |
+| `standard`, `file_read`, `net/client` | protected scope-only delegation profiles; harness context/attachment reads and no-escape resolution; checked DNS/HTTP client helpers, none a native tool fallback (D147) |
 | `net` | the command network (D79): `hello` reads a hostname out of a TLS handshake, `head` out of a `CONNECT` line or a `Host` header, `proxy` decides and carries a connection, `bridge` joins the proxy's threads to the one engine and the one audit log |
-| `tools/diff` | line diffs of edited files, for the transcript only — the model never sees them |
+| `saddle-tools::diff` | guest-owned minimal line hunks of edited files, human-only and retained on replay; no native diff implementation remains (D146) |
 | `context` | instruction files (`AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md` fallback), read through the policy |
 | `skills` | `SKILL.md` skills: discovery through the `read` gate, the prompt listing, `/skill:name` (D64, D67, D68, D69) |
 | `ignore` | re-exports `saddle-ignore`'s matching (`.gitignore`, `.ignore`, `.fdignore`), shared with native and guest search and `skills` (D68, D133) |
@@ -73,9 +75,17 @@ this process (D79), so `curl` in `bash` works where the grants allow it. Adding 
 adding a `net` grant to the policy, never widening the sandbox allowlist. A grant is a hostname, a
 `*.suffix`, or `*` for any public host (D40); a wildcard still cannot reach loopback or private space,
 because that exemption needs a grant that names the address. `saddle tool <name> '<json>'` runs any one
-of them as the agent through the gate, which is the most direct way to check a policy change by hand.
+of them as the agent through its shipped component and the gate, which is the most direct way to check a policy change by hand.
 
-`saddle plugin install/list/call` is the local read-tool workflow; `docs/plugins.md` documents its
+`saddle tools` lists shipped component digests; `saddle tools --config` prints the explicit protected
+`[standard-tools]` delegation table without editing existing config. New defaults contain it; existing
+configs must select their desired entries/scopes. No native fallback exists. Standard scopes select
+only current parent reach, with per-tool D66 roles and the same manifest/delegation checks. Source
+and precompiled artifacts are embedded by the package build; native bytes are never loaded from a
+runtime-writable cache. Standard mutations read/guard preimages and publish minimal human diffs
+accepted before effects; safe patch additions require absence.
+
+`saddle plugin install/list/call` is the explicit third-party workflow; `docs/plugins.md` documents its
 configuration, grants, SDK build and limits. Installation never enables a plugin or changes grants.
 Other plugin scopes/adapters, persistent instances and automatic updates remain deferred; no
 repository auto-loading or plugin-to-MCP adapter exists. MCP
@@ -134,6 +144,10 @@ digest. Cover principal isolation and unchanged exclusions as well. Passing impl
 is not evidence that an invented boundary matches the requested design.
 
 ## Commands
+
+Building the executable requires Rust's `wasm32-unknown-unknown` target. Normal Cargo builds/tests
+automatically build/componentize/precompile standard guests in a separate target directory. No
+manual `target/*-plugin` preparation is needed for standard tests or end users (D147).
 
 Use **`cargo nextest`** to run tests, not `cargo test`: one process per test, run in parallel, so a
 test cannot see another one's state and a leak is caught here rather than in CI. On a suite this
@@ -327,7 +341,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D145 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D147 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

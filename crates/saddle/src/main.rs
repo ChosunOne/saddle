@@ -16,6 +16,7 @@ mod config;
 mod context;
 mod defaults;
 mod execution;
+mod file_read;
 mod fs_access;
 mod ignore;
 mod mcp;
@@ -29,6 +30,7 @@ mod reserved;
 mod search_transport;
 mod session;
 mod skills;
+mod standard;
 mod store;
 mod term;
 mod tools;
@@ -109,6 +111,11 @@ struct AgentArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Inspect shipped standard components, or print explicit delegation defaults without editing config.
+    Tools {
+        #[arg(long)]
+        config: bool,
+    },
     /// Explicit local WASI plugins: installing is separate from enablement and grants (D128).
     Plugin {
         #[command(subcommand)]
@@ -317,6 +324,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 theme: cli.use_theme,
             },
         ),
+        Some(Cmd::Tools { config }) => {
+            if config {
+                print!("{}", standard::DEFAULT_PROFILES);
+            } else {
+                for artifact in saddle_standard::ARTIFACTS {
+                    println!(
+                        "{} · {} · sha256 {}",
+                        artifact.name, artifact.id, artifact.sha256
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Cmd::Check) => check(&cli.dir, &overrides),
         Some(Cmd::Tool { name, input }) => {
             tool(&cli.dir, &name, &input, &session, &paths, &overrides)
@@ -992,6 +1012,20 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
             setup.workspace_policy_path.display(),
             &setup.policy_sha256[..16]
         );
+    }
+    println!("standard tools explicit protected delegation; absent entries are disabled");
+    for (name, scopes) in &setup.standard_tools {
+        println!(
+            "  {name}: {}",
+            scopes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if setup.standard_tools.is_empty() {
+        println!("  none; see docs/plugins.md [standard-tools] migration (no native fallback)");
     }
     println!("effective");
     for line in &setup.merged {
@@ -1730,9 +1764,23 @@ fn tool(
     session.close()?;
     let out = result?;
     if out.ok {
-        println!("{}", out.content);
+        println!(
+            "{}",
+            if tools::NAMES.contains(&name) {
+                out.visible_content()
+            } else {
+                &out.content
+            }
+        );
     } else {
-        eprintln!("{}", out.content);
+        eprintln!(
+            "{}",
+            if tools::NAMES.contains(&name) {
+                out.visible_content()
+            } else {
+                &out.content
+            }
+        );
     }
     eprintln!("audit: {}", log.display());
     Ok(if out.ok {

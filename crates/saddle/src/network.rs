@@ -13,8 +13,8 @@ use serde_json::json;
 use url::Url;
 
 use crate::cancel;
+use crate::net::client::{self as fetch, Target};
 use crate::session::Session;
-use crate::tools::fetch::{self, Target};
 
 pub fn target(raw: &str) -> Result<(Url, Target), String> {
     if raw.len() > budgets::url_bytes() {

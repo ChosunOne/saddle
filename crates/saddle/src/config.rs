@@ -26,6 +26,7 @@ use crate::defaults;
 use crate::mcp;
 use crate::paths;
 use crate::plugins::Entry as PluginEntry;
+use crate::standard::{self, Profiles};
 use crate::tools;
 use crate::tui::theme::ThemeTables;
 use saddle_cap::sandbox;
@@ -49,6 +50,8 @@ use crate::provider::ProviderEntry;
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {
+    #[serde(default, rename = "standard-tools")]
+    pub standard_tools: Profiles,
     #[serde(default, rename = "tool-limits")]
     pub tool_limits: Budgets,
     /// explicit plugin grants, separate from installed/enabled artifact configuration (D128).
@@ -458,6 +461,15 @@ impl UserConfig {
             Err(e) if e.kind() == ErrorKind::NotFound => Self::default(),
             Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
         };
+        standard::validate(&config.standard_tools)?;
+        if config
+            .plugins
+            .keys()
+            .chain(config.plugin.keys())
+            .any(|id| id.as_str().starts_with("standard-"))
+        {
+            bail!("standard-* plugin ids are reserved for shipped tools; use [standard-tools]");
+        }
         config.tool_limits.validate().map_err(AnyError::msg)?;
         mcp::validate(&config.mcp).with_context(|| format!("{}", path.display()))?;
         if config.plugins.len() > config.tool_limits.plugin_count {

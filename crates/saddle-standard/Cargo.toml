@@ -1,0 +1,15 @@
+[package]
+name = "saddle-standard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[build-dependencies]
+saddle-loader.workspace = true
+saddle-cap.workspace = true
+sha2.workspace = true
+wit-component.workspace = true
+
+[lints]
+workspace = true

@@ -16,6 +16,7 @@ pub use saddle::host::fs_list::read_directory;
 pub use saddle::host::fs_list::{Entry as DirectoryEntry, EntryKind, Page as DirectoryPage};
 pub use saddle::host::fs_paths::label_root;
 pub use saddle::host::fs_paths::resolve_path;
+pub use saddle::host::fs_preimage::read as read_preimage;
 pub use saddle::host::fs_read::read_file;
 pub use saddle::host::fs_read::{Failure, Path as FilePath};
 pub use saddle::host::fs_read_range::Chunk;
@@ -49,6 +50,15 @@ fn parse_budgets(text: &str) -> Result<Budgets, String> {
     let budgets: Budgets = from_value(value).map_err(|e| format!("invalid host budgets: {e}"))?;
     budgets.validate()?;
     Ok(budgets)
+}
+
+/// preserve the ordinary denial shape across standard filesystem workflows (D147).
+pub fn failure_message(error: Failure) -> String {
+    match error {
+        Failure::Denied(why) => format!("denied: {why}"),
+        Failure::InvalidPath(why) | Failure::Io(why) => why,
+        Failure::TooLarge => "configured resource limit exceeded".into(),
+    }
 }
 
 #[cfg(test)]

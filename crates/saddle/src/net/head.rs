@@ -9,7 +9,7 @@
 //! supposed to be reaching the relay under a name, and an unnamed request is one whose host cannot
 //! be checked against a grant.
 
-use crate::tools::fetch::Target;
+use crate::net::client::Target;
 use std::str;
 
 /// A request head this large is refused rather than buffered without bound.

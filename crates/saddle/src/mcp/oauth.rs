@@ -21,10 +21,10 @@ use serde_json::Value;
 
 use crate::auth::AuthStore;
 use crate::mcp::http::{Answer, send};
+use crate::net::client::Target;
 use crate::provider::oauth::Tokens;
 use crate::provider::oauth::pkce;
 use crate::session::Session;
-use crate::tools::fetch::Target;
 
 /// How long the person has to finish in the browser. Long, because a sign-in is a person's time,
 /// but finite, because a terminal waiting forever is worse than one that says it gave up.

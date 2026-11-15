@@ -34,6 +34,7 @@ mod app;
 mod browser;
 pub mod catppuccin;
 mod editor;
+mod files;
 mod grant;
 pub mod image;
 mod login;
@@ -665,7 +666,7 @@ impl Ui for ChannelUi {
     fn result(&mut self, out: &ToolOutput) {
         let _ = self.0.send(AgentEvent::Result {
             ok: out.ok,
-            content: out.content.clone(),
+            content: out.visible_content().to_owned(),
             diff: out.diff.clone(),
             images: out.images.clone(),
         });

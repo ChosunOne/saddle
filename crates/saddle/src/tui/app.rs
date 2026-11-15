@@ -1,12 +1,13 @@
 //! TUI state and input handling. Nothing here touches the terminal, so it is tested directly.
 
+use super::files;
 use crate::provider;
 use crate::provider::Image;
 use crate::provider::Quota;
+use crate::provider::visible_tool_text;
 use crate::skills;
 use crate::skills::Skill;
 use crate::store::Point;
-use crate::tools::search;
 use crate::tui::image::Fit;
 use crate::tui::image::Protocol;
 use crate::tui::permissions::Change as PermissionsChange;
@@ -864,7 +865,7 @@ impl App {
             .as_ref()
             .is_none_or(|(_, at)| at.elapsed() > PICKER_REFRESH);
         if stale {
-            let list = search::list_files(&self.header.workspace, PICKER_FILES);
+            let list = files::list_files(&self.header.workspace, PICKER_FILES);
             self.files = Some((list, Instant::now()));
         }
         let files = self
@@ -1886,7 +1887,11 @@ pub fn entries_from(items: &[Item]) -> Vec<Entry> {
             for r in rs {
                 results.insert(
                     r.id.as_str(),
-                    (!r.is_error, r.content.as_str(), r.diff.as_deref()),
+                    (
+                        !r.is_error,
+                        visible_tool_text(&r.content, r.provenance.as_deref()),
+                        r.diff.as_deref(),
+                    ),
                 );
             }
         }

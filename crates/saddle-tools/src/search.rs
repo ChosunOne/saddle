@@ -5,8 +5,9 @@ use regex::RegexBuilder;
 use saddle_ignore::{FILES, Rules};
 use saddle_limits as budgets;
 #[cfg(target_arch = "wasm32")]
-#[cfg(target_arch = "wasm32")]
 use saddle_sdk::configure_limits;
+#[cfg(target_arch = "wasm32")]
+use saddle_sdk::failure_message;
 use saddle_sdk::{DirectoryPage, EntryKind};
 use serde::Deserialize;
 
@@ -46,7 +47,7 @@ impl Filesystem for HostFilesystem {
             after,
             budgets::directory_page_entries() as u32,
         )
-        .map_err(|error| format!("directory read failed: {error:?}"))
+        .map_err(failure_message)
     }
     fn file(&mut self, root: &str, path: &str, maximum: usize) -> Result<FileRead, String> {
         let path = FilePath {
@@ -163,7 +164,7 @@ fn normalize_search_path(arguments: &str) -> Result<String, String> {
         .get("root")
         .and_then(Value::as_str)
         .unwrap_or("workspace");
-    let label = label_root(root).map_err(|error| format!("root label failed: {error:?}"))?;
+    let label = label_root(root).map_err(failure_message)?;
     value["__display-root"] = label.into();
     Ok(value.to_string())
 }
