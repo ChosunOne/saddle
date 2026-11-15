@@ -1,0 +1,28 @@
+error: `crate::` is written where the path is used; import the name at the top of the module instead
+  --> $DIR/main.rs:14:5
+   |
+LL |     crate::inner::value()
+   |     ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[deny(qualified_paths)]` on by default
+
+error: `crate::` is written where the path is used; import the name at the top of the module instead
+  --> $DIR/main.rs:17:23
+   |
+LL | fn in_a_type(_shape: &crate::inner::Shape) {}
+   |                       ^^^^^^^^^^^^^^^^^^^
+
+error: `super::` is written where the path is used; import the name at the top of the module instead
+  --> $DIR/main.rs:24:31
+   |
+LL |     pub fn through_super() -> super::inner::Shape {
+   |                               ^^^^^^^^^^^^^^^^^^^
+
+error: `super::` is written where the path is used; import the name at the top of the module instead
+  --> $DIR/main.rs:25:9
+   |
+LL |         super::inner::Shape
+   |         ^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 4 previous errors
+

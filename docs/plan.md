@@ -3386,15 +3386,17 @@ omitted `fs-preimage`, `budgets` and `tool-result`, and a unit test asserted tha
 neither reading nor testing could notice. A function like that cannot accumulate while the compiler
 is asked; a comment can.
 
-One part of the same convention no lint sees: `crate::`, `super::` and `self::` written inside an
-expression. `absolute_paths` allows them because they start with a keyword, and
-`items_after_statements` only looks after statements, so twenty-eight survived the sweep that
-removed the others. `crates/saddle/build.rs` reads every `.rs` under `crates/` and fails the build
-with the file and line. It is a build script rather than a test because a build is the earliest place
-a person sees it, and because a rule enforced by whoever remembers it is how the twenty-eight
-arrived. It runs when the binary is built — which is every documented command, but not a
-single-crate `cargo build -p`, so a crate can be compiled on its own with a violation in it and the
-next full build says so.
+One part of the same convention no lint sees: `crate::`, `self::` and `super::` written where the
+path is used. `absolute_paths` allows them because they start with a keyword and
+`items_after_statements` only looks after statements, so twenty-eight of them survived the sweep that
+removed the others. They are a Dylint lint, `lints/qualified-paths`, which is outside the workspace
+members because it needs a nightly and the project does not: it walks HIR paths in expressions, types
+and patterns, so it sees what rustc sees — a `use` statement is never reported and a path inside a
+string is not a path — and it fails the check rather than warning. `cargo dylint --all` runs it over
+every crate; the library pins its own nightly in `lints/qualified-paths/rust-toolchain.toml`, which is
+what keeps `cargo build`, `cargo clippy` and `cargo nextest` on stable. The first attempt was a source
+scan in a build script: it read text and had to guess where code begins, and it made every build the
+place a lint runs. The compiler already knows; the library asks it.
 
 `#[allow(dead_code)]` survives in four places, each for an item that must exist without being read:
 the Catppuccin flavour table, whose 26 colours are checked as a table by a test; two fields of the pi

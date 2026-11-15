@@ -29,7 +29,11 @@ because it is followed.
 | `crates/saddle-tools` | standard guest tools: text/image reads, pagination, listing, traversal/search, transcript queries, write/edit/patch, shell and HTTP/search workflows; uses runtime-gated SDK services, not native filesystem/database access. Mutations and reads cover policy roots and delegated D66 directories; guests emit minimal human-only hunks and guarded preimages (D131–D147) |
 | `crates/saddle-ignore` | authority-free ignore-file parsing, shared by skill discovery, the editor's file-name completion and the guest search components (D68, D133) |
 | `crates/saddle-sandbox` | applies a sandbox spec to the current process and execs the target, including the command's own network namespace and the relay in it (D79); starts a long-lived child whose stdin and stdout belong to the caller, with the spec on fd 3 (D106); also builds the `saddle-sandbox` helper binary used by its own tests |
-| `crates/saddle` | the binary: tool dispatch, model providers, the model loop, the TUI; its build script enforces the import convention no lint covers (D148) |
+| `crates/saddle` | the binary: tool dispatch, model providers, the model loop, the TUI |
+
+`lints/qualified-paths` is outside the workspace: a Dylint library holding the one lint no rustc or
+Clippy lint can express (D148), with its own nightly toolchain and its own UI test. It is not a
+workspace member, so `cargo build` never compiles it.
 
 Inside `crates/saddle/src`:
 
@@ -173,7 +177,13 @@ cargo nextest run -p saddle-cap              # one crate
 cargo nextest run -E 'test(/^tui::/)'        # by name, with nextest's filter expressions
 cargo fmt --all --check                      # must stay clean; no rustfmt.toml, so defaults apply
 cargo clippy --all-targets                   # must stay clean
+cargo dylint --all                           # the D148 lint; needs cargo-dylint and its nightly
 ```
+
+`cargo dylint` is separate from Clippy and is the only command that needs nightly: install
+`cargo-dylint` and `dylint-link` once, and the pinned `lints/qualified-paths/rust-toolchain.toml` is
+fetched by rustup on first use. It checks the workspace with that nightly, guest builds included, so
+`wasm32-unknown-unknown` must be available for it too. Everything else stays on the stable toolchain.
 
 `nextest` is installed at `~/.cargo/bin/cargo-nextest` (0.9.146). Three differences from
 `cargo test` are worth knowing:
@@ -384,9 +394,10 @@ nearly every module header names the ones it implements, for example:
   `wildcard_imports` and `single_component_path_imports`, all denied. They catch a glob import, a
   path qualified with a leading module name, an import after a statement, and an item nothing
   reaches — `host_interfaces` was the last of those and its own test kept it looking maintained.
-  None of them sees `crate::`, `super::` or `self::` written inside an expression, so
-  `crates/saddle/build.rs` reads every `.rs` under `crates/` and fails the build naming the file and
-  line; that runs whenever the binary is built, which every documented command does. An
+  None of them sees `crate::`, `super::` or `self::` written inside an expression, so that shape is a
+  Dylint lint: `lints/qualified-paths`, declared in `[workspace.metadata.dylint]` and run with
+  `cargo dylint --all` (D148). It is outside the workspace members because it needs the nightly its
+  own `rust-toolchain.toml` pins, which is the lint's requirement and not the project's. An
   `#[allow(dead_code)]` is for an item that must exist without being read — a colour table, a field
   that is there so a file parses, a fixture one of two test binaries uses — and says why. New crates
   must set `[lints] workspace = true`.

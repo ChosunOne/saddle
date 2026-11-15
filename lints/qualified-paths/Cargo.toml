@@ -1,0 +1,20 @@
+[package]
+name = "qualified_paths"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "a path is imported where the module keeps its imports, never written inline (D148)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dylint_linting = "6.4"
+
+[dev-dependencies]
+dylint_testing = "6.4"
+
+[workspace]
+
+[package.metadata.rust-analyzer]
+rustc_private = true
