@@ -3691,6 +3691,33 @@ New workspace-file headers explain both override types. Acceptance includes actu
 confinement, another session inheriting the same paths, workspace isolation, and an unchanged SDK
 component gaining and losing declared external access on reload with exclusions still enforced.
 
+**D159.** Background launches stay visually pending and completed work wakes an idle agent.
+The TUI links host task identities to the tool invocation that created them. While any linked job
+is running, its launch block uses the theme's `toolPendingBg` and spinner, even though the launch
+call itself returned successfully. Host completion switches to success/error background and a
+labelled terminal state; task updates invalidate the render cache and animate even between turns.
+Neither a task id nor an exit state is parsed out of guest text. Historical results remain launch
+snapshots; resume does not resurrect live status, and forgotten live records cease spinning.
+
+This supersedes D153's rule that completion notices never cause a model request. An unconsumed
+completion from an explicit model tool invocation wakes the agent when the interactive session is
+idle, in both TUI and line mode. The TUI first arbitrates with editor activity so a prompt typed at
+the same instant wins; an active turn receives the notice at its next safe request point instead.
+Completions are grouped into a normal follow-up turn with the existing clearly labelled host
+notification as context, not a fabricated human instruction or automatic command output. Output
+still requires the owning tool's authorized inspection. Idle ticks, running work and consumed
+completions never start requests. Hook-only work without an originating model tool call does not
+trigger automatic model spending.
+
+The follow-up uses ordinary provider credentials, hooks, compaction, accounting, step limits,
+steering, cancellation and persistence. A wakeup is consumed before cancellation/compaction/step
+limit failures, preventing retry loops. Queued human input is serviced before idle wakeups. There
+is no second provider loop or policy engine. Session exit, reload and one-shot command shutdown
+retain D153 cleanup behavior; no session is kept alive merely to wait for its jobs and no saved
+notice reactivates work after restart. Tests cover pending/success/failure/timeout styling, editor
+arbitration, and real success/failure/timeout jobs prompting an idle line-mode agent exactly once
+without further stdin, with output absent from notifications and inspected through the owning tool.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

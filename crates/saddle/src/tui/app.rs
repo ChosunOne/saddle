@@ -42,6 +42,7 @@ use crate::plugins::services::panel::PanelView;
 use crate::provider::ModelsError;
 use crate::provider::Usage;
 use crate::provider::{Contribution, Item, Part};
+use crate::tasks::{State as TaskState, View as TaskView};
 use crate::term::clean;
 use crate::tui::permissions::Outcome as PermissionOutcome;
 use crate::tui::themes::Outcome as ThemeOutcome;
@@ -62,6 +63,7 @@ pub enum AgentEvent {
     Reasoning(String),
     Note(String),
     Call {
+        id: String,
         name: String,
         detail: String,
     },
@@ -83,6 +85,8 @@ pub enum AgentEvent {
     Quota(Quota),
     /// The skills a re-discovery found, for the `/` menu (D70).
     Skills(Vec<Skill>),
+    Tasks(Vec<TaskView>),
+    BackgroundReady,
     TurnEnd(End),
     /// The host failed (for example, the audit log could not be written). The session is over.
     Fatal(String),
@@ -175,6 +179,7 @@ pub enum Action {
     /// `/mcp`: what the granted servers are doing, or `restart <name>` for one of them (D118).
     Mcp(String),
     Tasks(String),
+    BackgroundTurn,
     /// Remove a saved conversation (D55).
     DeleteSession(String),
     /// Set the reasoning effort, or cycle to the next level (D57).
@@ -302,6 +307,8 @@ pub enum Entry {
     /// A thinking model's reasoning.
     Thinking(String),
     Tool {
+        id: String,
+        tasks: Vec<TaskView>,
         name: String,
         detail: String,
         /// `None` while running.
@@ -819,6 +826,10 @@ impl App {
         if let Some(c) = self.cache.last_mut() {
             *c = None;
         }
+    }
+
+    pub fn background_running(&self) -> bool {
+        self.entries.iter().any(|entry| matches!(entry, Entry::Tool { tasks, .. } if tasks.iter().any(|task| task.state == TaskState::Running)))
     }
 
     pub fn tick(&mut self) {
@@ -1756,9 +1767,11 @@ impl App {
             }
             AgentEvent::Skills(skills) => self.skills = skills,
             AgentEvent::Note(s) => self.push(Entry::Note(NoteKind::Warn, display(&s))),
-            AgentEvent::Call { name, detail } => {
+            AgentEvent::Call { id, name, detail } => {
                 self.busy = Some(Activity::Tool(display(&name)));
                 self.push(Entry::Tool {
+                    id,
+                    tasks: Vec::new(),
                     name: display(&name),
                     detail: display(&detail),
                     result: None,
@@ -1816,6 +1829,40 @@ impl App {
                 self.context = u.input + u.cache_read + u.cache_write + u.output;
             }
             AgentEvent::Quota(quota) => self.quota = Some(quota),
+            AgentEvent::BackgroundReady => {
+                if self.busy.is_none() {
+                    self.cancelling = false;
+                    self.busy = Some(Activity::Waiting);
+                    return Some(Action::BackgroundTurn);
+                }
+                // A queued human prompt will carry the completion at its safe request point.
+            }
+            AgentEvent::Tasks(views) => {
+                for (index, entry) in self.entries.iter_mut().enumerate() {
+                    if let Entry::Tool { id, tasks, .. } = entry {
+                        let mut next: Vec<_> = views
+                            .iter()
+                            .filter(|view| view.call.as_ref() == Some(id))
+                            .cloned()
+                            .collect();
+                        // Finished snapshots stay historical after eviction; forgotten live work
+                        // must not spin forever after reload or registry replacement.
+                        for previous in tasks.iter() {
+                            if !next.iter().any(|view| view.id == previous.id) {
+                                let mut previous = previous.clone();
+                                if previous.state == TaskState::Running {
+                                    previous.state = TaskState::Unavailable;
+                                }
+                                next.push(previous);
+                            }
+                        }
+                        if *tasks != next {
+                            *tasks = next;
+                            self.cache[index] = None;
+                        }
+                    }
+                }
+            }
             AgentEvent::TurnEnd(end) => {
                 self.busy = None;
                 self.cancelling = false;
@@ -1982,6 +2029,8 @@ pub fn entries_from(items: &[Item]) -> Vec<Entry> {
                         Part::Call(c) => {
                             let found = results.get(c.id.as_str());
                             out.push(Entry::Tool {
+                                id: c.id.clone(),
+                                tasks: Vec::new(),
                                 name: display(&c.name),
                                 detail: display(&call_detail(c)),
                                 result: found.map(|(ok, content, _)| (*ok, display(content))),
@@ -2070,6 +2119,8 @@ mod tests {
     use crate::tui::status::Template;
     use crate::tui::theme::ThemeTables;
     use crate::tui::themes::ThemePicker;
+
+    use crate::tasks::{State as TaskState, View as TaskView};
 
     use serde_json::json;
 
@@ -2331,6 +2382,7 @@ mod tests {
         );
         assert_eq!(a.busy, Some(Activity::Writing));
         a.agent(AgentEvent::Call {
+            id: "test-call".into(),
             name: "bash".into(),
             detail: "ls".into(),
         });
@@ -2881,6 +2933,8 @@ mod tests {
                 Entry::Thinking("look first".into()),
                 Entry::Assistant("Reading.".into()),
                 Entry::Tool {
+                    id: "c1".into(),
+                    tasks: Vec::new(),
                     name: "read".into(),
                     detail: "src/x.rs".into(),
                     result: Some((true, "fn x() {}".into())),
@@ -3095,5 +3149,64 @@ mod tests {
         assert!(
             matches!(a.entries.last(), Some(Entry::Note(NoteKind::Error, t)) if t.contains("ctrl+c quits"))
         );
+    }
+    #[test]
+    fn background_updates_keep_launches_pending_without_stealing_other_results() {
+        let mut a = app();
+        a.agent(AgentEvent::Call {
+            id: "launch".into(),
+            name: "bash".into(),
+            detail: "sleep 9".into(),
+        });
+        a.agent(AgentEvent::Result {
+            ok: true,
+            content: "untrusted result text".into(),
+            diff: None,
+            images: Vec::new(),
+        });
+        let view = |state| TaskView {
+            id: "task-host-id".into(),
+            call: Some("launch".into()),
+            state,
+        };
+        a.agent(AgentEvent::Tasks(vec![view(TaskState::Running)]));
+        a.agent(AgentEvent::TurnEnd(End::Answered));
+        assert!(a.background_running());
+        assert!(a.busy.is_none());
+        a.agent(AgentEvent::Call {
+            id: "other".into(),
+            name: "read".into(),
+            detail: "file".into(),
+        });
+        a.agent(AgentEvent::Result {
+            ok: true,
+            content: "other output".into(),
+            diff: None,
+            images: Vec::new(),
+        });
+        a.agent(AgentEvent::Tasks(vec![view(TaskState::Failed)]));
+        assert!(!a.background_running());
+        assert!(a.entries.iter().any(|entry| matches!(entry, Entry::Tool {id,result:Some((true, text)),tasks,..} if id == "other" && text == "other output" && tasks.is_empty())));
+        a.agent(AgentEvent::Tasks(vec![view(TaskState::Running)]));
+        a.agent(AgentEvent::Tasks(Vec::new()));
+        assert!(
+            !a.background_running(),
+            "registry replacement cannot leave a permanent spinner"
+        );
+    }
+
+    #[test]
+    fn background_wakeup_starts_only_when_the_editor_is_idle() {
+        let mut a = app();
+        assert_eq!(
+            a.agent(AgentEvent::BackgroundReady),
+            Some(Action::BackgroundTurn)
+        );
+        assert_eq!(a.busy, Some(Activity::Waiting));
+        assert_eq!(a.agent(AgentEvent::BackgroundReady), None);
+        a.agent(AgentEvent::TurnEnd(End::Answered));
+        a.start("human prompt".into());
+        assert_eq!(a.agent(AgentEvent::BackgroundReady), None);
+        assert_eq!(a.entries.last(), Some(&Entry::User("human prompt".into())));
     }
 }

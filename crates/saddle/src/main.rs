@@ -609,7 +609,17 @@ fn converse(
         }
         let line = match input.recv_timeout(Duration::from_millis(50)) {
             Ok(line) => line?,
-            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Timeout) => {
+                if tasks::pending(session)? {
+                    cancel::reset();
+                    let _sigint = cancel::SigintGuard::install();
+                    if let Some(end) = agent.background_turn(session, out)? {
+                        out.usage(agent.turn_usage);
+                        out.turn_end(&end);
+                    }
+                }
+                continue;
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         };
         let text = line.trim();

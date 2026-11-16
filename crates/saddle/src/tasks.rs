@@ -22,6 +22,7 @@ use crate::session::{Session, session_id};
 
 struct Task {
     id: String,
+    ui_call: Option<String>,
     owner: Principal,
     call: String,
     stop: Arc<AtomicBool>,
@@ -46,12 +47,79 @@ impl Drop for Task {
     }
 }
 
+/// host-owned presentation state, never parsed from a tool's output (D159).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
+    Unavailable,
+}
+
+impl State {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Succeeded => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed out",
+            Self::Unavailable => "no longer tracked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct View {
+    pub id: String,
+    pub call: Option<String>,
+    pub state: State,
+}
+
 #[derive(Default)]
 pub struct Tasks {
     entries: Vec<Task>,
 }
 
 impl Tasks {
+    pub fn ids(&self) -> Vec<String> {
+        self.entries.iter().map(|task| task.id.clone()).collect()
+    }
+
+    /// link only tasks created during this serialized tool invocation, not earlier hook work.
+    pub fn associate_new(&mut self, before: &[String], call: &str) {
+        for task in &mut self.entries {
+            if !before.contains(&task.id) {
+                task.ui_call = Some(call.to_owned());
+            }
+        }
+    }
+
+    pub fn views(&self) -> Vec<View> {
+        self.entries
+            .iter()
+            .map(|task| View {
+                id: task.id.clone(),
+                call: task.ui_call.clone(),
+                state: match &task.output {
+                    None => State::Running,
+                    Some(output) if output.timed_out => State::TimedOut,
+                    Some(output) if output.cancelled => State::Cancelled,
+                    Some(output) if output.code == Some(0) => State::Succeeded,
+                    Some(_) => State::Failed,
+                },
+            })
+            .collect()
+    }
+
+    pub fn pending(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|task| task.ui_call.is_some() && task.output.is_some() && !task.announced)
+    }
+
     pub fn active(&self) -> bool {
         self.entries.iter().any(|task| task.worker.is_some())
     }
@@ -200,6 +268,7 @@ pub fn start(
         .spawn(move || prepared.run(&flag, &mut || {}, Some(live)))
         .context("starting task monitor")?;
     let task = Task {
+        ui_call: None,
         id,
         owner: who.clone(),
         call: call.into(),
@@ -274,6 +343,12 @@ pub fn access(
         return Ok(Err("unknown task for this principal".into()));
     }
     Ok(Ok(replies))
+}
+
+/// an idle turn is needed only for an unconsumed completion, not a running task.
+pub fn pending(session: &mut Session) -> Result<bool> {
+    service(session)?;
+    Ok(session.tasks.pending())
 }
 
 /// notices contain only host-owned ids and state, never command output from an untrusted process.

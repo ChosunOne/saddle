@@ -138,6 +138,11 @@ and remote MCP work cannot be guaranteed cancelled. Omission retains existing de
 `bash` accepts `background: true` to return a session-owned task id, then `action: "status"`,
 `"list"` or `"cancel"` with `task_id` as appropriate (D153). The guest owns these workflows; the
 additive `exec-tasks` SDK service is bounded by the existing `exec` grant and isolates principals.
+D159 keeps running task launch blocks on the theme's pending background with a spinner and updates
+them from host state at completion. Interactive TUI/line-mode sessions start one normal follow-up
+turn for unconsumed completions from model tool calls when idle; active turns receive notices at
+safe request points. This may spend a model request, but idle ticks and consumed notices never do.
+Hook-only tasks do not trigger automatic model spending. Output still requires owning-tool access.
 One shell command per workspace may run at a time, across cooperating Saddle processes: a pinned
 workspace-directory lock spans snapshot, process cleanup and reserved-path restoration. File tools
 can run meanwhile. `timeout_secs` on a start also caps task lifetime; polling cannot renew it.
@@ -396,7 +401,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D158 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D159 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

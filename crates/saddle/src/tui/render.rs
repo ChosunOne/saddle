@@ -3,6 +3,7 @@
 use crate::plugins::services::panel::{PanelView, Row as PanelRow, Tone};
 use crate::provider;
 use crate::provider::Image;
+use crate::tasks::{State as TaskState, View as TaskView};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
@@ -951,6 +952,47 @@ fn tool_output(name: &str, content: &str) -> (Vec<String>, Option<String>) {
     (lines, status)
 }
 
+/// background execution is host state, not a successful launch result or guest text (D159).
+fn background_block(
+    rows: &mut [Row],
+    bg: &mut Color,
+    tasks: &[TaskView],
+    spinner: usize,
+    theme: &Theme,
+) {
+    if tasks.is_empty() {
+        return;
+    }
+    let running = tasks.iter().any(|task| task.state == TaskState::Running);
+    let unknown = tasks
+        .iter()
+        .any(|task| task.state == TaskState::Unavailable);
+    *bg = if running || unknown {
+        theme.tool_pending_bg
+    } else if tasks.iter().all(|task| task.state == TaskState::Succeeded) {
+        theme.tool_success_bg
+    } else {
+        theme.tool_error_bg
+    };
+    if let Some(row) = rows.first_mut() {
+        if running {
+            row.spans.insert(
+                0,
+                Span::styled(
+                    format!("{} ", SPINNER[spinner % SPINNER.len()]),
+                    Style::new().fg(theme.warning),
+                ),
+            );
+        }
+        for task in tasks {
+            row.spans.push(Span::styled(
+                format!("  [{}: {}]", task.id, task.state.label()),
+                dim(theme),
+            ));
+        }
+    }
+}
+
 /// A tool call as a shaded block: the call, then its output. Collapsed, bash shows its last
 /// lines (where errors and test summaries are) and other tools their first.
 fn tool_block(
@@ -1157,7 +1199,9 @@ fn transcript_with_images(
     let mut lines = Vec::new();
     for i in 0..app.entries.len() {
         let running = match &app.entries[i] {
-            Entry::Tool { result, .. } => result.is_none(),
+            Entry::Tool { result, tasks, .. } => {
+                result.is_none() || tasks.iter().any(|task| task.state == TaskState::Running)
+            }
             Entry::Compaction(v) => v.state == CompactState::Running,
             _ => false,
         };
@@ -1174,12 +1218,14 @@ fn transcript_with_images(
             };
             let rendered: Vec<Line<'static>> = match &app.entries[i] {
                 Entry::Tool {
+                    tasks,
                     name,
                     detail,
                     result,
                     diff,
+                    ..
                 } => {
-                    let (rows, bg) = tool_block(
+                    let (mut rows, mut bg) = tool_block(
                         name,
                         detail,
                         result.as_ref(),
@@ -1188,6 +1234,7 @@ fn transcript_with_images(
                         view.spinner,
                         &app.theme,
                     );
+                    background_block(&mut rows, &mut bg, tasks, view.spinner, &app.theme);
                     shaded(&rows, bg, width as usize)
                 }
                 Entry::Compaction(v) => {
@@ -4259,6 +4306,7 @@ mod tests {
         app.busy = Some(Activity::Waiting);
         app.agent(AgentEvent::Text("Looking at **it**.".into()));
         app.agent(AgentEvent::Call {
+            id: "test-call".into(),
             name: "bash".into(),
             detail: "cargo build".into(),
         });
@@ -4320,5 +4368,39 @@ mod tests {
         assert_eq!(buf[(column, row)].fg, Theme::default().error);
         assert_ne!(buf[(column, row)].fg, buf[(column, row)].bg);
         assert_eq!(terminal.backend().cursor_position(), Position::new(5, 17));
+    }
+    #[test]
+    fn background_blocks_use_pending_until_host_completion_and_distinguish_failure() {
+        let theme = Theme::default();
+        for (state, expected) in [
+            (TaskState::Running, theme.tool_pending_bg),
+            (TaskState::Succeeded, theme.tool_success_bg),
+            (TaskState::Failed, theme.tool_error_bg),
+            (TaskState::Cancelled, theme.tool_error_bg),
+            (TaskState::TimedOut, theme.tool_error_bg),
+        ] {
+            let (mut rows, mut bg) = tool_block(
+                "bash",
+                "sleep 9",
+                Some(&(true, "launch succeeded".into())),
+                None,
+                false,
+                0,
+                &theme,
+            );
+            background_block(
+                &mut rows,
+                &mut bg,
+                &[TaskView {
+                    id: "task-host".into(),
+                    call: Some("call".into()),
+                    state,
+                }],
+                0,
+                &theme,
+            );
+            assert_eq!(bg, expected);
+            assert!(text(&wrap(&rows[0], 200)).join(" ").contains(state.label()));
+        }
     }
 }

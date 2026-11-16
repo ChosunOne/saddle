@@ -98,6 +98,7 @@ enum Command {
         text: String,
         skill: Option<String>,
     },
+    BackgroundTurn,
     Clear,
     /// Applied between turns: the commands queue behind a running turn.
     SetProvider(Box<Provider>),
@@ -293,6 +294,8 @@ fn work(
 ) -> Result<()> {
     let mut ui = ChannelUi(events.clone());
     let mut fatal = None;
+    let mut shown_tasks = Vec::new();
+    let mut completion_requested = false;
     // How long the agent waits for a command before it looks at the clock itself. A session that
     // stays open is idle most of the time, and idle is when a compaction is cheapest (D77).
     let tick = IDLE_TICK;
@@ -308,6 +311,14 @@ fn work(
             fatal = Some(msg);
             break;
         }
+        let views = session.tasks.views();
+        if views != shown_tasks {
+            ui.tasks(&views);
+            shown_tasks = views;
+        }
+        if !session.tasks.pending() {
+            completion_requested = false;
+        }
         let command = match commands.recv_timeout(tick) {
             Ok(command) => command,
             Err(RecvTimeoutError::Timeout) => {
@@ -318,6 +329,14 @@ fn work(
                     let _ = events.send(AgentEvent::Fatal(msg.clone()));
                     fatal = Some(msg);
                     break;
+                }
+                if session.tasks.pending() && !completion_requested {
+                    // Let the UI arbitrate with a prompt typed at the same instant. The worker
+                    // must not start a turn behind an editor that still thinks it is idle.
+                    let _ = events.send(AgentEvent::BackgroundReady);
+                    completion_requested = true;
+                    last_activity = Instant::now();
+                    continue;
                 }
                 // Nothing has happened for a while. Compacting here costs a request the user did
                 // not ask for, so it only happens when the conversation is half full and the
@@ -340,7 +359,24 @@ fn work(
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
+        if matches!(&command, Command::Prompt { .. }) {
+            completion_requested = false;
+        }
         match command {
+            Command::BackgroundTurn => match agent.background_turn(&mut session, &mut ui) {
+                Ok(end) => {
+                    if end.is_some() {
+                        completion_requested = false;
+                    }
+                    let _ = events.send(AgentEvent::TurnEnd(end.unwrap_or(End::Answered)));
+                }
+                Err(error) => {
+                    let msg = format!("{error:#}");
+                    let _ = events.send(AgentEvent::Fatal(msg.clone()));
+                    fatal = Some(msg);
+                    break;
+                }
+            },
             Command::Prompt { text, skill } => match skill
                 .map(|name| session.record_skill_load(&name))
                 .transpose()
@@ -684,6 +720,9 @@ impl Sink for ChannelUi {
 }
 
 impl Ui for ChannelUi {
+    fn tasks(&mut self, tasks: &[tasks::View]) {
+        let _ = self.0.send(AgentEvent::Tasks(tasks.to_vec()));
+    }
     fn contribution(&mut self, value: &Contribution) {
         let _ = self.0.send(AgentEvent::Contribution(value.clone()));
     }
@@ -707,6 +746,7 @@ impl Ui for ChannelUi {
 
     fn call(&mut self, call: &ToolCall) {
         let _ = self.0.send(AgentEvent::Call {
+            id: call.id.clone(),
             name: call.name.clone(),
             detail: call_detail(call),
         });
@@ -917,7 +957,9 @@ fn event_loop(
             }
             dirty = true;
         }
-        let working = app.busy.is_some() || app.login.as_ref().is_some_and(|l| l.checking());
+        let working = app.busy.is_some()
+            || app.background_running()
+            || app.login.as_ref().is_some_and(|l| l.checking());
         // The "copied" note is timed, so its redraws stop on their own once it has expired.
         let noting = app.copied.is_some_and(|at| at.elapsed() < app::COPY_NOTE);
         if (working || noting) && last_tick.elapsed() >= TICK {
@@ -1052,6 +1094,11 @@ impl Controller {
             }
             Action::SessionInfo => {
                 self.send(app, Command::SessionInfo);
+                Ok(())
+            }
+            Action::BackgroundTurn => {
+                cancel::reset();
+                self.send(app, Command::BackgroundTurn);
                 Ok(())
             }
             Action::Tasks(arg) => {

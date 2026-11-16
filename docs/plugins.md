@@ -90,9 +90,16 @@ snapshots. File tools remain available. Build/test tasks work well; a dev server
 shell slot until stopped. Completed filesystem effects are not rolled back.
 
 `/tasks` lists tasks for the person; `/tasks cancel <id>` stops one. These commands also work in
-line mode and are handled between turns in the TUI. Completion notices appear without an extra
-model request, and enter the model's context at its next safe request point. Notices contain only
-host-owned identity/state, not untrusted command output. Ask the owning bash tool for output.
+line mode and are handled between turns in the TUI. Running jobs keep their originating tool block on the theme's pending background with a spinner,
+even after the launch call returns. On completion the block shows the host's terminal state and
+success/error background (D159).
+
+Completion notices enter an active turn at its next safe request point. If the agent's turn has
+already ended, an interactive TUI/line-mode session automatically starts one follow-up turn for
+unconsumed completions from model tool calls. This spends a normal model request; running jobs and
+repeated idle ticks do not. Hook-only jobs without an originating model tool invocation do not
+trigger automatic spending. A queued human prompt takes priority. Notices contain only host-owned
+identity/state, not untrusted command output. The agent must use the owning tool to inspect output.
 
 Tasks stop on session exit or any successful permission/settings reload. Reload drains cleanup and
 audit under the old grants before replacing them. Task ids/outputs are not persisted across restarts;

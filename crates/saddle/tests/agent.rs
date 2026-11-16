@@ -852,6 +852,100 @@ fn background_timeout_runs_during_model_wait_and_notices_do_not_expose_process_o
 }
 
 #[test]
+fn background_completion_wakes_idle_sessions_once_without_new_input() {
+    for (ending, state, timeout) in [
+        ("exit 0", "completed", 10),
+        ("exit 7", "failed", 10),
+        ("sleep 30", "timed out", 2),
+    ] {
+        let (base, seen) = serve_dynamic(5, move |index, body| match index {
+            0 => sse_response(&openai_sse(
+                "",
+                &[(
+                    "start",
+                    "bash",
+                    json!({
+                        "command":format!("while [ ! -f finish ]; do sleep 0.01; done; printf PRIVATE-TASK-OUTPUT; {ending}"),
+                        "background":true,"timeout_secs":timeout
+                    }),
+                )],
+            )),
+            1 => sse_response(&openai_sse("started", &[])),
+            2 => {
+                let notices: Vec<_> = body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|message| message["content"].as_str())
+                    .filter(|text| text.starts_with("[saddle background task notification]"))
+                    .collect();
+                assert_eq!(notices.len(), 1);
+                assert!(notices[0].contains(state), "{}", notices[0]);
+                assert!(!notices[0].contains("PRIVATE-TASK-OUTPUT"));
+                sse_response(&openai_sse(
+                    "",
+                    &[(
+                        "status",
+                        "bash",
+                        json!({"action":"status","task_id":background_id(body)}),
+                    )],
+                ))
+            }
+            3 => {
+                assert!(result_text(body, "status").contains("PRIVATE-TASK-OUTPUT"));
+                sse_response(&openai_sse("finished", &[]))
+            }
+            _ => panic!("completion caused a duplicate idle request"),
+        });
+        let env = Env::new(Api::Openai, &base);
+        let mut child = env
+            .command(&["run", "--json"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (send, receive) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if send.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        let wait_end = || {
+            loop {
+                let line = receive
+                    .recv_timeout(Duration::from_secs(15))
+                    .expect("waiting for turn end");
+                let value: Value = serde_json::from_str(&line).unwrap();
+                if value["type"] == "turn_end" {
+                    assert_eq!(value["end"], "answered", "{line}");
+                    break;
+                }
+            }
+        };
+        writeln!(child.stdin.as_mut().unwrap(), "start work").unwrap();
+        wait_end();
+        assert_eq!(seen.lock().unwrap().len(), 2, "no wakeup before completion");
+        // The first turn is over and stdin remains open, but no further prompt is sent.
+        fs::write(env.ws.path().join("finish"), "go").unwrap();
+        wait_end();
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            4,
+            "idle ticks must not duplicate the wakeup"
+        );
+        writeln!(child.stdin.take().unwrap(), "/quit").unwrap();
+        let output = child.wait_with_output().unwrap();
+        reader.join().unwrap();
+        assert!(output.status.success(), "{}", text(&output.stderr));
+    }
+}
+
+#[test]
 fn closing_a_session_cancels_background_work_and_restores_before_the_audit_closes() {
     let (base, _) = serve_dynamic(2, |index, _| {
         if index == 0 {

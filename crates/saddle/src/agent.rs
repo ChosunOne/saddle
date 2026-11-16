@@ -52,6 +52,7 @@ use saddle_wit::harness::exports::saddle::plugin::observer::Kind as HarnessKind;
 pub const RESULT_LIMIT: usize = 100 * 1024;
 
 pub trait Ui: Sink {
+    fn tasks(&mut self, _tasks: &[tasks::View]) {}
     fn contribution(&mut self, _value: &Contribution) {}
     fn panels(&mut self, _panels: &[PanelView]) {}
     fn plugin_usage(&mut self, _usage: &ModelUsage) {}
@@ -102,7 +103,7 @@ fn complete_servicing_tasks(
     provider: &Provider,
     conversation: &Conversation<'_>,
     session: &mut Session,
-    sink: &mut dyn Sink,
+    sink: &mut dyn Ui,
 ) -> Result<Reply> {
     if !session.tasks.active() {
         return provider.complete(conversation, sink);
@@ -127,6 +128,7 @@ fn complete_servicing_tasks(
                 }
                 stop.store(true, Ordering::Relaxed);
             }
+            sink.tasks(&session.tasks.views());
             match tasks::notices(session, false) {
                 Ok(notes) => {
                     for note in notes {
@@ -182,6 +184,24 @@ impl Sink for CompactSink<'_> {
 
     fn cancelled(&self) -> bool {
         self.ui.cancelled()
+    }
+}
+
+impl Ui for CompactSink<'_> {
+    fn tasks(&mut self, tasks: &[tasks::View]) {
+        self.ui.tasks(tasks);
+    }
+    fn call(&mut self, call: &ToolCall) {
+        self.ui.call(call);
+    }
+    fn result(&mut self, out: &ToolOutput) {
+        self.ui.result(out);
+    }
+    fn reply(&mut self, reply: &Reply, cost: f64) {
+        self.ui.reply(reply, cost);
+    }
+    fn compaction(&mut self, event: compact::Event) {
+        self.ui.compaction(event);
     }
 }
 
@@ -1591,6 +1611,27 @@ impl Agent {
     }
 
     pub fn turn(&mut self, session: &mut Session, prompt: &str, ui: &mut dyn Ui) -> Result<End> {
+        self.turn_with_prompt(session, Some(prompt), ui)
+    }
+
+    /// consume completion context once; idle ticks alone must never spend a request (D159).
+    pub fn background_turn(
+        &mut self,
+        session: &mut Session,
+        ui: &mut dyn Ui,
+    ) -> Result<Option<End>> {
+        if self.provider.is_none() || !tasks::pending(session)? {
+            return Ok(None);
+        }
+        self.turn_with_prompt(session, None, ui).map(Some)
+    }
+
+    fn turn_with_prompt(
+        &mut self,
+        session: &mut Session,
+        prompt: Option<&str>,
+        ui: &mut dyn Ui,
+    ) -> Result<End> {
         session
             .extensions
             .begin(&self.items, self.provider.as_ref().map(Provider::twin));
@@ -1681,7 +1722,12 @@ impl Agent {
         result
     }
 
-    fn turn_inner(&mut self, session: &mut Session, prompt: &str, ui: &mut dyn Ui) -> Result<End> {
+    fn turn_inner(
+        &mut self,
+        session: &mut Session,
+        prompt: Option<&str>,
+        ui: &mut dyn Ui,
+    ) -> Result<End> {
         self.turn_usage = Usage::default();
         // A miss last turn does not silence this one (D50).
         self.misses.turn_end();
@@ -1690,22 +1736,39 @@ impl Agent {
             return Ok(End::Failed);
         }
         self.start_turn(session, ui);
-        let (prompt, images) = self.attach(session, prompt, ui)?;
-        let hook_prompt = json!({"prompt":prompt});
-        // A prompt with pictures is its own kind of item, so every place that reads an item has to
-        // say what an attachment means there (D58).
-        if images.is_empty() {
-            self.record(Item::User(prompt), ui);
+        if let Some(prompt) = prompt {
+            let (prompt, images) = self.attach(session, prompt, ui)?;
+            let hook_prompt = json!({"prompt":prompt});
+            // A prompt with pictures is its own kind of item, so every place that reads an item has to
+            // say what an attachment means there (D58).
+            if images.is_empty() {
+                self.record(Item::User(prompt), ui);
+            } else {
+                self.record(
+                    Item::Attached {
+                        text: prompt,
+                        images,
+                    },
+                    ui,
+                );
+            }
+            self.turn_hook(session, HarnessKind::TurnStart, hook_prompt)?;
         } else {
-            self.record(
-                Item::Attached {
-                    text: prompt,
-                    images,
-                },
-                ui,
-            );
+            // Consume the wakeup before any step limit, cancellation or compaction failure so
+            // an unsuccessful automatic turn cannot retry itself on every idle tick.
+            for notice in tasks::notices(session, true)? {
+                ui.note(&notice);
+                self.record(
+                    Item::User(format!("[saddle background task notification] {notice}")),
+                    ui,
+                );
+            }
+            self.turn_hook(
+                session,
+                HarnessKind::TurnStart,
+                json!({"background_tasks":true}),
+            )?;
         }
-        self.turn_hook(session, HarnessKind::TurnStart, hook_prompt)?;
         let mut overflow_retried = false;
         let mut requests = 0usize;
         let mut guard = LoopGuard::default();
@@ -1738,6 +1801,7 @@ impl Agent {
             if let Some(end) = self.compact_before_request(session, ui)? {
                 return Ok(end);
             }
+            ui.tasks(&session.tasks.views());
             for notice in tasks::notices(session, true)? {
                 ui.note(&notice);
                 self.record(
@@ -1955,6 +2019,7 @@ pub fn call_detail(call: &ToolCall) -> String {
 }
 
 fn run_call(session: &mut Session, call: &ToolCall, ui: &mut dyn Ui) -> Result<ToolOutput> {
+    let before = session.tasks.ids();
     ui.call(call);
     let out = match &call.input {
         Err(raw) => ToolOutput::err(json!({ "INVALID_JSON": raw }).to_string()),
@@ -1972,6 +2037,8 @@ fn run_call(session: &mut Session, call: &ToolCall, ui: &mut dyn Ui) -> Result<T
         Ok(input) => tools::call(session, &call.name, input)?,
     };
     ui.result(&out);
+    session.tasks.associate_new(&before, &call.id);
+    ui.tasks(&session.tasks.views());
     Ok(out)
 }
 
