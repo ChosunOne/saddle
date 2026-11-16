@@ -62,7 +62,7 @@ pub fn workspace_header(workspace: &Path) -> String {
     )
 }
 
-pub const WORKSPACE_POLICY_HEADER: &str = r#"# This workspace's own grants, laid over the [agent] table in config.toml.
+pub const WORKSPACE_POLICY_HEADER: &str = r#"# This workspace's overrides, laid over config.toml (grants and sandbox paths).
 #
 # The `workspace` line above is the directory this file governs. The name is only a readable
 # encoding of that path and is allowed to be approximate; this line is what counts, and a session
@@ -72,7 +72,9 @@ pub const WORKSPACE_POLICY_HEADER: &str = r#"# This workspace's own grants, laid
 # is written here replaces that grant for this scope, and it may grant more or less than the base
 # does: this file is the authority for this directory. It lives in the config directory, which no
 # root contains, so nothing the agent runs can write it -- only you can. `saddle check` prints the
-# result, and --grant/--revoke change it for one run without touching this file.
+# result, and --grant/--revoke change grants for one run without touching this file.
+# [sandbox] read/write lists inherit when omitted, replace when plain, and modify the global
+# list with +path/-path entries. These overrides apply to every session in this workspace.
 "#;
 
 /// What a workspace's own policy file starts as (D43): a comment saying what it is for, and nothing
@@ -94,7 +96,6 @@ pub fn roots_for_validation() -> Result<Roots> {
 /// Everything needed to parse the policy. `check` stops here; a session goes on to open the audit
 /// log.
 pub struct Setup {
-    pub session_id: Option<String>,
     pub sandbox_override: Option<SandboxSource>,
     pub standard_tools: Profiles,
     pub tool_limits: Budgets,
@@ -122,8 +123,7 @@ pub struct Setup {
     /// This run's grant overrides, kept so a policy reload does not silently drop them (D63).
     pub overrides: Overrides,
     /// Directories the file tools may reach outside every root, and the tools allowed on each
-    /// (D66, D157). From protected global/session sandbox settings only; workspace policies cannot
-    /// declare these directories.
+    /// (D66, D157). from protected global/workspace sandbox settings only (D158).
     pub tool_paths: Vec<ToolPath>,
     /// Whether and how many skills to look for (D64), read with the rest of the config.
     pub skills: SkillsConfig,
@@ -143,15 +143,6 @@ impl Setup {
     /// `tmp` is the directory to use as the `tmp` root. `overrides` are this run's `--grant` and
     /// `--revoke`, which are not stored (D63).
     pub fn load(start: &Path, tmp: &Path, overrides: &Overrides) -> Result<Self> {
-        Self::load_for_session(start, tmp, overrides, None)
-    }
-
-    pub fn load_for_session(
-        start: &Path,
-        tmp: &Path,
-        overrides: &Overrides,
-        id: Option<&str>,
-    ) -> Result<Self> {
         let paths = Paths::from_env()?;
         let start = start
             .canonicalize()
@@ -167,36 +158,20 @@ impl Setup {
         ];
         entries.extend(user.root_entries()?);
         let roots = Roots::resolve(entries, &paths.protected())?;
-        let sandbox_override = id
-            .map(|id| sandbox_overrides::apply(&mut user, &paths, &roots, &workspace, id))
-            .transpose()?;
-        // The include rules are enumerated here, where the protected directories are known, so
-        // what a child may reach is a list rather than a pattern (D62).
-        let (extras, tool_paths) = user.sandbox_extras(&roots, &paths.protected())?;
-
         // `[agent]` in config.toml is the base; a separate file per workspace overrides only the
         // scopes it names (D63). Both live outside every root, protected by the kernel (D42).
         let config_path = paths.user_config();
         let mut notes = Vec::new();
-        if let Some(source) = &sandbox_override {
-            notes.push(format!(
-                "session sandbox overrides: {} ({})",
-                source.path.display(),
-                if source.sha256.is_some() {
-                    "loaded"
-                } else {
-                    "not present"
-                }
-            ));
-        }
         let skills_cfg = user.skills.clone();
         let context_cfg = user.context.clone();
         // This workspace's own grants are their own file (D63), so a directory's authority is
         // named after the directory and the global file does not grow a key per workspace.
         let own_path = paths.workspace_policy(&workspace);
-        let own_text = match fs::read_to_string(&own_path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == ErrorKind::NotFound => {
+        let own_text = match sandbox_overrides::read(&paths, &own_path)
+            .with_context(|| format!("reading {}", own_path.display()))?
+        {
+            Some(text) => text,
+            None => {
                 if let Some(dir) = own_path.parent() {
                     fs::create_dir_all(dir)
                         .with_context(|| format!("creating {}", dir.display()))?;
@@ -210,9 +185,9 @@ impl Setup {
                 ));
                 workspace_header(&workspace)
             }
-            Err(e) => return Err(e).with_context(|| format!("reading {}", own_path.display())),
         };
         // A header with no grants is the same as no file: nothing is overridden.
+        let sandbox_override;
         let mut own: Option<toml::Value> = {
             let doc: toml::Table = toml::from_str(&own_text)
                 .with_context(|| format!("reading {}", own_path.display()))?;
@@ -231,6 +206,9 @@ impl Setup {
                     workspace.display()
                 );
             }
+            sandbox_override = Some(sandbox_overrides::apply(
+                &mut user, &paths, &roots, &workspace, &own_path, &own_text, &doc,
+            )?);
             (doc.contains_key("agent") || doc.contains_key("plugin")).then(|| {
                 let mut out = toml::Table::new();
                 out.insert("version".into(), toml::Value::Integer(1));
@@ -242,6 +220,8 @@ impl Setup {
                 toml::Value::Table(out)
             })
         };
+        // All path claims use the same resolver after the one workspace override is applied.
+        let (extras, tool_paths) = user.sandbox_extras(&roots, &paths.protected())?;
         let global = user.global_policy();
         if !overrides.is_empty() {
             // Applied to the *merged* grants, not to the workspace's own: `--revoke exec` has to
@@ -351,7 +331,6 @@ impl Setup {
             .as_bytes(),
         );
         Ok(Self {
-            session_id: id.map(str::to_owned),
             sandbox_override,
             standard_tools: user.standard_tools,
             tool_limits: user.tool_limits,
@@ -378,7 +357,7 @@ impl Setup {
         })
     }
 
-    /// resolved explicit command paths and their protected session source (D157).
+    /// resolved explicit command paths and their protected workspace source (D157, D158).
     pub fn sandbox_audit(&self) -> Value {
         json!({"read":self.extras.read,"write":self.extras.write,"tool_paths":self.tool_paths.iter().map(|entry|json!({"path":entry.dir,"tools":entry.tools})).collect::<Vec<_>>(),"override":self.sandbox_override.as_ref().map(|source|json!({"path":source.path,"sha256":source.sha256}))})
     }
@@ -595,7 +574,7 @@ impl Session {
         let id = id.map(str::to_owned).unwrap_or_else(session_id);
         let run = format!("{id}-{}", session_id());
         let tmp = PrivateTmp::create(&run)?;
-        let setup = Setup::load_for_session(start, tmp.path(), overrides, Some(&id))?;
+        let setup = Setup::load(start, tmp.path(), overrides)?;
         let policy = setup.parse_policy()?;
         let sandbox = saddle_sandbox::availability();
 
@@ -705,12 +684,7 @@ impl Session {
     /// reloads grants and plugins without resetting model spending (D47, D129). Invalid settings
     /// leave the previous configuration in force; a host/audit failure after replacement is fatal.
     pub fn reload_policy(&mut self) -> Result<()> {
-        let fresh = Setup::load_for_session(
-            &self.setup.start,
-            self._tmp.path(),
-            &self.setup.overrides,
-            self.setup.session_id.as_deref(),
-        )?;
+        let fresh = Setup::load(&self.setup.start, self._tmp.path(), &self.setup.overrides)?;
         let policy = fresh.parse_policy()?;
         let file_roots = fresh
             .roots

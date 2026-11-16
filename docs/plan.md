@@ -3636,6 +3636,7 @@ never run another callback. Persistent Wasm instances, input widgets and indepen
 isolation remain deferred.
 
 **D157.** Sandbox path lists can be overridden for one session identity without copying the base.
+**Superseded by D158:** the list syntax remains, but the separate session-specific source is removed.
 The source is `$XDG_CONFIG_HOME/saddle/session-overrides/<session-id>.toml`, never a repository file
 or a workspace grants file. It must name the canonical `workspace` it governs and accepts only a
 `[sandbox]` table with `read` and `write`. No roots, providers, plugin ceilings, grants or include
@@ -3666,6 +3667,29 @@ Saddle never deletes a person's config file on close.
   re-reads the same identity's file against the current global base; deleting it restores inheritance.
   Session-start/reload audit records include the source path/hash and resolved explicit read/write
   lists. Ordinary file/exec effects still use the existing engine, delegation and sandbox lowering.
+
+**D158.** One protected workspace override file holds both grants and sandbox path lists.
+This supersedes D157's separate session-specific file and extends D66's configuration sources.
+`policies/--<workspace-path>--.toml` is the only override file; `config.toml` remains the global base.
+Its `[agent]` and `[plugin]` tables override grants as before; `[sandbox]` accepts `read` and `write`
+with D157's same-key list syntax (inherit when omitted, replace when plain, modify with `+`/`-`).
+The entire document is validated before applying either kind of override. Unknown top-level keys
+and sandbox fields are errors, not silently ignored configuration. Sandbox overrides require the
+matching canonical `workspace` line. No roots, providers or include rules may be declared here.
+
+The existing protected workspace file is read with pinned no-follow traversal, refusing symlinked
+files/directories. Config/state paths and aliases, reserved paths, delegation, principal isolation
+and root boundaries remain protected. These are directory claims, not policy-addressable roots;
+list subtraction is not a deny rule and cannot narrow an independent parent claim or workspace/tmp
+grant. The source hash and effective sandbox paths are audited alongside the effective grants.
+
+All sessions in a workspace use the same override file regardless of session id. `check` identifies
+that file and `/reload` re-reads it; invalid reloads retain the complete previous setup. The former
+`session-overrides` directory is no longer consulted. Users move any desired entries into the
+existing workspace file themselves; the harness does not migrate or merge authority automatically.
+New workspace-file headers explain both override types. Acceptance includes actual command
+confinement, another session inheriting the same paths, workspace isolation, and an unchanged SDK
+component gaining and losing declared external access on reload with exclusions still enforced.
 
 ## 4. Scope enumeration
 

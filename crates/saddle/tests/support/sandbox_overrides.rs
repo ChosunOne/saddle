@@ -1,8 +1,8 @@
-//! real command confinement and session identity for sandbox list operators (D157).
+//! real command confinement and workspace isolation for sandbox list operators (D157).
 
 use std::fs;
 use std::os::unix::fs::symlink;
-use std::process::Output;
+use std::process::{Command, Output};
 
 use serde_json::json;
 use toml::Table;
@@ -13,21 +13,12 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-fn session_file(env: &Env, id: &str, sandbox: &str) {
-    let directory = env.xdg.path().join("config/saddle/session-overrides");
-    fs::create_dir_all(&directory).unwrap();
-    fs::write(
-        directory.join(format!("{id}.toml")),
-        format!(
-            "workspace = {:?}\n[sandbox]\n{sandbox}",
-            env.ws.path().canonicalize().unwrap().display().to_string()
-        ),
-    )
-    .unwrap();
+fn override_file(env: &Env, sandbox: &str) {
+    env.write_override(&format!("[agent]\nexec = {{}}\n[sandbox]\n{sandbox}"));
 }
 
 #[test]
-fn sandbox_lists_append_subtract_replace_and_isolate_sessions_without_changing_root_grants() {
+fn sandbox_lists_share_workspace_overrides_without_changing_root_grants() {
     let env = Env::new();
     let one = env.outside.path().join("one");
     let two = env.outside.path().join("two");
@@ -41,9 +32,8 @@ fn sandbox_lists_append_subtract_replace_and_isolate_sessions_without_changing_r
         toml::Value::try_from(json!({"write":[one, two]})).unwrap(),
     );
     fs::write(env.policy_path(), toml::to_string(&config).unwrap()).unwrap();
-    session_file(
+    override_file(
         &env,
-        "chosen",
         &format!(
             "write = [{:?}, {:?}]\n",
             format!("+{}", extra.display()),
@@ -52,7 +42,7 @@ fn sandbox_lists_append_subtract_replace_and_isolate_sessions_without_changing_r
     );
     let check = env.saddle(&["--session", "chosen", "check"]);
     assert!(check.status.success(), "{}", stderr(&check));
-    assert!(stdout(&check).contains("session-overrides/chosen.toml"));
+    assert!(stdout(&check).contains(&env.override_path().display().to_string()));
     if saddle_sandbox::availability().is_ok() {
         let command = format!(
             "for d in '{}' '{}' '{}'; do if (printf x > \"$d/probe\") 2>/dev/null; then printf 'yes:%s\\n' \"$d\"; else printf 'no:%s\\n' \"$d\"; fi; done; printf kept > workspace-write",
@@ -86,7 +76,7 @@ fn sandbox_lists_append_subtract_replace_and_isolate_sessions_without_changing_r
             "bash",
             &json!({"command":format!("printf x > '{}/other'",extra.display())}).to_string(),
         ]);
-        assert!(!other.status.success());
+        assert!(other.status.success(), "{}", stderr(&other));
         let other = env.saddle(&[
             "--session",
             "other",
@@ -94,7 +84,21 @@ fn sandbox_lists_append_subtract_replace_and_isolate_sessions_without_changing_r
             "bash",
             &json!({"command":format!("printf x > '{}/other'",one.display())}).to_string(),
         ]);
-        assert!(other.status.success(), "{}", stderr(&other));
+        assert!(!other.status.success());
+        // The same global configuration and session id do not lend another workspace this claim.
+        let other_workspace = tempfile::tempdir().unwrap();
+        let isolated = Command::new(env!("CARGO_BIN_EXE_saddle"))
+            .arg("-C")
+            .arg(other_workspace.path())
+            .args(["--session", "chosen", "tool", "bash"])
+            .arg(json!({"command":format!("printf x > '{}/isolated'",extra.display())}).to_string())
+            .env("HOME", env.home.path())
+            .env("XDG_CONFIG_HOME", env.xdg.path().join("config"))
+            .env("XDG_STATE_HOME", env.xdg.path().join("state"))
+            .output()
+            .unwrap();
+        assert!(!isolated.status.success());
+        assert!(!extra.join("isolated").exists());
     }
     // A bare command path does not become a file-tool root or lend a D66 tool role.
     let read = env.saddle(&[
@@ -106,9 +110,8 @@ fn sandbox_lists_append_subtract_replace_and_isolate_sessions_without_changing_r
     ]);
     assert!(!read.status.success());
     assert!(stderr(&read).contains("denied:"), "{}", stderr(&read));
-    session_file(
+    override_file(
         &env,
-        "chosen",
         &format!("write = [{:?}]\n", extra.display().to_string()),
     );
     let check = env.saddle(&["--session", "chosen", "check"]);
@@ -128,19 +131,18 @@ fn invalid_override_operators_protected_paths_and_symlinked_authority_are_refuse
         "write = ['+relative']",
         "typo = ['+/one']",
     ] {
-        session_file(&env, "chosen", invalid);
+        override_file(&env, invalid);
         let out = env.saddle(&["--session", "chosen", "check"]);
         assert!(!out.status.success(), "{invalid}");
         assert!(
-            stderr(&out).contains("invalid session override"),
+            stderr(&out).contains("invalid workspace override"),
             "{}",
             stderr(&out)
         );
     }
     let protected = env.policy_path().parent().unwrap().to_path_buf();
-    session_file(
+    override_file(
         &env,
-        "chosen",
         &format!("write = [{:?}]", format!("+{}", protected.display())),
     );
     let out = env.saddle(&["--session", "chosen", "check"]);
@@ -150,15 +152,12 @@ fn invalid_override_operators_protected_paths_and_symlinked_authority_are_refuse
         "{}",
         stderr(&out)
     );
-    session_file(&env, "chosen", "write = []");
-    let path = env
-        .xdg
-        .path()
-        .join("config/saddle/session-overrides/chosen.toml");
+    override_file(&env, "write = []");
+    let path = env.override_path();
     fs::write(&path, "workspace = '/different'\n[sandbox]\nwrite=[]").unwrap();
     let out = env.saddle(&["--session", "chosen", "check"]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("cannot cross workspaces"));
+    assert!(stderr(&out).contains("is for /different"));
     fs::remove_file(&path).unwrap();
     let source = env.ws.path().join("untrusted.toml");
     fs::write(
@@ -172,6 +171,11 @@ fn invalid_override_operators_protected_paths_and_symlinked_authority_are_refuse
     symlink(&source, &path).unwrap();
     let out = env.saddle(&["--session", "chosen", "check"]);
     assert!(!out.status.success(), "{}", stderr(&out));
+    fs::remove_file(&path).unwrap();
+    env.write_override("[providers.typo]\nurl='https://example.com'");
+    let out = env.saddle(&["check"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("unsupported workspace override section"));
     fs::remove_file(&path).unwrap();
     for prefix in ['+', '-'] {
         let mut config: Table = env.policy().parse().unwrap();

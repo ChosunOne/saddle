@@ -396,7 +396,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D157 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D158 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
@@ -515,15 +515,17 @@ rather than loosening it.
   policy can name one; `check` lists them separately. An entry that names, contains or sits inside
   the state or config directory is refused, and a misspelt tool name is an error because the file
   tools run in saddle, with no kernel behind them. A named write still cannot reach a reserved path.
-  D157 also permits these claims in a protected session-specific file, never in a workspace grants
-  file: `$XDG_CONFIG_HOME/saddle/session-overrides/<session-id>.toml`, with a matching canonical
-  `workspace` line and only `[sandbox] read`/`write`. A list of `+path`/`-path` entries modifies the
-  inherited global list; an unprefixed list replaces it, and omission inherits it. Mixed lists and
-  operators in global config are invalid; reload retains the previous setup on error. Session
-  override files/directories cannot be symlinks. List subtraction is not a deny rule and cannot
-  carve a hole in a parent claim or change workspace/tmp grants. `/reload` reads the same id's file;
-  new ids do not inherit it. `check --session <id>` names the file, and audits record its hash and
-  effective command lists. Neither an entry nor its source is an agent-editable grant mechanism.
+  D158 permits these claims in the same protected workspace override file as `[agent]` and
+  `[plugin]`: `$XDG_CONFIG_HOME/saddle/policies/--<workspace-path>--.toml`. Its matching canonical
+  `workspace` line is required for sandbox lists. There is no separate session override file;
+  D157's session-specific source is superseded and no longer read. `[sandbox]` allows only `read`
+  and `write`. A list of `+path`/`-path` entries modifies the inherited global list; an unprefixed
+  list replaces it, and omission inherits it. Mixed lists and operators in global config are
+  invalid; reload retains the entire previous setup on error. Unknown workspace sections are
+  rejected. Override files/directories cannot be symlinks. List subtraction is not a deny rule and
+  cannot carve a hole in a parent claim or change workspace/tmp grants. All sessions in the
+  workspace use this file; `check` names it and audits record its hash and effective command lists.
+  Neither an entry nor its source is an agent-editable grant mechanism.
   `~/.agents` is built in (`read`, `ls`, `find`, `grep`) unless `tools-defaults = false`, and an
   entry for the same directory adds to it instead of replacing it. A symlink inside one of these
   directories is followed, which no root allows, but only to another declared entry: otherwise a

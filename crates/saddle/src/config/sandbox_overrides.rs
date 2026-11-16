@@ -1,4 +1,4 @@
-//! protected, session-scoped sandbox list overrides; operators never become grants (D157).
+//! protected workspace sandbox list overrides; operators never become grants (D157, D158).
 
 use std::fs;
 use std::io::{ErrorKind, Read};
@@ -11,7 +11,6 @@ use saddle_policy::audit::sha256_hex;
 use serde::Deserialize;
 
 use super::{SandboxConfig, SandboxEntry, UserConfig};
-use crate::allow;
 use crate::fs_access;
 use crate::paths::Paths;
 
@@ -20,14 +19,6 @@ use crate::paths::Paths;
 struct Lists {
     read: Option<Vec<SandboxEntry>>,
     write: Option<Vec<SandboxEntry>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Document {
-    workspace: PathBuf,
-    #[serde(default)]
-    sandbox: Lists,
 }
 
 pub struct Source {
@@ -40,80 +31,74 @@ pub fn validate_global(sandbox: &SandboxConfig) -> Result<()> {
     for (name, entries) in [("read", &sandbox.read), ("write", &sandbox.write)] {
         if entries.iter().any(|entry| operator(entry.path()).is_some()) {
             bail!(
-                "invalid config: sandbox.{name} uses + or - in global config; list operators are only valid in session overrides"
+                "invalid config: sandbox.{name} uses + or - in global config; list operators are only valid in workspace overrides"
             );
         }
     }
     Ok(())
 }
 
-/// the session id is a filename component, never an arbitrary model-supplied config path.
-pub fn path(paths: &Paths, id: &str) -> Result<PathBuf> {
-    allow::check_id(id)?;
-    Ok(paths
-        .config
-        .join("session-overrides")
-        .join(format!("{id}.toml")))
+/// read the existing workspace override beneath protected configuration without following links.
+pub fn read(paths: &Paths, path: &Path) -> Result<Option<String>> {
+    let pinned = match fs::canonicalize(&paths.config) {
+        Ok(path) => path,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let root = fs_access::root(&pinned)?;
+    let relative = RelPath::new(path.strip_prefix(&paths.config)?)?;
+    let mut file = match fs_access::file(&root, &relative) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(Some(text))
 }
 
-/// read only beneath protected configuration, refusing symlinked files and directories.
+/// sandbox lists share the protected workspace document with grants, never a second file.
 pub fn apply(
     user: &mut UserConfig,
     paths: &Paths,
     roots: &Roots,
     workspace: &Path,
-    id: &str,
+    path: &Path,
+    text: &str,
+    doc: &toml::Table,
 ) -> Result<Source> {
-    let path = path(paths, id)?;
-    let load = || -> Result<Option<String>> {
-        let pinned = match fs::canonicalize(&paths.config) {
-            Ok(path) => path,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let root = match fs_access::root(&pinned) {
-            Ok(root) => root,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let relative = RelPath::new(format!("session-overrides/{id}.toml"))?;
-        let mut file = match fs_access::file(&root, &relative) {
-            Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let mut text = String::new();
-        file.read_to_string(&mut text)?;
-        Ok(Some(text))
-    };
-    let Some(text) = load().with_context(|| format!("reading {}", path.display()))? else {
-        return Ok(Source { path, sha256: None });
-    };
-    let document: Document = toml::from_str(&text)
-        .with_context(|| format!("invalid session override {}", path.display()))?;
-    if document.workspace != workspace {
-        bail!(
-            "{} is for {}, not {}; session overrides cannot cross workspaces",
-            path.display(),
-            document.workspace.display(),
-            workspace.display()
-        );
+    for key in doc.keys() {
+        if !["version", "workspace", "agent", "plugin", "sandbox"].contains(&key.as_str()) {
+            bail!(
+                "unsupported workspace override section `{key}` in {}",
+                path.display()
+            );
+        }
     }
-    for (name, base, override_list) in [
-        ("read", &mut user.sandbox.read, document.sandbox.read),
-        ("write", &mut user.sandbox.write, document.sandbox.write),
-    ] {
-        if let Some(entries) = override_list {
-            *base = merge(base, entries, roots, &paths.protected()).with_context(|| {
-                format!(
-                    "invalid session override {}: sandbox.{name}",
-                    path.display()
-                )
-            })?;
+    if let Some(value) = doc.get("sandbox") {
+        if doc.get("workspace").and_then(|value| value.as_str()) != workspace.to_str() {
+            bail!("sandbox overrides require a matching canonical workspace line");
+        }
+        let lists: Lists = value
+            .clone()
+            .try_into()
+            .with_context(|| format!("invalid workspace override {}", path.display()))?;
+        for (name, base, override_list) in [
+            ("read", &mut user.sandbox.read, lists.read),
+            ("write", &mut user.sandbox.write, lists.write),
+        ] {
+            if let Some(entries) = override_list {
+                *base = merge(base, entries, roots, &paths.protected()).with_context(|| {
+                    format!(
+                        "invalid workspace override {}: sandbox.{name}",
+                        path.display()
+                    )
+                })?;
+            }
         }
     }
     Ok(Source {
-        path,
+        path: path.to_path_buf(),
         sha256: Some(sha256_hex(text.as_bytes())),
     })
 }

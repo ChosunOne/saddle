@@ -350,7 +350,7 @@ fn custom_only_listener_can_receive_without_transcript_or_publish_grants() {
 }
 
 #[test]
-fn session_sandbox_overrides_enable_revoke_and_keep_invalid_reloads_atomic() {
+fn workspace_sandbox_overrides_enable_revoke_and_keep_invalid_reloads_atomic() {
     let (base, seen) = serve(
         (0..7)
             .map(|_| sse_response(&openai_sse("done", &[])))
@@ -360,7 +360,7 @@ fn session_sandbox_overrides_enable_revoke_and_keep_invalid_reloads_atomic() {
     configure(&env, "tool-read={tools=['read']}\n");
     let external = tempfile::tempdir().unwrap();
     let target = external.path().join("external.txt");
-    fs::write(&target, "session-only content").unwrap();
+    fs::write(&target, "workspace override content").unwrap();
     fs::write(env.ws.path().join("sample"), "workspace content").unwrap();
     fs::write(env.ws.path().join(".env"), "excluded content").unwrap();
     let config = env.xdg.path().join("config/saddle/config.toml");
@@ -375,9 +375,17 @@ fn session_sandbox_overrides_enable_revoke_and_keep_invalid_reloads_atomic() {
         TomlValue::try_from(json!({"read":[{"path":env.ws.path(),"tools":["read"]}]})).unwrap(),
     );
     fs::write(&config, toml::to_string(&table).unwrap()).unwrap();
-    let directory = config.parent().unwrap().join("session-overrides");
-    fs::create_dir_all(&directory).unwrap();
-    let path = directory.join("scoped.toml");
+    env.write_override("");
+    let workspace = env.ws.path().canonicalize().unwrap();
+    let key = workspace
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .replace(['/', '\\', ':'], "-");
+    let path = config
+        .parent()
+        .unwrap()
+        .join("policies")
+        .join(format!("--{key}--.toml"));
     let override_text = format!(
         "workspace={:?}\n[sandbox]\nread=[{{path={:?},tools=['read']}}]\n",
         env.ws.path().canonicalize().unwrap().display().to_string(),
@@ -432,12 +440,17 @@ fn session_sandbox_overrides_enable_revoke_and_keep_invalid_reloads_atomic() {
                     .filter(|row| row["allow"] == false)
                     .collect::<Vec<_>>()
             ))
-            .contains("session-only content")
+            .contains("workspace override content")
     );
     fs::remove_file(&output_file).unwrap();
     assert_success(&env.saddle(&["--session", "other", "run", target.to_str().unwrap()]));
     assert_eq!(seen.lock().unwrap().len(), 4);
-    assert!(!output_file.exists());
+    assert!(
+        fs::read_to_string(&output_file)
+            .unwrap()
+            .contains("workspace override content")
+    );
+    fs::remove_file(&output_file).unwrap();
     fs::write(
         &path,
         format!(
@@ -462,7 +475,7 @@ fn session_sandbox_overrides_enable_revoke_and_keep_invalid_reloads_atomic() {
                     .filter(|row| row["allow"] == false)
                     .collect::<Vec<_>>()
             ))
-            .contains("session-only content")
+            .contains("workspace override content")
     );
     fs::remove_file(&output_file).unwrap();
     writeln!(child.stdin.as_mut().unwrap(), ".env").unwrap();

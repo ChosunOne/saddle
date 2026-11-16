@@ -341,7 +341,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Some(Cmd::Check) => check(&cli.dir, &overrides, &session),
+        Some(Cmd::Check) => check(&cli.dir, &overrides),
         Some(Cmd::Tool { name, input }) => {
             tool(&cli.dir, &name, &input, &session, &paths, &overrides)
         }
@@ -1013,9 +1013,9 @@ fn session_cmd(cmd: SessionCmd, paths: &paths::Paths) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn check(dir: &Path, overrides: &config::Overrides, id: &str) -> Result<ExitCode> {
+fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
     let tmp = PrivateTmp::create(&session_id())?;
-    let setup = Setup::load_for_session(dir, tmp.path(), overrides, Some(id))?;
+    let setup = Setup::load(dir, tmp.path(), overrides)?;
     // The layering happens in `Setup::load`, so an invalid project file is reported here rather
     // than on the first tool call.
     println!("workspace  {}", setup.workspace.display());

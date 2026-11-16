@@ -489,26 +489,28 @@ networking, event publication, contributions and model spending. Ordinary author
 line/JSON events; they are not model context or saved conversation items. Reload clears panels and
 rechecks current grants. Failed rendering retains the previous frame.
 
-## Session-only sandbox overrides (D157)
+## Workspace overrides (D158)
 
-Command paths normally come from the protected global `[sandbox]` settings. To add a cache for one
-session identity without replacing the inherited list, create a file at
-`$XDG_CONFIG_HOME/saddle/session-overrides/<session-id>.toml` (normally
-`~/.config/saddle/session-overrides/<session-id>.toml`):
+There is one protected override file per workspace, shared by all its sessions:
+`$XDG_CONFIG_HOME/saddle/policies/--<workspace-path>--.toml`. `saddle check` names the exact file.
+It holds both `[agent]`/`[plugin]` grant overrides and `[sandbox]` path overrides on top of the
+base in `config.toml`. For example, add this to the existing workspace file:
 
 ```toml
 workspace = "/home/me/source/project" # the exact canonical workspace path
+
+[agent]
+exec = {}
 
 [sandbox]
 write = ["+~/.dylint_drivers"]
 ```
 
-The intro prints the selected file; `saddle --session <id> check` also names it and prints resolved
-command paths. Edit it yourself and use `/reload`. A normal new session chooses a new id and does
-not load another id's file. Explicitly reusing an id reuses the file; removing it and reloading
-restores the global lists. The file stays yours—session close does not delete it. This is separate
-from persistent `policies/<workspace>.toml`, which still overrides resource grants, not sandbox paths.
-Session files require the matching `workspace` line and accept only `[sandbox] read` and `write`.
+Edit it yourself and use `/reload`. It applies to every session in this workspace, not other
+workspaces. The separate `session-overrides/<session-id>.toml` source introduced by D157 has been
+removed and is not read. Move any desired entries into the workspace file yourself; no automatic
+migration changes authority. Unknown top-level sections or sandbox fields are rejected rather than
+silently ignored. `[sandbox]` permits only `read` and `write`, not include rules or other settings.
 
 List semantics are:
 
