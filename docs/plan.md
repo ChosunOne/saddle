@@ -182,6 +182,8 @@ when the kernel supports it. `exec` is unavailable on macOS in v1.
 - Filesystem: the principal's `fs-read` roots read-only, its `fs-write` roots read-write, the extra
   sandbox roots from the user's `config.toml`, `/usr`, `/bin`, `/sbin`, `/lib*`, `/etc` and `/proc`
   read and execute, and a few `/dev` nodes. `$HOME` is not granted. `TMPDIR` points at the `tmp` root.
+  These decide what a path may be *opened* for. Landlock has no right for metadata, so a command can
+  still `stat` a path no grant names, and change the mode or times of any file it owns (§9).
 - Network: none. seccomp blocks `socket()` for `AF_INET`, `AF_INET6`, `AF_UNIX`, `AF_NETLINK` and
   `AF_PACKET`, and blocks `io_uring_setup`, `io_uring_enter` and `io_uring_register`, since io_uring
   can open sockets without calling `socket`. `socketpair` stays allowed. Blocking `AF_UNIX` keeps the
@@ -254,6 +256,16 @@ The host reserves `.git/config` and anything under `.git/hooks`, including the s
 D42 moved it out of the tree, at which point the kernel took over.) Git
 hooks and settings such as `core.fsmonitor` and `core.sshCommand` run later as the user, outside any
 sandbox. D20 covers writes from `exec`.
+
+The same reasoning covers every file a version-control tool reads as the user's own configuration,
+so the list also holds `config.worktree` (in `.git`, in `.git/worktrees/<name>` and under
+`.git/modules`, read once `extensions.worktreeConfig` is on), the `config` and `hooks` of a bare
+repository named `<name>.git`, and jj's: `.jj/repo/config.toml` and `.jj/workspace-config.toml`,
+which jj 0.45 adopts as trusted configuration when it finds them (`ui.pager` runs on every
+`jj log`), `.jj/repo/store/git_target`, which names the git repository jj drives, and the `config`
+and `hooks` of the repository a non-colocated jj keeps at `.jj/repo/store/git`, whose config git
+reads on `jj git fetch` and `push`. The engine matches each at any depth; the `exec` restore puts
+back the ones at the top of the workspace, as it did before.
 
 Rewriting instructions cannot be granted (D7). The original no-network rule for `exec` (D19) is
 superseded by D79: a command's network connections now pass the same policy gate as host requests.
@@ -868,7 +880,8 @@ works offline, so it reports what a session would open with.
   make the tree a wall of identical rows that say nothing, which is the state this replaced.
 - The controls are pi's: up/down, page up/page down, home/end, enter, escape and ctrl+c to close,
   ctrl+u for the prompts only and ctrl+a for everything, ctrl+left and alt+left for the previous
-  prompt and ctrl+right and alt+right for the next, ctrl+x to copy the whole selected message.
+  prompt and ctrl+right and alt+right for the next, ctrl+x to copy the whole selected message. The
+  ends of the branches have no default key; `[keys]` binds one (D168, D169).
 - `/clone` is the separate thing: it copies the active branch into a new session, so the copy can
   be worked on independently. A branch point inside one session and a second session are different
   answers to "I want to try something else", and both are cheap to keep.
@@ -962,16 +975,21 @@ works offline, so it reports what a session would open with.
   escapes are written to stdout afterwards. The marker line `[image shot.png 1280×720]` stays either
   way: it is the fallback, it is what a copy of the transcript contains, and it is what the model was
   told about.
-- Each image carries an id so the terminal caches the data rather than receiving it every frame. A
-  kitty image larger than 4096 base64 characters is continued across several escapes, which is what
-  the protocol requires.
-- **A large picture is retransmitted when its band changes**, because every placement is `a=T`,
-  which transmits and displays in one action. The cost is the whole file again each time: a 45 KiB
-  screenshot is 60 KB of base64 in 15 escapes and is unnoticeable, while a 4.5 MiB photograph is
-  6.3 MB in 1549 escapes for every row it scrolls. Kitty's cheaper way is to transmit once and then
-  re-place with `a=p,i=<id>` and a new source rectangle; that is the optimisation to reach for if
-  large pictures feel slow over a remote connection, and it is not done yet because it depends on
-  the terminal keeping the data under that id.
+- Each image carries an id so the terminal keeps the data rather than receiving it every frame. The
+  file is transmitted once (`a=t`), continued across several escapes above 4096 base64 characters,
+  which is what the protocol requires, and every later frame is a *placement* of it.
+- **A scroll moves a picture; it does not send it again.** Kitty replaces a placement sent again
+  with the same image id and placement id — "This can be used to resize or move placements around
+  the screen, without flicker" (`docs/graphics-protocol.rst`, *Display images on screen*) — so every
+  picture uses the one placement id `1`, and a new row, band or cell box is one small escape. Before
+  this every placement was `a=T`, which transmits and displays in one action: a 4.5 MiB photograph
+  was 6.3 MB in 1549 escapes for every row it scrolled, after deleting the old copy, which is what
+  flickered and what made a scroll feel slow. iTerm2 has no store and no placement id, so there the
+  whole file still travels with each drawing. A frame in which nothing moved sends nothing, on
+  either protocol.
+- The escape carries the **base64 the session already stores**, because that is what both protocols
+  take. A frame that only moves a picture therefore never decodes it, which a large one paid for on
+  every frame before this.
 - **No cell box for kitty when the picture fits.** Without `c`/`r` kitty draws at the image's own
   pixel size, so one pixel of the file is one pixel of screen. The layout still reserves rows, but
   from the picture's height rather than a fixed number, and as a hint only: the terminal decides the
@@ -984,19 +1002,30 @@ works offline, so it reports what a session would open with.
   (`docs/graphics-protocol.rst`, *Controlling displayed image layout*). Kitty does not stretch. The
   64×64 icon smeared across eighty columns that made us drop the cell box was observed in WezTerm,
   which implements the protocol itself; whatever it does with a box, the box is still the wrong tool
-  for a picture that already fits. What the letterboxing rule does mean is that the **assumed cell
-  size is load-bearing**: a source band and the cell box it is placed in must have the same shape, or
+  for a picture that already fits. What the letterboxing rule does mean is that the **cell size is
+  load-bearing**: a source band and the cell box it is placed in must have the same shape, or
   kitty leaves a margin and the picture looks like it has slipped against the text. `tui/image.rs`
   asserts that equality in a test rather than trusting the arithmetic.
-- **A picture is erased before it is redrawn.** Kitty keeps an image at the cell it was drawn on,
-  and ratatui only rewrites characters — it has no idea a picture is under them. So a scroll moved
-  the text but not the image, and the next frame drew a second copy at the new position: smearing.
-  Each frame now deletes the ids it drew last time (`a=d,d=i`) and draws again, which is cheap
-  because the ids are stable per transcript entry. A frame where nothing moved sends nothing, so an
-  ordinary keystroke does not flicker.
+- **A picture that leaves the screen is forgotten.** Kitty keeps an image at the cell it was drawn
+  on, and ratatui only rewrites characters — it has no idea a picture is under them — so a picture
+  that is no longer placed has to be deleted rather than left where it was: that is the smearing.
+  Leaving the screen does both in one escape (`a=d,d=I`: the uppercase `I` frees the data as well as
+  the placement), so the terminal holds only the pictures that are on screen; scrolling back sends
+  the file once more. Deleting and re-placing a picture that is still on screen is what this avoids:
+  the placement id makes it a replacement, not a gap.
+- **A transcript replaced under the pictures cannot be trusted.** An id comes from the entry's
+  position, so a resume or a `/new` can put a different picture where the last one was drawn. The
+  app marks the drawn state `stale`, and the next frame frees every id it drew and sends the new
+  ones. **A resize does the same**, because ratatui clears the screen on every size change and the
+  protocol says the clear escape deletes the images too, so what the last frame was placing no
+  longer exists; a frame in which only the rows moved is still a placement.
 - A picture is drawn only inside the transcript area, because the terminal would happily paint it
   over the editor and the status line — the other half of the smearing. Its rows are reserved in the
   layout, so the boundary is decided there and not by the escape.
+- **A menu or dialog is drawn over the pictures, not under them** (D161). The frame is written
+  before the pictures are placed, so a picture under a popup or a dialog would sit on top of it: the
+  covered rectangles are handed to the drawing pass, which cuts a band at the first covered row and
+  takes a picture off the screen when the covers reach its first row.
 - **A picture is placed while any of its rows is on screen, not while its marker line is.** The
   marker is a caption, and the first version of this had the layout skip any picture whose marker was
   outside the view, which meant scrolling a picture's caption off the top made the picture vanish
@@ -1017,8 +1046,27 @@ works offline, so it reports what a session would open with.
   screenshot is shrunk to the transcript instead of vanishing. Dropping it instead is what made two
   large images look like "only one renders": two 320×200 pictures need 23 transcript rows, and a
   real transcript has 16.
-- Cell sizes are assumed (10×20 pixels) because no terminal reports them. That decides the layout and
-  the scale factor, and the terminal decides the final pixels when it paints.
+- **A picture's size is a function of the picture and the room, and of nothing else.** The first
+  version of the band crop put a picture that fits into a cell box as soon as part of it was off the
+  screen, so a 1000×400 one was drawn at the assumed cell size while it straddled the fold and at the
+  terminal's own pixels once it was wholly visible: it looked shrunk to fit, then jumped to its
+  original size as it scrolled. `c`/`r` now follow `Fit::scaled` alone — a picture too big for the
+  room always gets the box, band or no band, and a picture that fits never gets one, the band being
+  `y`/`h`: which pixels, never how big. The layout reserves rows from the same `Fit` on the same
+  width, so the rows left for a picture and the box it is drawn in are one computation; they used to
+  differ by four columns, and in the row count at the boundary between the two.
+- **The cell size is measured, not assumed.** It decides the layout and whether a picture is scaled,
+  and the window size does not carry it, so the terminal is asked once before the screen is taken
+  over: `CSI 16 t` for the cell itself and `CSI 14 t` for the window it is a fraction of, in the same
+  place and under the same 100 ms rule as the colour question (D73, D75). A terminal that answers
+  neither keeps a 10×20 assumption, the usual shape at an ordinary font size. Without the
+  measurement the assumed cell was load-bearing in the wrong direction: a picture sized for a cell the
+  terminal does not use is drawn over the text below it, because the reserved rows were counted in
+  cells the terminal never had.
+- `SADDLE_IMAGE_LOG=<path>` records what each frame told the terminal: the area, the scroll position,
+  and every picture's id, row, box and escape, without the transmitted files. A terminal that draws a
+  picture the wrong size and an escape that asked for the wrong size look identical on screen, and
+  only the second is answerable from a file.
 - `saddle check` reports which protocol was chosen and what decided it. A terminal that draws nothing
   and a terminal that was never asked look identical on screen, so the answer has to be somewhere a
   person can read it.
@@ -1112,6 +1160,7 @@ use it.
   the way out is visible where the permissions are.
 
 **D62.** A rule is an input; the enumerated list is the authority.
+**D160 supersedes the implicit whole-home default below**, retaining explicit include enumeration.
 
 - A sandboxed command should not need saddle to know the name of every tool. The default is an
   `[[sandbox.include]]` rule: walk a base directory at startup, keep every directory that does not
@@ -2344,11 +2393,12 @@ changed came back on a model it had never used.
   with no `[agent]` table include `transcript-read`, so searching one's own conversation works out
   of the box. Existing explicit `[agent]` tables are never widened or rewritten: omitting the grant
   there still denies access, and `--revoke transcript-read` disables it for one run.
-- The host exports only the active conversation's branch, including original pre-compaction messages,
+- The host exports only one conversation's branch, including original pre-compaction messages,
   into a fresh in-memory SQLite snapshot. SQL never runs on the saved database connection. Abandoned
-  branches, other conversations, state paths, native provider blocks and image bytes are not
-  exported; what each request on the branch used is, as a second view (D94). Tool-result diffs are
-  omitted as they are elsewhere in model context.
+  branches, state paths, native provider blocks and image bytes are not exported; what each request
+  on the branch used is, as a second view (D94). Tool-result diffs are
+  omitted as they are elsewhere in model context. (D163 lets a grant name another conversation of
+  the same workspace; the export is still one branch into one in-memory database.)
 - The sole public view is `messages(ordinal INTEGER, id INTEGER, role TEXT, text TEXT)`. Roles are
   `user`, `assistant`, `tool`, `summary`; ordinal is one-based branch order. Replies include text
   and serialized tool calls; tool results include call ids and content. A clone's copied history
@@ -2875,6 +2925,14 @@ the rest of the transcript answers the same way. A summary loaded with a resumed
 therefore collapsed too, which is the case that matters most: thirty lines of it used to push the
 conversation being continued off the screen. The text is still the conversation's — selection copies
 the rendered lines (D87), and expanding is what puts them on screen.
+- **One control for the entry, and the reasoning is inside it.** A compaction is written by a model
+  that thinks, and the reasoning was drawn in full whenever ctrl+t had reasoning on — which is the
+  default. So the entry that is meant to be quietest in the transcript arrived with all of its
+  thinking laid out, and it had two toggles for one card: ctrl+o for the summary and ctrl+t for the
+  reasoning. Reasoning is part of what ctrl+o opens now, and a collapsed compaction says how many
+  lines of it there are and which key shows them. A person who has turned reasoning off keeps it
+  off — `[thinking]` is a global answer about seeing reasoning at all — and the collapsed line then
+  names ctrl+t, since ctrl+o would not reveal it.
 
 **D125.** A Responses request that fails transiently before any text or reasoning is shown gets
 one automatic recovery attempt, after a one-second wait that cancellation can interrupt (or the
@@ -3089,23 +3147,25 @@ presentation belong in guests; privileged mechanisms remain core services expose
 interfaces. Existing D66 directory declarations must be reused by their future SDK adapter, not
 copied into new roots or a second directory allowlist. Per-plugin service access remains explicit.
 
-The additive `saddle:host/transcript-read@0.1.0` interface accepts a SQL string and returns bounded
-JSON result text or an error. It requires the plugin's explicit `transcript-read` grant, the manifest
+The additive `saddle:host/transcript-read@0.1.0` interface accepts a SQL string and the conversation
+it is against, and returns bounded JSON result text or an error. It requires the plugin's explicit `transcript-read` grant, the manifest
 ceiling and the agent's same capability; neither `tool`, filesystem grants nor a sibling's grants
 supply it. The linker offers this interface only to that bounded principal. SDK bindings are not
 authority: importing a service without its grant fails before initialization. Filesystem-only
 components do not acquire a transcript dependency merely by using the SDK.
 
-`saddle::transcript` owns active-branch, in-memory query execution and is shared by the temporary
-native adapter and the standard transcript guest. It exposes no saved-database handle, session
-selector, arbitrary tables, writes or file functions. The model loop supplies only the current
-branch snapshot, including pre-compaction history, to loaded tools holding this service, and clears
-it after the call. SQL is capped at 16 KiB; results at 100 rows/50 KiB, including escaped column
+`saddle::transcript` owns in-memory query execution and is shared by the temporary native adapter
+and the standard transcript guest. It exposes no saved-database handle, arbitrary tables, writes or
+file functions; the conversation a query is against is resolved by the host, not read out of the
+SQL (D163). The model loop supplies the conversation in hand's branch snapshot, including
+pre-compaction history, to loaded tools holding this service, and clears it after the call; a query
+against another conversation of the workspace is loaded from the session's own store instead. SQL is capped at 16 KiB; results at 100 rows/50 KiB, including escaped column
 names. D92/D94/D98's authorizer, expression and execution limits still apply, with deadline and
 cancellation checks during snapshot materialization and query execution. Every dispatched query is
 decided and audited by the session's engine under the host-assigned principal and call id. Host and
-audit failures remain fatal; standalone calls report no active conversation. The guest owns the
-tool schema and result presentation, not SQL authorization or branch selection.
+audit failures remain fatal; standalone calls report no active conversation unless they name one.
+The guest owns the tool schema and result presentation, not SQL authorization or which conversation
+a selector names.
 
 **D138.** D66's tool-visible directories are available through the additive
 `saddle:host/tool-paths@0.1.0` SDK interface: bounded path resolution, byte ranges and filtered
@@ -3718,6 +3778,411 @@ notice reactivates work after restart. Tests cover pending/success/failure/timeo
 arbitration, and real success/failure/timeout jobs prompting an idle line-mode agent exactly once
 without further stdin, with output absent from notifications and inspected through the owning tool.
 
+**D160.** Commands must not enumerate the whole home directory by default.
+D62's implicit `base = "~"` rule granted unrelated personal files and checkouts merely because
+they were not in a list of known credential stores. The built-in includes now enumerate only
+`~/.cargo`, `~/.rustup` and `~/.config`. Cargo credential files remain excluded; known credential
+and browser stores beneath `.config` keep the corresponding D62 exclusions. These are useful
+configuration directories, not a promise that they contain no sensitive data. Config/state
+protection is unchanged and always enforced. Implicit bases that are symlinks are skipped rather
+than granting an unrelated target. Other toolchains and personal directories need explicit paths.
+`include-defaults = false` disables these includes, without changing grants or explicit entries.
+
+This applies to existing configurations with the default flag omitted as well as new installations;
+the host does not rewrite protected config. Explicit `read`/`write` paths and include rules remain
+in force. In particular, a user-written home include is still broad authority, not silently removed.
+When defaults are enabled, that explicit home rule retains the previous merged credential exclusions
+and depth. Separate implicit child rules are suppressed in that case so they cannot undo the home
+rule's exclusions by union. Same-base merging, no-follow enumeration and mandatory protected-path
+filtering remain as in D62; no roots or new authority mechanism are introduced.
+
+The system prompt no longer describes home as broadly readable; it lists effective command reads,
+including the enumerated includes, as `check` already does. Prompt path strings are JSON-quoted
+so filesystem names cannot introduce raw control characters into its structure. New config comments and instructions
+name the three defaults accurately. Acceptance uses the same shipped bash artifact: toolchain and
+allowed config files are readable, personal Pictures/Documents/other-checkout/unknown-dotdirectory
+files and credential/config-state files are not, a protected explicit directory entry enables a
+personal read, and revocation denies it again without rebuilding or repinning. File-tool authority
+is not lent by a command-only entry. Tests also cover implicit symlink bases and preservation of
+exclusions in explicit home includes.
+
+**D161.** A picture is never drawn where a menu or a dialog is.
+
+The transcript's pictures are placed after the frame, and the terminal paints them over the cells
+the frame wrote. A `/` or `@` popup, or a dialog that owns the screen, is therefore covered by any
+picture whose rows it overlaps — the menu is drawn and then disappears under the image.
+
+The frame now reports what it covered: `draw_menu` pushes the rectangle it cleared, and a drawn
+surface (`resume`, `tree`, `settings`, `permissions`, `themes`, `login`) pushes the whole screen.
+The drawing pass cuts a picture's band at the first row a rectangle covers (`image::Window` already
+crops from the top, so this is the same `from`/`rows` pair with a smaller `rows`), which keeps the
+part of a large picture above a menu visible. A picture the rectangle reaches from its first
+visible row has nothing to show, so its placement is taken off and the terminal's copy of the data
+kept (`a=d,d=i`): closing the dialog puts it back with a placement instead of sending the file
+again. Data is still freed when the picture leaves the transcript altogether, so what the terminal
+holds stays bounded by the screen.
+
+iTerm2 has neither a data store nor a delete, and draws a picture as the content of cells: only
+writing over it takes it off. A frame in which the covered rectangles changed is therefore painted
+over a cleared screen, which is one full repaint, once per menu or dialog, and the picture is gone.
+That repaint happens on the frame after the change, because the coverage is known only once the
+frame is drawn; the cost is one frame in which an iTerm2 picture still sits over the dialog it is
+on, and no such frame on kitty, where the delete escape is in the same write. Kitty gets no repaint
+at all, and must not: the protocol says the clear escape deletes the images the terminal holds, so
+clearing to hide one would throw away every other picture on the screen.
+
+**D162.** A request carries only as many pictures as the provider will take.
+
+Every request sends the whole conversation, and a conversation keeps every picture it was ever
+shown. A long enough one therefore asks for a body over the provider's limit — Synthetic answered
+past 100 MB — and from then on *every* request failed, the failing one included: the conversation
+could not be continued, and resuming it failed the same way. Dropping the pictures from the stored
+session would make it readable again at the cost of the transcript the person actually saw, so the
+trim happens to the request only.
+
+`[tool-limits] request-image-bytes` (32 MiB of base64, reloadable like every other budget) bounds
+the pictures in one request. `provider::within_image_budget` walks the conversation from the newest
+item back, keeps pictures while they fit, and replaces each one that does not with a line naming it:
+`[picture shot.png (1280×720) was not sent: this request carries the newest pictures, up to 32 MiB]`.
+The items that were stored, the transcript and the saved conversation are unchanged, so the model is
+told what exists and what it was not shown, and compaction still owns the context length.
+
+The person is told once per turn, not once per request, that older pictures were left out. If a
+provider still answers that the body is too large — a limit lower than the default, or text that
+fills it on its own — the request is made once more with half the budget before the turn fails,
+because the failure that started this was one that no later attempt could recover from.
+
+Tests cover the newest-first trim, the note in a tool result that lost its picture, the unchanged
+path when everything fits, and the recognition of a 413 and of a context-length error as different
+failures. The budget is a request-shaping rule, not a permission: no grant changes and no path is
+involved.
+
+**D163.** A session reads this workspace's other conversations unless its grant says otherwise.
+
+D92 made `session_query` a query of the conversation in hand, and a person with two sessions in one
+directory had no way to ask the second what the first had established. The conversations of one
+directory are one person's work, so the grant now says which of them it covers, and the default is
+all of them.
+
+`transcript-read` keeps its shape and gains one optional field:
+
+```toml
+transcript-read = {}                          # every conversation of this workspace: the default
+transcript-read = { sessions = "self" }       # only the conversation in hand, as D92 had it
+```
+
+A bare grant means the workspace, so the first-run defaults need no new syntax and an existing
+config keeps working; a person who wants the old reach adds one word. `saddle check` and
+`/permissions` print which one is in force, because a grant that reads more than it used to is
+worth seeing. `--revoke transcript-read` still removes the grant for one run.
+
+The decision is still the engine's, per call: `Request::TranscriptQuery` now carries whether the
+query is against another conversation, and the engine refuses that one when the grant is
+`self`. Delegation copies the field and narrows it: a plugin or a standard tool profile may read
+another conversation only when the agent's own grant covers the workspace, and an omitted field on
+either side is the narrow one.
+
+**What a query reaches.** Only the conversations of the *same workspace* — the store that is opened
+is the one for this workspace, and its listing is filtered by workspace path, so a query cannot name
+a session saved somewhere else at all. A query is against one conversation: absent a selector it is
+the one in hand, which is what the agent already snapshotted; a selector is an id or a unique prefix
+from a new `sessions(id, name, title, model, updated, messages, forked_from)` view, resolved the way
+`saddle session` resolves one, so a prefix that names two conversations is an error rather than a
+guess. The four views are still built into a fresh in-memory database per call, and the saved
+database is still never handed SQL.
+
+**What a refusal reveals.** With `sessions = "self"`, a selector is refused before it is resolved and
+the workspace is not listed: the error says the principal may read only this conversation, not how
+many others exist or what they are called. The `sessions` view lists only the conversation in hand
+in that case, so it cannot be used to enumerate either.
+
+**Audit.** The same `transcript-read` decision as before, now with `session` naming the conversation
+the query was against, resolved when the grant allows the workspace, and `others` saying whether it
+was another one. A refusal records the selector as it was asked for, because resolving it first
+would say whether it exists.
+
+**Bounds.** One conversation is loaded per query, as before: the row, byte, step and deadline limits
+are unchanged, the SQL string is checked against `query-bytes`, and the session selector against
+`directory-name-bytes`. A second store connection is opened for the session when a query needs one
+the agent did not snapshot; it only lists and loads, and the agent's own connection still does every
+write.
+
+Acceptance is through the binary (`crates/saddle/tests/agent.rs`): one run saves a conversation, a
+second run reads its messages by id and sees it listed in `sessions`; the same two runs with
+`sessions = "self"` get a denial that names the narrowing, and the audit says which conversation was
+asked for and whether it was another one. Delegation narrowing, the parser's handling of a bare and
+a narrowed grant, and the resolver's exact/prefix/ambiguous cases are unit-tested.
+
+**D164.** A turn that ends while the person is not looking is announced. `[ui] notify` chooses how:
+`bell` (the default), `osc9` or `osc777` for a desktop notification the terminal draws, or `off`.
+Whether anyone is looking is the terminal's focus, reported once the TUI turns on mode 1004 with
+its other modes. Until the terminal reports focus it is treated as unfocused, because a terminal
+that never reports would otherwise never announce anything, and one extra bell is the cheaper
+mistake. The announcement goes out when a turn ends and leaves the session idle, so a queued prompt
+that starts the next turn at once is not announced, and neither is a cancelled turn, since the
+person who cancelled it is present. A session that stops on a fatal error is announced too. The
+notification's title is `saddle` and the workspace's directory name, with control characters
+removed and, for OSC 777, `;` replaced, so a directory name cannot end the sequence or start
+another. Under tmux an OSC goes through tmux's passthrough as OSC 52 does; the bell is sent as it
+is, since tmux passes a pane's bell on. Line mode does not announce: it runs without the TUI's
+terminal modes, so it cannot tell whether anyone is looking.
+
+**D165.** A formula in the transcript is typeset by Typst and drawn with the terminal's graphics
+protocol: a block of its own at one image pixel per screen pixel, in the rows the layout reserved for
+it, and one inside a line of text in cells of that line, on its baseline.
+
+- The two media that need no graphics protocol were considered and are not enough. Unicode glyphs on
+  the character grid cannot scale a glyph or place it off the grid, so a fraction comes out `a/b` and
+  a radical `√(x)`: substitutions, not typesetting. Braille gives 2×4 dots per cell — a quarter of
+  the screen's pixels — so a formula drawn that way is a picture of a picture. A terminal that speaks
+  the protocol has the real thing available, and WezTerm does.
+- **Typst, in-process, with the fonts bundled** (`typst`, `typst-assets`'s New Computer Modern):
+  no external binary, no system font, no authority, and the same formula looks the same on every
+  machine. It is a large dependency and that is the price of TeX-quality layout rather than a drawing
+  of one; the alternative, shelling out to `typst` or `latex`, would make the interface depend on a
+  toolchain and on `exec`.
+- `$…$` and `$$…$$` arrive already parsed (`Options::ENABLE_MATH`), which is also Typst's own
+  delimiter. LaTeX spelling is translated to Typst's math syntax by `tui::math::latex` —
+  `\frac{a}{b}`, `\sqrt[3]{x}`, `\begin{pmatrix}…\end{pmatrix}`, `\alpha`, `\text{…}`, `\left(…\right)`
+  — so both notations work and text already written the Typst way passes through. A command the
+  front-end does not know, or a formula with no legible room left, is drawn as its **source**, never
+  as something wrong.
+- **A letter run is letters.** LaTeX has no multi-letter variable: `dx` is `d` times `x`, while Typst
+  reads it as a name that does not exist and refuses the whole formula — which is how the first
+  integral anyone writes came out as its source on the first day of this decision. So the body is
+  tried as written (that is the form Typst's own spellings need) and, only if Typst refuses it,
+  tried again with every multi-letter run separated: `d x` is `dx` set as TeX sets it, because a
+  space in math is not drawn. A run that is a call (`frac(`), the member of a dotted name
+  (`epsilon.alt`), a name Typst has or this file emits (`alpha`, `Omega`, `delim`) or inside a quoted
+  string is left alone, and a name wrongly kept costs the source while a name wrongly split would
+  draw letters. `\ll` and `\gg` are symbols like any other (`lt.double`, `gt.double`), because that
+  is how physics is written.
+- **An environment is all or nothing.** A matrix or a `cases` with one cell this front end cannot
+  translate refuses the whole environment rather than leaving that cell blank: a matrix with a hole
+  in it is a formula drawn wrong, and the rule is that what cannot be drawn is drawn as its source.
+  A missing `\ll` is how that was found — inside a cell, an unknown command used to disappear
+  instead of failing.
+- Two words must not run into one: `n`, `\to`, `\infty` is `narrow.rinfinity` without a separator,
+  which is a name that means something else. The translator tracks whether the last thing written
+  was a name or a character and inserts a space only where two names would otherwise touch.
+- **A growing delimiter grows by itself**, so `\left(` and `\right)` only name the bracket they
+  contribute and `\left.` contributes none. `\{`, `\}`, `\|` and the angle and floor brackets are
+  written as the symbols that draw them (`brace.l`, `bar.v.double`, `chevron.l`, `floor.l`), since
+  Typst's `{` is grouping and its `%`, `#` and `$` begin a comment, code or interpolation.
+- **The size comes from the cell the terminal measured at startup** (D59). A display formula is laid
+  out a shade larger than the text and shrunk only when the width or a row cap demands it, so one
+  image pixel is one screen pixel, the terminal never scales it, and the rows reserved for it are
+  exactly its height. That is the difference between this and an attached screenshot, whose size the
+  layout can only guess at.
+- **What is matched is the lowercase letters, not the em.** A monospace face carries a much larger
+  x-height than New Computer Modern, so a formula set at the text's em reads as smaller than the
+  prose beside it — which is how the first version of this came out a shade too small on the
+  terminal it was written for, and why the em is not the thing to match. A fifth larger than the
+  text's em is the correction, and `[ui] math-scale` multiplies it: 1.0 is what the fonts and the
+  cell give, 1.2 a fifth larger, and anything outside half to four times is held to that rather
+  than drawn illegibly or off the screen. A differently sized formula is a different picture, so
+  the scale is part of the cache key.
+- **A formula is placed in a cell box, always.** A picture that fits is otherwise handed to the
+  terminal at its own pixel size (D59), which is the size the layout reserved only when the cell
+  saddle measured is the cell the terminal really has — and that depends on a question the terminal
+  may not answer at all, on a display whose scale nobody tells saddle about. The first version of
+  this was therefore a third of the size it should have been on the machine it was written for. A
+  formula has no size of its own to preserve: the rows the transcript reserved are its size, so it
+  always carries `c=`/`r=` and the terminal scales it into the grid it actually has. What is left
+  depending on the measurement is the resolution of the raster and the cell's width-to-height
+  ratio, neither of which changes how big it looks. `saddle check` prints the cell and whether the
+  terminal is the one that said so.
+- **The picture is finer than the box and padded inside it.** Two things the first version got wrong
+  on a real terminal: the raster was only as fine as the cell saddle had, so the terminal enlarged it
+  and the glyphs came out soft — it is now rasterised at twice that and scaled into the same box, so
+  the extra pixels cost bytes rather than size (a typical formula is 10–16 KB, sent once); and the
+  glyphs sat flush with the edge of the box, so a fraction's denominator touched the line below — the
+  page carries 1pt of room above, 7pt below and 2pt beside, which is inside the cells the layout
+  reserves, so the padding is part of the formula's height rather than something the transcript has
+  to know about. It is asymmetric because a formula's line box already leaves the room its ascenders
+  need — padding above is added to a gap that is there, and 3pt above read as a hole under the
+  previous line on a real terminal — while below is where the room is wanted: descenders hang into
+  it, and a formula is a block that the text after it has to be separated from.
+- **A formula takes the block break without its blank row.** A picture's ink starts at the very top of
+  its box, where a paragraph of text has its own line leading filling the row: the blank row a block
+  break puts above the next block therefore reads as a hole above a formula and as ordinary spacing
+  above a paragraph — the same gap, twice reported as too large on a real terminal. So a formula
+  removes the blank row the break just added, and the room inside the picture (7pt below, 1pt above)
+  is the separation instead. The text that follows still gets its own blank row, because that comes
+  from the paragraph after it.
+- **A formula is not an entry.** It is inside a message, whose rows are wrapped and shifted before
+  they are drawn, so what the layout leaves behind is a private-use marker: the drawing pass finds
+  the marker, blanks what it took — a whole row for a block, a run of cells for a formula in a line —
+  and places the picture there under the id its entry and position give it.
+  From there the picture is an ordinary one — transmitted once, moved rather than sent again, cropped
+  at the fold, hidden under a dialog, freed when it leaves the screen (D59, D161). A block's marker
+  is its own row and the picture starts on the row below it, so its last row is the row the next
+  block starts on — what keeps the two apart is the 7pt of room inside the bottom of the picture,
+  which is part of why that room is there and not a number to reduce without looking at what follows
+  a formula.
+- **Setting is drawing, and the drawing is not the conversation.** The picture exists for the frames
+  of one terminal: the message keeps its Markdown, the store keeps its rows, `session_query` returns
+  the text, a selection copies the TeX the picture was drawn from (D166), and the request a provider
+  is sent carries the TeX unchanged. No
+  formula ever becomes an image part — the only pictures in a request are the ones a person attached
+  (D58, D162) — so a model reads its own earlier formula back as source, and a test holds that at
+  each of the three renderers. The prompt says so in as many words, because the same fact decides how
+  a formula is written: a formula, not a description of one.
+- **A formula inside a line takes cells of that line.** There are no rows to reserve, so what it gets
+  instead is cells of the row it is in: the layout leaves a run of the marker and one filler per cell
+  (private-use characters, one cell wide and not whitespace, so the wrapper measures the run as a word
+  and cannot break inside it), and the drawing pass finds the marker anywhere in a row, blanks the run
+  and places the picture at the column it ended up at. A run that does not fit where it was written
+  moves to the next row whole, with the words around it, which is what makes a sentence with a formula
+  in it wrap like a sentence. Three cases are left to the source: a terminal with no graphics
+  protocol, a cell of a table, whose columns are fitted rather than wrapped and therefore have no run
+  a picture could sit in, and a formula wider than three quarters of the transcript, which is a
+  display formula written inline and cannot be sure of a whole row once a list's indent has taken
+  some of it.
+- **An inline formula is one row tall, on the row's baseline.** That is where the words beside it are
+  set, and it is not the middle of the row: `x` has nothing below the baseline at all, and `y` has
+  everything. No terminal answers a question about where its font puts the baseline inside a cell, so
+  it is an assumption of the same kind as the cell itself (D59) — three quarters of the row, wrong by
+  a pixel at worst, and the number to move if a formula reads high or low beside its line. What is
+  not assumed is where the baseline is *inside the picture*: the page carries an invisible zero-width
+  strut whose baseline is a fixed distance down, and a page exactly twice that distance tall has its
+  baseline exactly that far from the top whatever the formula's ink does. The ink is then found in
+  the raster, which gives the formula's own ascent and descent from that baseline, and the box is the
+  smallest one that holds the ink either side of it — and no smaller than the size the prose beside
+  it is matched at, a line of points divided by the same x-height correction a display formula gets,
+  because what is matched is the lowercase letters and not the em. A formula whose ink needs more
+  than that is drawn smaller, as TeX's text style draws a fraction smaller, and one that would have
+  to be shrunk past `FLOOR` to fit a row is left to its source: a fraction of a fraction, a sum with
+  its limits, anything set on three lines. One fraction is one line's worth and is drawn as one.
+- **The picture is the box's shape exactly.** A terminal fits an image into the cells it is asked for
+  and preserves its proportions, so a picture whose shape is not the box's is shrunk on one axis and
+  left short of the row — which for an inline formula means its baseline is no longer three quarters
+  of the way down and it floats above the words. So the cells are the width rounded up, the raster is
+  taken at the density a line of text would give it (a formula shrunk to fit arrives with more pixels
+  than it is drawn at, which is sharpness rather than size), and the difference between the formula's
+  own width and those whole cells is transparent columns, split evenly so that neither word beside it
+  is the one that gets the gap. Typst's inline mode — `$…$` with the delimiters against the body —
+  is the other half of why it fits: limits are side-set there, as in TeX's text style.
+- **The delimiters are rewritten before the parser reads them.** `pulldown-cmark` knows `$x$` and
+  `$$x$$` and nothing else, and it reads the two spellings a person writing by hand reaches for first
+  as prose — necessarily, because a dollar with a space inside is what money looks like, and the
+  backslash of `\(x\)` is an escape that is gone before a maths layer could ever see it. The first
+  version of this therefore drew nothing for `\(x\)` or `$ x $`, which is exactly what was reported
+  from a real terminal. So the text is rewritten into the parser's own spelling before it is parsed:
+  `\(…\)` to `$…$`, `\[…\]` to `$$…$$`, and a padded `$ … $` to `$…$` when what it holds reads as
+  maths — TeX in it, or else one word of symbols — and left alone when it does not, so `costs $5 and
+  $10` stays money. Fenced blocks and spans between backticks are copied through, because code is
+  what someone asked to be read exactly as written — a fence line as a *whole line*, because read as
+  an inline span its backticks open one that never closes, and the rest of the message is then
+  copied through unread: that is what left the one formula after a code block as its source on a
+  real terminal, and a backtick with no partner is treated the same way. The rewrite is presentation
+  like the rest of this: what is stored, copied and sent is the text as it was typed, delimiters and
+  all.
+- A terminal with no graphics protocol gets the source for every formula, since a picture there would
+  be a marker and nothing else.
+
+**D166.** A formula copied from the transcript is the TeX it was drawn from, in TeX's own delimiters.
+- **The cells under a picture hold nothing.** A drag over a formula copied the blank cells the
+  terminal drew it over, so a derivation could not be moved out of the transcript — and being moved
+  into a paper is the one thing a rendered formula is for besides being read. The
+  drawing pass already knows every picture's row, column and cells, so it hands them on with the TeX
+  (`Seen` carries a `Source` per formula) and the copy walks a row's characters, replacing the cells
+  of each formula it meets with the source. Copy and placement come from the same `At` entries, so
+  they cannot disagree about where a formula is.
+- **A formula is copied whole or not at all.** A drag across part of one takes all of it: half a
+  matrix is not a matrix, and the cells a formula took are blank, so a partial copy could only be
+  spaces. A run the selection misses entirely stays what it is on screen.
+- **The delimiters are TeX's own.** `\(…\)` inside a line and `\[…\]` as a block, because what
+  the copy is for is a paper — `amsmath` discourages `$$`, a plain TeX construct — and because these
+  are exactly the spellings the rewrite before the parser already accepts (D165), so a copy pasted
+  back into saddle is drawn again rather than read as prose. The stored conversation keeps whatever
+  was typed, `$$…$$` and `\[…\]` included: what a copy takes is the text that was *drawn*, in one
+  canonical spelling, not the text that was saved.
+- **A block's source goes where the block begins, and its empty rows are dropped.** The rows of a
+  block's box below the first hold the picture and nothing else, so the copy puts the source on the
+  box's first row and leaves those rows out, and a paste has no gap in the middle of it. A drag that
+  begins part-way down a block begins on one of those rows, and that copy puts the formula at its
+  start rather than losing it — the box's rows are blank, so extending the row's width to the cells a
+  formula covers is what lets a drag reach it at all. One empty row is copied after it, because a
+  display formula is a paragraph of its own in what it is pasted into and the rows that separated it
+  from the text below are rows the box took.
+- **The source travels with the copy, not with the picture.** The cache is keyed by the translated
+  formula (D165), so two spellings that typeset alike share one raster; the source is set on the
+  formula handed out, so each copy gets the spelling it came from.
+- **Nothing else changes.** An attached picture has no source in the conversation, so a copy of it is
+  the row it was announced on and nothing more; a terminal with no graphics protocol already shows
+  the source, and a copy of that is the text that is there, with no delimiters added around it.
+
+**D167.** The branch a move in `/tree` leaves behind is summarized only when the person says so.
+- **A summary is a model request, and it was being spent unasked.** Choosing a point in `/tree` moved
+  the conversation and then, whenever what it left had produced a reply or tool output, sent that to
+  a model for a note on the new branch — one request, silently, on every branch switch. The move is
+  the person's decision and is made before the question is asked; the request is not. The tree asks
+  first: `y` moves and summarizes, `n` moves without, and escape (or ctrl+c, which puts every other
+  dialog away) leaves the conversation where it is, because nothing has happened yet to undo.
+- **The question is asked only when there is something to summarize.** The rule the summary itself
+  used decides it: at least one reply or tool result among the messages the move leaves behind, which
+  is what the tree counts from the rows it already has (a child is always created after its parent,
+  so the messages the new branch does not keep are the ones on the active branch with a later node).
+  The count is in the question, and a move that steps over prompts or continues from the last reply
+  asks nothing at all.
+- **Declining loses nothing but the note.** The abandoned branch stays in the tree, active or not, and
+  can be chosen again; what is skipped is the sentence about it on the new branch. Saying yes after a
+  move is therefore not offered, because it would mean asking a second question about something no
+  longer on screen.
+- **The answer travels with the command.** `Rewind` carries whether to summarize rather than the
+  agent deciding, so there is one place where a request is spent and it is the one the person
+  answered. An empty abandoned set, or a summary the model answers `NONE` to, still spends nothing
+  beyond the request that was agreed to.
+
+**D168.** The tree is a screen of its own, and the ends of its branches are one key apart.
+- **Full screen rather than a window.** It was a rounded box at most 96 columns wide and 14 rows
+  holding every message in the session, so a long conversation was a scroll inside a scroll and the
+  rest of the screen was transcript the box already covered. It takes the whole frame now: a title
+  row, the list in every row the title and the footer rows leave, a counts row and two key rows. It
+  is a mode rather than a box — the rows it has are what a page and the scroll offset are measured
+  in, so the drawing pass tells the tree its height on each frame instead of a constant deciding for
+  it, and the list fills the screen even where it has nothing to say, which is also what stops the
+  transcript showing through between its rows.
+- **The branch ends can be walked.** A leaf — a message nothing follows — is where a branch can be
+  continued from, and a session with several had no way to reach one but paging through the others.
+  The tree can move to the next and previous end, without wrapping, as the prompt jump does: at the
+  last end there is nothing further to reach. Jumping moves the keyboard only; enter still decides
+  what happens at the row it lands on. There is **no default key** for it: a binding is a person's,
+  and the tree takes one from `[keys]` (D169) or offers the move to nobody.
+- **An end is a message no other message names as its parent**, counted over every message and not
+  only the rows a filter shows: a prompt with a reply behind it does not end a branch, so turning on
+  prompts-only cannot invent ends — and may leave none to jump to, which is the honest answer.
+- **What a drag copies is the tree's own lines** (D87), which is now the whole screen, and the title
+  says when the filter is on while the counts row says how many ends there are, so the key's effect
+  is legible before it is pressed.
+
+**D169.** The one move with no default key is bound in `[keys]` in `config.toml`.
+- **Not a keybinding layer.** Every key saddle has is part of what a mode is: up and down move,
+  enter chooses, escape closes, and each mode prints its own keys in its footer. That is cheaper
+  than a file that has to agree with them, and it means the footer cannot lie. pi needs a
+  configurable layer because it has several modes to keep distinct; saddle answers the same question
+  with a line of text, and a key nobody can find in the footer is a key nobody uses.
+- **The exception is a move with no default at all.** Moving between the ends of the branches
+  (D168) is such a move: saddle will not take a key for it unasked, because a key that changes where
+  the keyboard lands is a person's to choose, and a default would also have to be taken from a key
+  something else wants. So it exists only if `[keys]` gives it one — `tree-next-end`,
+  `tree-previous-end` — and with no `[keys]` table there is no such key.
+- **A key is written the way a footer would say it**: `ctrl+n`, `alt+j`, `shift+tab`, `f5`,
+  `page-up`, `space`, `enter`, or one character. A modifier named is one required; a shifted letter
+  is stored as the capital, because that is what a terminal sends. The spelling is normalised, so
+  what the footer prints is the canonical form and can be reported back.
+- **A spelling this build does not know is an error in the file**, with the text of the line in the
+  message, on the same principle as a misspelt `[sandbox]` tool name (D66): a key that silently
+  never fires is worse than a config that will not load.
+- **The footer names the key only when there is one**, and the counts row says how many ends exist
+  either way, so the state is legible without the file. `/reload` reads the table again; the next
+  tree opened takes it, since a key is not something to change under a moving selection.
+- **What this is not**: no arbitrary command binding, no per-mode remapping of the keys a mode
+  already has, and nothing outside `/tree`. Adding another entry is a small change to this table
+  when a second move earns one; a general layer is a feature with its own decisions, and this is
+  not it.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
@@ -3824,7 +4289,9 @@ read bindings under a write capability must never let that principal read a file
   of untrusted artifacts; D127 caps input bytes but fuel/epochs bound execution, not the compiler.
 - `exec` on macOS through Seatbelt.
 - A mount namespace with read-only bind mounts for reserved paths and empty mounts over excluded
-  paths, replacing the D20 snapshot and making `exclude` bind `exec`.
+  paths, replacing the D20 snapshot and making `exclude` bind `exec`. The same view is the only way
+  to hide a path no sandbox list names, and with it the `stat` a command can do outside its grants
+  (§9).
 - Tracking child processes by cgroup. A child that calls `setsid` leaves its process group and
   survives the group kill in D19.
 - An external append-only sink for the audit log.
@@ -3855,3 +4322,22 @@ read bindings under a write capability must never let that principal read a file
 - The component model toolchain moves. A pinned version is a schedule dependency, not a detail.
 - The sandbox depends on a list of system paths (D19). A tool that needs a path outside the list fails
   with a permission error that looks like a bug in the tool.
+- **Landlock does not decide metadata, so a command can look at paths no grant names.** Its
+  filesystem rights cover opening, creating, removing, renaming, linking, executing, truncating and
+  device ioctls; `stat(2)` and the rest of the metadata family are outside every ABI, and so are
+  `chmod(2)`, `chown(2)`, `utime(2)` and `setxattr(2)`. A sandboxed command can therefore tell that
+  `~/Documents/taxes.pdf` exists, how large it is, who owns it and when it changed, and can change
+  the mode or times of any such file the user owns, without a grant naming it. Measured in this
+  sandbox: `stat /var`, `stat /opt` and `stat ~/.bashrc` all answer, `chmod 664 ~/.bashrc` and
+  `touch -c ~/.bashrc` both succeed, while `ls /var` and `ls ~` are refused — the directory read and
+  the file read are the parts landlock does cover. seccomp cannot close this: a filter sees syscall
+  arguments, not the path a pointer names, and refusing `stat` outright breaks every program (the
+  kernel's own documentation says the same about user-space sandbox managers and races). The fix is
+  the deferred mount-namespace view: a command's own root built from the same read and write lists,
+  so a path outside them does not exist to be looked at. It has to be built *before* the landlock
+  ruleset is applied, because a landlocked thread may not call `mount(2)` or `pivot_root(2)` at all,
+  and it needs a user namespace for every command rather than only a networked one — which makes the
+  unprivileged-userns switch a dependency of confinement rather than of `net`. Mount propagation in
+  a user namespace (locked mounts, `MS_PRIVATE` on an inherited root) is the part to get right and
+  test on the target kernel; a failure there must leave the command as it is today, not run it
+  unconfined.

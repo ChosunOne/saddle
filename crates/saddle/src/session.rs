@@ -49,7 +49,7 @@ use crate::plugins::hooks::Queue as EventQueue;
 use crate::plugins::services::State as ExtensionState;
 use crate::plugins::{Entry as PluginEntry, HostFailure, Registry as PluginRegistry};
 use crate::provider::ToolDef;
-use crate::store::Snapshot;
+use crate::store::{Snapshot, Store};
 use crate::tasks::{self, Tasks};
 
 /// The header a workspace's own grant file starts with. Empty of grants on purpose: its presence
@@ -559,6 +559,9 @@ pub struct Session {
     /// A host-built, branch-only snapshot, supplied by the agent for one query (D92, D94).
     pub query_snapshot: Option<Snapshot>,
     pub query_conversation: Option<String>,
+    /// This workspace's saved conversations, opened the first time a transcript query needs one
+    /// the agent did not snapshot (D163). Read-only in use: the agent's own store does the writing.
+    transcripts: Option<Store>,
     _tmp: PrivateTmp,
 }
 
@@ -609,12 +612,19 @@ impl Session {
             .map(|(name, path)| Ok((name.clone(), fs_access::root(path)?)))
             .collect::<Result<_>>()?;
         let plugins = PluginRegistry::new(setup.plugins.clone());
-        let host_env: Vec<(String, String)> = env::vars().collect();
+        let user = UserConfig::load(&setup.paths.user_config()).unwrap_or_default();
+        // D19: a variable that may hold a provider key never reaches a child, even when an exec
+        // grant names it. This is the one place the environment is read, so every later copy (the
+        // MCP registry's, a command's, a plugin's) starts without them, whichever subcommand opened
+        // the session.
+        let secrets = provider::secret_env_names(&user.providers);
+        let host_env: Vec<(String, String)> = env::vars()
+            .filter(|(name, _)| !secrets.contains(name))
+            .collect();
         // D108: the servers this policy grants, and the tables that declare how to start them. A
         // granted server with no table is not an error here: `saddle check` says so, and the first
         // search reports it once.
         let mcp = {
-            let user = UserConfig::load(&setup.paths.user_config()).unwrap_or_default();
             let grants = policy
                 .grants(&Principal::Agent)
                 .map(|g| g.mcp.clone())
@@ -643,6 +653,7 @@ impl Session {
             mcp,
             query_snapshot: None,
             query_conversation: None,
+            transcripts: None,
             _tmp: tmp,
         };
         // Managed directories are pinned separately from policy-addressable roots (D138).
@@ -659,6 +670,20 @@ impl Session {
         session.plugins = plugins;
         loaded?;
         Ok(session)
+    }
+
+    /// The saved conversations of this workspace (D163).
+    ///
+    /// A second connection to the same database, opened on demand: the agent's store is on the
+    /// agent thread and this one is read by a query, and WAL lets a reader in while a write is
+    /// happening. It only ever lists and loads: no query reaches the database itself.
+    pub fn transcript_store(&mut self) -> Result<&Store> {
+        if self.transcripts.is_none() {
+            let store = Store::open(&self.setup.paths.session_db(), self.setup.workspace.clone())
+                .context("opening the saved conversations")?;
+            self.transcripts = Some(store);
+        }
+        Ok(self.transcripts.as_ref().expect("opened just above"))
     }
 
     pub fn roots(&self) -> &Roots {

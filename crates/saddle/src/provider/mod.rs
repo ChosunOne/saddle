@@ -163,6 +163,176 @@ pub enum Item {
     Summary(String),
 }
 
+/// What one request left out of the conversation's pictures (D162).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Omitted {
+    /// How many pictures were replaced by the note that says they were there.
+    pub pictures: usize,
+    /// The base64 bytes those pictures come to.
+    pub bytes: usize,
+}
+
+/// The conversation as one request may carry it, or `None` when every picture fits (D162).
+///
+/// A conversation keeps every picture it was ever shown, and each request carries all of them: a
+/// long enough conversation asks for more than a provider will accept in one body, and then nothing
+/// can be sent at all — not even the turn that was just typed. Past `budget` bytes of encoded
+/// pictures the older ones are replaced by a line saying they were there, keeping the newest, which
+/// are the ones the turn is about. Nothing stored changes: the transcript and the saved session
+/// keep their pictures, and only the request is thinner.
+pub fn within_image_budget(items: &[Item], budget: usize) -> Option<(Vec<Item>, Omitted)> {
+    if image_bytes(items) <= budget {
+        return None;
+    }
+    let mut left = budget;
+    let mut omitted = Omitted::default();
+    let mut out: Vec<Item> = Vec::with_capacity(items.len());
+    for item in items.iter().rev() {
+        out.push(trimmed(item, budget, &mut left, &mut omitted));
+    }
+    out.reverse();
+    Some((out, omitted))
+}
+
+/// The base64 bytes the pictures in `items` come to.
+fn image_bytes(items: &[Item]) -> usize {
+    items.iter().map(item_image_bytes).sum()
+}
+
+fn item_image_bytes(item: &Item) -> usize {
+    match item {
+        Item::Attached { images, .. } => images.iter().map(|i| i.data.len()).sum(),
+        Item::ToolResults(results) => results
+            .iter()
+            .flat_map(|r| &r.images)
+            .map(|i| i.data.len())
+            .sum(),
+        Item::Assistant(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                Part::Image(image) => Some(image.data.len()),
+                _ => None,
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn trimmed(item: &Item, budget: usize, left: &mut usize, omitted: &mut Omitted) -> Item {
+    match item {
+        Item::Attached { text, images } => {
+            let (kept, notes) = keep(images, budget, left, omitted);
+            Item::Attached {
+                text: with_notes(text, &notes),
+                images: kept,
+            }
+        }
+        Item::ToolResults(results) => Item::ToolResults(
+            results
+                .iter()
+                .map(|r| {
+                    if r.images.is_empty() {
+                        return r.clone();
+                    }
+                    let (kept, notes) = keep(&r.images, budget, left, omitted);
+                    let mut r = r.clone();
+                    r.content = with_notes(&r.content, &notes);
+                    r.images = kept;
+                    r
+                })
+                .collect(),
+        ),
+        Item::Assistant(parts) => Item::Assistant(
+            parts
+                .iter()
+                .map(|p| match p {
+                    Part::Image(image) if image.data.len() > *left => {
+                        *omitted = Omitted {
+                            pictures: omitted.pictures + 1,
+                            bytes: omitted.bytes + image.data.len(),
+                        };
+                        Part::Text(omitted_note(image, budget))
+                    }
+                    Part::Image(image) => {
+                        *left -= image.data.len();
+                        Part::Image(image.clone())
+                    }
+                    other => other.clone(),
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn keep(
+    images: &[Image],
+    budget: usize,
+    left: &mut usize,
+    omitted: &mut Omitted,
+) -> (Vec<Image>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut notes = Vec::new();
+    for image in images {
+        if image.data.len() <= *left {
+            *left -= image.data.len();
+            kept.push(image.clone());
+        } else {
+            omitted.pictures += 1;
+            omitted.bytes += image.data.len();
+            notes.push(omitted_note(image, budget));
+        }
+    }
+    (kept, notes)
+}
+
+fn with_notes(text: &str, notes: &[String]) -> String {
+    if notes.is_empty() {
+        return text.to_owned();
+    }
+    if text.is_empty() {
+        return notes.join("\n");
+    }
+    format!("{text}\n{}", notes.join("\n"))
+}
+
+fn omitted_note(image: &Image, budget: usize) -> String {
+    format!(
+        "[picture {} ({}×{}) was not sent: this request carries the newest pictures, up to {}]",
+        image.name,
+        image.width,
+        image.height,
+        human_size(budget)
+    )
+}
+
+/// A byte count as a person reads it, for the note about a picture that was not sent (D162).
+pub fn human_size(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        return format!("{} MiB", bytes / (1024 * 1024));
+    }
+    format!("{} KiB", bytes.div_ceil(1024))
+}
+
+/// Whether a request failed because its body was over the provider's limit (D162).
+///
+/// The status is the reliable part; the phrases are what the compatible servers put in the message.
+pub fn is_too_large(message: &str) -> bool {
+    let m = message.to_lowercase();
+    m.contains("returned 413")
+        || [
+            "payload too large",
+            "request entity too large",
+            "request too large",
+            "entity too large",
+            "content too large",
+            "body too large",
+            "request size",
+        ]
+        .iter()
+        .any(|phrase| m.contains(phrase))
+}
+
 /// human-only removal of the authenticated outer plugin frame; stored/model content stays framed.
 pub fn visible_tool_text<'a>(text: &'a str, provenance: Option<&Provenance>) -> &'a str {
     let Some(origin) = provenance else {
@@ -234,11 +404,6 @@ impl Image {
             height,
         })
     }
-
-    /// The bytes back, for drawing them (D59).
-    pub fn bytes(&self) -> Option<Vec<u8>> {
-        base64_decode(&self.data)
-    }
 }
 
 /// What the magic bytes say: the media type and the pixel size (D58).
@@ -298,11 +463,6 @@ fn sniff(d: &[u8]) -> Option<(&'static str, u32, u32)> {
 /// Standard base64 with padding, which is what both APIs take.
 pub fn base64_encode(bytes: &[u8]) -> String {
     general_purpose::STANDARD.encode(bytes)
-}
-
-/// The bytes back, or `None` if the string is not base64.
-pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    general_purpose::STANDARD.decode(text).ok()
 }
 
 impl Item {
@@ -1486,6 +1646,98 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
 
+    fn picture(name: &str, bytes: usize) -> Image {
+        Image {
+            media_type: "image/png".into(),
+            data: "A".repeat(bytes),
+            name: name.into(),
+            width: 100,
+            height: 50,
+        }
+    }
+
+    fn attached(text: &str, pictures: &[(&str, usize)]) -> Item {
+        Item::Attached {
+            text: text.into(),
+            images: pictures.iter().map(|(n, b)| picture(n, *b)).collect(),
+        }
+    }
+
+    #[test]
+    fn a_conversation_whose_pictures_fit_is_sent_unchanged() {
+        let items = [attached("look", &[("a.png", 100)])];
+        assert!(within_image_budget(&items, 100).is_none());
+        assert!(within_image_budget(&items, 99).is_some());
+    }
+
+    #[test]
+    fn the_newest_pictures_are_kept_and_the_older_ones_are_replaced_by_a_note() {
+        // Two turns of pictures, and room for the second only: what the person just said is what
+        // the model can see, and the older picture still says that it existed (D162).
+        let items = [
+            attached("first", &[("old.png", 60)]),
+            Item::User("and now".into()),
+            attached("second", &[("new.png", 60)]),
+            Item::Assistant(vec![Part::Text("ok".into())]),
+        ];
+        let (trimmed, omitted) = within_image_budget(&items, 60).expect("over the budget");
+        assert_eq!(omitted.pictures, 1);
+        assert_eq!(omitted.bytes, 60);
+        match &trimmed[0] {
+            Item::Attached { text, images } => {
+                assert!(images.is_empty(), "the older picture is not sent");
+                assert!(text.starts_with("first\n"));
+                assert!(text.contains("old.png"), "{text}");
+                assert!(text.contains("was not sent"), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match &trimmed[2] {
+            Item::Attached { images, .. } => assert_eq!(images.len(), 1, "the newest stays"),
+            other => panic!("{other:?}"),
+        }
+        // Everything else is untouched, and the items keep their order.
+        assert_eq!(trimmed[1], Item::User("and now".into()));
+        assert_eq!(trimmed.len(), items.len());
+    }
+
+    #[test]
+    fn a_tool_result_that_lost_its_picture_says_so_in_its_own_text() {
+        let items = [
+            Item::ToolResults(vec![ToolResult {
+                provenance: None,
+                id: "c1".into(),
+                content: "shot saved".into(),
+                is_error: false,
+                images: vec![picture("shot.png", 60)],
+                diff: None,
+            }]),
+            attached("and this", &[("new.png", 60)]),
+        ];
+        let (trimmed, omitted) = within_image_budget(&items, 60).expect("over the budget");
+        assert_eq!(omitted.pictures, 1);
+        let Item::ToolResults(results) = &trimmed[0] else {
+            panic!("{trimmed:?}")
+        };
+        assert!(results[0].images.is_empty());
+        assert!(results[0].content.starts_with("shot saved\n"));
+        assert!(results[0].content.contains("shot.png"));
+    }
+
+    #[test]
+    fn a_body_the_provider_called_too_large_is_recognised_but_a_long_prompt_is_not() {
+        // D162: the status is what the retry turns on. A 413 or a phrase about the entity is a
+        // body too big; a context-length message is the other retry's.
+        assert!(is_too_large("synthetic returned 413: Payload Too Large"));
+        assert!(is_too_large(
+            "api returned 400: request body too large for this endpoint"
+        ));
+        assert!(!is_too_large(
+            "api returned 400: prompt is too long: 200000 tokens"
+        ));
+        assert!(!is_too_large("synthetic returned 429: slow down"));
+    }
+
     #[test]
     fn human_tool_rendering_unframes_only_with_matching_host_provenance() {
         let framed =
@@ -2090,16 +2342,16 @@ output = 0.000015
     #[test]
     fn an_image_is_recognised_by_its_bytes_not_its_name() {
         // A 1x1 PNG.
-        let png = base64_decode(PNG_1X1).unwrap();
+        let png = general_purpose::STANDARD.decode(PNG_1X1).unwrap();
         let image = Image::read(Path::new("shot.txt"), png.clone()).unwrap();
         assert_eq!(image.media_type, "image/png");
         assert_eq!((image.width, image.height), (1, 1));
         // The name is only for showing; the type came from the bytes.
         assert_eq!(image.name, "shot.txt");
-        assert_eq!(image.bytes().unwrap(), png);
+        assert_eq!(general_purpose::STANDARD.decode(&image.data).unwrap(), png);
 
         // The same bytes behind the wrong extension are still a PNG (D58).
-        let gif = base64_decode(GIF_1X1).unwrap();
+        let gif = general_purpose::STANDARD.decode(GIF_1X1).unwrap();
         let image = Image::read(Path::new("x.png"), gif).unwrap();
         assert_eq!(image.media_type, "image/gif");
         assert_eq!((image.width, image.height), (1, 1));

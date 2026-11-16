@@ -21,8 +21,12 @@ use crate::tui::theme::Theme;
 use crate::tui::themes::ThemePicker;
 use base64::Engine as _;
 use base64::engine::general_purpose;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::terminal as crossterm_terminal;
 use ratatui::layout::Rect;
+use saddle_cap::Scope;
+use std::cell::RefCell;
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
@@ -33,7 +37,9 @@ use std::panic;
 use std::path::Path;
 use std::process;
 use std::process::Command as ProcessCommand;
+use std::rc::Rc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 mod app;
 mod browser;
 pub mod catppuccin;
@@ -41,7 +47,10 @@ mod editor;
 mod files;
 mod grant;
 pub mod image;
+pub mod keys;
 mod login;
+mod math;
+pub mod notify;
 pub mod palette;
 mod permissions;
 mod render;
@@ -63,10 +72,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -76,6 +85,7 @@ use ratatui::crossterm::terminal::{
 pub use app::Header;
 use app::{Action, AgentEvent, App, Drawn, NoteKind, Placed};
 use login::{CUSTOM_LABEL, Choice, Draft, Listed, Login, LoginRequest, Pick};
+use notify::Focus;
 use permissions::{Kind, Permissions, Row};
 
 use crate::agent::{Agent, Compacted, End, Steer, Ui, call_detail};
@@ -118,8 +128,12 @@ enum Command {
     Resume(String),
     /// Read the prompts on the branch, to offer them in `/tree` (D53).
     OpenTree,
-    /// Move the conversation to a point without deleting what came after it (D54).
-    Rewind(Option<i64>),
+    /// Move the conversation to a point without deleting what came after it (D54), and summarize
+    /// the branch left behind when asked to (D167).
+    Rewind {
+        node: Option<i64>,
+        summarize: bool,
+    },
     /// Copy the branch into a new conversation and continue that one (D53).
     Clone,
     /// Name this conversation, or clear the name (D55).
@@ -185,6 +199,13 @@ pub fn run(
     app.skills = skills;
     // What this terminal can draw is decided once, from the setting and the environment (D59).
     app.protocol = image::detect(app.header.images.as_deref(), &|k| env::var(k).ok());
+    // How big a cell is decides how many rows a picture needs and whether it is drawn at its own
+    // size, and the window size does not carry it, so the terminal is asked once before the screen
+    // is taken over — the same question the theme asks about colours, and asked there for the same
+    // reason (D59, D75). A terminal that does not answer keeps the assumption.
+    if app.protocol != image::Protocol::Text {
+        image::set_cell_px(terminal::cell_px());
+    }
     // The colours, from config.toml (D71). A theme that does not build is reported and the default
     // is drawn: a bad colour must not stop a session from opening, and the person has to be told
     // rather than quietly shown the wrong thing.
@@ -226,7 +247,7 @@ pub fn run(
     }
     let ui_result = {
         let mut screen = Screen::enter(app.header.mouse)?;
-        event_loop(&mut screen.terminal, &mut app, &control, &ev_rx)
+        event_loop(&mut screen, &mut app, &control, &ev_rx)
     };
 
     if app.busy.is_some() {
@@ -649,14 +670,17 @@ fn work(
                     let _ = events.send(AgentEvent::Note(format!("could not clone: {e:#}")));
                 }
             },
-            Command::Rewind(node) => match agent.rewind(node) {
+            Command::Rewind { node, summarize } => match agent.rewind(node) {
                 Ok(left) => {
                     // The branch being left is worth a note on the one entered, so what it found
-                    // is not wasted. A failure here does not undo the move (D54).
+                    // is not wasted — but that is a model request, so it happens only when the
+                    // person said yes to the question `/tree` asked (D167). A failure here does
+                    // not undo the move (D54).
                     let mut resumed = left.resumed;
                     session.mcp.restore(&resumed.declared);
                     agent.refresh_tools(session.declared_tools());
-                    if !left.abandoned.is_empty()
+                    if summarize
+                        && !left.abandoned.is_empty()
                         && agent
                             .summarize_left_behind(&mut session, &mut ui, &left.abandoned)
                             .unwrap_or(false)
@@ -773,101 +797,309 @@ impl Ui for ChannelUi {
     }
 }
 
+/// What one frame has to do to the pictures on screen (D59). Pure, so the scrolling behaviour can
+/// be tested without a terminal.
+#[derive(Debug, Default)]
+struct Plan {
+    /// Ids whose data goes: the picture left the screen, or the transcript under it was replaced.
+    free: Vec<u32>,
+    /// Placements to take off without freeing the data: a menu or dialog is over the picture, which
+    /// is still in the transcript (D161).
+    hide: Vec<u32>,
+    /// A picture the terminal does not hold yet, sent once rather than once per frame.
+    transmit: Vec<(u32, String)>,
+    /// Where to put a picture that is not already where it should be: its screen row, its column,
+    /// and the escape.
+    place: Vec<(usize, u16, String)>,
+    /// What the next frame will find on the screen.
+    drawn: Drawn,
+}
+
 /// Puts each attached picture on the screen, at the row its marker line was drawn on (D59).
 ///
 /// The escapes are written after the frame, because the terminal position is a side effect the
 /// frame cannot express: the picture occupies cells the layout reserved as blanks, and the cursor
 /// is put back where the frame left it so the next draw starts from the same place.
-/// What one frame has to do to the images on screen: the ids to take off, and the escapes to put
-/// back on (D59). Pure, so the scrolling behaviour can be tested without a terminal.
 ///
 /// A picture is treated like text: the rows that are scrolled off are simply not drawn. The old rule
 /// was that the whole picture had to fit, which meant two large screenshots could never both be
 /// visible, so one of them silently disappeared.
+///
+/// A picture the terminal already holds at the right place and showing the right band is left
+/// alone. One that only moved is re-placed, at its own id and placement id, which kitty replaces
+/// without the frame of nothing that erasing and redrawing produced. The file is only sent again
+/// when the terminal does not have it (D59).
 fn plan_images(
     protocol: image::Protocol,
     drawn: &Drawn,
     images: &[Placed],
     area: Rect,
     top: usize,
-) -> (Vec<u32>, Vec<(usize, String)>, Drawn) {
+    covered: &[Rect],
+) -> Plan {
     let height = area.height as usize;
     // The band each picture is drawn with is part of "what is on screen": scrolling changes which
     // part of a picture is visible even when its row has not moved (D59).
-    let mut wanted: Vec<(usize, u32, u16, u16)> = Vec::new();
-    let mut draw: Vec<(usize, String)> = Vec::new();
+    let mut visible: Vec<(usize, &Placed, u16, u16)> = Vec::new();
     for placed in images {
-        // The picture occupies the lines after its marker; the screen shows [top, top + height).
-        // What is left of that intersection is what gets drawn (D59).
+        // The picture occupies the cells from its own row down; the screen shows [top, top +
+        // height), and what is left of that intersection is what gets drawn (D59).
         let Some((from, rows)) = image::band(placed.line, placed.box_.rows, top, height) else {
             continue;
         };
-        let window = image::Window {
-            full: placed.box_,
-            from,
-            rows,
-        };
-        let Some(escape) = image::draw(protocol, &placed.png, placed.pixels, &window, placed.id)
-        else {
-            // This terminal cannot draw pictures; the marker line is all there is.
-            continue;
-        };
-        // The screen row of the picture's first visible line: the marker, plus the rows scrolled
-        // off its top, plus the one line between the marker and the picture.
-        let row = placed.line + 1 + from as usize - top;
-        draw.push((row, escape));
-        wanted.push((row, placed.id, window.from, window.rows));
+        // The screen row of the picture's first visible line: its own row, plus the rows scrolled
+        // off its top, less what the screen has scrolled past.
+        let row = placed.line + from as usize - top;
+        visible.push((row, placed, from, rows));
     }
-    // Only where the area starts matters: a width change moves nothing now that no cell box is
-    // sent for a picture at its own size, and anything else that changed shows up in `wanted`.
-    let at = (area.x, area.y);
-    let after = Drawn {
-        shown: wanted.clone(),
-        at: Some(at),
+    // A menu or a dialog is drawn over the transcript, and a picture placed after it would sit on
+    // top: only the rows above it are drawn, and a picture it reaches from its first row waits
+    // until the menu closes (D161). `cut` counts rows of the band from the top, which is the crop
+    // `image::draw` turns into a source rectangle.
+    let clear_rows = |row: usize, rows: u16| -> Option<u16> {
+        let top = area.y + row as u16;
+        let mut cut = rows;
+        for rect in covered {
+            if !Rect::new(area.x, top, area.width, rows).intersects(*rect) {
+                continue;
+            }
+            if rect.y <= top {
+                return None;
+            }
+            cut = cut.min(rect.y - top);
+        }
+        (cut > 0).then_some(cut)
     };
-    if drawn.at == Some(at) && drawn.shown == wanted {
-        // Nothing moved and nothing new arrived: re-sending would only flicker.
-        return (Vec::new(), Vec::new(), after);
+    let wanted: Vec<(usize, &Placed, u16, u16)> = visible
+        .iter()
+        .filter_map(|(row, placed, from, rows)| {
+            clear_rows(*row, *rows).map(|cut| (*row, *placed, *from, cut))
+        })
+        .collect();
+    // The terminal clears its images when the screen is cleared, and ratatui clears it on every
+    // resize: what the terminal held is gone, and the parts that stay on screen are sent again.
+    let resized = drawn
+        .at
+        .is_some_and(|at| (at.width, at.height) != (area.width, area.height));
+    let stale = drawn.stale || resized;
+    let moved = stale || drawn.at != Some(area);
+    let kitty = protocol == image::Protocol::Kitty;
+    let mut plan = Plan::default();
+    // What the terminal holds the data of. `stale` is the exception: the transcript was replaced
+    // under the pictures and the same id may name a different one, so every id it names is taken
+    // off — data too — and sent again.
+    let mut held = if stale {
+        Vec::new()
+    } else {
+        drawn.held.clone()
+    };
+    if kitty && stale {
+        plan.free.extend(drawn.held.iter().copied());
     }
-    let remove = drawn.shown.iter().map(|(_, id, _, _)| *id).collect();
-    (remove, draw, after)
+    // A picture that left the screen entirely is one nothing will draw again soon, so its data goes
+    // with it rather than growing the terminal's store with every picture the transcript showed.
+    held.retain(|id| {
+        let keep = visible.iter().any(|(_, placed, _, _)| placed.id == *id);
+        if kitty && !keep {
+            plan.free.push(*id);
+        }
+        keep
+    });
+    // A picture a menu or dialog reached from its first row keeps its data and loses only its
+    // placement: closing the dialog puts it back on the screen without the file travelling
+    // again (D161).
+    if kitty && !stale {
+        for (_, _, id, _, _) in &drawn.shown {
+            let hidden = visible.iter().any(|(_, placed, _, _)| placed.id == *id)
+                && !wanted.iter().any(|(_, placed, _, _)| placed.id == *id);
+            if hidden {
+                plan.hide.push(*id);
+            }
+        }
+    }
+    for (row, placed, from, rows) in &wanted {
+        let id = placed.id;
+        if !held.contains(&id) {
+            if let Some(escape) = image::transmit(protocol, &placed.data, id) {
+                plan.transmit.push((id, escape));
+            }
+            held.push(id);
+        }
+        let old = drawn
+            .shown
+            .iter()
+            .find(|(_, _, drawn_id, _, _)| *drawn_id == id);
+        // The column is part of where the picture is: a formula inside a line moves with the words
+        // before it without the row it is on changing (D165).
+        let unchanged = !moved
+            && old.is_some_and(|(drawn_row, drawn_col, _, drawn_from, drawn_rows)| {
+                *drawn_row == *row
+                    && *drawn_col == placed.column
+                    && *drawn_from == *from
+                    && *drawn_rows == *rows
+            });
+        if !unchanged {
+            let window = image::Window {
+                full: placed.box_,
+                from: *from,
+                rows: *rows,
+            };
+            if let Some(escape) = image::draw(protocol, &placed.data, placed.pixels, &window, id) {
+                plan.place.push((*row, placed.column, escape));
+            }
+        }
+    }
+    plan.drawn = Drawn {
+        shown: wanted
+            .iter()
+            .map(|(row, placed, from, rows)| (*row, placed.column, placed.id, *from, *rows))
+            .collect(),
+        held,
+        at: Some(area),
+        covered: covered.to_vec(),
+        stale: false,
+    };
+    plan
 }
 
-fn draw_images(app: &mut App) {
-    if app.protocol == image::Protocol::Text {
-        return;
+/// The escapes for one frame's plan, in the order the terminal has to read them: forget what is
+/// gone, hand over what it does not hold, then put each picture where it belongs (D59).
+fn image_escapes(plan: &Plan, area: Rect) -> String {
+    // Placing a picture means moving to its row, so the cursor is saved first and put back at the
+    // end: a terminal draws its cursor wherever it was left, and a block sitting on the first row of
+    // a formula looked like the formula arriving selected.
+    let mut out = String::from("\x1b7");
+    // Take off the pictures that left the screen, and forget their data so the terminal's store
+    // does not grow with every picture the transcript ever showed. Kitty keeps an image at the cell
+    // it was drawn on and ratatui only rewrites characters, so leaving it would smear (D59).
+    for id in &plan.free {
+        let _ = write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\");
     }
-    let Some(seen) = &app.seen else {
-        return;
-    };
-    let area = seen.area;
-    let (remove, draw, after) = plan_images(app.protocol, &app.drawn, &app.images, area, seen.top);
-    app.drawn = after;
-    if remove.is_empty() && draw.is_empty() {
-        return;
-    }
-    let mut out = String::new();
-    // Take the last frame's pictures off the screen before drawing this frame's. Kitty keeps an
-    // image at the cell it was drawn on, and ratatui only rewrites characters, so a scroll would
-    // otherwise leave the old copy behind and add another (D59).
-    for id in remove {
+    // A picture something is drawn over is taken off the cells it covers, and its data is kept
+    // (D161). Kitty only: iTerm2 has neither a store nor a delete, and a full repaint is what takes
+    // its picture off the screen.
+    for id in &plan.hide {
         let _ = write!(out, "\x1b_Ga=d,d=i,i={id},q=2\x1b\\");
     }
-    for (row, escape) in draw {
-        // `row` is the picture's first visible line, counted from the top of the area; terminal
-        // rows are one-based from the top of the screen.
+    // A picture is handed over once, here; from then on the terminal holds it under its id (D59).
+    for (_, escape) in &plan.transmit {
+        out.push_str(escape);
+    }
+    for (row, column, escape) in &plan.place {
+        // `row` is the picture's first visible line, counted from the top of the area, and `column`
+        // its first cell across it; terminal rows and columns are one-based.
         let _ = write!(
             out,
             "\x1b[{};{}H{}",
             area.y as usize + row + 1,
-            area.x as usize + 1,
+            area.x as usize + *column as usize + 1,
             escape
         );
     }
-    // Leave the cursor where the frame put it, so the editor's caret does not jump.
-    let _ = write!(out, "\x1b[?25h");
+    if out.len() > 4 {
+        out.push_str("\x1b8");
+    } else {
+        out.clear();
+    }
+    out
+}
+
+/// Where `SADDLE_IMAGE_LOG` says to record what each frame told the terminal about its pictures.
+///
+/// A terminal that draws a picture the wrong size is indistinguishable from one that was sent the
+/// wrong escape, and the second is answerable from a file: every frame writes the area, the scroll
+/// position, and each picture's id, row and escape (D59). Off unless the variable is set, because a
+/// running interface should not write log files nobody asked for.
+fn image_log() -> Option<&'static Mutex<io::BufWriter<fs::File>>> {
+    static LOG: OnceLock<Option<Mutex<io::BufWriter<fs::File>>>> = OnceLock::new();
+    LOG.get_or_init(|| {
+        let path = env::var_os("SADDLE_IMAGE_LOG")?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        Some(Mutex::new(io::BufWriter::new(file)))
+    })
+    .as_ref()
+}
+
+/// One frame's line in that file, without the transmitted files.
+fn trace_line(plan: &Plan, area: Rect, top: usize) -> String {
+    let mut line = format!(
+        "frame x={} y={} {}x{} top={top} covered={}",
+        area.x,
+        area.y,
+        area.width,
+        area.height,
+        plan.drawn.covered.len()
+    );
+    for id in &plan.free {
+        let _ = write!(line, " free {id}");
+    }
+    for id in &plan.hide {
+        let _ = write!(line, " hide {id}");
+    }
+    for (id, _) in &plan.transmit {
+        let _ = write!(line, " transmit {id}");
+    }
+    for (row, column, escape) in &plan.place {
+        // The escape as bytes a person can read in a file, since it is written to a terminal with
+        // control characters that a text editor would swallow.
+        let _ = write!(
+            line,
+            " place{row}.{column} {}",
+            escape.replace('\x1b', "ESC").replace('\\', "ST")
+        );
+    }
+    for (row, column, id, from, rows) in &plan.drawn.shown {
+        let _ = write!(line, " shown {id}@{row}.{column}+{from}/{rows}");
+    }
+    line.push('\n');
+    line
+}
+
+/// Appends that line to the log, if one was asked for.
+fn trace_frame(plan: &Plan, area: Rect, top: usize) {
+    let Some(log) = image_log() else {
+        return;
+    };
+    let line = trace_line(plan, area, top);
+    if let Ok(mut out) = log.lock() {
+        let _ = out.write_all(line.as_bytes());
+        let _ = out.flush();
+    }
+}
+
+/// Writes the frame ratatui has drawn, and the pictures on it, to the terminal in one write (D59).
+///
+/// Ratatui draws into a buffer rather than to the screen, so the escapes can follow the frame before
+/// anything is flushed. Written separately, a scrolled frame would be presented once with the text
+/// moved and the pictures still where they were, and again with them moved: that gap is the flicker
+/// a large picture made obvious, because it is the frame after the text that the eye sees first.
+fn flush_frame(frame: &FrameBuffer, app: &mut App) {
+    let mut out = frame.take();
+    if app.protocol != image::Protocol::Text
+        && let Some(seen) = &app.seen
+    {
+        let (area, top) = (seen.area, seen.top);
+        let plan = plan_images(
+            app.protocol,
+            &app.drawn,
+            &app.images,
+            area,
+            top,
+            &app.covered,
+        );
+        out.extend_from_slice(image_escapes(&plan, area).as_bytes());
+        trace_frame(&plan, area, top);
+        // A change in what covers the pictures is one iTerm2 cannot follow with an escape: it has
+        // no delete, so the next frame is painted over a cleared screen instead (D161).
+        app.repaint |= app.drawn.covered != plan.drawn.covered;
+        app.drawn = plan.drawn;
+    }
     let mut stdout = io::stdout();
-    let _ = stdout.write_all(out.as_bytes());
+    let _ = stdout.write_all(&out);
     let _ = stdout.flush();
 }
 
@@ -883,7 +1115,7 @@ fn keep_raw_mode() {
 }
 
 fn event_loop(
-    terminal: &mut DefaultTerminal,
+    screen: &mut Screen,
     app: &mut App,
     control: &Controller,
     events: &Receiver<AgentEvent>,
@@ -891,6 +1123,8 @@ fn event_loop(
     let mut dirty = true;
     let mut last_tick = Instant::now();
     let mut last_mode_check = Instant::now();
+    // Unknown until the terminal reports it, which some never do (D164).
+    let mut focus = Focus::Unknown;
     loop {
         // The interface is unusable without raw mode: keys are echoed instead of delivered, and the
         // screen fills with what is typed. Whatever took it away — a child process, a terminal
@@ -900,9 +1134,20 @@ fn event_loop(
             last_mode_check = Instant::now();
             keep_raw_mode();
         }
+        if app.repaint {
+            // The previous frame found a menu or dialog changed what covers the pictures. A
+            // repaint is the only way to take a picture off iTerm2, which has no delete; kitty's
+            // clear escape also deletes the images it holds, so there the placement is taken off
+            // instead and no repaint is wanted (D161).
+            app.repaint = false;
+            if app.protocol == image::Protocol::Iterm2 {
+                screen.terminal.clear()?;
+                dirty = true;
+            }
+        }
         if dirty {
-            terminal.draw(|f| render::draw(f, app))?;
-            draw_images(app);
+            screen.terminal.draw(|f| render::draw(f, app))?;
+            flush_frame(&screen.frame, app);
             dirty = false;
         }
         // A short poll keeps streamed text flowing without a second wake-up mechanism.
@@ -915,6 +1160,14 @@ fn event_loop(
                         None
                     }
                     Event::Mouse(m) => app.mouse(m),
+                    Event::FocusGained => {
+                        focus = Focus::In;
+                        None
+                    }
+                    Event::FocusLost => {
+                        focus = Focus::Out;
+                        None
+                    }
                     _ => None,
                 };
                 match action {
@@ -925,16 +1178,18 @@ fn event_loop(
                         }
                         Err(e) => app.note(NoteKind::Error, &format!("could not copy: {e}")),
                     },
-                    Some(Action::EditPrompt) => edit_prompt(terminal, app, &control.paths)?,
+                    Some(Action::EditPrompt) => {
+                        edit_prompt(&mut screen.terminal, app, &control.paths)?
+                    }
                     Some(Action::Apply(Change::EditConfig)) => {
                         let path = control.paths.user_config();
-                        edit_file(terminal, &path, app.header.mouse)?;
+                        edit_file(&mut screen.terminal, &path, app)?;
                         control.after_config_edit(app);
                     }
                     Some(Action::Apply(Change::EditPolicy)) => {
                         // One base file: the grants are its `[agent]` table (D63).
                         let path = control.paths.user_config();
-                        edit_file(terminal, &path, app.header.mouse)?;
+                        edit_file(&mut screen.terminal, &path, app)?;
                         control.after_policy_edit(app);
                     }
                     Some(action) => control.perform(app, action),
@@ -949,11 +1204,22 @@ fn event_loop(
         while let Ok(ev) = events.try_recv() {
             // A turn has just spent tokens, so what is left is worth asking about again (D36).
             let turn_ended = matches!(ev, AgentEvent::TurnEnd(_));
+            let outcome = match &ev {
+                AgentEvent::TurnEnd(end) => notify::ended(*end),
+                AgentEvent::Fatal(_) => Some("the session stopped"),
+                _ => None,
+            };
             if let Some(action) = app.agent(ev) {
                 control.perform(app, action);
             }
             if turn_ended && let Err(e) = control.refresh_usage(app) {
                 app.note(NoteKind::Error, &format!("{e:#}"));
+            }
+            // A queued prompt has already started the next turn, which is nothing to announce.
+            if let Some(outcome) = outcome
+                && app.busy.is_none()
+            {
+                announce(app, focus, outcome);
             }
             dirty = true;
         }
@@ -1076,8 +1342,8 @@ impl Controller {
                 self.send(app, Command::OpenTree);
                 Ok(())
             }
-            Action::Rewind(node) => {
-                self.send(app, Command::Rewind(node));
+            Action::Rewind { node, summarize } => {
+                self.send(app, Command::Rewind { node, summarize });
                 Ok(())
             }
             Action::Clone => {
@@ -1836,6 +2102,10 @@ impl Controller {
         // The theme is rebuilt from the answer the terminal gave at startup; it is not asked again
         // here, because the interface owns the terminal by now (D75).
         self.reload_theme(app);
+        app.header.notify = user.ui.notify.unwrap_or_default();
+        // The keys with no default are the file's to give, and the next tree opened takes them
+        // (D169).
+        app.header.keys = user.keys.clone();
         app.max_steps = user.max_steps.filter(|n| *n > 0);
         self.send(app, Command::SetMaxSteps(app.max_steps));
         let compaction = Settings::from_config(&user.compaction);
@@ -2005,10 +2275,17 @@ impl Controller {
             });
         }
         for (scope, g) in &grants.plain {
+            // A transcript grant covers this conversation or the workspace's, and which is worth
+            // saying where the grant is listed (D163).
+            let root = if *scope == Scope::TranscriptRead {
+                format!("{scope} · {}", g.sessions)
+            } else {
+                scope.to_string()
+            };
             rows.push(Row {
                 rule: g.rule.to_string(),
                 kind: Kind::Plain,
-                root: scope.to_string(),
+                root,
                 exclude: String::new(),
                 on: true,
                 editable: false,
@@ -2256,15 +2533,47 @@ impl Controller {
     }
 }
 
+/// The bytes ratatui has drawn but not yet handed to the terminal.
+///
+/// Ratatui flushes at the end of a draw, and a picture placed afterwards would arrive in a second
+/// write — a frame in which the text has scrolled and the picture has not. A writer whose flush
+/// keeps the bytes lets the picture escapes be appended to the frame, so one write is one frame
+/// with its pictures on it (D59).
+#[derive(Clone, Default)]
+struct FrameBuffer(Rc<RefCell<Vec<u8>>>);
+
+impl FrameBuffer {
+    /// Everything drawn since the last write.
+    fn take(&self) -> Vec<u8> {
+        mem::take(&mut *self.0.borrow_mut())
+    }
+}
+
+impl io::Write for FrameBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // Kept for the caller, which appends the frame's pictures before writing any of it.
+        Ok(())
+    }
+}
+
+type ScreenTerminal = Terminal<CrosstermBackend<FrameBuffer>>;
+
 /// Raw mode, the alternate screen, mouse wheel, bracketed paste and, where the terminal supports
 /// it, unambiguous keys (so shift+enter differs from enter). Dropping it restores the terminal.
 struct Screen {
-    terminal: DefaultTerminal,
+    terminal: ScreenTerminal,
+    /// The terminal's writer, shared with `terminal`, so a frame can be completed and written once.
+    frame: FrameBuffer,
 }
 
 /// Ctrl+G: the prompt goes to a private file, `$EDITOR` edits it, and the result comes back into
 /// the editor.
-fn edit_prompt(terminal: &mut DefaultTerminal, app: &mut App, paths: &Paths) -> Result<()> {
+fn edit_prompt(terminal: &mut ScreenTerminal, app: &mut App, paths: &Paths) -> Result<()> {
     fs::create_dir_all(&paths.state)?;
     let path = paths.state.join(format!("prompt-{}.md", process::id()));
     let mut file = OpenOptions::new()
@@ -2275,7 +2584,7 @@ fn edit_prompt(terminal: &mut DefaultTerminal, app: &mut App, paths: &Paths) -> 
         .open(&path)?;
     file.write_all(app.editor.text().as_bytes())?;
     drop(file);
-    let edited = edit_file(terminal, &path, app.header.mouse);
+    let edited = edit_file(terminal, &path, app);
     let text = fs::read_to_string(&path);
     let _ = fs::remove_file(&path);
     edited?;
@@ -2286,7 +2595,10 @@ fn edit_prompt(terminal: &mut DefaultTerminal, app: &mut App, paths: &Paths) -> 
 }
 
 /// Hands the terminal to `$VISUAL` or `$EDITOR` (or vi) for `path`, then takes it back.
-fn edit_file(terminal: &mut DefaultTerminal, path: &Path, mouse: bool) -> Result<()> {
+///
+/// Leaving and re-entering the alternate screen clears the screen, and with it the pictures the
+/// terminal was holding (D59, D161), so the next frame sends them again.
+fn edit_file(terminal: &mut ScreenTerminal, path: &Path, app: &mut App) -> Result<()> {
     leave_modes();
     ratatui::restore();
     let editor = env::var("VISUAL")
@@ -2299,15 +2611,28 @@ fn edit_file(terminal: &mut DefaultTerminal, path: &Path, mouse: bool) -> Result
     let status = ProcessCommand::new(&program).args(words).arg(path).status();
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen)?;
-    enter_modes(mouse)?;
+    enter_modes(app.header.mouse)?;
     terminal.clear()?;
+    app.drawn.stale = true;
     status.with_context(|| format!("running {program}"))?;
     Ok(())
 }
 
-/// Enables the modes the UI runs in. Mouse reporting is on unless `[ui] mouse = false` (D35): while
-/// it is on, the terminal sends drags to saddle rather than selecting them itself, and saddle does
-/// its own selection, highlight and copy.
+/// Announces the end of a turn the person may not be watching, as `[ui] notify` says (D164). The
+/// title names the workspace, so two sessions in two windows can be told apart.
+fn announce(app: &App, focus: Focus, outcome: &str) {
+    let tmux = env::var_os("TMUX").is_some_and(|v| !v.is_empty());
+    let title = match app.header.workspace.file_name() {
+        Some(name) => format!("saddle {}", name.to_string_lossy()),
+        None => "saddle".to_owned(),
+    };
+    if let Some(bytes) = notify::sequence(app.header.notify, focus, &title, outcome, tmux) {
+        let mut stdout = stdout();
+        let _ = stdout.write_all(bytes.as_bytes());
+        let _ = stdout.flush();
+    }
+}
+
 /// Copies `text` to the terminal's clipboard with OSC 52.
 ///
 /// Once saddle owns the mouse a drag no longer reaches the terminal's own selection, so this is how
@@ -2322,22 +2647,20 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
-/// The bytes that put `text` on the terminal's clipboard: OSC 52 with the text base64-encoded.
-/// tmux forwards an escape sequence only when it is wrapped in one of its own, with every ESC
-/// inside doubled, so that form is built here rather than in the writer.
+/// The bytes that put `text` on the terminal's clipboard: OSC 52 with the text base64-encoded,
+/// wrapped for tmux when saddle runs inside it.
 fn clipboard_sequence(text: &str, tmux: bool) -> String {
     let payload = general_purpose::STANDARD.encode(text);
-    let sequence = format!("\x1b]52;c;{payload}\x07");
-    if tmux {
-        format!("\x1bPtmux;{}\x1b\\", sequence.replace('\x1b', "\x1b\x1b"))
-    } else {
-        sequence
-    }
+    notify::passthrough(&format!("\x1b]52;c;{payload}\x07"), tmux)
 }
 
+/// Enables the modes the UI runs in. Mouse reporting is on unless `[ui] mouse = false` (D35): while
+/// it is on, the terminal sends drags to saddle rather than selecting them itself, and saddle does
+/// its own selection, highlight and copy. Focus reporting tells the end of a turn whether anyone is
+/// looking (D164).
 fn enter_modes(mouse: bool) -> Result<()> {
     let mut out = stdout();
-    execute!(out, EnableBracketedPaste)?;
+    execute!(out, EnableBracketedPaste, EnableFocusChange)?;
     if mouse {
         execute!(out, EnableMouseCapture)?;
     }
@@ -2353,23 +2676,36 @@ fn enter_modes(mouse: bool) -> Result<()> {
 fn leave_modes() {
     let mut out = stdout();
     let _ = execute!(out, PopKeyboardEnhancementFlags);
-    let _ = execute!(out, DisableBracketedPaste, DisableMouseCapture);
+    let _ = execute!(
+        out,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        DisableFocusChange
+    );
 }
 
 impl Screen {
     fn enter(mouse: bool) -> Result<Self> {
-        let terminal = ratatui::try_init().context("starting the terminal UI")?;
+        // The three steps `ratatui::try_init` takes, with a writer of our own: the frame and the
+        // pictures on it then leave in one write (D59).
+        enable_raw_mode().context("starting the terminal UI")?;
+        execute!(stdout(), EnterAlternateScreen).context("starting the terminal UI")?;
+        let frame = FrameBuffer::default();
+        let terminal = Terminal::new(CrosstermBackend::new(frame.clone()))
+            .context("starting the terminal UI")?;
         // A reply to the startup's colour query that arrived after its deadline is a keystroke as
         // far as this loop is concerned, and would be typed into the prompt (D75).
         terminal::discard_pending();
         enter_modes(mouse)?;
-        // ratatui's hook restores raw mode and the screen; this one also turns off the modes above.
+        // A panic is printed on the screen the person can read, and raw mode, the alternate screen
+        // and the modes above are all put back before it is.
         let previous = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
             leave_modes();
+            ratatui::restore();
             previous(info);
         }));
-        Ok(Self { terminal })
+        Ok(Self { terminal, frame })
     }
 }
 
@@ -2386,6 +2722,7 @@ mod tests {
     use crate::provider::Usage;
     use crate::tui::Header;
     use crate::tui::image::Fit;
+    use crate::tui::notify::Notify;
     use crate::tui::status::Template;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
@@ -2397,6 +2734,7 @@ mod tests {
     use super::*;
     use crate::auth::AuthStore;
     use crate::tui::app::Entry;
+    use crate::tui::keys::Keys;
 
     /// A controller over a throwaway config, so a slash command can be followed all the way to
     /// what it does (D74).
@@ -2435,6 +2773,9 @@ mod tests {
             status: Template::default(),
             images: None,
             theme: None,
+            notify: Notify::Off,
+            math_scale: 1.0,
+            keys: Keys::default(),
         })
     }
 
@@ -2867,9 +3208,11 @@ mod tests {
         );
     }
 
+    /// A picture announced by the line `line`, and so drawn on the row below it (D59).
     fn placed(line: usize, id: u32) -> Placed {
         Placed {
-            line,
+            line: line + 1,
+            column: 0,
             id,
             box_: Fit {
                 cols: 10,
@@ -2877,7 +3220,8 @@ mod tests {
                 scaled: false,
             },
             pixels: (100, 80),
-            png: vec![7u8; 8],
+            // Not a real picture: these tests are about where it goes, not what it is.
+            data: "BwcHBwcHBwc=".to_owned(),
         }
     }
 
@@ -2886,37 +3230,59 @@ mod tests {
     }
 
     #[test]
-    fn a_scroll_takes_the_old_picture_off_before_drawing_the_new_one() {
-        // The bug this fixes: kitty keeps an image where it was drawn while ratatui rewrites only
-        // characters, so a scroll left the old copy behind and drew a second one (D59).
+    fn a_scroll_moves_the_picture_rather_than_sending_it_again() {
+        // A large picture used to be erased and sent again for every row it scrolled, which
+        // flickered: the whole file went over the wire, and the screen showed nothing until it
+        // arrived. Now it is sent once and the placement is what moves (D59).
         let first = Drawn::default();
         let images = [placed(10, 7)];
-        let (remove, draw, after) = plan_images(image::Protocol::Kitty, &first, &images, area(), 0);
-        assert!(remove.is_empty(), "nothing was on screen yet");
-        assert_eq!(draw.len(), 1);
-        assert_eq!(draw[0].0, 11, "on the row after its marker");
+        let plan = plan_images(image::Protocol::Kitty, &first, &images, area(), 0, &[]);
+        assert!(plan.free.is_empty(), "nothing was on screen yet");
+        assert_eq!(plan.transmit.len(), 1, "the file goes once");
+        assert_eq!(plan.transmit[0].0, 7);
+        assert!(
+            plan.transmit[0].1.contains("a=t,"),
+            "{}",
+            plan.transmit[0].1
+        );
+        assert_eq!(plan.place.len(), 1);
+        assert_eq!(plan.place[0].0, 11, "on the row after its marker");
+        assert!(
+            plan.place[0].2.contains("a=p,i=7,p=1"),
+            "{}",
+            plan.place[0].1
+        );
 
-        // Scroll by two lines: the same picture is now at row 8, and the old one is taken off.
-        let (remove, draw, after) = plan_images(image::Protocol::Kitty, &after, &images, area(), 2);
-        assert_eq!(remove, [7], "the id that was on screen");
-        assert_eq!(draw.len(), 1);
-        assert_eq!(draw[0].0, 9);
-        assert_eq!(after.shown, [(9, 7, 0, 4)]);
+        // Scroll by two lines: the same picture is now at row 9. It is neither sent nor taken off,
+        // only placed again, and the one placement id is what stops it disappearing in between.
+        let plan = plan_images(image::Protocol::Kitty, &plan.drawn, &images, area(), 2, &[]);
+        assert!(plan.free.is_empty(), "the terminal keeps the data");
+        assert!(plan.transmit.is_empty(), "nothing to send a second time");
+        assert_eq!(plan.place.len(), 1);
+        assert_eq!(plan.place[0].0, 9);
+        assert_eq!(plan.drawn.shown, [(9, 0, 7, 0, 4)]);
     }
 
     #[test]
     fn a_frame_where_nothing_moved_sends_nothing() {
         // Otherwise every keystroke would erase and redraw the picture, which flickers.
-        let (_, _, after) = plan_images(
+        let first = plan_images(
             image::Protocol::Kitty,
             &Drawn::default(),
             &[placed(10, 7)],
             area(),
             0,
+            &[],
         );
-        let (remove, draw, _) =
-            plan_images(image::Protocol::Kitty, &after, &[placed(10, 7)], area(), 0);
-        assert!(remove.is_empty() && draw.is_empty());
+        let plan = plan_images(
+            image::Protocol::Kitty,
+            &first.drawn,
+            &[placed(10, 7)],
+            area(),
+            0,
+            &[],
+        );
+        assert!(plan.free.is_empty() && plan.transmit.is_empty() && plan.place.is_empty());
     }
 
     #[test]
@@ -2925,22 +3291,38 @@ mod tests {
         // rows, and the old rule skipped it entirely. Now the part that is on screen is drawn, the
         // way text would be (D59).
         let images = [placed(20, 7)];
-        let (_, draw, after) = plan_images(
+        let plan = plan_images(
             image::Protocol::Kitty,
             &Drawn::default(),
             &images,
             area(),
             0,
+            &[],
         );
-        assert_eq!(draw.len(), 1, "the visible part is drawn: {draw:?}");
+        assert_eq!(plan.place.len(), 1, "the visible part is drawn: {plan:?}");
         // The picture occupies 21..25, and the area is 24 tall, so three of its four rows show.
-        assert_eq!(after.shown, [(21, 7, 0, 3)]);
+        assert_eq!(plan.drawn.shown, [(21, 0, 7, 0, 3)]);
         // Scrolled so the picture starts above the window, the top band comes off and the rest is
         // drawn from the second row down.
-        let (_, _, after) = plan_images(image::Protocol::Kitty, &after, &images, area(), 2);
-        assert_eq!(after.shown, [(19, 7, 0, 4)], "still whole, just higher");
-        let (_, _, after) = plan_images(image::Protocol::Kitty, &after, &images, area(), 22);
-        assert_eq!(after.shown, [(0, 7, 1, 3)], "the last three rows only");
+        let plan = plan_images(image::Protocol::Kitty, &plan.drawn, &images, area(), 2, &[]);
+        assert_eq!(
+            plan.drawn.shown,
+            [(19, 0, 7, 0, 4)],
+            "still whole, just higher"
+        );
+        let plan = plan_images(
+            image::Protocol::Kitty,
+            &plan.drawn,
+            &images,
+            area(),
+            22,
+            &[],
+        );
+        assert_eq!(
+            plan.drawn.shown,
+            [(0, 0, 7, 1, 3)],
+            "the last three rows only"
+        );
     }
 
     #[test]
@@ -2951,82 +3333,504 @@ mod tests {
         let images = [placed(8, 7)];
         // The marker is two lines above the top of a 24-row area, so the picture, which occupies
         // 9..13, has its first row off screen and three on it.
-        let (remove, draw, after) = plan_images(
+        let plan = plan_images(
             image::Protocol::Kitty,
             &Drawn::default(),
             &images,
             area(),
             10,
+            &[],
         );
-        assert!(remove.is_empty(), "nothing was on screen before");
-        assert_eq!(draw.len(), 1, "the visible part is still drawn: {draw:?}");
+        assert!(plan.free.is_empty(), "nothing was on screen before");
+        assert_eq!(plan.place.len(), 1, "the visible part is still drawn");
         assert_eq!(
-            after.shown,
-            [(0, 7, 1, 3)],
+            plan.drawn.shown,
+            [(0, 0, 7, 1, 3)],
             "cropped, at the top of the area"
         );
     }
 
     #[test]
-    fn a_picture_scrolled_out_of_view_is_removed() {
-        let (_, _, after) = plan_images(
-            image::Protocol::Kitty,
-            &Drawn::default(),
-            &[placed(10, 7)],
-            area(),
-            0,
-        );
-        // Scrolled far past it: the picture is not in the list any more, and its id is cleared.
-        let (remove, draw, after2) = plan_images(image::Protocol::Kitty, &after, &[], area(), 40);
-        assert_eq!(remove, [7]);
-        assert!(draw.is_empty());
-        assert!(after2.shown.is_empty());
-    }
-
-    #[test]
-    fn a_resize_redraws_when_it_moves_the_area_or_changes_what_fits() {
-        let (_, _, after) = plan_images(
-            image::Protocol::Kitty,
-            &Drawn::default(),
-            &[placed(10, 7)],
-            area(),
-            0,
-        );
-        // Wider only: the picture sits exactly where it did, so nothing is sent.
-        let wider = Rect::new(0, 0, 120, 24);
-        let (remove, draw, _) =
-            plan_images(image::Protocol::Kitty, &after, &[placed(10, 7)], wider, 0);
-        assert!(remove.is_empty() && draw.is_empty());
-        // A shorter transcript: only the first two rows of the picture are on screen, so it is
-        // drawn again with a smaller band.
-        let shorter = Rect::new(0, 0, 80, 12);
-        let (remove, draw, after) =
-            plan_images(image::Protocol::Kitty, &after, &[placed(10, 7)], shorter, 0);
-        assert_eq!(remove, [7]);
-        assert_eq!(draw.len(), 1);
-        assert_eq!(after.shown, [(11, 7, 0, 1)], "one row of four");
-        // Moved down the screen: every row shifts, so it is drawn again.
-        let moved = Rect::new(0, 2, 80, 24);
-        let (remove, draw, _) =
-            plan_images(image::Protocol::Kitty, &after, &[placed(10, 7)], moved, 0);
-        assert_eq!(remove, [7]);
-        assert_eq!(draw.len(), 1);
-    }
-
-    #[test]
-    fn two_pictures_each_keep_their_own_id() {
-        let images = [placed(2, 1), placed(10, 2)];
-        let (_, draw, after) = plan_images(
+    fn a_resize_sends_the_pictures_again_because_the_screen_was_cleared() {
+        // Ratatui clears the screen on every size change, and the protocol says that clear deletes
+        // the images the terminal holds: placing one would name data that no longer exists (D59).
+        let images = [placed(10, 7)];
+        let first = plan_images(
             image::Protocol::Kitty,
             &Drawn::default(),
             &images,
             area(),
             0,
+            &[],
         );
-        assert_eq!(draw.len(), 2);
-        assert_eq!(after.shown, [(3, 1, 0, 4), (11, 2, 0, 4)]);
-        let (remove, _, _) = plan_images(image::Protocol::Kitty, &after, &[], area(), 0);
-        assert_eq!(remove, [1, 2], "both are taken off, not just the first");
+        let taller = Rect::new(0, 0, 80, 30);
+        let plan = plan_images(
+            image::Protocol::Kitty,
+            &first.drawn,
+            &images,
+            taller,
+            0,
+            &[],
+        );
+        assert_eq!(plan.transmit.len(), 1, "sent again after the clear");
+        assert_eq!(plan.place.len(), 1);
+        // The same size is not a clear, so the next frame only moves what moved.
+        let again = plan_images(image::Protocol::Kitty, &plan.drawn, &images, taller, 0, &[]);
+        assert!(again.transmit.is_empty() && again.place.is_empty());
+    }
+
+    #[test]
+    fn a_picture_a_menu_covers_is_cut_short_rather_than_drawn_over_it() {
+        // A picture is placed after the frame, so one under the `/` menu would be drawn on top of
+        // it. The rows above the menu are still worth showing, so the band is cut there, and the
+        // terminal keeps the data for the rest (D161).
+        let images = [placed(10, 7)];
+        let first = plan_images(
+            image::Protocol::Kitty,
+            &Drawn::default(),
+            &images,
+            area(),
+            0,
+            &[],
+        );
+        assert_eq!(first.drawn.shown, [(11, 0, 7, 0, 4)]);
+        // The menu's first row is the picture's second: one row of it is clear.
+        let menu = Rect::new(0, 12, 80, 8);
+        let cropped = plan_images(
+            image::Protocol::Kitty,
+            &first.drawn,
+            &images,
+            area(),
+            0,
+            &[menu],
+        );
+        assert_eq!(cropped.drawn.shown, [(11, 0, 7, 0, 1)], "the row above it");
+        assert!(cropped.hide.is_empty() && cropped.transmit.is_empty() && cropped.free.is_empty());
+        assert_eq!(cropped.place.len(), 1, "cropped, so placed again");
+        // Closing it puts the whole band back, and nothing travels again.
+        let back = plan_images(
+            image::Protocol::Kitty,
+            &cropped.drawn,
+            &images,
+            area(),
+            0,
+            &[],
+        );
+        assert!(back.transmit.is_empty() && back.hide.is_empty() && back.free.is_empty());
+        assert_eq!(back.drawn.shown, [(11, 0, 7, 0, 4)]);
+    }
+
+    #[test]
+    fn a_dialog_takes_a_picture_off_the_screen_and_the_terminal_keeps_it() {
+        // A dialog owns the screen, so there is nothing of the picture to show. Its placement is
+        // deleted and its data kept, so closing the dialog is a placement and not a transmission
+        // (D161).
+        let images = [placed(10, 7)];
+        let first = plan_images(
+            image::Protocol::Kitty,
+            &Drawn::default(),
+            &images,
+            area(),
+            0,
+            &[],
+        );
+        let plan = plan_images(
+            image::Protocol::Kitty,
+            &first.drawn,
+            &images,
+            area(),
+            0,
+            &[area()],
+        );
+        assert_eq!(plan.hide, [7], "off the cells the dialog covers");
+        assert!(plan.free.is_empty(), "the terminal keeps the data");
+        assert!(plan.transmit.is_empty() && plan.place.is_empty());
+        assert!(plan.drawn.shown.is_empty());
+        assert_eq!(plan.drawn.held, [7]);
+        let escapes = image_escapes(&plan, area());
+        assert!(
+            escapes.contains("a=d,d=i,i=7"),
+            "delete the placement, not the data: {escapes:?}"
+        );
+        // Closing it puts the picture back, and nothing travels again.
+        let back = plan_images(image::Protocol::Kitty, &plan.drawn, &images, area(), 0, &[]);
+        assert!(back.transmit.is_empty() && back.hide.is_empty() && back.free.is_empty());
+        assert_eq!(back.place.len(), 1, "placed where it was");
+    }
+
+    #[test]
+    fn a_picture_the_menu_does_not_reach_stays_where_it_is() {
+        // Only what is actually covered comes off: a menu at the bottom of the screen must not
+        // disturb a picture higher up, or every keystroke in the `/` menu would flash it (D161).
+        let images = [placed(2, 7)];
+        let first = plan_images(
+            image::Protocol::Kitty,
+            &Drawn::default(),
+            &images,
+            area(),
+            0,
+            &[],
+        );
+        let menu = Rect::new(0, 14, 80, 8);
+        let plan = plan_images(
+            image::Protocol::Kitty,
+            &first.drawn,
+            &images,
+            area(),
+            0,
+            &[menu],
+        );
+        assert!(plan.hide.is_empty() && plan.place.is_empty() && plan.transmit.is_empty());
+        assert_eq!(plan.drawn.shown, first.drawn.shown);
+    }
+
+    #[test]
+    fn a_picture_scrolled_out_of_view_is_removed_and_its_data_forgotten() {
+        let first = plan_images(
+            image::Protocol::Kitty,
+            &Drawn::default(),
+            &[placed(10, 7)],
+            area(),
+            0,
+            &[],
+        );
+        // Scrolled far past it: the picture is not in the list any more, so its placement and the
+        // data the terminal holds are both dropped rather than growing with the transcript.
+        let plan = plan_images(image::Protocol::Kitty, &first.drawn, &[], area(), 40, &[]);
+        assert_eq!(plan.free, [7]);
+        assert!(plan.transmit.is_empty() && plan.place.is_empty());
+        assert!(plan.drawn.shown.is_empty());
+        // Coming back is a transmission again, because nothing was kept.
+        let plan = plan_images(
+            image::Protocol::Kitty,
+            &plan.drawn,
+            &[placed(10, 7)],
+            area(),
+            0,
+            &[],
+        );
+        assert_eq!(plan.transmit.len(), 1);
+        assert_eq!(plan.place.len(), 1);
+    }
+
+    #[test]
+    fn a_resize_redraws_when_it_moves_the_area_or_changes_what_fits() {
+        let first = plan_images(
+            image::Protocol::Kitty,
+            &Drawn::default(),
+            &[placed(10, 7)],
+            area(),
+            0,
+            &[],
+        );
+        // Wider only: the terminal cleared its screen with the resize, so the picture is sent again
+        // — placing it would name data the terminal no longer holds (D59).
+        let wider = Rect::new(0, 0, 120, 24);
+        let plan = plan_images(
+            image::Protocol::Kitty,
+            &first.drawn,
+            &[placed(10, 7)],
+            wider,
+            0,
+            &[],
+        );
+        assert_eq!(plan.transmit.len(), 1, "the clear took the data with it");
+        assert_eq!(plan.place.len(), 1);
+        // A shorter transcript: only the first row of the picture is on screen, so it is placed
+        // again with a smaller band.
+        let shorter = Rect::new(0, 0, 80, 12);
+        let plan = plan_images(
+            image::Protocol::Kitty,
+            &plan.drawn,
+            &[placed(10, 7)],
+            shorter,
+            0,
+            &[],
+        );
+        assert_eq!(plan.transmit.len(), 1, "another clear, another send");
+        assert_eq!(plan.place.len(), 1);
+        assert_eq!(plan.drawn.shown, [(11, 0, 7, 0, 1)], "one row of four");
+        // Moved down the screen without changing size: the terminal kept its data, and every row
+        // shifts, so it is placed again.
+        let moved = Rect::new(0, 2, 80, 12);
+        let plan = plan_images(
+            image::Protocol::Kitty,
+            &plan.drawn,
+            &[placed(10, 7)],
+            moved,
+            0,
+            &[],
+        );
+        assert!(plan.free.is_empty() && plan.transmit.is_empty());
+        assert_eq!(plan.place.len(), 1);
+    }
+
+    #[test]
+    fn two_pictures_each_keep_their_own_id() {
+        let images = [placed(2, 1), placed(10, 2)];
+        let plan = plan_images(
+            image::Protocol::Kitty,
+            &Drawn::default(),
+            &images,
+            area(),
+            0,
+            &[],
+        );
+        assert_eq!(plan.transmit.len(), 2);
+        assert_eq!(plan.place.len(), 2);
+        assert_eq!(plan.drawn.shown, [(3, 0, 1, 0, 4), (11, 0, 2, 0, 4)]);
+        let plan = plan_images(image::Protocol::Kitty, &plan.drawn, &[], area(), 0, &[]);
+        assert_eq!(plan.free, [1, 2], "both are taken off, not just the first");
+    }
+
+    #[test]
+    fn a_picture_that_only_moves_is_not_taken_off_first() {
+        // What the flicker was: erase, then transmit, then draw, with the screen empty in between.
+        // Moving is now one placement, which the terminal replaces in place (D59).
+        let images = [placed(10, 7), placed(20, 9)];
+        let first = plan_images(
+            image::Protocol::Kitty,
+            &Drawn::default(),
+            &images,
+            area(),
+            0,
+            &[],
+        );
+        // Scroll by one: both pictures shift, neither is erased or re-sent.
+        let plan = plan_images(
+            image::Protocol::Kitty,
+            &first.drawn,
+            &images,
+            area(),
+            1,
+            &[],
+        );
+        assert!(plan.free.is_empty(), "nothing leaves the screen");
+        assert!(plan.transmit.is_empty(), "the files are already there");
+        assert_eq!(plan.place.len(), 2, "both are placed at their new rows");
+    }
+
+    #[test]
+    fn a_replaced_transcript_takes_its_pictures_off_and_sends_the_new_ones() {
+        // The same transcript position has the same id, so a resume or a `/new` can put a different
+        // picture where the last one was drawn. That is the one case where an id on screen cannot
+        // be trusted to be the picture it names (D59).
+        let first = plan_images(
+            image::Protocol::Kitty,
+            &Drawn::default(),
+            &[placed(10, 7)],
+            area(),
+            0,
+            &[],
+        );
+        let mut drawn = first.drawn;
+        drawn.stale = true;
+        let plan = plan_images(
+            image::Protocol::Kitty,
+            &drawn,
+            &[placed(10, 7)],
+            area(),
+            0,
+            &[],
+        );
+        assert_eq!(plan.free, [7], "the old picture goes");
+        assert_eq!(plan.transmit.len(), 1, "and the new one is sent");
+        assert_eq!(plan.place.len(), 1);
+        assert!(!plan.drawn.stale, "the next frame trusts itself again");
+    }
+
+    #[test]
+    fn the_escapes_forget_a_picture_that_left_and_move_one_that_stayed() {
+        // The two halves of the bug: a picture scrolled off is deleted with its data, and one that
+        // only moved is a cursor move and a placement, with nothing erased first (D59).
+        let area = Rect::new(0, 2, 80, 24);
+        let first = plan_images(
+            image::Protocol::Kitty,
+            &Drawn::default(),
+            &[placed(10, 7), placed(20, 8)],
+            area,
+            0,
+            &[],
+        );
+        let escapes = image_escapes(&first, area);
+        assert!(escapes.contains("a=t,f=100,q=2,i=7,"), "sent once");
+        assert!(
+            escapes.contains("\x1b[14;1H"),
+            "the area starts at row 2 and the marker is its line 10: {escapes:?}"
+        );
+        assert!(escapes.contains("a=p,i=7,p=1"), "placed, not transmitted");
+        assert!(
+            !escapes.contains("a=d"),
+            "nothing to delete on the first frame"
+        );
+        assert!(
+            escapes.ends_with("\x1b8"),
+            "the cursor the frame placed is put back after the last placement: {escapes:?}"
+        );
+
+        // One picture scrolled off the top: it is deleted and its data freed; the other, whose own
+        // row did not move, is left exactly as it is.
+        let second = plan_images(
+            image::Protocol::Kitty,
+            &first.drawn,
+            &[placed(20, 8)],
+            area,
+            0,
+            &[],
+        );
+        let escapes = image_escapes(&second, area);
+        assert_eq!(escapes.matches("a=d,d=I,i=").count(), 1, "{escapes:?}");
+        assert!(
+            escapes.contains("d=I,i=7,"),
+            "the one that left: {escapes:?}"
+        );
+        assert!(
+            !escapes.contains("a=p"),
+            "the one that stayed is not redrawn"
+        );
+        assert!(!escapes.contains("a=t"), "and not sent again");
+    }
+
+    #[test]
+    fn a_picture_inside_a_line_is_placed_at_its_column() {
+        // D165: a formula in a sentence is drawn where the words leave it, so moving it across the
+        // row — which is what a re-wrap does — is a new placement, not a frame with nothing in it.
+        let mut picture = placed(10, 7);
+        picture.column = 4;
+        let images = [picture];
+        let plan = plan_images(
+            image::Protocol::Kitty,
+            &Drawn::default(),
+            &images,
+            area(),
+            0,
+            &[],
+        );
+        assert_eq!(plan.place.len(), 1, "placed once");
+        let escapes = image_escapes(&plan, area());
+        assert!(
+            escapes.contains("\x1b[12;5H"),
+            "the fifth column of the twelfth row: {escapes:?}"
+        );
+        let mut moved = images.clone();
+        moved[0].column = 5;
+        let again = plan_images(image::Protocol::Kitty, &plan.drawn, &moved, area(), 0, &[]);
+        assert_eq!(again.place.len(), 1, "the column changed: {again:?}");
+        // And the row it is on is unchanged, so a frame that only re-wraps the words does not send
+        // the picture's data again.
+        assert!(again.transmit.is_empty(), "the terminal still holds it");
+    }
+
+    #[test]
+    fn a_move_is_a_placement_at_the_new_row_with_nothing_erased() {
+        let area = Rect::new(0, 0, 80, 24);
+        let images = [placed(10, 7)];
+        let first = plan_images(
+            image::Protocol::Kitty,
+            &Drawn::default(),
+            &images,
+            area,
+            0,
+            &[],
+        );
+        let moved = plan_images(image::Protocol::Kitty, &first.drawn, &images, area, 3, &[]);
+        let escapes = image_escapes(&moved, area);
+        assert!(
+            !escapes.contains("a=d") && !escapes.contains("a=t"),
+            "{escapes:?}"
+        );
+        assert!(
+            escapes.starts_with("\x1b7\x1b[9;1H\x1b_Ga=p,i=7,p=1"),
+            "{escapes:?}"
+        );
+        assert!(escapes.ends_with("\x1b8"), "{escapes:?}");
+    }
+
+    #[test]
+    fn placing_a_picture_leaves_the_cursor_where_the_frame_put_it() {
+        // A placement has to move to the picture's row, and the frame had already put the cursor in
+        // the editor. Left there, the terminal drew its block cursor on the formula's first row,
+        // which read as the formula having arrived selected (D165).
+        let area = Rect::new(0, 0, 80, 24);
+        let images = [placed(10, 7)];
+        let plan = plan_images(
+            image::Protocol::Kitty,
+            &Drawn::default(),
+            &images,
+            area,
+            0,
+            &[],
+        );
+        let escapes = image_escapes(&plan, area);
+        assert!(escapes.starts_with("\x1b7"), "{escapes:?}");
+        assert!(escapes.ends_with("\x1b8"), "{escapes:?}");
+        // A frame with nothing to place is not a save and restore of nothing: it says nothing.
+        let quiet = plan_images(image::Protocol::Kitty, &Drawn::default(), &[], area, 0, &[]);
+        assert_eq!(image_escapes(&quiet, area), "");
+    }
+
+    #[test]
+    fn an_iterm_picture_is_sent_every_time_because_nothing_is_stored() {
+        // iTerm2 has no image store and no placement id, so its whole file travels with the frame
+        // that moves it. Nothing is transmitted ahead of time and nothing is deleted.
+        let images = [placed(10, 7)];
+        let first = plan_images(
+            image::Protocol::Iterm2,
+            &Drawn::default(),
+            &images,
+            area(),
+            0,
+            &[],
+        );
+        assert!(first.transmit.is_empty());
+        assert_eq!(first.place.len(), 1);
+        let plan = plan_images(
+            image::Protocol::Iterm2,
+            &first.drawn,
+            &images,
+            area(),
+            2,
+            &[],
+        );
+        assert!(plan.free.is_empty() && plan.transmit.is_empty());
+        assert_eq!(plan.place.len(), 1, "drawn again where it now is");
+        let plan = plan_images(image::Protocol::Iterm2, &plan.drawn, &[], area(), 40, &[]);
+        assert!(plan.free.is_empty(), "there is nothing to delete");
+    }
+
+    #[test]
+    fn the_image_log_says_what_the_terminal_was_told() {
+        // What `SADDLE_IMAGE_LOG` writes: a terminal that draws a picture the wrong size and an
+        // escape that asked for the wrong size look the same on screen, and this is the difference
+        // in a file (D59). The escapes are written as text, one line a frame.
+        let images = [placed(10, 7)];
+        let plan = plan_images(
+            image::Protocol::Kitty,
+            &Drawn::default(),
+            &images,
+            area(),
+            0,
+            &[],
+        );
+        let line = trace_line(&plan, area(), 0);
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(
+            line.starts_with("frame x=0 y=0 80x24 top=0 covered=0"),
+            "{line}"
+        );
+        assert!(line.contains(" transmit 7"), "{line}");
+        assert!(line.contains(" place11.0 ESC_Ga=p,i=7,p=1"), "{line}");
+        assert!(line.contains(" shown 7@11.0+0/4"), "{line}");
+        assert!(!line.contains('\x1b'), "no raw control characters: {line}");
+        assert!(
+            !line.contains('\u{1b}'),
+            "no raw control characters: {line}"
+        );
+        // Nothing on screen, nothing placed: one line saying so, not an empty file.
+        let empty = plan_images(image::Protocol::Kitty, &plan.drawn, &[], area(), 0, &[]);
+        let line = trace_line(&empty, area(), 0);
+        assert!(line.contains(" free 7"), "{line}");
+        assert!(!line.contains(" place"), "{line}");
     }
 
     #[test]

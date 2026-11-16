@@ -10,6 +10,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use std::borrow::Cow;
 use std::env;
 use std::iter;
 use std::mem;
@@ -18,19 +19,23 @@ use std::time::SystemTime;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
-    Activity, App, COPY_NOTE, Cached, CompactState, CompactionView, Entry, NoteKind, Placed, Seen,
+    Activity, App, COPY_NOTE, Cached, CompactState, CompactionView, Confirm, Entry, NoteKind,
+    Placed, Seen, Source,
 };
 use super::login::{Login, MODEL_ROWS, Purpose, Stage, matching};
 use super::permissions::{ADD_HELP, Kind, Permissions};
 use super::sessions::{ROWS as SESSION_ROWS, SessionPicker, age};
 use super::settings::{ROWS, SettingsDialog};
 use super::themes::{ROWS as THEME_ROWS, ThemePicker};
-use super::tree::{ROWS as TREE_ROWS, Tree};
+use super::tree::Tree;
 use crate::tui::image;
+use crate::tui::math;
+use crate::tui::math::Formula;
 #[cfg(test)]
 use crate::tui::plan_images;
 use crate::tui::status::{Field, StatusData};
 use crate::tui::syntax::{self, Language, State};
+use crate::tui::theme::Appearance;
 use crate::tui::theme::Theme;
 
 #[cfg(test)]
@@ -158,6 +163,211 @@ fn block_style(theme: &Theme) -> Style {
     Style::new().fg(theme.md_code_block)
 }
 
+/// The character a formula's first reserved row carries until the drawing pass finds it (D165).
+///
+/// A picture is placed at a row of the transcript, and a formula is not an entry of its own: it is
+/// inside a message, whose rows are wrapped and shifted before they are drawn. The marker is how a
+/// row that has to be blank in the end survives that, without the picture's position being counted
+/// through a wrap that splits other rows. It is a private-use character and is replaced by a blank
+/// before anything is drawn or copied.
+const FORMULA: char = '\u{E000}';
+
+/// The character the rest of an inline formula's reserved run carries (D165).
+///
+/// A formula inside a line of text takes cells of that line, and the cells are reserved as a run of
+/// characters the wrapper measures like any other text but cannot break: a private-use letter is
+/// one cell wide and is not whitespace, so the run moves to the next row whole rather than being
+/// split down the middle. Both characters are replaced by blanks before anything is drawn.
+const GUTTER: char = '\u{E001}';
+
+/// The most rows a formula may take. Beyond this the source is drawn instead: a page-high equation
+/// is not what a transcript is for (D165).
+const MAX_MATH_ROWS: u16 = 16;
+
+/// The Markdown as it was written, with the other spellings of a formula rewritten into the parser's
+/// own (D165).
+///
+/// `pulldown-cmark` knows `$x$` and `$$x$$` and nothing else. The two spellings people write instead
+/// reach it as ordinary text, and have to: a dollar with a space inside is what money looks like, and
+/// the backslash of `\(x\)` is an escape that is gone before any maths layer could see it. So they
+/// are rewritten here, before it parses anything — outside code, which is what a person wrote to be
+/// read exactly as it is: a fenced block, or a span between backticks.
+fn delimiters(text: &str) -> Cow<'_, str> {
+    if !text.contains('$') && !text.contains("\\(") && !text.contains("\\[") {
+        return Cow::Borrowed(text);
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut changed = false;
+    let mut fence: Option<(char, usize)> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // A fence line is a whole line, and is copied as one: read as an inline span instead, its
+        // backticks would open a span that never closes and the rest of the message would be left
+        // exactly as it was written (D165).
+        if (i == 0 || chars[i - 1] == '\n')
+            && let Some(marker) = fence_marker(&chars[i..])
+        {
+            match fence {
+                Some((open, count)) if open == marker.0 && marker.1 >= count => fence = None,
+                None => fence = Some(marker),
+                _ => {}
+            }
+            let end = chars[i..]
+                .iter()
+                .position(|c| *c == '\n')
+                .map_or(chars.len(), |at| i + at);
+            out.extend(&chars[i..end]);
+            i = end;
+            continue;
+        }
+        if fence.is_some() {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        match c {
+            // A span in backticks is code however it reads, so it is copied to its closing run —
+            // and a run that never closes is just a backtick, which is what the parser makes of it.
+            '`' => {
+                let run = chars[i..].iter().take_while(|c| **c == '`').count();
+                match code_span_end(&chars, i + run, run) {
+                    Some(end) => {
+                        out.extend(&chars[i..end]);
+                        i = end;
+                    }
+                    None => {
+                        out.extend(&chars[i..i + run]);
+                        i += run;
+                    }
+                }
+            }
+            // TeX's own delimiters: the backslash is what makes them unambiguous.
+            '\\' if matches!(chars.get(i + 1), Some('(' | '[')) => {
+                let (close, mark) = match chars[i + 1] {
+                    '(' => (')', "$"),
+                    _ => (']', "$$"),
+                };
+                let mut j = i + 2;
+                let mut end = None;
+                while j + 1 < chars.len() {
+                    if chars[j] == '\\' && chars[j + 1] == close {
+                        end = Some(j);
+                        break;
+                    }
+                    j += 1;
+                }
+                match end {
+                    Some(j) if j > i + 2 => {
+                        let body: String = chars[i + 2..j].iter().collect();
+                        out.push_str(mark);
+                        out.push_str(body.trim());
+                        out.push_str(mark);
+                        changed = true;
+                        i = j + 2;
+                    }
+                    _ => {
+                        out.push(c);
+                        i += 1;
+                    }
+                }
+            }
+            // A dollar with a space inside: maths when it reads as maths, money when it does not.
+            '$' if chars.get(i + 1) != Some(&'$') => {
+                let mut j = i + 1;
+                let mut end = None;
+                while j < chars.len() {
+                    match chars[j] {
+                        '\n' => break,
+                        '\\' => j += 2,
+                        '$' => {
+                            end = Some(j);
+                            break;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                match end {
+                    Some(j) if maths_like(&chars[i + 1..j]) => {
+                        let body: String = chars[i + 1..j].iter().collect();
+                        let trimmed = body.trim();
+                        if trimmed.len() != body.len() {
+                            out.push('$');
+                            out.push_str(trimmed);
+                            out.push('$');
+                            changed = true;
+                        } else {
+                            out.extend(&chars[i..=j]);
+                        }
+                        i = j + 1;
+                    }
+                    _ => {
+                        out.push(c);
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    match changed {
+        true => Cow::Owned(out),
+        false => Cow::Borrowed(text),
+    }
+}
+
+/// Just past the run of `run` backticks that closes a code span beginning at `from`, if one does.
+fn code_span_end(chars: &[char], from: usize, run: usize) -> Option<usize> {
+    let mut j = from;
+    while j < chars.len() {
+        let here = chars[j..].iter().take_while(|c| **c == '`').count();
+        if here == 0 {
+            j += 1;
+            continue;
+        }
+        if here == run {
+            return Some(j + here);
+        }
+        j += here;
+    }
+    None
+}
+
+/// The fence a line opens or closes, when it starts with one: three or more backticks or tildes, no
+/// more than three spaces in.
+fn fence_marker(line: &[char]) -> Option<(char, usize)> {
+    let indent = line.iter().take_while(|c| **c == ' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let marker = *line.get(indent)?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+    let count = line[indent..].iter().take_while(|c| **c == marker).count();
+    (count >= 3).then_some((marker, count))
+}
+
+/// Whether what stands between two dollars is a formula rather than an amount of money (D165).
+///
+/// A formula has TeX in it — a command, a script, a group, a relation — or else it is one word of
+/// symbols; money has figures in it, and prose has spaces.
+fn maths_like(body: &[char]) -> bool {
+    let body: String = body.iter().collect();
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains(['\\', '^', '_', '{', '}', '=', '+', '<', '>', '|']) {
+        return true;
+    }
+    !trimmed.contains([' ', '\t', ',']) && !trimmed.chars().any(|c| c.is_ascii_digit())
+}
+
 /// Markdown to rows, fitted to `room` columns. Soft breaks are kept as line breaks, since a model's
 /// line breaks are usually deliberate (tables, lists written by hand).
 ///
@@ -165,28 +375,42 @@ fn block_style(theme: &Theme) -> Style {
 /// cannot survive being wrapped afterwards, because a wrapped row loses the alignment that makes
 /// it a table. Every other block is wrapped by [`wrap`] as it always was.
 pub fn markdown(text: &str, theme: &Theme, room: usize) -> Vec<Row> {
-    markdown_over(text, theme, Style::new(), room)
+    markdown_over(text, theme, Style::new(), room, false, 1.0, &mut Vec::new())
 }
 
 /// Markdown drawn over `base`, which is what a message the user typed gets: the text is already in
 /// their colour, and the emphasis they wrote is a modifier on top of it.
-fn markdown_over(text: &str, theme: &Theme, base: Style, room: usize) -> Vec<Row> {
+fn markdown_over(
+    text: &str,
+    theme: &Theme,
+    base: Style,
+    room: usize,
+    pictures: bool,
+    scale: f32,
+    images: &mut Vec<Formula>,
+) -> Vec<Row> {
     let mut md = Markdown {
         theme: theme.clone(),
         base,
         room,
+        pictures,
+        scale,
         ..Markdown::default()
     };
-    let options =
-        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    for event in Parser::new_ext(text, options) {
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        // `$…$` and `$$…$$` arrive as their own events, which is what makes a formula a picture
+        // rather than a span of text (D165).
+        | Options::ENABLE_MATH;
+    for event in Parser::new_ext(&delimiters(text), options) {
         md.event(event);
     }
     md.flush();
+    images.append(&mut md.images);
     md.rows
 }
 
-#[derive(Default)]
 struct Markdown {
     /// The columns a table may use, so it is fitted instead of wrapped apart.
     room: usize,
@@ -209,6 +433,43 @@ struct Markdown {
     /// The style everything is drawn over: empty for a reply, the prompt's own colour for a message
     /// the user typed, so the emphasis inside it is visible against their text (D81).
     base: Style,
+    /// Whether a formula can be drawn at all: a terminal with no graphics protocol gets its source
+    /// (D59, D165).
+    pictures: bool,
+    /// The formulas this block reserved rows for, in the order their markers appear.
+    images: Vec<Formula>,
+    /// `[ui] math-scale`, which is 1.0 unless someone asked for larger or smaller formulas (D165).
+    scale: f32,
+    /// Whether the last row pushed is the blank a block break asked for (D165).
+    block_blank: bool,
+}
+
+impl Default for Markdown {
+    fn default() -> Self {
+        Self {
+            room: 0,
+            theme: Theme::default(),
+            rows: Vec::new(),
+            line: Vec::new(),
+            styles: Vec::new(),
+            lists: Vec::new(),
+            bullet: None,
+            quote: 0,
+            code: false,
+            lang: Language::default(),
+            code_state: State::default(),
+            blank_before_next_block: false,
+            link: None,
+            table: None,
+            base: Style::default(),
+            pictures: false,
+            images: Vec::new(),
+            // Not a type's zero: the size the fonts and the cell work out to is the default, and
+            // zero would draw a formula half-size (D165).
+            scale: 1.0,
+            block_blank: false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -266,6 +527,7 @@ impl Markdown {
         if self.line.is_empty() {
             return;
         }
+        self.block_blank = false;
         let (first, rest) = self.prefixes();
         let spans = mem::take(&mut self.line);
         self.rows.push(Row { first, rest, spans });
@@ -273,10 +535,98 @@ impl Markdown {
 
     fn start_block(&mut self) {
         self.flush();
-        if self.blank_before_next_block && !self.rows.is_empty() && self.lists.is_empty() {
+        let blank = self.blank_before_next_block && !self.rows.is_empty() && self.lists.is_empty();
+        if blank {
             self.rows.push(Row::default());
         }
+        // Which row, if any, the break put there: a formula takes the break without it.
+        self.block_blank = blank;
         self.blank_before_next_block = false;
+    }
+
+    /// Typesets one display formula and reserves the rows it will be drawn in (D165).
+    ///
+    /// The rows are blank in the end, and the first of them carries a marker: the picture is placed
+    /// at that row, so the layout and the drawing pass agree even though the rows around it are
+    /// wrapped and counted later.
+    fn formula(&mut self, source: &str) {
+        // A block break puts a blank row above the block, and a picture's ink starts at the very top
+        // of its box: that row reads as a hole above a formula, where above a paragraph of text its
+        // own line leading fills the same gap. A formula brings its own room — the padding inside
+        // the picture — so it takes the break without the blank row (D165).
+        self.flush();
+        if self.block_blank {
+            self.rows.pop();
+            self.block_blank = false;
+        }
+        let room = math::Room {
+            cell: image::cell_px(),
+            cols: self.room.max(1) as u16,
+            rows: MAX_MATH_ROWS,
+            colour: maths_colour(&self.theme),
+            scale: self.scale,
+        };
+        let formula = if self.pictures {
+            math::render(source, &room)
+        } else {
+            None
+        };
+        let Some(formula) = formula else {
+            // The rule that keeps the transcript honest: what cannot be typeset is drawn as the
+            // source, never as something wrong (D165).
+            self.line
+                .push(Span::styled(format!("$${source}$$"), self.code_style()));
+            self.flush();
+            self.blank_before_next_block = true;
+            return;
+        };
+        // The rows this formula is drawn in are the rows the layout reserves (D165): the picture is
+        // scaled into them, so the two cannot disagree about how tall it is.
+        let rows = formula.cells.1.max(1);
+        self.rows
+            .push(Row::plain(vec![Span::raw(FORMULA.to_string())]));
+        for _ in 1..rows {
+            self.rows.push(Row::default());
+        }
+        self.images.push(formula);
+        // The same reason below: the room inside the picture is the separation, so the text that
+        // follows a formula starts on the next row instead of after a blank one (D165).
+        self.blank_before_next_block = false;
+    }
+
+    /// Typesets one formula inside a line of text and reserves the cells it is drawn in (D165).
+    ///
+    /// It cannot have rows of its own, so what it gets instead is cells of the line it is in: a run
+    /// the wrapper measures as usual and cannot break inside. The run moves to the next row with
+    /// the words around it, and the drawing pass finds the marker and puts the picture at the column
+    /// the run ended up at.
+    fn inline(&mut self, source: &str) {
+        // A table's cells are fitted rather than wrapped, so there is no column for a picture to
+        // take: a formula inside one stays its source, as it does in a terminal with no pictures.
+        let formula = if self.table.is_some() || !self.pictures {
+            None
+        } else {
+            let room = math::Room {
+                cell: image::cell_px(),
+                cols: self.room.max(1) as u16,
+                rows: 1,
+                colour: maths_colour(&self.theme),
+                scale: self.scale,
+            };
+            math::render_inline(source, &room)
+        };
+        let Some(formula) = formula else {
+            let style = self.code_style();
+            self.text(&format!("${source}$"), style);
+            return;
+        };
+        let mut reserved = String::with_capacity(formula.cells.0.max(1) as usize);
+        reserved.push(FORMULA);
+        for _ in 1..formula.cells.0.max(1) {
+            reserved.push(GUTTER);
+        }
+        self.line.push(Span::raw(reserved));
+        self.images.push(formula);
     }
 
     fn text(&mut self, s: &str, style: Style) {
@@ -315,6 +665,10 @@ impl Markdown {
                 self.text(&t, style);
             }
             Event::Code(t) => self.text(&t, self.code_style()),
+            // A display formula is typeset and placed as a picture, and so is one inside a line:
+            // both are drawn in the cells the layout reserves for them (D165).
+            Event::DisplayMath(t) => self.formula(&t),
+            Event::InlineMath(t) => self.inline(&t),
             Event::SoftBreak | Event::HardBreak => self.flush(),
             Event::Rule => {
                 self.start_block();
@@ -329,10 +683,7 @@ impl Markdown {
                 self.line
                     .push(Span::raw(if done { "[x] " } else { "[ ] " }));
             }
-            Event::Html(t)
-            | Event::InlineHtml(t)
-            | Event::InlineMath(t)
-            | Event::DisplayMath(t) => {
+            Event::Html(t) | Event::InlineHtml(t) => {
                 let style = self.style();
                 self.text(t.trim_end_matches('\n'), style);
             }
@@ -750,6 +1101,9 @@ struct View {
     /// Whether the terminal can draw a picture, which decides whether an attachment gets rows
     /// reserved for one (D59).
     images: bool,
+    /// `[ui] math-scale`: a formula drawn larger or smaller than the fonts and the cell work out to
+    /// (D165).
+    scale: f32,
 }
 
 fn thinking_rows(text: &str, shown: bool, theme: &Theme, room: usize) -> Vec<Row> {
@@ -769,6 +1123,9 @@ fn thinking_rows(text: &str, shown: bool, theme: &Theme, room: usize) -> Vec<Row
         theme,
         bar.add_modifier(Modifier::ITALIC),
         room.saturating_sub(2),
+        false,
+        1.0,
+        &mut Vec::new(),
     );
     for row in &mut rows {
         row.first.insert(0, Span::styled("│ ", bar));
@@ -784,8 +1141,23 @@ fn thinking_rows(text: &str, shown: bool, theme: &Theme, room: usize) -> Vec<Row
 /// by the same code. The text is not bold, so that `**bold**` inside it is visible; the `>` marker is
 /// what says whose message it is. Every row gets the marker's width as its continuation, including
 /// a row a block construct made, so a list in a prompt still lines up under the message.
-fn user_rows(text: &str, theme: &Theme, room: usize) -> Vec<Row> {
-    let mut rows = markdown_over(text, theme, Style::new().fg(theme.user_message_text), room);
+fn user_rows(
+    text: &str,
+    theme: &Theme,
+    room: usize,
+    pictures: bool,
+    scale: f32,
+    images: &mut Vec<Formula>,
+) -> Vec<Row> {
+    let mut rows = markdown_over(
+        text,
+        theme,
+        Style::new().fg(theme.user_message_text),
+        room,
+        pictures,
+        scale,
+        images,
+    );
     let marker = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
     for (i, row) in rows.iter_mut().enumerate() {
         row.first = vec![Span::styled(
@@ -798,11 +1170,26 @@ fn user_rows(text: &str, theme: &Theme, room: usize) -> Vec<Row> {
 }
 
 /// Rows for entries drawn as plain text; tool calls are drawn as blocks by [`tool_block`].
-fn entry_rows(entry: &Entry, view: View, theme: &Theme) -> Vec<Row> {
+fn entry_rows(entry: &Entry, view: View, theme: &Theme, images: &mut Vec<Formula>) -> Vec<Row> {
     match entry {
         Entry::Thinking(text) => thinking_rows(text, view.thinking, theme, view.room.0 as usize),
-        Entry::User(text) => user_rows(text, theme, view.room.0 as usize),
-        Entry::Assistant(text) => markdown(text, theme, view.room.0 as usize),
+        Entry::User(text) => user_rows(
+            text,
+            theme,
+            view.room.0 as usize,
+            view.images,
+            view.scale,
+            images,
+        ),
+        Entry::Assistant(text) => markdown_over(
+            text,
+            theme,
+            Style::new(),
+            view.room.0 as usize,
+            view.images,
+            view.scale,
+            images,
+        ),
         Entry::Image(image) => {
             // The picture is drawn over the rows after this one, so they are left empty for it. The
             // marker line stays, and is all a terminal without a graphics protocol shows (D59).
@@ -865,7 +1252,11 @@ fn compaction_block(
     let reasoning = v.reasoning.trim();
     if !reasoning.is_empty() {
         rows.push(Row::default());
-        if thinking {
+        // One control for the entry: ctrl+o opens the compaction, and the reasoning it was written
+        // from is part of what it opens. It used to follow ctrl+t instead, which meant a person who
+        // had reasoning on saw every compaction arrive with all of its thinking laid out — two
+        // toggles for one entry, and the default was the wrong way round (D124).
+        if expand && thinking {
             rows.extend(thinking_rows(
                 reasoning,
                 true,
@@ -873,9 +1264,14 @@ fn compaction_block(
                 room.saturating_sub(2),
             ));
         } else {
+            let hint = if thinking {
+                "ctrl+o shows all"
+            } else {
+                "ctrl+t shows it"
+            };
             rows.push(Row::plain(vec![Span::styled(
                 format!(
-                    "∴ reasoned for {} lines · ctrl+t shows it",
+                    "∴ reasoned for {} lines · {hint}",
                     reasoning.lines().count()
                 ),
                 italic,
@@ -1189,13 +1585,36 @@ fn shaded(rows: &[Row], bg: Color, width: usize) -> Vec<Line<'static>> {
 /// All transcript lines at `width`, reusing cached entries.
 /// The transcript, and the line each attachment is announced on, so the picture can be drawn just
 /// below it (D59).
-fn transcript_with_images(
-    app: &mut App,
-    width: u16,
-) -> (Vec<Line<'static>>, Vec<(usize, Image, u32)>) {
-    // The third field is the terminal id: it comes from the entry's position, so the same picture
-    // keeps the same id every frame and does not have to be re-sent (D59).
-    let mut images: Vec<(usize, Image, u32)> = Vec::new();
+/// One picture the transcript drew, and where it goes.
+struct At {
+    /// The line the picture's box starts at: for a picture its own text announces, the row below the
+    /// line announcing it; for a formula, the row below its marker, or the marker's own row when the
+    /// formula sits inside a line (D165).
+    line: usize,
+    /// The column its first cell is at, or `None` when it starts its row. A formula inside a line of
+    /// text starts where the words before it leave off (D165).
+    column: Option<u16>,
+    /// The picture, and the cells it is drawn in. An attachment states its own size; a formula's
+    /// cells are the rows the layout reserved for it (D165).
+    picture: Picture,
+    /// The TeX a formula was typeset from, which is what a copy of it takes (D166). Empty for a
+    /// picture an attachment brings, which has no source in the conversation.
+    tex: String,
+    /// Whether the formula sits inside a line: `$…$` when it is copied, `$$…$$` when it is a block.
+    inline: bool,
+    /// The id the terminal knows it by: the entry's position gives it, so the same picture keeps
+    /// the same id every frame and does not have to be re-sent (D59).
+    id: u32,
+}
+
+/// A picture the transcript places, and its size in cells.
+struct Picture {
+    image: Image,
+    cells: image::Fit,
+}
+
+fn transcript_with_images(app: &mut App, width: u16) -> (Vec<Line<'static>>, Vec<At>) {
+    let mut images: Vec<At> = Vec::new();
     let mut lines = Vec::new();
     for i in 0..app.entries.len() {
         let running = match &app.entries[i] {
@@ -1209,12 +1628,14 @@ fn transcript_with_images(
             c.width == width && c.expand == app.expand_tools && c.thinking == app.show_thinking
         });
         if !fresh || running {
+            let mut formulas: Vec<Formula> = Vec::new();
             let view = View {
                 expand: app.expand_tools,
                 thinking: app.show_thinking,
                 spinner: app.spinner,
                 room: (width, image::MAX_ROWS),
                 images: app.protocol != image::Protocol::Text,
+                scale: app.header.math_scale,
             };
             let rendered: Vec<Line<'static>> = match &app.entries[i] {
                 Entry::Tool {
@@ -1248,16 +1669,17 @@ fn transcript_with_images(
                     );
                     shaded(&rows, bg, width as usize)
                 }
-                entry => entry_rows(entry, view, &app.theme)
-                    .iter()
-                    .flat_map(|r| wrap(r, width as usize))
-                    .collect(),
+                entry => {
+                    let rows = entry_rows(entry, view, &app.theme, &mut formulas);
+                    rows.iter().flat_map(|r| wrap(r, width as usize)).collect()
+                }
             };
             app.cache[i] = Some(Cached {
                 width,
                 expand: app.expand_tools,
                 thinking: app.show_thinking,
                 lines: rendered,
+                pictures: formulas,
             });
         }
         if i > 0 {
@@ -1266,8 +1688,19 @@ fn transcript_with_images(
         // The marker line is where the picture goes, so its index is taken before the entry's own
         // lines are added and the picture starts there.
         if let Some(image) = app.cached_image(i) {
-            images.push((lines.len(), image, i as u32 + 1));
+            let cells = image::fit((image.width, image.height), (width, image::MAX_ROWS));
+            images.push(At {
+                // The picture goes under the line that announces it.
+                line: lines.len() + 1,
+                column: None,
+                picture: Picture { image, cells },
+                // An attachment has no source in the conversation: it *is* the content.
+                tex: String::new(),
+                inline: false,
+                id: picture_id(i, 0),
+            });
         }
+        let start = lines.len();
         lines.extend(
             app.cache[i]
                 .as_ref()
@@ -1275,8 +1708,102 @@ fn transcript_with_images(
                 .into_iter()
                 .flatten(),
         );
+        // Every formula left a marker where it is drawn: a row of its own for a block, and a run of
+        // cells inside a row for one that sits in a line. What is drawn is the picture; the cells it
+        // took are blanked so nothing shows through it (D165).
+        let pictures = app
+            .cache
+            .get(i)
+            .map(|c| c.as_ref().map(|c| c.pictures.clone()).unwrap_or_default())
+            .unwrap_or_default();
+        for (k, image) in pictures.into_iter().enumerate() {
+            let Some(at) = lines[start..]
+                .iter()
+                .position(|line| plain(line).contains(FORMULA))
+            else {
+                // The block was cached without its picture, which means the source is what is on
+                // screen; there is nothing to place.
+                continue;
+            };
+            let (line, column) = if image.inline {
+                let Some(column) = unmark(&mut lines[start + at]) else {
+                    continue;
+                };
+                (start + at, Some(column as u16))
+            } else {
+                // A block's marker has the row to itself, and the picture starts on the row below.
+                lines[start + at] = Line::default();
+                (start + at + 1, None)
+            };
+            images.push(At {
+                line,
+                column,
+                tex: image.source.clone(),
+                inline: image.inline,
+                // The cells the formula says it occupies, asked for as a box: the terminal scales
+                // the picture into them, whatever its own pixels are (D165).
+                picture: Picture {
+                    cells: image::Fit {
+                        cols: image.cells.0.max(1),
+                        rows: image.cells.1.max(1),
+                        scaled: true,
+                    },
+                    image: image.image,
+                },
+                id: picture_id(i, k + 1),
+            });
+        }
     }
     (lines, images)
+}
+
+/// The terminal id of one of an entry's pictures (D59, D165).
+///
+/// An id has to be the same in every frame and different for every picture on the screen: the entry
+/// it belongs to and its place in that entry give both, and the room for 63 pictures in a message
+/// is far beyond what one reply holds.
+fn picture_id(entry: usize, within: usize) -> u32 {
+    (entry as u32) * 64 + within as u32 + 1
+}
+
+/// The colour a formula is drawn in: the theme's text colour, or near-black or near-white when the
+/// theme leaves it to the terminal, which a picture cannot do (D165).
+fn maths_colour(theme: &Theme) -> (u8, u8, u8) {
+    match theme.text {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => match theme.appearance {
+            Appearance::Light => (24, 24, 24),
+            Appearance::Dark => (232, 232, 232),
+        },
+    }
+}
+
+/// Blanks the run a formula reserved inside a line, returning the column it started at (D165).
+///
+/// The run is the marker and the fillers after it, one cell each: spaces keep the line's layout
+/// exactly, so what the row shows at that column is the picture and nothing else.
+fn unmark(line: &mut Line<'static>) -> Option<usize> {
+    let mut column = 0;
+    for span in &mut line.spans {
+        let Some(at) = span.content.find(FORMULA) else {
+            column += span.content.width();
+            continue;
+        };
+        let before = &span.content[..at];
+        let column = column + before.width();
+        let chars: Vec<char> = span.content.chars().collect();
+        let from = before.chars().count();
+        let mut to = from;
+        while to < chars.len() && (chars[to] == FORMULA || chars[to] == GUTTER) {
+            to += 1;
+        }
+        let mut blanked: String = chars[..from].iter().collect();
+        blanked.extend(iter::repeat_n(' ', to - from));
+        blanked.extend(chars[to..].iter());
+        *span.content.to_mut() = blanked;
+        return Some(column);
+    }
+    None
 }
 
 /// A rendered line's text, as it appears on screen.
@@ -1409,6 +1936,9 @@ fn draw_panels(frame: &mut Frame<'_>, panels: &[PanelView], area: Rect, theme: &
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
+    // Filled in as the frame is drawn: a menu or dialog that covers a picture keeps it off the
+    // screen (D161).
+    app.covered.clear();
     let inner_width = area.width.saturating_sub(2) as usize;
     let layout = app.editor.layout(inner_width.max(1));
     let editor_rows = layout.rows.len().clamp(1, MAX_EDITOR_ROWS);
@@ -1577,8 +2107,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(picker) = &app.resume {
         surface = Some(draw_resume(frame, picker, area, &app.theme));
     }
-    if let Some(tree) = &app.tree {
+    if let Some(tree) = &mut app.tree {
         surface = Some(draw_tree(frame, tree, area, &app.theme));
+    }
+    if let Some(confirm) = &app.confirm {
+        surface = Some(draw_confirm(frame, confirm, area, &app.theme));
     }
     if let Some(dialog) = &app.settings {
         surface = Some(draw_settings(frame, dialog, area, &app.theme));
@@ -1604,6 +2137,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         // The selection belonged to the surface that has just changed, and its line numbers mean
         // nothing on the other one: keeping it would highlight unrelated text and copy it (D87).
         app.selection = None;
+    }
+    if app.dialog_seen.is_some() {
+        // A dialog owns the screen: no picture is drawn anywhere while it is open (D161).
+        app.covered.push(area);
     }
     shade_dialog(frame, app);
 }
@@ -1644,6 +2181,35 @@ fn shade_dialog(frame: &mut Frame<'_>, app: &App) {
             cell.set_style(cell.style().patch(selected_style(&app.theme)));
         }
     }
+}
+
+/// Asks whether the branch a move in `/tree` leaves behind is worth a summary (D167).
+///
+/// One keystroke either way, and escape leaves the conversation where it is: the move is the
+/// person's decision already, and the summary is the only part of it that spends a request.
+fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm, area: Rect, theme: &Theme) -> Seen {
+    let width = area.width.saturating_sub(4).min(84);
+    let inner = width.saturating_sub(2) as usize;
+    let (what, asked) = confirm.asked();
+    let lines = vec![
+        Line::from(Span::styled(keep_head(&what, inner), Style::new())),
+        Line::from(Span::styled(keep_head(&asked, inner), Style::new())),
+        Line::default(),
+        Line::from(Span::styled(
+            keep_head("y summarize · n do not · esc stay where you are", inner),
+            dim(theme),
+        )),
+    ];
+    modal(
+        frame,
+        area,
+        width,
+        " Leave this branch ",
+        lines,
+        None,
+        theme,
+    )
+    .seen
 }
 
 /// The `/` menu, drawn over the transcript just above the editor.
@@ -1705,6 +2271,8 @@ fn draw_menu(frame: &mut Frame<'_>, app: &mut App, editor_area: Rect) {
         ),
         rect,
     );
+    // The menu is drawn over the transcript, so a picture under it would sit on top of it (D161).
+    app.covered.push(rect);
 }
 
 fn login_title(login: &Login) -> String {
@@ -2085,6 +2653,8 @@ fn modal(
             ),
             top: 0,
             lines: text,
+            // A dialog is not the transcript and draws no formula pictures (D166).
+            pictures: Vec::new(),
         },
         rect,
     }
@@ -2098,16 +2668,37 @@ struct Surface {
 
 /// `/tree`: every message on the branch, the one the conversation is at, and where another branch
 /// leaves from (D54).
-fn draw_tree(frame: &mut Frame<'_>, tree: &Tree, area: Rect, theme: &Theme) -> Seen {
-    let width = area.width.saturating_sub(4).min(96);
-    let inner = width.saturating_sub(2) as usize;
+fn draw_tree(frame: &mut Frame<'_>, tree: &mut Tree, area: Rect, theme: &Theme) -> Seen {
+    // The whole screen, as pi has it: the tree is a mode of the terminal rather than a window in
+    // it, so a long conversation is one scroll instead of a scroll inside a scroll (D168).
+    let width = area.width as usize;
+    let height = area.height as usize;
     let accent = Style::new().fg(theme.accent);
-    let mut lines: Vec<Line> = Vec::new();
+    // The title and the footers are the rows the list does not get, and the list is what the keys
+    // are measured in: a page is a screenful, and the scroll keeps the keyboard's row on it. Two
+    // key lines rather than one because a narrow terminal was cutting the last of them off.
+    let room = height.saturating_sub(5).max(1);
+    tree.rows = room;
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            keep_head(
+                &if tree.user_only {
+                    " conversation tree · prompts only".to_owned()
+                } else {
+                    " conversation tree".to_owned()
+                },
+                width,
+            ),
+            accent.add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+    ];
     let rows = tree.visible();
     let top = tree.offset();
-    for (i, row) in rows.iter().enumerate().skip(top).take(TREE_ROWS) {
+    let mut drawn = 0;
+    for (i, row) in rows.iter().enumerate().skip(top).take(room) {
         let chosen = i == tree.selected;
-        let label = keep_head(&tree.label(row), inner.saturating_sub(2));
+        let label = keep_head(&tree.label(row), width.saturating_sub(2));
         // The message the conversation is at is marked in green, so "where am I" is answered
         // before reading a word; a message on a branch the next request would not carry is dimmed
         // (D54).
@@ -2124,29 +2715,71 @@ fn draw_tree(frame: &mut Frame<'_>, tree: &Tree, area: Rect, theme: &Theme) -> S
             Span::styled(if chosen { "› " } else { "  " }, accent),
             Span::styled(label, style),
         ]));
+        drawn += 1;
     }
     if rows.is_empty() {
         lines.push(Line::from(Span::styled("no messages yet", dim(theme))));
+        drawn += 1;
     }
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
+    // The list fills the screen even where it has nothing to say, so the transcript cannot show
+    // through between its rows and the mode looks like a mode.
+    for _ in drawn..room {
+        lines.push(Line::default());
+    }
+    let leaves = tree.leaves().len();
+    let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    let counts = if leaves > 1 {
         format!(
-            "{} prompts{} · enter continue here · ctrl+u prompts only · ctrl+x copy · esc closes",
-            tree.prompts(),
-            if tree.user_only { " (filtered)" } else { "" }
-        ),
+            "{} · {} · {}",
+            plural(tree.points.len(), "message"),
+            plural(tree.prompts(), "prompt"),
+            plural(leaves, "branch end")
+        )
+    } else {
+        format!(
+            "{} · {}",
+            plural(tree.points.len(), "message"),
+            plural(tree.prompts(), "prompt")
+        )
+    };
+    lines.push(Line::from(Span::styled(
+        keep_head(&counts, width),
         dim(theme),
     )));
-    modal(
-        frame,
+    // The branch ends have a key only if `[keys]` gave them one, so the footer names it when it
+    // exists and says nothing about it when it does not (D169).
+    let mut move_keys = "↑↓ move".to_owned();
+    if leaves > 1
+        && let Some(ends) = tree.keys.ends()
+    {
+        move_keys.push_str(&format!(" · {ends}"));
+    }
+    move_keys.push_str(" · ctrl+u prompts only");
+    for keys in [
+        move_keys,
+        "enter continue here · ctrl+x copy · esc closes".to_owned(),
+    ] {
+        lines.push(Line::from(Span::styled(
+            keep_head(&keys, width),
+            dim(theme),
+        )));
+    }
+    lines.truncate(height);
+    // What each row says, cut to the cells it occupies, so a drag copies the tree and not the
+    // transcript underneath it (D87).
+    let text: Vec<String> = lines
+        .iter()
+        .map(|line| plain(line).chars().take(width).collect())
+        .collect();
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines), area);
+    Seen {
         area,
-        width,
-        " Conversation tree ",
-        lines,
-        None,
-        theme,
-    )
-    .seen
+        top: 0,
+        lines: text,
+        // The tree draws no formula pictures (D166).
+        pictures: Vec::new(),
+    }
 }
 
 fn draw_resume(frame: &mut Frame<'_>, picker: &SessionPicker, area: Rect, theme: &Theme) -> Seen {
@@ -2554,6 +3187,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     // shading these lines with them painted a second highlight near the top of the screen (D87).
     let dialog_open = app.resume.is_some()
         || app.tree.is_some()
+        || app.confirm.is_some()
         || app.settings.is_some()
         || app.permissions.is_some()
         || app.themes.is_some()
@@ -2573,19 +3207,44 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         }
     }
     // An image is drawn in the rows below its marker line, and stays on screen while any of those
-    // rows is: the marker scrolling off the top does not take the picture with it (D59).
-    let room = area.width.saturating_sub(4).max(8);
-    for (line, image, id) in at {
-        let box_ = image::fit((image.width, image.height), (room, image::MAX_ROWS));
+    // rows is: the marker scrolling off the top does not take the picture with it (D59). Its cells
+    // and its pixels come from the layout, which is what stops a picture from being drawn at a size
+    // other than the one the rows were reserved for (D165).
+    // Where each formula's words belong, so a drag over the picture copies the TeX it was drawn
+    // from rather than the blank cells it left on screen (D166). Built for every picture, not only
+    // the ones on screen: a selection can start above them.
+    let sources: Vec<Source> = at
+        .iter()
+        .filter(|at| !at.tex.is_empty())
+        .map(|at| Source {
+            line: at.line,
+            // A block formula starts its row, and its box is the rows the layout gave it.
+            column: at.column.unwrap_or(0),
+            rows: at.picture.cells.rows.max(1),
+            cols: at.picture.cells.cols.max(1),
+            inline: at.inline,
+            tex: at.tex.clone(),
+        })
+        .collect();
+    for At {
+        line,
+        column,
+        picture,
+        id,
+        ..
+    } in at
+    {
+        let Picture { image, cells: box_ } = picture;
         if image::band(line, box_.rows, top, height).is_none() {
             continue;
         }
         placed.push(Placed {
             line,
+            column: column.unwrap_or(0),
             id,
             box_,
             pixels: (image.width, image.height),
-            png: image.bytes().unwrap_or_default(),
+            data: image.data,
         });
     }
     let visible: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
@@ -2595,6 +3254,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         area,
         top,
         lines: text,
+        pictures: sources,
     });
     app.jump_badge = None;
     if app.scroll > 0 {
@@ -2630,6 +3290,8 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::*;
     use crate::agent::End;
     use crate::provider::Image;
@@ -2637,6 +3299,8 @@ mod tests {
     use crate::store::{Point, PointKind, Summary};
     use crate::tui::app::{Action, Cell, Selection};
     use crate::tui::app::{AgentEvent, Header};
+    use crate::tui::keys::Keys;
+    use crate::tui::notify::Notify;
     use crate::tui::permissions::{Kind, Permissions, Row as PermissionRow};
     use crate::tui::settings::Values;
     use crate::tui::status;
@@ -2709,9 +3373,51 @@ mod tests {
         assert_ne!(app.images[0].id, app.images[1].id, "with different ids");
         // And the drawing pass plans both, on their own rows.
         let area = Rect::new(0, 0, 80, 40);
-        let (_, draw, _) = plan_images(image::Protocol::Kitty, &app.drawn, &app.images, area, 0);
-        assert_eq!(draw.len(), 2, "{draw:?}");
-        assert_ne!(draw[0].0, draw[1].0, "on different rows: {draw:?}");
+        let plan = plan_images(
+            image::Protocol::Kitty,
+            &app.drawn,
+            &app.images,
+            area,
+            0,
+            &[],
+        );
+        assert_eq!(plan.place.len(), 2, "{plan:?}");
+        assert_ne!(
+            plan.place[0].0, plan.place[1].0,
+            "on different rows: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn the_rows_left_for_a_picture_are_the_box_it_is_drawn_in() {
+        // One fit, one width: the layout reserves blank rows from the same computation the drawing
+        // pass puts the picture in. They were worked out on widths four columns apart, so a picture
+        // that fitted the wider room left a row spare and, at the boundary, had the next row of the
+        // transcript drawn over its last one (D59). 1000×400 is scaled here, which is the case
+        // where the two widths disagree: the wider room gives it a row more than the narrower one.
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Kitty;
+        app.entries.push(Entry::User("look".into()));
+        app.cache.push(None);
+        app.entries.push(Entry::Image(img("shot.png", 1000, 400)));
+        app.cache.push(None);
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let area = app.seen.as_ref().unwrap().area;
+        let box_ = image::fit((1000, 400), (area.width, image::MAX_ROWS));
+        assert_eq!(app.images[0].box_, box_, "fitted to the transcript width");
+        // The marker line, then one blank row per row of the picture, and nothing else: this entry
+        // is the last one in the transcript. Four columns narrower and the fit is one row shorter,
+        // which is what the layout used to reserve against.
+        let (lines, at) = transcript_with_images(&mut app, area.width);
+        let start = at[0].line;
+        let reserved = lines.len().saturating_sub(start);
+        assert_eq!(reserved, box_.rows as usize, "{box_:?}");
+        assert_ne!(
+            image::fit((1000, 400), (area.width - 4, image::MAX_ROWS)).rows,
+            box_.rows,
+            "this picture is the case where the two widths disagree"
+        );
     }
 
     #[test]
@@ -2735,17 +3441,17 @@ mod tests {
         let seen = app.seen.as_ref().unwrap();
         let (width, height, total) = (seen.area.width, app.view_height, app.total_lines);
         let (_, at) = transcript_with_images(&mut app, width);
-        let (marker, _, _) = at[0];
+        let start = at[0].line;
 
-        // Put the marker two lines above the top of the view, so the first two rows of the picture
-        // are off screen and the rest of it is visible.
-        let want_top = marker + 2;
+        // Put the picture's own first row above the top of the view, so that one row of it is off
+        // screen and the rest is visible.
+        let want_top = start + 1;
         app.scroll = total.saturating_sub(height + want_top);
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let seen = app.seen.as_ref().unwrap();
         assert_eq!(
             seen.top, want_top,
-            "the marker is off the top of the screen"
+            "the picture's first row is off the top of the screen"
         );
 
         assert_eq!(
@@ -2755,21 +3461,25 @@ mod tests {
             app.images
         );
         let placed = &app.images[0];
-        assert_eq!(placed.line, marker);
+        assert_eq!(placed.line, start);
         // And the drawing pass crops it to the rows that are on screen, at the top of the area.
-        let (_, draw, after) = plan_images(
+        let plan = plan_images(
             image::Protocol::Kitty,
             &app.drawn,
             &app.images,
             seen.area,
             seen.top,
+            &[],
         );
-        assert_eq!(draw.len(), 1, "{draw:?}");
-        assert_eq!(draw[0].0, 0, "drawn from the top of the area: {draw:?}");
+        assert_eq!(plan.place.len(), 1, "{plan:?}");
         assert_eq!(
-            after.shown[0].2, 1,
+            plan.place[0].0, 0,
+            "drawn from the top of the area: {plan:?}"
+        );
+        assert_eq!(
+            plan.drawn.shown[0].3, 1,
             "one row of the picture is above the fold: {:?}",
-            after.shown
+            plan.drawn.shown
         );
     }
 
@@ -2817,8 +3527,9 @@ mod tests {
             spinner: 0,
             room: (80, 24),
             images: false,
+            scale: 1.0,
         };
-        entry_rows(&Entry::User(text.into()), view, &theme)
+        entry_rows(&Entry::User(text.into()), view, &theme, &mut Vec::new())
             .into_iter()
             .flat_map(|row| row.spans)
             .map(|s| (s.content.into_owned(), s.style.add_modifier))
@@ -2891,8 +3602,10 @@ mod tests {
                 spinner: 0,
                 room: (80, 24),
                 images: false,
+                scale: 1.0,
             },
             &Theme::default(),
+            &mut Vec::new(),
         );
         assert_eq!(rows[0].first[0].content.as_ref(), "› ");
         assert_eq!(rows[1].first[0].content.as_ref(), "  ");
@@ -2906,8 +3619,10 @@ mod tests {
                 spinner: 0,
                 room: (80, 24),
                 images: false,
+                scale: 1.0,
             },
             &themed,
+            &mut Vec::new(),
         );
         let joined: String = rows
             .iter()
@@ -2936,8 +3651,10 @@ mod tests {
                 spinner: 0,
                 room: (80, 24),
                 images: false,
+                scale: 1.0,
             },
             &theme,
+            &mut Vec::new(),
         );
         let spans: Vec<&Span> = rows.iter().flat_map(|r| r.spans.iter()).collect();
         for span in &spans {
@@ -3216,6 +3933,59 @@ mod tests {
     }
 
     #[test]
+    fn a_compaction_collapses_its_reasoning_with_the_summary() {
+        // D124: the entry is one thing, opened by one key. The reasoning a compaction was written
+        // from used to follow ctrl+t, so a session with reasoning on showed every compaction with
+        // all of its thinking laid out — the opposite of collapsing it.
+        let reasoning = (1..=12)
+            .map(|n| format!("thought {n} of the compaction"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = |thinking: bool, expand: bool| {
+            let view = CompactionView {
+                header: "24 messages".to_owned(),
+                reasoning: reasoning.clone(),
+                summary: "kept: the parser rewrite".to_owned(),
+                state: CompactState::Done(String::new()),
+                blocks: true,
+            };
+            let (rows, _) = compaction_block(&view, thinking, expand, 0, &Theme::default(), 80);
+            rows.iter()
+                .flat_map(|r| text(&wrap(r, 80)))
+                .collect::<Vec<_>>()
+        };
+
+        // The default: reasoning on, ctrl+o never pressed. One line that says what is there.
+        let collapsed = block(true, false);
+        assert!(
+            collapsed
+                .iter()
+                .any(|l| l.contains("∴ reasoned for 12 lines · ctrl+o shows all")),
+            "a collapsed compaction does not offer the key that opens it: {collapsed:#?}"
+        );
+        assert!(
+            !collapsed.iter().any(|l| l.contains("thought 1 of")),
+            "the reasoning was laid out unasked: {collapsed:#?}"
+        );
+
+        // ctrl+o opens the entry, and the reasoning is part of what it opens.
+        let expanded = block(true, true);
+        assert!(
+            expanded.iter().any(|l| l.contains("thought 1 of")),
+            "ctrl+o did not open the reasoning with the rest: {expanded:#?}"
+        );
+
+        // A person who turned reasoning off keeps it off, and the note says which key would show
+        // it rather than promising one that would not.
+        let off = block(false, true);
+        assert!(!off.iter().any(|l| l.contains("thought 1 of")), "{off:#?}");
+        assert!(
+            off.iter().any(|l| l.contains("· ctrl+t shows it")),
+            "{off:#?}"
+        );
+    }
+
+    #[test]
     fn tool_blocks_show_the_call_and_the_useful_end_of_the_output() {
         let block = |name: &str, detail: &str, ok: bool, content: &str, expand: bool| {
             let (rows, bg) = tool_block(
@@ -3415,6 +4185,35 @@ mod tests {
             !text.contains("FPAT-OKEE6"),
             "the old code is gone:\n{text}"
         );
+    }
+
+    #[test]
+    fn the_question_about_leaving_a_branch_is_drawn_over_the_transcript() {
+        // D167: the question is a dialog of its own, so it is drawn over the transcript and owns
+        // the selection while it is up, like every other one (D87).
+        let mut app = bare_app();
+        app.agent(AgentEvent::Text("a reply on the branch".into()));
+        app.confirm = Some(Confirm {
+            left: 3,
+            rewind_to: Some(5),
+            text: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(
+            text.contains("3 messages would be left behind"),
+            "the question is not on screen:\n{text}"
+        );
+        assert!(
+            text.contains("y summarize · n do not · esc stay where you are"),
+            "the keys are not on screen:\n{text}"
+        );
+        assert!(
+            text.contains("Leave this branch"),
+            "the title is not on screen:\n{text}"
+        );
+        assert!(app.dialog_seen.is_some(), "the question is its own surface");
     }
 
     #[test]
@@ -3836,6 +4635,262 @@ mod tests {
     }
 
     #[test]
+    fn a_formula_asks_for_the_rows_it_reserved_rather_than_its_pixel_size() {
+        // D165: a formula has no size of its own for the terminal to preserve — the rows the
+        // transcript reserved are its size. It therefore carries a cell box, so a terminal whose
+        // cell is bigger than the one saddle measured (a display scaled 2x, a query never answered)
+        // still draws it across those rows instead of at its own pixel count.
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Kitty;
+        app.entries.push(Entry::Assistant(
+            "and therefore $$\\frac{1}{3}$$ holds".into(),
+        ));
+        app.cache.push(None);
+        let (lines, at) = transcript_with_images(&mut app, 80);
+        assert_eq!(at.len(), 1, "one formula, one picture");
+        let At { line, picture, .. } = &at[0];
+        // The marker line is blanked, and the picture's cells are the box the terminal is asked
+        // for — not a size computed from its pixels.
+        assert_eq!(plain(&lines[*line]), "");
+        let Picture { image, cells } = picture;
+        assert!(cells.scaled, "a formula is always drawn in a cell box");
+        assert_eq!(cells.rows, 3, "a fraction is three rows tall: {cells:?}");
+        assert!(
+            image.height > cells.rows as u32 * image::cell_px().1,
+            "the raster is finer than the box: {:?}",
+            image
+        );
+    }
+
+    #[test]
+    fn a_formula_written_the_other_ways_people_write_it_is_typeset() {
+        // D165: the parser knows `$x$` and `$$x$$`. The two spellings a person writing by hand
+        // reaches for first — `\(x\)` and a padded `$ x $` — reach it as prose, so they are
+        // rewritten before it parses anything.
+        assert_eq!(delimiters(r"so \(x^2\) is").as_ref(), "so $x^2$ is");
+        assert_eq!(
+            delimiters(r"\[ \frac{a}{b} \]").as_ref(),
+            "$$\\frac{a}{b}$$"
+        );
+        assert_eq!(delimiters("a $ x^2 $ b").as_ref(), "a $x^2$ b");
+        assert_eq!(delimiters("a $ x $ b").as_ref(), "a $x$ b");
+        assert_eq!(delimiters(r"$ \theta $").as_ref(), "$\\theta$");
+        // Money is not a formula, and neither is prose between two dollar signs.
+        let money = "costs $5 and $10 today";
+        assert_eq!(delimiters(money).as_ref(), money);
+        let prose = "from $ here to $ there";
+        assert_eq!(delimiters(prose).as_ref(), prose);
+        // Code is read exactly as it was written, which is what code is for.
+        let fenced = "```\n\\(x\\) and $ y $\n```\n";
+        assert_eq!(delimiters(fenced).as_ref(), fenced);
+        let span = "a `\\(x\\)` b";
+        assert_eq!(delimiters(span).as_ref(), span);
+        // And the text after a fence is still text: read as an inline span, the closing fence's
+        // backticks opened one that never closed, and every formula after the block was left as
+        // its source — which is what a real terminal showed (D165).
+        let after = "```\nx\n```\n\nso \\(x^2\\) holds, and `a` too.";
+        assert_eq!(
+            delimiters(after).as_ref(),
+            "```\nx\n```\n\nso $x^2$ holds, and `a` too."
+        );
+        // A backtick with no partner is a backtick, not the end of the message.
+        assert_eq!(delimiters("a ` b and \\(x\\)").as_ref(), "a ` b and $x$");
+        // Nothing to rewrite means the text is parsed where it is, without a copy.
+        assert!(matches!(delimiters("a $x$ b"), Cow::Borrowed(_)));
+        assert!(matches!(delimiters("plain prose"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn a_formula_in_tex_s_own_delimiters_is_drawn_too() {
+        // End to end: `\(…\)` is what a mathematician types, and it reaches the same picture as
+        // `$…$` does (D165).
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Kitty;
+        app.entries
+            .push(Entry::Assistant("so \\(x^2\\) holds".into()));
+        app.cache.push(None);
+        let (lines, at) = transcript_with_images(&mut app, 80);
+        assert_eq!(at.len(), 1, "one formula, one picture");
+        assert_eq!(at[0].column, Some(3), "{:?}", plain(&lines[at[0].line]));
+        assert!(
+            lines.iter().all(|l| !plain(l).contains("\\(x^2\\)")),
+            "the source is not what is shown"
+        );
+    }
+
+    #[test]
+    fn a_copy_of_a_drawn_formula_is_the_tex_it_was_drawn_from() {
+        // D166: end to end, through the drawing pass. The layout is what knows where each picture
+        // stands, so the copy is tested from there: a drag over the whole transcript takes the words
+        // each formula was typeset from, in places where the screen has blank cells.
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Kitty;
+        app.entries.push(Entry::Assistant(
+            "by parts\n\n$$\\int u\\,dv=uv-\\int v\\,du$$\n\nso \\(x^2\\) holds".into(),
+        ));
+        app.cache.push(None);
+        let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let seen = app.seen.clone().expect("the transcript was drawn");
+        assert_eq!(
+            seen.pictures.len(),
+            2,
+            "one block and one in a line: {:?}",
+            seen.pictures
+        );
+        let last = seen.lines.len() - 1;
+        app.selection = Some(Selection {
+            anchor: Cell { line: 0, ch: 0 },
+            focus: Cell { line: last, ch: 60 },
+            dragging: false,
+        });
+        let text = app.selected_text().expect("a copy");
+        assert!(
+            text.contains("\\[\\int u\\,dv=uv-\\int v\\,du\\]"),
+            "{text:?}"
+        );
+        assert!(text.contains("\\(x^2\\)"), "{text:?}");
+        // What was drawn over is not in the copy twice, and the source text the picture replaced is
+        // not there either.
+        assert!(!text.contains("$$"), "{text:?}");
+        assert_eq!(text.matches("x^2").count(), 1, "{text:?}");
+    }
+
+    #[test]
+    fn a_copy_from_a_terminal_with_no_pictures_keeps_what_it_shows() {
+        // No pictures means the source is on screen, and a copy of it is the text that is there: the
+        // copy must not wrap delimiters around delimiters (D166).
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Text;
+        app.entries.push(Entry::Assistant("so $x^2$ holds".into()));
+        app.cache.push(None);
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let seen = app.seen.clone().expect("the transcript was drawn");
+        assert!(seen.pictures.is_empty(), "{:?}", seen.pictures);
+        let last = seen.lines.len() - 1;
+        app.selection = Some(Selection {
+            anchor: Cell { line: 0, ch: 0 },
+            focus: Cell { line: last, ch: 60 },
+            dragging: false,
+        });
+        let text = app.selected_text().expect("a copy");
+        assert!(text.contains("so $x^2$ holds"), "{text:?}");
+        assert!(!text.contains("\\("), "{text:?}");
+    }
+
+    #[test]
+    fn a_formula_in_a_line_takes_cells_of_that_line() {
+        // D165: a formula inside a sentence is drawn in cells the words around it leave, at the
+        // column it starts at, and the row is the same width it was as source.
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Kitty;
+        app.entries
+            .push(Entry::Assistant("if $x^2$ holds then".into()));
+        app.cache.push(None);
+        let (lines, at) = transcript_with_images(&mut app, 80);
+        assert_eq!(at.len(), 1, "one formula, one picture");
+        let At {
+            line,
+            column,
+            picture,
+            ..
+        } = &at[0];
+        assert_eq!(
+            *column,
+            Some(3),
+            "`if ` is three cells: {:?}",
+            plain(&lines[*line])
+        );
+        assert_eq!(picture.cells.rows, 1, "one row, whatever the formula is");
+        assert!(
+            picture.cells.cols > 1,
+            "as wide as it is: {:?}",
+            picture.cells
+        );
+        // The words are where they were, and nothing of the reservation is left on screen.
+        let shown = plain(&lines[*line]);
+        let words: Vec<&str> = shown.split_whitespace().collect();
+        assert_eq!(words, ["if", "holds", "then"], "{shown:?}");
+        assert!(!shown.contains(FORMULA) && !shown.contains(GUTTER));
+        // And the marker is not anywhere else either.
+        assert!(
+            lines.iter().all(|l| !plain(l).contains(FORMULA)),
+            "every formula was placed"
+        );
+    }
+
+    #[test]
+    fn a_formula_in_a_line_moves_to_the_next_row_whole() {
+        // The run is measured like a word and cannot be broken: a formula that does not fit where
+        // it was written goes to the next row in one piece, rather than being cut in half by the
+        // wrapper (D165).
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Kitty;
+        // Eight words of four and a space fill 39 of the 40 columns, leaving room for no run at
+        // all: the formula written after them has to move.
+        let words = "1234 5678 9012 3456 7890 1234 5678 9012";
+        app.entries
+            .push(Entry::Assistant(format!("{words} $\\frac{{a}}{{b}}$ end")));
+        app.cache.push(None);
+        let (lines, at) = transcript_with_images(&mut app, 40);
+        assert_eq!(at.len(), 1, "one formula, one picture");
+        let At {
+            line,
+            column,
+            picture,
+            ..
+        } = &at[0];
+        assert!(*line > 0, "it was moved off the row it was written on");
+        assert_eq!(*column, Some(0), "to the start of the next row");
+        let shown = plain(&lines[*line]);
+        assert_eq!(
+            shown.trim(),
+            "end",
+            "the words after it are on the row it moved to: {shown:?}"
+        );
+        assert!(
+            shown.starts_with(&" ".repeat(picture.cells.cols as usize)),
+            "the run takes its whole width on that row: {shown:?}"
+        );
+    }
+
+    #[test]
+    fn a_terminal_with_no_pictures_gets_an_inline_formula_as_its_source() {
+        // D165: a formula whose picture cannot be drawn is drawn as the TeX it was written as, and
+        // that holds for one inside a sentence as much as for one on its own line.
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Text;
+        app.entries
+            .push(Entry::Assistant("if $x^2$ holds then".into()));
+        app.cache.push(None);
+        let (lines, at) = transcript_with_images(&mut app, 80);
+        assert!(at.is_empty(), "nothing to place");
+        assert!(
+            lines.iter().any(|l| plain(l).contains("$x^2$")),
+            "the source is what is shown"
+        );
+    }
+
+    #[test]
+    fn a_formula_in_a_table_cell_stays_its_source() {
+        // A table's columns are fitted rather than wrapped, so there is no run of cells for a
+        // picture to sit in: it stays the TeX it was written as (D165).
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Kitty;
+        app.entries.push(Entry::Assistant(
+            "| a | b |\n|---|---|\n| $x^2$ | y |".into(),
+        ));
+        app.cache.push(None);
+        let (lines, at) = transcript_with_images(&mut app, 80);
+        assert!(at.is_empty(), "nothing to place");
+        assert!(
+            lines.iter().any(|l| plain(l).contains("$x^2$")),
+            "the source is what the table shows"
+        );
+    }
+
+    #[test]
     fn the_theme_list_is_drawn_with_the_theme_it_offers() {
         // D74: the point of the picker is that you see the choice before making it, so the box has
         // to be drawn in the highlighted theme and say which one that is.
@@ -3903,6 +4958,9 @@ mod tests {
             status: Template::default(),
             images: None,
             theme: None,
+            notify: Notify::Off,
+            math_scale: 1.0,
+            keys: Keys::default(),
         })
     }
 
@@ -3940,7 +4998,9 @@ mod tests {
             state: CompactState::Running,
             blocks: false,
         };
-        let (rows, _) = compaction_block(&view, true, false, 0, &theme, 30);
+        // The reasoning is inside the entry's own toggle: it is drawn when the compaction is open,
+        // not merely because reasoning is on (D124).
+        let (rows, _) = compaction_block(&view, true, true, 0, &theme, 30);
         let shown = rows
             .iter()
             .flat_map(|row| text(&wrap(row, 30)))
@@ -3950,6 +5010,17 @@ mod tests {
             shown.contains("│ Testing the library") && !shown.contains("***"),
             "{shown}"
         );
+        let (rows, _) = compaction_block(&view, true, false, 0, &theme, 30);
+        let folded = rows
+            .iter()
+            .flat_map(|row| text(&wrap(row, 30)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !folded.contains("│ Testing the library"),
+            "a closed compaction showed its reasoning: {folded}"
+        );
+        assert!(folded.contains("∴ reasoned for 5 lines"), "{folded}");
     }
 
     #[test]
@@ -4189,7 +5260,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let all = screen(&terminal);
-        assert!(all.contains("Conversation tree"), "{all}");
+        assert!(all.contains("conversation tree"), "{all}");
         assert!(all.contains("❯ fix the build"), "{all}");
         assert!(all.contains("◆ looking"), "{all}");
         assert!(all.contains("⚙ tool results"), "{all}");
@@ -4200,6 +5271,64 @@ mod tests {
             "{all}"
         );
         assert!(all.contains("enter continue here"), "{all}");
+        // D168: the tree is the screen, not a window in it — its rows reach the last one.
+        assert_eq!(
+            app.dialog_seen.as_ref().map(|s| s.lines.len()),
+            Some(20),
+            "the tree drew {} rows of 20",
+            app.dialog_seen.as_ref().map_or(0, |s| s.lines.len())
+        );
+        assert!(all.contains("5 messages"), "{all}");
+    }
+
+    #[test]
+    fn the_tree_fills_the_screen_and_scrolls_inside_it() {
+        // D168: the mode is the screen. A conversation longer than it scrolls with the keyboard, and
+        // the list takes every row the title and the footers leave.
+        let mut app = bare_app();
+        let points = (1..=40)
+            .map(|n| Point {
+                node: n,
+                parent: (n > 1).then(|| n - 1),
+                kind: PointKind::Assistant,
+                preview: format!("message {n}"),
+                text: String::new(),
+                here: n == 40,
+                active: true,
+            })
+            .collect();
+        let mut tree = Tree::new(points);
+        tree.selected = 39;
+        app.tree = Some(tree);
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let seen = app
+            .dialog_seen
+            .as_ref()
+            .expect("the tree is its own surface");
+        assert_eq!(seen.lines.len(), 20, "every row of the screen");
+        assert_eq!((seen.area.height, seen.top), (20, 0));
+        // Title, a blank, fifteen rows of list, then the counts and the two key lines.
+        assert_eq!(app.tree.as_ref().unwrap().rows, 15);
+        assert!(
+            seen.lines[0].contains("conversation tree"),
+            "{:?}",
+            seen.lines
+        );
+        assert!(
+            seen.lines[16].contains("message 40"),
+            "the keyboard's row is not the last row of the list: {:?}",
+            seen.lines
+        );
+        assert!(seen.lines[16].starts_with('›'), "{:?}", seen.lines[16]);
+        assert!(seen.lines[17].contains("40 messages"), "{:?}", seen.lines);
+        assert!(seen.lines[19].contains("esc closes"), "{:?}", seen.lines);
+        // Nothing of the transcript is left on the screen behind it.
+        assert!(
+            !seen.lines[1].contains("saddle ·"),
+            "the header shows through: {:?}",
+            seen.lines
+        );
     }
 
     #[test]
@@ -4300,6 +5429,9 @@ mod tests {
             status: Template::default(),
             images: None,
             theme: None,
+            notify: Notify::Off,
+            math_scale: 1.0,
+            keys: Keys::default(),
         });
         app.entries.push(Entry::User("fix the build".into()));
         app.cache.push(None);

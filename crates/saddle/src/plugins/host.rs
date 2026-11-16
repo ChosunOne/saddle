@@ -151,6 +151,8 @@ enum Event {
         who: Principal,
         deadline: Instant,
         sql: String,
+        /// The conversation the guest asked for: empty for the one in hand (D163).
+        session: String,
         answer: SyncSender<HostReply<String, String>>,
     },
     Read {
@@ -462,6 +464,7 @@ impl HostServices for Host {
         &mut self,
         call: &Invocation,
         sql: String,
+        session: String,
     ) -> Result<Result<String, String>> {
         let (answer, result) = mpsc::sync_channel(1);
         self.events
@@ -469,6 +472,7 @@ impl HostServices for Host {
                 who: call.principal().clone(),
                 deadline: call.deadline(),
                 sql,
+                session,
                 answer,
             })
             .map_err(|_| anyhow!("plugin session ended"))?;
@@ -899,10 +903,11 @@ fn execute_inner(
                 who,
                 deadline,
                 sql,
+                session: target,
                 answer,
             }) => {
                 respond(
-                    transcript::execute(session, &who, &sql, Some(call), Some(deadline))
+                    transcript::execute(session, &who, &sql, &target, Some(call), Some(deadline))
                         .map(|result| result.map(|value| value.to_string())),
                     answer,
                     &mut fatal,

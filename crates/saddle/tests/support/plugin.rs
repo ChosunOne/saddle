@@ -84,9 +84,9 @@ pub fn transcript_query(sql: &str) -> Vec<u8> {
                 &format!("(data (i32.const 256) \"{escaped}\")"),
             )
             .replace(
-                "local.get $sql local.get $len i32.const 32 call $query",
+                "local.get $sql local.get $len i32.const 176 i32.const 0 i32.const 32 call $query",
                 &format!(
-                    "i32.const 256 i32.const {} i32.const 32 call $query",
+                    "i32.const 256 i32.const {} i32.const 176 i32.const 0 i32.const 32 call $query",
                     sql.len()
                 ),
             ),

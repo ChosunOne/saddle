@@ -10,6 +10,9 @@ use crate::skills::Skill;
 use crate::store::Point;
 use crate::tui::image::Fit;
 use crate::tui::image::Protocol;
+use crate::tui::keys::Keys;
+use crate::tui::math::Formula;
+use crate::tui::notify::Notify;
 use crate::tui::permissions::Change as PermissionsChange;
 use crate::tui::permissions::Permissions;
 use crate::tui::status::Template;
@@ -168,8 +171,12 @@ pub enum Action {
     OpenPermissions,
     /// Show the conversation tree, to continue from an earlier message (D54).
     OpenTree,
-    /// Move the conversation to a point, keeping what came after it in the store (D54).
-    Rewind(Option<i64>),
+    /// Move the conversation to a point, keeping what came after it in the store (D54), and
+    /// summarize the branch left behind only when the person said to (D167).
+    Rewind {
+        node: Option<i64>,
+        summarize: bool,
+    },
     /// Copy this conversation into a new one and continue that (D53).
     Clone,
     /// Give this conversation a name, or clear it (D55).
@@ -245,20 +252,46 @@ pub struct Seen {
     pub area: Rect,
     pub top: usize,
     pub lines: Vec<String>,
+    /// The formulas drawn in those lines, with the TeX each was typeset from, so a copy takes the
+    /// words rather than the blank cells the picture left on screen (D166).
+    pub pictures: Vec<Source>,
+}
+
+/// One formula as the transcript drew it: the cells it took, and the TeX that produced it (D166).
+///
+/// A copy cannot take the cells, because there is nothing in them: the picture is drawn over them by
+/// the terminal. It takes the source instead, on the first row of the box, which is where the
+/// formula begins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    /// The first row of the picture's box.
+    pub line: usize,
+    /// The column its first cell is at: zero for a block, the words before it for one inside a line.
+    pub column: u16,
+    pub rows: u16,
+    pub cols: u16,
+    /// Whether it is drawn inside a line, which decides the delimiters a copy wraps it in.
+    pub inline: bool,
+    pub tex: String,
 }
 
 /// One image in the transcript, next to the text that announces it (D59).
 #[derive(Debug, Clone)]
 pub struct Placed {
-    /// The transcript line the picture starts at.
+    /// The transcript line the picture's box starts at: the row below a marker line for a picture
+    /// announced by text, or the formula's own row when it sits inside one (D165).
     pub line: usize,
+    /// The column of the picture's first cell: zero for a picture that starts its row, and the
+    /// column the words before it leave for a formula inside a line (D165).
+    pub column: u16,
     /// The id the terminal knows it by, so it can be taken back off the screen (D59).
     pub id: u32,
     /// The picture's full size: cells, and pixels.
     pub box_: Fit,
     pub pixels: (u32, u32),
-    /// The encoded file, kept so the escape can be built for whatever band is on screen (D59).
-    pub png: Vec<u8>,
+    /// The encoded file, base64 as the protocols carry it, kept so a picture the terminal does not
+    /// hold can be sent without decoding it again on a frame that only moves it (D59).
+    pub data: String,
 }
 
 /// What the last frame put on the screen, so the next one can take it back off (D59).
@@ -268,10 +301,26 @@ pub struct Placed {
 /// leaves copies of it all over the screen, which is what scrolling used to do.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Drawn {
-    /// What is on screen: the row each picture was drawn on, its id, and which band of it.
-    pub shown: Vec<(usize, u32, u16, u16)>,
-    /// Where the transcript area started, since a resize moves every row.
-    pub at: Option<(u16, u16)>,
+    /// What is on screen: the row and column each picture was drawn at, its id, and which band of
+    /// it. The column is part of it because a formula inside a line moves with the words around it
+    /// without the row changing (D165).
+    pub shown: Vec<(usize, u16, u32, u16, u16)>,
+    /// Ids the terminal holds the data of. It outlives `shown`: a dialog covers a picture without
+    /// the picture leaving the transcript, and the data stays in the terminal's store so closing
+    /// the dialog puts it back instead of sending it again (D59).
+    pub held: Vec<u32>,
+    /// The transcript area the frame was drawn in. A resize moves every row, and it also clears
+    /// the screen — kitty deletes the images it holds when the screen is cleared — so a change here
+    /// is a frame that has to send every picture again (D59).
+    pub at: Option<Rect>,
+    /// The rectangles a menu or dialog drew over the pictures last frame, so a frame in which they
+    /// changed is repainted from scratch: iTerm2 has no delete, and only a full repaint takes a
+    /// picture back off the cells it covers (D161).
+    pub covered: Vec<Rect>,
+    /// Set when the transcript was replaced under the pictures, so the next frame takes every one
+    /// of them off rather than trusting what the last one drew: the same id may now name a
+    /// different picture.
+    pub stale: bool,
 }
 
 /// How long two escapes may be apart and still count as one gesture (D54).
@@ -343,6 +392,39 @@ pub enum CompactState {
     Failed(String),
 }
 
+/// The question `/tree` asks before a move that would leave work behind (D167).
+///
+/// Summarizing the branch being left is a model request, so it is asked for rather than spent: the
+/// move is already the person's decision, and this is the one part of it that costs something.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Confirm {
+    /// How many messages the move would leave behind that produced something.
+    pub left: usize,
+    /// The node the conversation moves to, and the prompt to put back in the editor.
+    pub rewind_to: Option<i64>,
+    pub text: Option<String>,
+}
+
+impl Confirm {
+    /// The question, as the two lines it is drawn as: what would be left behind, and what the
+    /// answer does. Two lines rather than one because a dialog that cuts its own question with an
+    /// ellipsis is not asking anything.
+    pub fn asked(&self) -> (String, String) {
+        let (what, it) = if self.left == 1 {
+            ("1 message would be left behind".to_owned(), "it")
+        } else {
+            (
+                format!("{} messages would be left behind", self.left),
+                "they",
+            )
+        };
+        (
+            what,
+            format!("summarize what {it} established onto the branch you are entering?"),
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Activity {
     Waiting,
@@ -376,6 +458,13 @@ pub struct Header {
     pub images: Option<String>,
     /// `[ui] theme`: the name of the theme to draw with (D71).
     pub theme: Option<String>,
+    /// `[ui] notify`: how a turn that ends while the terminal is not focused is announced (D164).
+    pub notify: Notify,
+    /// `[ui] math-scale`: how much larger or smaller than the fonts and the cell say a formula is
+    /// drawn, 1.0 being what they say (D165).
+    pub math_scale: f32,
+    /// `[keys]`: the moves that have a key only because a person chose one (D169).
+    pub keys: Keys,
 }
 
 /// Rendered lines for one entry, valid while the width and both toggles match.
@@ -384,6 +473,8 @@ pub struct Cached {
     pub expand: bool,
     pub thinking: bool,
     pub lines: Vec<Line<'static>>,
+    /// The formulas this entry reserved rows for, in the order their markers appear (D165).
+    pub pictures: Vec<Formula>,
 }
 
 /// One line of the `/` menu. Owned, because a skill's command is built from what the session
@@ -544,12 +635,18 @@ pub struct App {
     pub total_lines: usize,
     /// Where each image sits in the transcript, and the escape that draws it (D59).
     pub images: Vec<Placed>,
+    /// What this frame drew over the pictures: a menu above the editor, or a dialog that owns the
+    /// screen. Nothing is drawn where it would sit on top of them (D161).
+    pub covered: Vec<Rect>,
     /// What this terminal can draw, detected once at startup (D59).
     pub protocol: Protocol,
     /// The colours to draw with (D71). Every role the renderer paints comes from here.
     pub theme: Theme,
     /// What the last frame drew, and where (D59).
     pub drawn: Drawn,
+    /// A frame where what covers the pictures changed, so the next one repaints from scratch: a
+    /// terminal with no delete takes a picture off only by writing over it (D161).
+    pub repaint: bool,
     pub usage: Usage,
     /// Dollars spent this session, when a price is known (D36).
     pub cost: f64,
@@ -565,6 +662,8 @@ pub struct App {
     pub settings: Option<SettingsDialog>,
     /// The conversation tree, drawn over everything else while open (D53).
     pub tree: Option<Tree>,
+    /// The question a move in `/tree` asks when it would leave work behind (D167).
+    pub confirm: Option<Confirm>,
     /// The permissions editor, drawn over everything else while open (D45).
     pub permissions: Option<Permissions>,
     /// The theme list, drawn over everything else while open, and previewed as it moves (D74).
@@ -660,9 +759,11 @@ impl App {
             last_escape: None,
             total_lines: 0,
             images: Vec::new(),
+            covered: Vec::new(),
             protocol: Protocol::Text,
             theme: Theme::default(),
             drawn: Drawn::default(),
+            repaint: false,
             usage: Usage::default(),
             cost: 0.0,
             quota: None,
@@ -673,6 +774,7 @@ impl App {
             resume: None,
             settings: None,
             tree: None,
+            confirm: None,
             permissions: None,
             themes: None,
             theme_before: None,
@@ -802,6 +904,9 @@ impl App {
     fn show_resumed(&mut self, items: &[Item]) {
         self.entries.clear();
         self.cache.clear();
+        // The pictures on the screen belong to the transcript being replaced, and an id may now
+        // name a different one (D59).
+        self.drawn.stale = true;
         // The old highlight points at lines that no longer exist.
         self.selection = None;
         self.scroll = 0;
@@ -1030,6 +1135,11 @@ impl App {
         if key.code != KeyCode::Esc {
             self.last_escape = None;
         }
+        // The question a move in `/tree` asks comes first: it is one keystroke, and it was asked
+        // for the move that is already half made (D167).
+        if self.confirm.is_some() {
+            return self.answer(key);
+        }
         if let Some(login) = &mut self.login {
             return match login.key(key) {
                 Outcome::Stay => None,
@@ -1094,13 +1204,24 @@ impl App {
                     self.tree = None;
                     None
                 }
-                TreeOutcome::Select { rewind_to, text } => {
+                TreeOutcome::Select {
+                    rewind_to,
+                    text,
+                    left,
+                } => {
                     self.tree = None;
-                    // The prompt goes back into the editor, ready to be changed and sent again.
-                    if let Some(text) = text {
-                        self.editor.set(text);
+                    // A move that leaves replies and tool output behind used to summarize them
+                    // without being asked, which is a model request spent on a decision nobody
+                    // made. It asks now, and only when there is something to summarize (D167).
+                    if left > 0 {
+                        self.confirm = Some(Confirm {
+                            left,
+                            rewind_to,
+                            text,
+                        });
+                        return None;
                     }
-                    Some(Action::Rewind(rewind_to))
+                    self.move_to(rewind_to, text, false)
                 }
                 TreeOutcome::Copy(text) => Some(Action::Copy(text, "the branch")),
             };
@@ -1457,7 +1578,51 @@ impl App {
         Some(Cell { line, ch })
     }
 
+    /// Answers the question a move in `/tree` asks: `y` summarizes the branch left behind, `n`
+    /// leaves it as it is, and escape stays where the conversation is (D167).
+    fn answer(&mut self, key: KeyEvent) -> Option<Action> {
+        let confirm = self.confirm.take()?;
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.move_to(confirm.rewind_to, confirm.text, true)
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.move_to(confirm.rewind_to, confirm.text, false)
+            }
+            // Escape puts the question away and the conversation stays where it was: the move has
+            // not happened yet, so there is nothing to undo. ctrl+c is the other way to put a
+            // dialog away, as it is for every other one; a second press is the quit it always was.
+            KeyCode::Esc => None,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => None,
+            _ => {
+                // Anything else is not an answer, so the question stays up.
+                self.confirm = Some(confirm);
+                None
+            }
+        }
+    }
+
+    /// Moves the conversation to a point in the tree, putting a prompt back in the editor when the
+    /// point was one (D54).
+    fn move_to(
+        &mut self,
+        node: Option<i64>,
+        text: Option<String>,
+        summarize: bool,
+    ) -> Option<Action> {
+        if let Some(text) = text {
+            self.editor.set(text);
+        }
+        Some(Action::Rewind { node, summarize })
+    }
+
     /// The text under the selection, as it was drawn.
+    ///
+    /// A formula is a picture the terminal drew, and the cells under it are blank: what a copy takes
+    /// there is the TeX the picture was typeset from, wrapped in the delimiters that make it a
+    /// formula again wherever it is pasted (D166). A picture is copied whole — a drag across part of
+    /// one takes all of it — and the rows a block was drawn in below the first add no blank lines,
+    /// since there is nothing on them.
     pub fn selected_text(&self) -> Option<String> {
         let sel = self.selection?;
         let seen = self.surface()?;
@@ -1467,11 +1632,24 @@ impl App {
         let (first, last) = sel.ends();
         // A drag pulled below the transcript points past its end; take what is there.
         let last_line = last.line.min(seen.lines.len() - 1);
-        let mut out = String::new();
+        let mut parts: Vec<String> = Vec::new();
+        // A drag that begins part-way down a block formula still copies it: the rows it began in
+        // hold nothing but the picture, which is copied where the formula starts, and the rows of
+        // the box are dropped below (D166).
+        if let Some(picture) = seen.pictures.iter().find(|p| below(p, first.line)) {
+            parts.push(delimited(picture));
+            parts.push(String::new());
+        }
         let rows = seen.lines.get(first.line..=last_line).unwrap_or_default();
         for (offset, text) in rows.iter().enumerate() {
             let line = first.line + offset;
-            let chars: Vec<char> = text.chars().collect();
+            // The rows a block formula is drawn in are blank, and the picture covers cells the row
+            // does not have: those cells are part of the row as far as a selection goes, which is
+            // how a drag over a formula reaches it at all (D166). The padding they add is trimmed
+            // with the frame's, below.
+            let mut chars: Vec<char> = text.chars().collect();
+            let width = chars.len().max(cells_end(line, &seen.pictures));
+            chars.resize(width, ' ');
             let from = if line == first.line {
                 first.ch.min(chars.len())
             } else {
@@ -1482,14 +1660,23 @@ impl App {
             } else {
                 chars.len()
             };
-            let part: String = chars[from.min(to)..to].iter().collect();
             // Lines are padded to the frame's width; the padding is not part of the copy.
-            out.push_str(part.trim_end());
-            if line != last_line {
-                out.push('\n');
+            let (part, block) = selected(&chars, from.min(to), to, line, &seen.pictures);
+            let part = part.trim_end().to_owned();
+            // Below its first row a block formula's box holds the picture and nothing else, and the
+            // picture is copied where it begins (D166).
+            if part.is_empty() && continued(line, &seen.pictures) {
+                continue;
+            }
+            parts.push(part);
+            // A display formula is a paragraph of its own in what it is pasted into, and the rows
+            // that separated it from what follows are the ones the box took (D166).
+            if block {
+                parts.push(String::new());
             }
         }
-        let text = out.trim_end().to_owned();
+        let text = parts.join("\n");
+        let text = text.trim_end().to_owned();
         (!text.is_empty()).then_some(text)
     }
 
@@ -1694,6 +1881,8 @@ impl App {
                 // still in the store and under this run's audit log (D90).
                 self.entries.clear();
                 self.cache.clear();
+                // Any picture on the screen belongs to the conversation being left (D59).
+                self.drawn.stale = true;
                 self.selection = None;
                 self.usage = Usage::default();
                 self.cost = 0.0;
@@ -1961,7 +2150,11 @@ impl App {
                         "nothing to fork from yet: this session has no prompt",
                     );
                 } else {
-                    self.tree = Some(Tree::new(points));
+                    let mut tree = Tree::new(points);
+                    // Only the moves with no default key are configurable, and the tree is where
+                    // the one of them lives (D169).
+                    tree.keys = self.header.keys.clone();
+                    self.tree = Some(tree);
                 }
             }
             AgentEvent::Attached(images) => {
@@ -2102,6 +2295,77 @@ fn char_at(text: &str, col: u16) -> usize {
     text.chars().count()
 }
 
+/// One row of a copy: the selected characters, with every formula the selection touches replaced by
+/// its TeX (D166).
+///
+/// A picture is copied whole or not at all — half of a matrix is not a matrix — and a run of cells
+/// the selection misses entirely stays what it is on screen, which is blank. The flag says a block
+/// formula was one of them, since that is a paragraph of its own where it is pasted.
+fn selected(
+    chars: &[char],
+    from: usize,
+    to: usize,
+    line: usize,
+    pictures: &[Source],
+) -> (String, bool) {
+    let mut on_row: Vec<&Source> = pictures.iter().filter(|p| p.line == line).collect();
+    on_row.sort_by_key(|p| p.column);
+    let mut out = String::new();
+    let mut cursor = from;
+    let mut block = false;
+    for picture in on_row {
+        let start = usize::from(picture.column);
+        let end = start.saturating_add(usize::from(picture.cols));
+        let (lo, hi) = (start.max(from), end.min(to));
+        if lo >= hi || hi <= cursor {
+            continue;
+        }
+        out.extend(&chars[cursor.min(lo)..lo]);
+        out.push_str(&delimited(picture));
+        block = block || !picture.inline;
+        cursor = hi;
+    }
+    out.extend(&chars[cursor.min(to)..to]);
+    (out, block)
+}
+
+/// The delimiters a copy of a formula gets: `\(…\)` for one inside a line, `\[…\]` for a block
+/// (D166).
+///
+/// TeX's own spelling rather than `$…$`, because what the copy is for is a paper: `amsmath`
+/// discourages `$$`, which is a plain TeX construct, and these are what a document gets. They are
+/// also what this front end reads back, so pasting a copy into saddle draws it again (D165).
+fn delimited(picture: &Source) -> String {
+    if picture.inline {
+        format!("\\({}\\)", picture.tex)
+    } else {
+        format!("\\[{}\\]", picture.tex)
+    }
+}
+
+/// Whether `line` is a row a block formula was drawn in, below the row its source is copied from
+/// (D166).
+fn below(picture: &Source, line: usize) -> bool {
+    !picture.inline
+        && picture.line < line
+        && line < picture.line.saturating_add(usize::from(picture.rows))
+}
+
+/// The column the last cell of a formula on `line` reaches, or zero when none is drawn there (D166).
+fn cells_end(line: usize, pictures: &[Source]) -> usize {
+    pictures
+        .iter()
+        .filter(|p| p.line == line)
+        .map(|p| usize::from(p.column).saturating_add(usize::from(p.cols)))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether `line` is such a row for any of the formulas drawn (D166).
+fn continued(line: usize, pictures: &[Source]) -> bool {
+    pictures.iter().any(|p| below(p, line))
+}
+
 /// Text from the model or a tool, made safe and stable for the screen.
 fn display(s: &str) -> String {
     clean(s).replace('\t', "    ")
@@ -2115,6 +2379,8 @@ mod tests {
     use crate::skills;
     use crate::skills::Skill;
     use crate::store::Model;
+    use crate::store::Point;
+    use crate::store::PointKind;
     use crate::tui::login::{Choice, Login, Outcome as LoginOutcome};
     use crate::tui::status::Template;
     use crate::tui::theme::ThemeTables;
@@ -2140,6 +2406,9 @@ mod tests {
             status: Template::default(),
             images: None,
             theme: None,
+            notify: Notify::Off,
+            math_scale: 1.0,
+            keys: Keys::default(),
         })
     }
 
@@ -2946,6 +3215,106 @@ mod tests {
         assert!(matches!(&a.entries[0], Entry::Note(_, t) if t == "resumed a session of 1 prompt"));
     }
 
+    /// A transcript with one block formula drawn over three rows below its marker row, and one
+    /// inside a line (D166).
+    fn drawn_with_formulas() -> App {
+        let mut a = app();
+        a.seen = Some(Seen {
+            area: Rect::new(0, 0, 40, 8),
+            top: 0,
+            lines: vec![
+                "by parts".into(),
+                // The marker row, which a block formula leaves blank.
+                String::new(),
+                // The first row of its box, and the two the box goes on for.
+                String::new(),
+                String::new(),
+                String::new(),
+                "so it holds".into(),
+                format!("if {} then", " ".repeat(6)),
+            ],
+            pictures: vec![
+                Source {
+                    line: 2,
+                    column: 0,
+                    rows: 3,
+                    cols: 10,
+                    inline: false,
+                    tex: r"\int u\,dv=uv-\int v\,du".into(),
+                },
+                Source {
+                    line: 6,
+                    column: 3,
+                    rows: 1,
+                    cols: 6,
+                    inline: true,
+                    tex: "x^2".into(),
+                },
+            ],
+        });
+        a
+    }
+
+    #[test]
+    fn a_copy_of_a_formula_is_the_tex_it_was_drawn_from() {
+        // D166: the cells a picture is drawn in are blank on screen, so a copy that took them would
+        // paste a hole. It takes the source instead, on the row the picture starts at, in the
+        // delimiters a document reads.
+        let mut a = drawn_with_formulas();
+        a.selection = Some(Selection {
+            anchor: Cell { line: 0, ch: 0 },
+            focus: Cell { line: 7, ch: 40 },
+            dragging: false,
+        });
+        assert_eq!(
+            a.selected_text().as_deref(),
+            Some(
+                "by parts\n\n\\[\\int u\\,dv=uv-\\int v\\,du\\]\n\nso it holds\nif \\(x^2\\) then"
+            )
+        );
+    }
+
+    #[test]
+    fn a_copy_of_a_formula_takes_it_whole() {
+        // Half a formula is not a formula: a drag across part of one takes all of it, and the cells
+        // it took are not left as spaces beside it.
+        let mut a = drawn_with_formulas();
+        a.selection = Some(Selection {
+            anchor: Cell { line: 6, ch: 5 },
+            focus: Cell { line: 6, ch: 7 },
+            dragging: false,
+        });
+        assert_eq!(a.selected_text().as_deref(), Some("\\(x^2\\)"));
+    }
+
+    #[test]
+    fn a_copy_that_begins_inside_a_formula_still_takes_it() {
+        // A drag that starts part-way down a block formula begins on a row that holds nothing but
+        // the picture, which is what the copy puts at its start (D166).
+        let mut a = drawn_with_formulas();
+        a.selection = Some(Selection {
+            anchor: Cell { line: 4, ch: 0 },
+            focus: Cell { line: 5, ch: 11 },
+            dragging: false,
+        });
+        assert_eq!(
+            a.selected_text().as_deref(),
+            Some("\\[\\int u\\,dv=uv-\\int v\\,du\\]\n\nso it holds")
+        );
+    }
+
+    #[test]
+    fn a_copy_of_text_with_no_formula_in_it_is_unchanged() {
+        // Everything else is copied as it was drawn, pictures or not.
+        let mut a = drawn_with_formulas();
+        a.selection = Some(Selection {
+            anchor: Cell { line: 0, ch: 0 },
+            focus: Cell { line: 0, ch: 8 },
+            dragging: false,
+        });
+        assert_eq!(a.selected_text().as_deref(), Some("by parts"));
+    }
+
     #[test]
     fn dialogs_take_the_keys_and_commands_open_them() {
         let mut a = app();
@@ -2961,6 +3330,120 @@ mod tests {
         assert!(a.resume.is_none());
     }
 
+    /// A conversation of one prompt, a reply, tool results and a second prompt with its reply.
+    fn branching_app() -> App {
+        let point = |node: i64, kind: PointKind, preview: &str| Point {
+            node,
+            parent: (node > 1).then(|| node - 1),
+            kind,
+            preview: preview.into(),
+            text: if kind == PointKind::User {
+                format!("{preview} (full)")
+            } else {
+                String::new()
+            },
+            here: false,
+            active: true,
+        };
+        let mut points = vec![
+            point(1, PointKind::User, "first task"),
+            point(2, PointKind::Assistant, "done"),
+            point(3, PointKind::Tool, "2 tool results"),
+            point(4, PointKind::User, "second task"),
+            point(5, PointKind::Assistant, "also done"),
+        ];
+        points[4].here = true;
+        let mut a = app();
+        a.agent(AgentEvent::Tree(points));
+        a
+    }
+
+    #[test]
+    fn leaving_a_branch_asks_before_summarizing_it() {
+        // D167: the summary is a model request, so the move asks rather than spending one. The
+        // question is answered with one key, and escape stays where the conversation is.
+        let mut a = branching_app();
+        a.tree.as_mut().unwrap().selected = 3;
+        assert_eq!(a.key(key(KeyCode::Enter)), None, "it asks before it moves");
+        let confirm = a.confirm.as_ref().expect("the question is up");
+        assert_eq!(confirm.left, 1, "the reply that follows the tool result");
+        assert!(a.tree.is_none(), "the tree has closed");
+        // One message is `it`, several are `they`: the question is a sentence, not a template.
+        assert_eq!(confirm.asked().0, "1 message would be left behind");
+        assert_eq!(
+            confirm.asked().1,
+            "summarize what it established onto the branch you are entering?"
+        );
+        let several = Confirm {
+            left: 4,
+            ..confirm.clone()
+        };
+        assert_eq!(several.asked().0, "4 messages would be left behind");
+        assert!(
+            several
+                .asked()
+                .1
+                .starts_with("summarize what they established")
+        );
+        // A key that is not an answer leaves the question up.
+        assert_eq!(a.key(key(KeyCode::Char('q'))), None);
+        assert!(a.confirm.is_some());
+        // `y` summarizes the branch it leaves, and the prompt goes back to the editor.
+        assert_eq!(
+            a.key(key(KeyCode::Char('y'))),
+            Some(Action::Rewind {
+                node: Some(3),
+                summarize: true,
+            })
+        );
+        assert!(a.confirm.is_none());
+        assert_eq!(a.editor.text(), "second task (full)");
+    }
+
+    #[test]
+    fn a_branch_can_be_left_without_a_summary() {
+        let mut a = branching_app();
+        a.tree.as_mut().unwrap().selected = 3;
+        a.key(key(KeyCode::Enter));
+        assert_eq!(
+            a.key(key(KeyCode::Char('n'))),
+            Some(Action::Rewind {
+                node: Some(3),
+                summarize: false,
+            })
+        );
+        // Escape is the other way to decline: the question goes and nothing moves.
+        let mut a = branching_app();
+        a.tree.as_mut().unwrap().selected = 3;
+        a.key(key(KeyCode::Enter));
+        assert_eq!(a.key(key(KeyCode::Esc)), None);
+        assert!(a.confirm.is_none());
+        assert!(a.editor.is_empty(), "nothing was put back in the editor");
+        // ctrl+c puts the question away too, and the second one is the quit it always was.
+        let mut a = branching_app();
+        a.tree.as_mut().unwrap().selected = 3;
+        a.key(key(KeyCode::Enter));
+        assert_eq!(a.key(ctrl('c')), None);
+        assert!(a.confirm.is_none());
+        assert_eq!(a.key(ctrl('c')), Some(Action::Quit));
+    }
+
+    #[test]
+    fn a_move_that_leaves_nothing_behind_does_not_ask() {
+        // Choosing the last reply on the branch continues from it: there is nothing to summarize,
+        // so there is nothing to ask.
+        let mut a = branching_app();
+        a.tree.as_mut().unwrap().selected = 4;
+        assert_eq!(
+            a.key(key(KeyCode::Enter)),
+            Some(Action::Rewind {
+                node: Some(5),
+                summarize: false,
+            })
+        );
+        assert!(a.confirm.is_none());
+    }
+
     #[test]
     fn a_drag_selects_the_text_under_it_and_the_release_copies_it() {
         let mut a = app();
@@ -2968,6 +3451,7 @@ mod tests {
             area: Rect::new(0, 0, 20, 5),
             top: 0,
             lines: vec!["› hello world".into(), "  second line".into()],
+            pictures: Vec::new(),
         });
         let ev = |kind, column, row| MouseEvent {
             kind,
@@ -3007,6 +3491,7 @@ mod tests {
             area: Rect::new(0, 0, 20, 5),
             top: 0,
             lines: vec!["one two three".into()],
+            pictures: Vec::new(),
         });
         let ev = |kind, column, row| MouseEvent {
             kind,
@@ -3027,6 +3512,7 @@ mod tests {
             area: Rect::new(0, 0, 20, 5),
             top: 0,
             lines: vec!["some text".into()],
+            pictures: Vec::new(),
         });
         let ev = |kind| MouseEvent {
             kind,
@@ -3050,6 +3536,7 @@ mod tests {
             area: Rect::new(0, 4, 20, 5),
             top: 10,
             lines: (0..20).map(|i| format!("line {i}")).collect(),
+            pictures: Vec::new(),
         });
         let ev = |kind, column, row| MouseEvent {
             kind,
@@ -3092,6 +3579,7 @@ mod tests {
             area: Rect::new(0, 0, 20, 5),
             top: 0,
             lines: vec!["some text".into()],
+            pictures: Vec::new(),
         });
         a.resume = Some(SessionPicker::new(Vec::new()));
         let ev = |kind| MouseEvent {

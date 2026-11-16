@@ -291,10 +291,35 @@ impl McpGrant {
     }
 }
 
+/// which conversations a `transcript-read` grant covers (D163).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+pub enum Sessions {
+    /// this conversation only: what the grant meant before a session could read another's (D92).
+    #[serde(rename = "self")]
+    #[default]
+    SelfOnly,
+    /// every saved conversation of this workspace. The default when the field is not written,
+    /// because reading the rest of the workspace is what the grant is for (D163).
+    #[serde(rename = "workspace")]
+    Workspace,
+}
+
+impl fmt::Display for Sessions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SelfOnly => f.write_str("this session only"),
+            Self::Workspace => f.write_str("this workspace's sessions"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PlainGrant {
     pub rule: RuleId,
     pub why: String,
+    /// Meaningful only for `transcript-read`, and only ever set from that grant: the other plain
+    /// scopes carry the narrowest value so a grant copied by delegation cannot widen by omission.
+    pub sessions: Sessions,
 }
 
 impl PlainGrant {
@@ -303,6 +328,7 @@ impl PlainGrant {
         Self {
             rule: RuleId(source),
             why,
+            sessions: Sessions::SelfOnly,
         }
     }
 }
@@ -485,7 +511,7 @@ struct RawGrants {
     #[serde(default)]
     mcp: Vec<RawMcp>,
     model_invoke: Option<RawBudget>,
-    transcript_read: Option<RawPlain>,
+    transcript_read: Option<RawTranscriptRead>,
     event_publish: Option<RawPlain>,
     event_subscribe: Option<RawPlain>,
     context_contribute: Option<RawPlain>,
@@ -556,6 +582,17 @@ struct RawBudget {
 struct RawPlain {
     #[serde(default)]
     why: Option<String>,
+}
+
+/// `transcript-read` names the conversations it covers; every other plain scope carries nothing
+/// but its `why` (D163).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTranscriptRead {
+    #[serde(default)]
+    why: Option<String>,
+    #[serde(default)]
+    sessions: Option<Sessions>,
 }
 
 #[derive(Deserialize)]
@@ -673,8 +710,14 @@ impl Policy {
                     &b.why,
                 ));
             }
-            for p in g.plain.values() {
-                lines.push(with_why(p.rule.to_string(), &p.why));
+            for (scope, p) in &g.plain {
+                let mut line = p.rule.to_string();
+                // Which conversations a transcript grant covers is worth saying out loud, since a
+                // bare grant means the whole workspace (D163).
+                if *scope == Scope::TranscriptRead {
+                    line.push_str(&format!(" ({})", p.sessions));
+                }
+                lines.push(with_why(line, &p.why));
             }
         }
         lines
@@ -889,7 +932,6 @@ fn lower(who: &Principal, raw: RawGrants, roots: &Roots) -> Result<Grants, Polic
     }
 
     let plain = [
-        (Scope::TranscriptRead, raw.transcript_read),
         (Scope::EventPublish, raw.event_publish),
         (Scope::EventSubscribe, raw.event_subscribe),
         (Scope::ContextContribute, raw.context_contribute),
@@ -906,9 +948,22 @@ fn lower(who: &Principal, raw: RawGrants, roots: &Roots) -> Result<Grants, Polic
                 PlainGrant {
                     why: why(p.why),
                     rule,
+                    sessions: Sessions::SelfOnly,
                 },
             );
         }
+    }
+    if let Some(p) = raw.transcript_read {
+        let rule = RuleId::new(who, Scope::TranscriptRead, None);
+        grants.plain.insert(
+            Scope::TranscriptRead,
+            PlainGrant {
+                why: why(p.why),
+                rule,
+                // Bare `transcript-read` is every conversation of the workspace (D163).
+                sessions: p.sessions.unwrap_or(Sessions::Workspace),
+            },
+        );
     }
     Ok(grants)
 }
@@ -994,6 +1049,50 @@ model-invoke = { tokens-per-session = 200000, why = "summarises results" }
 
         let agent = policy.grants(&Principal::Agent).unwrap();
         assert!(agent.net.is_empty(), "the agent still has no net grant");
+    }
+
+    #[test]
+    fn transcript_read_names_the_conversations_it_covers() {
+        // D163: a bare grant is every conversation of the workspace; `self` is what the grant
+        // meant before that, and anything else is a typo rather than a silent fallback.
+        let bare = Policy::parse(
+            "version = 1\n[agent]\ntranscript-read = { why = \"x\" }\n",
+            &roots().1,
+        )
+        .unwrap();
+        let grant = &bare.grants(&Principal::Agent).unwrap().plain[&Scope::TranscriptRead];
+        assert_eq!(grant.sessions, Sessions::Workspace);
+        assert!(
+            bare.describe()
+                .iter()
+                .any(|l| l.contains("this workspace's sessions"))
+        );
+
+        let only = Policy::parse(
+            "version = 1\n[agent]\ntranscript-read = { sessions = \"self\" }\n",
+            &roots().1,
+        )
+        .unwrap();
+        let grant = &only.grants(&Principal::Agent).unwrap().plain[&Scope::TranscriptRead];
+        assert_eq!(grant.sessions, Sessions::SelfOnly);
+        assert!(
+            only.describe()
+                .iter()
+                .any(|l| l.contains("this session only"))
+        );
+
+        let bad = Policy::parse(
+            "version = 1\n[agent]\ntranscript-read = { sessions = \"all\" }\n",
+            &roots().1,
+        );
+        assert!(bad.is_err(), "a word that is not a scope is refused");
+
+        // The other plain scopes take no such field: they name a permission, not a place.
+        let wrong = Policy::parse(
+            "version = 1\n[agent]\npersist = { sessions = \"workspace\" }\n",
+            &roots().1,
+        );
+        assert!(wrong.is_err());
     }
 
     #[test]

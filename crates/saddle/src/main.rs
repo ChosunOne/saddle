@@ -427,8 +427,6 @@ fn run_agent(
     session.search = provider
         .as_ref()
         .and_then(provider::Provider::search_target);
-    let secrets = provider::secret_env_names(&user.providers);
-    session.host_env.retain(|(k, _)| !secrets.contains(k));
     let (context, refused) = context::load(&mut session, &user.context, &paths)?;
     if !context.is_empty() {
         let names: Vec<&str> = context.iter().map(|f| f.label.as_str()).collect();
@@ -481,8 +479,11 @@ fn run_agent(
         // Unlimited unless the flag or the config sets a limit (D37).
         max_steps: args.max_steps.or(user.max_steps),
         images: user.ui.images.clone(),
+        notify: user.ui.notify.unwrap_or_default(),
+        math_scale: user.ui.math_scale.unwrap_or(1.0),
         // One run's choice wins over the saved setting, and is not written anywhere.
         theme: one.theme.clone().or_else(|| user.ui.theme.clone()),
+        keys: user.keys.clone(),
     };
     let store = store::Store::open(&paths.session_db(), session.setup.workspace.clone())?;
     let latest = if args.resume_latest {
@@ -1151,7 +1152,32 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
         };
         println!("images     {protocol:?}, {why}");
     }
+    // What a formula is sized against (D165): the cell, and whether the terminal is the one that
+    // said so, because a guess and an answer look the same on screen.
+    {
+        let (cell, answered) = tui::terminal::cell_report();
+        let source = if answered {
+            "the terminal's answer"
+        } else {
+            "assumed, the terminal did not answer"
+        };
+        println!("cell       {}x{} px, {source}", cell.0, cell.1);
+    }
     let user = UserConfig::load(&setup.paths.user_config())?;
+    // D165: how large a formula is drawn, and what decided it, because a formula that is the wrong
+    // size is a setting to check rather than something to rebuild the binary for.
+    println!(
+        "math       {}x the size its fonts and the terminal's cell give",
+        user.ui.math_scale.unwrap_or(1.0)
+    );
+    // D169: the moves that have a key only because `[keys]` gave them one, since a key that never
+    // fires is a line to look at rather than a bug to report.
+    println!(
+        "keys       {}",
+        user.keys
+            .ends()
+            .unwrap_or_else(|| "tree branch ends: none bound".to_owned())
+    );
     let auth = auth::AuthStore::load(&setup.paths.auth_store())?;
     let reported = provider::Reported::stored(&setup.paths.reported_windows());
     match &user.provider {

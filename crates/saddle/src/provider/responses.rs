@@ -588,6 +588,25 @@ mod tests {
     use std::time::{Duration, Instant};
     use tungstenite::{Message, accept};
 
+    #[test]
+    fn a_formula_is_sent_as_the_tex_and_never_as_a_picture() {
+        // D165: a display formula is drawn by the person's terminal, so the input carries the TeX
+        // in an ordinary text part — never an `input_image`, which only an attachment produces.
+        let formula =
+            "$$\\nabla \\times \\mathbf{E} = -\\frac{\\partial \\mathbf{B}}{\\partial t}$$";
+        let items = [
+            Item::User(format!("explain {formula}")),
+            Item::Assistant(vec![Part::Text(format!("faraday: {formula}"))]),
+        ];
+        let input = input(&items);
+        assert_eq!(input[0]["content"][0]["text"], format!("explain {formula}"));
+        assert_eq!(
+            input[1]["content"][0]["text"],
+            format!("faraday: {formula}")
+        );
+        assert!(!json!(input).to_string().contains("input_image"));
+    }
+
     struct Script(Vec<(&'static str, &'static str)>);
 
     struct Silent;

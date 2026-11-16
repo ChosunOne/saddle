@@ -87,6 +87,7 @@ budgets! {
     image_bytes: usize = 5 * 1024 * 1024,
     image_count: usize = 1,
     image_name_bytes: usize = 256,
+    request_image_bytes: usize = 32 * 1024 * 1024,
     read_page_bytes: usize = 50 * 1024,
     read_page_lines: usize = 2000,
     read_scan_bytes: usize = 64 * 1024 * 1024,

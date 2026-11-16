@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use crate::audit::sha256_hex;
 use globset::GlobSet;
-use saddle_cap::policy::{FsGrant, NetGrant, POLICY_FILE, exclude_set, net_allows};
+use saddle_cap::policy::{FsGrant, NetGrant, POLICY_FILE, Sessions, exclude_set, net_allows};
 use saddle_cap::{Location, Policy, Principal, RelPath, RootName, RuleId, Scope};
 use serde_json::{Value, json};
 
@@ -55,7 +55,10 @@ pub enum Request<'a> {
         cost: Option<f64>,
     },
     TranscriptQuery {
+        /// The conversation the query is against: this one, or another of this workspace (D163).
         session: &'a str,
+        /// Whether that is a conversation other than the one this session is holding.
+        others: bool,
         sql: &'a str,
     },
     PluginService {
@@ -131,7 +134,11 @@ impl Request<'_> {
             Request::ModelReserve { tokens, cost } => {
                 json!({"operation":"model-reserve","tokens":tokens,"cost":cost})
             }
-            Request::TranscriptQuery { session, sql } => json!({ "session": session, "sql": sql }),
+            Request::TranscriptQuery {
+                session,
+                others,
+                sql,
+            } => json!({ "session": session, "others": others, "sql": sql }),
             Request::Hook {
                 operation,
                 channel,
@@ -206,18 +213,33 @@ pub struct Reserved {
     policy_file: Location,
 }
 
-/// Git paths that run code as the user later: hooks and config, in the main repository and in
-/// submodules.
-pub const RESERVED_GIT: &[&str] = &[
+/// Version-control paths that run code as the user later, outside any sandbox: hooks and config,
+/// matched at any depth (D23).
+pub const RESERVED_VCS: &[&str] = &[
+    // git: the repository, a linked worktree's own config, submodules, and a bare repository
+    // (`name.git`), which has no `.git` directory to match.
     ".git/hooks",
     ".git/config",
+    ".git/config.worktree",
+    ".git/worktrees/*/config.worktree",
     ".git/modules/**/hooks",
     ".git/modules/**/config",
+    ".git/modules/**/config.worktree",
+    "*.git/hooks",
+    "*.git/config",
+    // jj: a repo or workspace config found in the tree is adopted as the user's own, `git_target`
+    // names the git repository jj drives, and a jj repository that is not colocated keeps that
+    // repository under `.jj`, where git reads its config on fetch and push.
+    ".jj/repo/config.toml",
+    ".jj/workspace-config.toml",
+    ".jj/repo/store/git_target",
+    ".jj/repo/store/git/hooks",
+    ".jj/repo/store/git/config",
 ];
 
 impl Reserved {
     pub fn new() -> Self {
-        let patterns: Vec<String> = RESERVED_GIT.iter().map(|p| format!("**/{p}")).collect();
+        let patterns: Vec<String> = RESERVED_VCS.iter().map(|p| format!("**/{p}")).collect();
         Self {
             any_root: exclude_set(&patterns).expect("reserved patterns compile"),
             policy_file: Location::new(
@@ -377,6 +399,16 @@ impl Engine {
         &self.reserved
     }
 
+    /// Which conversations the principal's transcript grant covers (D163). `None` when it holds
+    /// none, which is what the host uses to decide whether another session may even be resolved;
+    /// the decision itself is still [`Engine::decide`].
+    pub fn transcript_sessions(&self, who: &Principal) -> Option<Sessions> {
+        self.policy
+            .grants(who)
+            .and_then(|g| g.plain.get(&Scope::TranscriptRead))
+            .map(|g| g.sessions)
+    }
+
     /// Whether a net grant names this host exactly (D28). The fetch tool asks before dialling a
     /// literal address: a wildcard grant allows public addresses but does not open loopback, which
     /// only a grant that spells the address out may do (D40).
@@ -467,8 +499,22 @@ impl Engine {
                 *used += tokens;
                 Decision::allow(scope, &g.rule, &g.why)
             }
-            Request::TranscriptQuery { .. } => {
-                self.decide(who, &Request::Plain(Scope::TranscriptRead))
+            // D163: the grant names which conversations it covers. A query against this one needs
+            // no more than the grant itself; one against another needs the workspace's.
+            Request::TranscriptQuery { others, .. } => {
+                let Some(grant) = grants.plain.get(&Scope::TranscriptRead) else {
+                    return Decision::deny(scope, format!("{who} has no {scope} grant"));
+                };
+                if *others && grant.sessions != Sessions::Workspace {
+                    return Decision::deny(
+                        scope,
+                        format!(
+                            "{who} may read only this conversation, not another one ({})",
+                            grant.rule
+                        ),
+                    );
+                }
+                Decision::allow(scope, &grant.rule, &grant.why)
             }
             Request::Plain(s)
             | Request::Hook { scope: s, .. }
@@ -636,6 +682,41 @@ model-invoke = { tokens-per-session = 100, why = "summaries" }
     }
 
     #[test]
+    fn a_transcript_query_against_another_conversation_needs_a_workspace_grant() {
+        // D163: `transcript-read` names the conversations it covers. Reading the one in hand is
+        // what it always meant; reading another is the workspace's, and a bare grant is that.
+        let (dir, _) = engine();
+        let roots = Roots::resolve([(RootName::workspace(), dir.path().into())], &[]).unwrap();
+        let case = |text: &str, others: bool| {
+            let policy = Policy::parse(text, &roots).unwrap();
+            let engine = Engine::new(policy);
+            let req = Request::TranscriptQuery {
+                session: "other",
+                others,
+                sql: "SELECT 1",
+            };
+            engine.decide(&Principal::Agent, &req)
+        };
+        let bare = "version = 1\n[agent]\ntranscript-read = {}\n";
+        assert!(case(bare, false).allow);
+        assert!(case(bare, true).allow, "a bare grant covers the workspace");
+        let only = "version = 1\n[agent]\ntranscript-read = { sessions = \"self\" }\n";
+        assert!(
+            case(only, false).allow,
+            "this conversation is still readable"
+        );
+        let refused = case(only, true);
+        assert!(!refused.allow);
+        assert!(
+            refused.explanation.contains("only this conversation"),
+            "{}",
+            refused.explanation
+        );
+        let none = case("version = 1\n[agent]\nexec = {}\n", false);
+        assert!(!none.allow && none.explanation.contains("transcript-read"));
+    }
+
+    #[test]
     fn a_net_request_records_its_header_names_and_no_values() {
         // D48: the record says what the request carried, not what was in it.
         let headers = vec!["authorization".to_owned(), "x-api-key".to_owned()];
@@ -738,6 +819,16 @@ model-invoke = { tokens-per-session = 100, why = "summaries" }
             ".git/config",
             "sub/.git/hooks",
             ".git/modules/x/config",
+            ".git/config.worktree",
+            ".git/worktrees/side/config.worktree",
+            ".git/modules/x/config.worktree",
+            "vendor/lib.git/config",
+            "vendor/lib.git/hooks/pre-receive",
+            ".jj/repo/config.toml",
+            ".jj/workspace-config.toml",
+            ".jj/repo/store/git_target",
+            ".jj/repo/store/git/config",
+            ".jj/repo/store/git/hooks/pre-push",
         ] {
             let d = e.decide(&a, &Request::FsWrite { loc: &ws(path) });
             assert!(!d.allow, "{path}");
@@ -746,6 +837,16 @@ model-invoke = { tokens-per-session = 100, why = "summaries" }
                 "{path}: {}",
                 d.explanation
             );
+        }
+        // The rest of a repository stays writable: jj and git rewrite it on every command.
+        for path in [
+            ".git/config.lock",
+            ".jj/repo/op_heads/heads/x",
+            ".jj/repo/store/git/objects/ab/cd",
+            ".jj/working_copy/tree_state",
+        ] {
+            let d = e.decide(&a, &Request::FsWrite { loc: &ws(path) });
+            assert!(d.allow, "{path}: {}", d.explanation);
         }
         // Reading reserved paths is fine; only writes are refused.
         assert!(

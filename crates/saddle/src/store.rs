@@ -127,8 +127,8 @@ pub struct ReasoningRow {
     pub text: String,
 }
 
-/// What one `session_query` may see: this branch's messages, the requests that produced them
-/// (D94), and what the model thought while producing them (D98).
+/// What one `session_query` may see of one conversation: its branch's messages, the requests that
+/// produced them (D94), and what the model thought while producing them (D98).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
     /// `(node, role, text)` per message on the branch, in order.
@@ -440,8 +440,9 @@ impl Store {
         self.branch_to(self.leaf(session)?)
     }
 
-    /// What `session_query` may see of one conversation: its branch's text, before compaction as
-    /// well as after it (D92), and what each request on that branch used (D94).
+    /// What `session_query` may see of one conversation — the one in hand, or another of this
+    /// workspace when the grant covers it (D163): its branch's text, before compaction as well as
+    /// after it (D92), and what each request on that branch used (D94).
     ///
     /// One walk fills all three, which is what lets a request name the message it answered and a
     /// reasoning block name the reply it produced: a request that cost nothing for a 100k-token

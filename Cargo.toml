@@ -75,6 +75,14 @@ url = "2"
 tungstenite = { version = "0.30", features = ["url", "rustls-tls-webpki-roots"] }
 ratatui = "0.30"
 pulldown-cmark = { version = "0.13", default-features = false }
+# Mathematics in the transcript (D165): Typst typesets the formula, and the picture goes to the
+# terminal's graphics protocol at one image pixel per screen pixel. 0.14 is the line whose MSRV is
+# this workspace's, and `typst-assets` is the bundled New Computer Modern family, so no system font
+# is needed and the same formula looks the same everywhere.
+typst = "0.14"
+typst-render = "0.14"
+typst-assets = { version = "0.14", features = ["fonts"] }
+png = "0.17"
 unicode-width = "0.2"
 toml_edit = "0.25"
 similar = "3"

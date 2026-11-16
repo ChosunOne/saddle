@@ -305,6 +305,7 @@ pub trait HostServices: Send + 'static {
         &mut self,
         _call: &Invocation,
         _sql: String,
+        _session: String,
     ) -> anyhow::Result<Result<String, String>> {
         Ok(Err("host does not implement transcript queries".into()))
     }
@@ -690,14 +691,17 @@ impl<H: HostServices> Host for State<H> {
 }
 
 impl<H: HostServices> TranscriptHost for State<H> {
-    fn query(&mut self, sql: String) -> anyhow::Result<Result<String, String>> {
+    fn query(&mut self, sql: String, session: String) -> anyhow::Result<Result<String, String>> {
         if self.call.cancelled() || Instant::now() >= self.call.deadline {
             return Err(anyhow!("plugin call cancelled or timed out"));
         }
         if sql.len() > budgets::query_bytes() {
             return Ok(Err("transcript SQL exceeds 16 KiB".into()));
         }
-        let result = self.host.query_transcript(&self.call, sql)?;
+        if session.len() > budgets::directory_name_bytes() {
+            return Ok(Err("transcript session selector is too long".into()));
+        }
+        let result = self.host.query_transcript(&self.call, sql, session)?;
         if matches!(&result, Ok(value) | Err(value) if value.len() > budgets::query_result_bytes())
         {
             return Ok(Err("transcript result exceeds 50 KiB".into()));
@@ -1882,6 +1886,7 @@ mod tests {
             &mut self,
             call: &Invocation,
             _: String,
+            _: String,
         ) -> anyhow::Result<Result<String, String>> {
             assert!(call.grants().fs_read.is_empty());
             self.calls.fetch_add(1, Ordering::Relaxed);
@@ -1910,13 +1915,27 @@ mod tests {
             )
             .unwrap();
         assert!(
-            TranscriptHost::query(store.data_mut(), "x".repeat(MAX_QUERY_BYTES + 1))
-                .unwrap()
-                .is_err()
+            TranscriptHost::query(
+                store.data_mut(),
+                "x".repeat(MAX_QUERY_BYTES + 1),
+                String::new()
+            )
+            .unwrap()
+            .is_err()
+        );
+        assert!(
+            TranscriptHost::query(
+                store.data_mut(),
+                "SELECT 1".into(),
+                "s".repeat(budgets::directory_name_bytes() + 1)
+            )
+            .unwrap()
+            .is_err(),
+            "a selector longer than a name is refused"
         );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert_eq!(
-            TranscriptHost::query(store.data_mut(), "SELECT 1".into())
+            TranscriptHost::query(store.data_mut(), "SELECT 1".into(), String::new())
                 .unwrap()
                 .unwrap(),
             "ok"
@@ -1927,7 +1946,7 @@ mod tests {
         ] {
             store.data_mut().host.result = result;
             assert!(
-                TranscriptHost::query(store.data_mut(), "SELECT 1".into())
+                TranscriptHost::query(store.data_mut(), "SELECT 1".into(), String::new())
                     .unwrap()
                     .unwrap_err()
                     .contains("50 KiB")

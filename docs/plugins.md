@@ -61,6 +61,23 @@ replacements. Profiles enter the policy hash; reload rebuilds the catalogue and 
 views without resetting spending or changing artifact digests. Changing a profile does not change
 `[agent]`, and granting the agent more reach does not lend an omitted operation scope to a tool.
 
+## Command filesystem defaults (D160)
+
+Commands inherit granted filesystem roots and protected sandbox paths. The implicit read includes
+are limited to `~/.cargo`, `~/.rustup` and `~/.config`—Saddle does not walk all of home by default.
+Cargo credential files, known credential/browser stores under `.config`, and protected Saddle
+config/state remain withheld. Other files in these directories can still contain sensitive data;
+this is a directory selection, not a guarantee about their contents. Implicit symlink bases are
+skipped. These command-only includes do not grant direct file-tool access or additional writes.
+
+Use protected `[sandbox] read` entries for other command directories, and `tools` roles when direct
+file-tool access is also wanted. `include-defaults = false` turns off the implicit includes.
+Explicit paths/include rules remain in force, including any user-written whole-home rule. With
+defaults enabled, an explicit home rule keeps the old merged credential exclusions; overlapping
+implicit child rules are omitted so they cannot undo an exclusion. Existing configs with no flag
+receive the narrower defaults on startup/reload; no protected file is automatically rewritten.
+`saddle check` and the model prompt report the effective command read paths.
+
 ## Background shell work
 
 Use the same bash tool with `background: true` (D153):
@@ -220,9 +237,19 @@ steer publication through a swapped symlink or multiply-linked inode outside its
   headers. Credentials stay in core and only reach the configured provider/fixed Exa endpoints.
   Search snapshots are principal-scoped, not shared with siblings; expansion rechecks current endpoint
   reach and reload evicts data above narrowed cache budgets.
-- **session_query:** read-only branch snapshots, including pre-compaction messages, request usage and
-  prose reasoning. No saved-database handle, session selector, writes or arbitrary SQL functions.
-  Parent and delegate both need transcript-read. Standalone calls report no active conversation.
+- **session_query:** read-only SQL over one conversation's branch snapshot, including pre-compaction
+  messages, request usage and prose reasoning, with a `sessions` view naming the conversations of this
+  workspace. No saved-database handle, writes or arbitrary SQL functions. Parent and delegate both
+  need transcript-read, and a delegated grant is narrowed to the parent's: a plugin reads another
+  conversation only when the agent's own grant covers the workspace (D163). Standalone calls report
+  no active conversation unless they name one.
+
+  The grant names what it covers: `transcript-read = {}` is every conversation of this workspace (the
+  default, and what a bare grant always means now), `transcript-read = { sessions = "self" }` is only
+  the conversation in hand. The tool takes an optional `session` (an id or unique prefix from
+  `sessions`); without it the query is against the conversation in hand, as before. `saddle check`
+  and `/permissions` print which reach is in force, and an audited decision records the conversation
+  it was for and whether that was another one.
 
 Numeric bounds in these contracts are protected runtime settings, not component build variants.
 UTF-8 WIT strings, supported image formats, partial multi-file effects, process-group limitations
@@ -338,7 +365,7 @@ delivered, not silently truncated. Tool events surround normal shipped/plugin/MC
 surround agent turns. Fatal host/audit failures do not run another handler.
 
 The observer export requires explicit `transcript-read` in the manifest ceiling and plugin grants,
-bounded by the agent's transcript reach. This example also needs `event-publish` because it emits a
+bounded by the agent's transcript reach (which conversations that covers, D163). This example also needs `event-publish` because it emits a
 custom event. An observer is not a veto: its error is audited but cannot deny or rewrite a pending
 call. It cannot inject a model message by returning text.
 
@@ -628,6 +655,7 @@ native-diff-input-bytes = 2097152
 image-bytes = 5242880
 image-count = 1
 image-name-bytes = 256
+request-image-bytes = 33554432
 read-page-bytes = 51200
 read-page-lines = 2000
 read-scan-bytes = 67108864
@@ -673,7 +701,9 @@ query-steps = 1000000
 ```
 
 
-`image-bytes` bounds each image and aggregate emitted image bytes. SQL instruction work is checked
+`image-bytes` bounds each image and aggregate emitted image bytes; `request-image-bytes` bounds the
+pictures one model request carries, oldest replaced by a note when a long conversation would exceed
+it (D162). SQL instruction work is checked
 at 1000-instruction progress callbacks, not an exact single-instruction boundary. Native thread stack
 includes a host allowance beyond the Wasm stack; library embedders must reserve adequate native stack.
 Unknown future SDK metadata keys are ignored for forward compatibility; protected config still rejects

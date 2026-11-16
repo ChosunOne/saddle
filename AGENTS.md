@@ -56,13 +56,13 @@ Inside `crates/saddle/src`:
 | `skills` | `SKILL.md` skills: discovery through the `read` gate, the prompt listing, `/skill:name` (D64, D67, D68, D69) |
 | `ignore` | re-exports `saddle-ignore`'s matching (`.gitignore`, `.ignore`, `.fdignore`), shared with `skills` and the editor's completion; the searching itself happens in a guest (D68, D133) |
 | `mcp` | the MCP servers a person declared in `config.toml` (`[mcp.<name>]`): the transport fields and their validation (D104), the `check` lines that compare them with the grants, `saddle mcp call` as the model's own path with no conversation around it (D111), a `decision` record for every call allowed or refused with the arguments hashed (D112), the answers to what a server asks — `roots/list`, `-32601` for sampling and elicitation, a re-read when a catalogue changes (D114) — the discovered OAuth sign-in with its tokens in `auth.json` (D115), and the bearer a call carries with one refresh and one retry when a token expires (D116), the stdio client — JSON-RPC over a sandboxed child's pipes, with a reply deadline and a bounded stderr tail (D107) — the streamable-HTTP transport, whose every request is decided against that server's own narrowed net reach and recorded with the server named (D110), and the per-server deadline both transports enforce from the table's own `timeout` (D113), the prompt line per granted server and the label on whose words a result is (D120), `saddle mcp logout` (D121), the `/mcp` report, its restart, and its session-scoped disable and enable (D118, D123), the `exposure` word each table chooses — `deferred`, `direct` or `hidden`, with `codemode` refused by name (D117) — and its exact-name `tool-exposure` overrides (D122), and the registry that `tool_search` declares tools from, so nothing a server offers is in the prompt until the model asks (D108), with a declaration saved as a branch node so a resume, a fork or a `/tree` jump brings it back and a rewind forgets it — and restoring one re-checks the grant (D109) |
-| `compact` | replacing the older part of a long conversation with a model-written summary (D33), of a session left alone (D77) or written while the turn carries on (D78) |
+| `compact` | replacing the older part of a long conversation with a model-written summary (D33), of a session left alone (D77) or written while the turn carries on (D78); a compaction's summary and its reasoning are one collapsed block opened by ctrl+o (D124) |
 | `store` | the saved conversations: a SQLite tree of messages per workspace (D53), imported from the older JSON Lines files once, with one row per model request recording what it used and which model answered (D94), and a `declared` node for what an MCP search declared on a branch (D109) |
 | `output` | line-mode output: a terminal, or one JSON object per line for a program (D52) |
 | `cache` | the cache-miss notice: one line to the user when a prompt is re-read at full price (D50) |
 | `reserved` | the D20 snapshot and restore of reserved paths around `exec` |
-| `provider/` | the neutral conversation form, the Anthropic, OpenAI-compatible and Responses renderers (every other server is a `[providers.<name>]` table naming which one it imitates, D84), the cache-affinity key, headers, lifetime and originator, sent to OpenAI's own API and to the subscription backend (D100), and the WebSocket that backend is spoken to over, with the delta a kept connection allows (D101), its endpoint/authentication-bound reuse and completed-socket handoff (D102), and one HTTP recovery of a transient Responses stream failure before text or reasoning is shown (D125), OAuth login and token refresh (D85), the model list, the cached context windows and prices (D34, D36); reasoning is kept for every model and replayed in its original position (D95, D96), while Responses summary parts retain display paragraph boundaries and reasoning renders as Markdown live and on resume (D151) |
-| `tui/` | the full-screen UI: app state, rendering (a prompt is markdown in the user's colour, D81; tables are fitted to the width, D83), editor, login (a key or an OAuth sign-in, D85; the searchable model picker `/model` opens, D88), selection (a drag copies the transcript's text or the open dialog's, D87), settings, session list, `permissions` (the grants editor, D45), `tree` (the message tree, D54), `image` (drawing a picture: kitty and iTerm2, D59), `status` (the `[ui] status` template, D36), `theme` (the colour roles, D71), `catppuccin` (the four built-in flavours, D76), `palette` (pi's role vocabulary, colour forms and the palette derived from the terminal, D72, D73), `terminal` (asking the terminal for its colours, D73), `syntax` (code blocks: syntect's grammars, nine roles, the theme's colours, D80), `themes` (the `/theme` picker, D74), `grant` (writing one change into this workspace's policy file, D45), `files` (the `@` file-name completion's own enumeration, which is not an agent tool) and `browser` (opening the link a sign-in shows, D86) |
+| `provider/` | the neutral conversation form, the Anthropic, OpenAI-compatible and Responses renderers (every other server is a `[providers.<name>]` table naming which one it imitates, D84), the cache-affinity key, headers, lifetime and originator, sent to OpenAI's own API and to the subscription backend (D100), and the WebSocket that backend is spoken to over, with the delta a kept connection allows (D101), its endpoint/authentication-bound reuse and completed-socket handoff (D102), and one HTTP recovery of a transient Responses stream failure before text or reasoning is shown (D125), OAuth login and token refresh (D85), the model list, the cached context windows and prices (D34, D36); reasoning is kept for every model and replayed in its original position (D95, D96), while Responses summary parts retain display paragraph boundaries and reasoning renders as Markdown live and on resume (D151), and the pictures one request may carry, older ones replaced by a note past the budget (D162) |
+| `tui/` | the full-screen UI: app state, rendering (a prompt is markdown in the user's colour, D81; tables are fitted to the width, D83), editor, login (a key or an OAuth sign-in, D85; the searchable model picker `/model` opens, D88), selection (a drag copies the transcript's text or the open dialog's, D87, and a formula it covers as the TeX it was drawn from, D166), settings, session list, `permissions` (the grants editor, D45), `tree` (the message tree, full screen, D54, D168; the branch ends have no default key and take one from `[keys]`, D169; a move that would leave replies behind asks before summarizing them, D167), `image` (drawing a picture: kitty and iTerm2, D59; a formula is pinned to its cells and the cursor is saved around every placement, D165; never where a menu or dialog is drawn, D161), `math` (a formula typeset by Typst and placed as a picture in the cells the layout reserved — a block's own rows at one image pixel per screen pixel, or one row of a line of text, on its baseline, D165 — sized to the text's lowercase letters and scaled by `[ui] math-scale`; LaTeX translated to Typst's math syntax, the source where it cannot be drawn, and presentation only — the stored text, a copy and the request a model is sent all carry the TeX, the copy in `\(…\)`/`\[…\]` D166), `status` (the `[ui] status` template, D36), `theme` (the colour roles, D71), `catppuccin` (the four built-in flavours, D76), `palette` (pi's role vocabulary, colour forms and the palette derived from the terminal, D72, D73), `terminal` (asking the terminal for its colours and its cell size, D73, D59), `syntax` (code blocks: syntect's grammars, nine roles, the theme's colours, D80), `themes` (the `/theme` picker, D74), `grant` (writing one change into this workspace's policy file, D45), `keys` (the few moves with no default key, read from `[keys]` in `config.toml`, D169), `files` (the `@` file-name completion's own enumeration, which is not an agent tool) and `browser` (opening the link a sign-in shows, D86) |
 
 `crates/saddle/src/main.rs` dispatches subcommands (`tools`, `plugin install|list|call`, `run`,
 `check`, `tool`, `mcp list|auth|logout|call`, `login`, `logout`, `session`, `audit verify`) and
@@ -151,10 +151,12 @@ and are audited before policy replacement on reload and before session close. Th
 restart/resume; `exec-tasks` in `[tool-limits]` bounds retained records (16 by default). Never give a
 monitor its own policy engine or let task ids lend another principal's output/cancellation reach.
 
-`session_query` requires `transcript-read = {}` in the agent grants. First-run defaults include it;
+`session_query` requires `transcript-read` in the agent grants. First-run defaults include it;
 existing explicit `[agent]` tables remain as written, and `--revoke transcript-read` disables it for
-one run. It queries only the active conversation branch, including pre-compaction messages, through
-three in-memory views:
+one run. A bare grant covers every conversation of **this workspace**, which is the default; the
+grant may name `sessions = "self"` to cover only the conversation in hand (D163). A query is against
+one conversation — the one in hand unless an id or unique prefix from the `sessions` view is named —
+including pre-compaction messages, through four in-memory views:
 `messages(ordinal, id, role, text)`, `requests(ordinal, node, kind, provider, model, input,
 output, cache_read, cache_write, cached, cost, reasoning_dropped, reasoning_tokens, at, after)` —
 one row per model request, `kind` being `reply`, `summary` or `plugin`, `cached` 1 when the prompt came from
@@ -162,13 +164,14 @@ the provider's cache, `reasoning_dropped` the reasoning items the provider said 
 prompt (D97), `reasoning_tokens` how much of `output` was thinking (D99), and `after` the ordinal
 of the last message before it (D92, D94) — and `reasoning(ordinal, node,
 part, text)`, one row per reasoning block, joined to `messages` on `ordinal` and in arrival order by
-`part` (D98). Only the prose is a row: an encrypted or redacted block is kept and replayed (D95) but
+`part` (D98), and `sessions(id, name, title, model, updated, messages, forked_from)`, the
+conversations a query may name (D163). Only the prose is a row: an encrypted or redacted block is kept and replayed (D95) but
 has nothing a query could read. That is what a poor cache hit rate is diagnosed
 with: `SELECT provider, model, sum(cache_read), sum(input + cache_read + cache_write) FROM requests
 GROUP BY provider, model` (D94). It never runs SQL on the saved database, grants filesystem
 access to state, or permits transcript mutation (D92). Results are capped at 100 rows and 50 KiB;
 SQL and execution are bounded too. A standalone `saddle tool session_query` has no active
-conversation and reports that rather than picking another session.
+conversation of its own, so it reports that unless it names one in the workspace.
 
 ## Plugin migration design contract
 
@@ -354,6 +357,14 @@ spend the status line shows and the context estimate all begin again, the last c
 trust step (D44): nothing the agent runs can write a policy file, so `saddle check` is the whole
 review.
 
+## Committing
+
+This is a Jujutsu repository (`.jj`, no `.git` working tree). Commit with `jj` after each change —
+`jj commit -m "<lowercase sentence>"` or `jj describe -m "…" && jj new` — so the work is one
+described change rather than an undifferentiated working copy. Never rewrite or abandon another
+person's changes to tidy the history; a decision the change adds goes to `docs/plan.md` §3 in the same
+commit.
+
 ## The invariant that must not be broken
 
 One capability representation, in `saddle-cap`, lowered three ways (plan §5):
@@ -401,7 +412,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D159 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D160 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
@@ -477,8 +488,11 @@ rather than loosening it.
   snapshot/restore that guarded it (D20) is a race a `setsid` child wins.
 - **Reserved paths.** Writes to `.git/config` and anything under `.git/hooks` (including
   `.git/modules/**/hooks`) are refused under every grant (D23), because hooks and settings like
-  `core.fsmonitor` run later as the user, outside any sandbox. The policy file was on that list until
-  D42 moved it out of the tree; it is now protected by the kernel instead.
+  `core.fsmonitor` run later as the user, outside any sandbox. The list in `RESERVED_VCS` also holds
+  `config.worktree`, a bare `<name>.git` repository's config and hooks, and jj's in-tree config,
+  `git_target` and `.jj/repo/store/git`; a new tool that reads configuration from the tree belongs
+  there too. The policy file was on that list until D42 moved it out of the tree; it is now
+  protected by the kernel instead.
 - **Symlinks.** A path is decided on both the requested path and the resolved one, including dangling
   links; either denial refuses the call. A link to an absolute path is refused. Resolution goes
   through cap-std (`openat2` + `RESOLVE_BENEATH`), so `..` and symlink escapes are closed.
@@ -488,6 +502,13 @@ rather than loosening it.
   reserved directory for a symlink cannot steer the restore outside the workspace.
 - **Exclusions do not bind `exec`.** An `exclude` pattern narrows built-in tools and plugin host
   calls only. A secret that must stay unreadable belongs outside every root.
+- **A command can look at a path it cannot open.** Landlock decides what a path may be opened,
+  created, removed, renamed, executed or truncated for; `stat`, `chmod`, `utime` and `setxattr` are
+  outside every ABI (plan D19, §9). A sandboxed command can therefore tell that an ungranted file
+  exists and change the mode or times of one it owns, so a secret has to be somewhere the user
+  cannot traverse at all, not merely outside every root. The fix is the deferred mount-namespace
+  view, and it must be built before the landlock ruleset is applied; do not try to block `stat` in
+  seccomp.
 - **Provider keys never reach a child.** Every variable that may hold a key is stripped from the
   environment a sandboxed command inherits, even if the `exec` grant names it.
 - **State and config directories are outside every root**, so neither the agent nor a sandboxed
@@ -502,18 +523,19 @@ rather than loosening it.
   `saddle session pending` lists the ids waiting, `saddle session revoke <number|prefix>` withdraws
   one, `check` reports the same thing without refusing, and `allow-sensitive = true` in the user's
   config skips the check for a machine with no secrets. A project inside home is fine.
-- **A command's file access is an enumerated list, not a fixed set of roots** (D62). The default
-  `[[sandbox.include]]` rule walks `~` at startup, withholds what matches `except` (`.ssh`, `.aws`,
-  `.local/share/keyrings`, the package-registry and history files, and the rest of the usual
-  credential stores), and hands landlock the **list**, which `check` prints under `exec reads`. So a toolchain saddle has never heard of works, and adding one pattern
-  takes a directory out of reach for `exec` as well — which a grant-level `exclude` cannot do
-  (D22). Two rules make it honest: a directory that **contains** a withheld one is expanded rather
-  than granted, because a rule covers everything beneath it; and the state and config directories
-  are withheld whatever the pattern says (D16). Rules over the same base are **merged**, so adding
-  an `except` narrows; two separate rules would union and defeat each other. A toolchain directory
-  is never a `[roots]` entry: a root is nameable by any policy, so `fs-write = [{ root = "cargo" }]`
-  in a workspace file could plant a program in `~/.cargo/bin`. `[sandbox] read`/`write` take paths
-  for exactly that reason.
+- **A command's file access is an enumerated list, not a fixed set of roots** (D62, D160).
+  The implicit includes enumerate only `~/.cargo`, `~/.rustup` and `~/.config`, not all of home.
+  Cargo credential files and known credential/browser stores inside `.config` are withheld, as
+  are Saddle's protected config/state paths. Implicit symlink bases are skipped. Pictures,
+  Documents, unrelated checkouts and other dot-directories need explicit command paths or grants.
+  `include-defaults = false` disables the built-in includes; custom include rules remain explicit
+  authority. An explicit home include remains broad and, with defaults enabled, retains its prior
+  merged credential exclusions; overlapping implicit child rules must not undo those exclusions.
+  Configuration directories can still contain secrets beyond the known stores: these defaults
+  do not claim otherwise. `check` prints the resolved `exec reads`, also listed in the prompt.
+  A directory that contains a withheld path is expanded rather than granted, and protected paths
+  are withheld regardless of patterns. Same-base rules merge exclusions. Toolchain directories
+  never become policy-addressable roots: protected `[sandbox] read`/`write` entries name paths.
 - **A `[sandbox]` entry is a claim, not a pattern** (D66). It may be a bare path — a sandboxed
   command's indirect reach, which is all any entry meant before — or a table that adds `tools`, the
   file tools that may name that directory directly. Tool-visible directories are not roots and no

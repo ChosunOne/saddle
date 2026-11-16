@@ -17,7 +17,7 @@ pub const DEFAULT_AGENT: &str = r#"
 fs-read  = [{ root = "workspace", exclude = [".env*"], why = "reads the project" }]
 fs-write = [{ root = "workspace", exclude = [".env*"], why = "edits the project" }]
 exec     = { why = "runs builds, tests and git" }
-transcript-read = { why = "searches this conversation's history" }
+transcript-read = { why = "reads this workspace's conversations" }
 "#;
 
 /// A directory under `$HOME` that confined commands need: its root name, and whether they may
@@ -67,7 +67,9 @@ pub fn config_text(home: Option<&Path>) -> String {
 fs-read  = [{{ root = "workspace", exclude = [".env*"], why = "reads the project" }}]
 fs-write = [{{ root = "workspace", exclude = [".env*"], why = "edits the project" }}]
 exec     = {{ why = "runs builds, tests and git" }}
-transcript-read = {{ why = "searches this conversation's history" }}
+# The transcript grant covers every saved conversation of this workspace. Add
+# `sessions = "self"` to keep session_query to the conversation in hand.
+transcript-read = {{ why = "reads this workspace's conversations" }}
 
 # Directories outside the workspace, by name, so a policy can grant them to the tools. A root is
 # what read, ls, find, grep, write and edit decide over: a tool path has to fall inside one, and the
@@ -101,29 +103,14 @@ transcript-read = {{ why = "searches this conversation's history" }}
 [sandbox]
 write = [{write}]
 
-# Sandboxed commands get what they need without saddle knowing about each tool: saddle walks your
-# home directory at startup, withholds the usual credential stores below, and hands the kernel the
-# list of what is left. So a toolchain works without being named, and a directory added later stays
-# out of reach until the next start (D62).
-#
-# This rule is built in and is not written here, so there is one place to read it: the list below is
-# what it withholds. Add your own [[sandbox.include]] rule to exclude more, or set
-# `include-defaults = false` to use only the rules you write.
-#
-#   [[sandbox.include]]
-#   base = "~"
-#   depth = 3
-#   except = ["^\\.ssh$", "^\\.aws$", ...]
-#
-# Withheld by default: .ssh .gnupg .pki .password-store .local/share/keyrings
-# .local/share/kwalletd .config/op .vault-token .aws .azure .config/gcloud .kube .docker
-# .config/containers .terraform.d .oci .s3cfg .boto .config/rclone .config/doctl .config/hcloud
-# .config/gh .config/glab-cli .config/hub .config/tea .netrc .git-credentials
-# .config/git/credentials .npmrc .yarnrc .yarnrc.yml .pypirc .config/pip .pip .gem/credentials
-# .nuget .m2/settings.xml .gradle/gradle.properties .composer .config/composer .hex
-# .cargo/credentials .cargo/credentials.toml .pgpass .my.cnf .mylogin.cnf .msmtprc .offlineimaprc
-# .fetchmailrc .authinfo .bash_history .zsh_history .python_history .node_repl_history
-# .psql_history .mysql_history .mozilla .thunderbird .config/google-chrome .config/chromium
+# Command reads include only ~/.cargo, ~/.rustup and ~/.config by default (D160), withholding
+# known credential/browser stores as well as Saddle config/state. Saddle does NOT walk your whole
+# home: Pictures, Documents, other projects, shell history,
+# and unrelated dot-directories are not implicitly readable. `include-defaults = false` disables
+# these includes. Add other command paths explicitly to [sandbox] read/write above.
+# Entries can name tools to allow direct file-tool access as well; bare paths are command-only.
+# Custom [[sandbox.include]] rules are explicit, opt-in enumeration, not a default home walk.
+# Rules over the same base merge exclusions; protected config/state paths are always withheld.
 
 # Colours. `theme` names one: built in are default, dark, light, mono, system and the four
 # catppuccin flavours (catppuccin-latte, catppuccin-frappe, catppuccin-macchiato,
@@ -181,9 +168,25 @@ write = [{write}]
 # expand-tools = false
 # mouse = true                          # false hands the mouse back to the terminal, which
 #                                       # selects natively but loses the wheel and drag-to-copy
-# status = "↑{{input}} ↓{{output}} {{cache}} · ctx {{ctx}}/{{window}} · {{cost}} · {{quota}} · {{provider}} {{model}}"
+# notify = "bell"                       # a turn that ends while this window is not focused:
+#                                       # bell, osc9 or osc777 (desktop notifications), or off
+# images = "kitty"                      # how a picture is drawn: kitty, iterm2, none, or unset
+#                                       # to work it out from the terminal
+# math-scale = 1.0                      # how large a formula is drawn: 1.0 is the size its fonts
+#                                       # and the terminal's cell give it, 1.2 a fifth larger
+# status ="↑{{input}} ↓{{output}} {{cache}} · ctx {{ctx}}/{{window}} · {{cost}} · {{quota}} · {{provider}} {{model}}"
 #                                       # fields: provider, model, input, output, cache, ctx,
 #                                       # window, percent, cost, quota, workspace
+
+# Keys. Almost nothing here is configurable: a mode says its keys in its footer, and up/down/enter/
+# esc are what a list is for. The exception is a move saddle would otherwise not offer at all, where
+# there is no key to print until someone picks one — the ends of the branches in /tree (D169).
+# With no [keys] table there is no such key. A modifier a key names is one it requires; write
+# ctrl, alt or shift, then a key name (n, tab, space, enter, up, page-down, f5, ...).
+#
+# [keys]
+# tree-next-end = "ctrl+n"            # move to the next end of a branch in /tree
+# tree-previous-end = "ctrl+p"        # ... and the previous one
 
 # Other providers, or overrides of a built-in one (a table named after it changes its fields).
 # /login writes these tables too. Keys it stores go to ~/.local/state/saddle/auth.json, not here.
@@ -292,22 +295,10 @@ mod tests {
     }
 
     #[test]
-    fn the_default_rule_withholds_every_path_it_names_in_a_real_tree() {
-        // The regex test below only proves the patterns match a string. This one builds the tree
-        // and runs the walk, which is what actually decides: with `depth = 2`, `.local/share/
-        // keyrings` is three levels down, was never enumerated, and its pattern matched nothing —
-        // so the keyring was readable (D62).
+    fn default_toolchain_includes_do_not_grant_personal_files_in_a_real_tree() {
+        // Enumerate the actual default bases: personal siblings must not be considered or
+        // granted, while known stores within the selected bases remain withheld (D160).
         let home = tempfile::tempdir().unwrap();
-        let rule = config::default_include();
-        let include = Include {
-            base: home.path().to_path_buf(),
-            depth: rule.depth,
-            except: rule
-                .except
-                .iter()
-                .map(|p| regex::Regex::new(p).unwrap())
-                .collect(),
-        };
         // Everything the default list names, created so the walk has to find it.
         let withheld = [
             ".ssh/id_rsa",
@@ -352,6 +343,13 @@ mod tests {
             ".hex/hex.config",
             ".cargo/credentials",
             ".cargo/credentials.toml",
+            ".gitconfig",
+            "src/main.rs",
+            "notes.txt",
+            "Pictures/comfyui/result.png",
+            "Documents/private.txt",
+            "other-checkout/source.rs",
+            ".unknown-private/token",
             ".pgpass",
             ".my.cnf",
             ".mylogin.cnf",
@@ -382,16 +380,27 @@ mod tests {
             ".rustup/toolchains/stable",
             ".config/git/config",
             ".config/jj/config.toml",
-            ".gitconfig",
-            "src/main.rs",
-            "notes.txt",
         ];
         for rel in granted {
             let path = home.path().join(rel);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, "fine\n").unwrap();
         }
-        let out = sandbox::enumerate(&include, &[]);
+        let out: Vec<_> = config::default_includes()
+            .into_iter()
+            .flat_map(|rule| {
+                let include = Include {
+                    base: home.path().join(rule.base.strip_prefix("~/").unwrap()),
+                    depth: rule.depth,
+                    except: rule
+                        .except
+                        .iter()
+                        .map(|p| regex::Regex::new(p).unwrap())
+                        .collect(),
+                };
+                sandbox::enumerate(&include, &[])
+            })
+            .collect();
         let got: Vec<&Path> = out.iter().map(|p| p.as_path()).collect();
         for rel in withheld {
             let path = home.path().join(rel);
@@ -409,10 +418,10 @@ mod tests {
     }
 
     #[test]
-    fn every_default_except_pattern_matches_the_store_it_names() {
+    fn explicit_home_compatibility_exclusions_match_the_stores_they_name() {
         // A pattern that never matches is silent: the directory is simply granted. So each one is
         // pinned to the path it is meant to withhold (D62).
-        let rule = config::default_include();
+        let rule = config::explicit_home_defaults();
         let patterns: Vec<regex::Regex> = rule
             .except
             .iter()

@@ -309,7 +309,8 @@ Be specific and complete; this replaces the conversation.{focus}
     )
 }
 
-/// The request for a summary of the branch being left, so what it found is not lost (D54).
+/// The request for a summary of the branch being left, so what it found is not lost (D54). It is
+/// sent only when the person said to summarize, because it is a model request (D167).
 pub fn branch_request(transcript: &str, workspace: &Path) -> String {
     format!(
         "Below is a coding session between a user and an assistant working in {}. The user is \

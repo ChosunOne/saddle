@@ -82,26 +82,7 @@ fn may_ask(stdin_is_tty: bool, stdout_is_tty: bool, raw_mode: bool) -> bool {
 }
 
 fn ask() -> Reported {
-    let raw_mode = terminal::is_raw_mode_enabled().unwrap_or(false);
-    if !may_ask(
-        io::stdin().is_terminal(),
-        io::stdout().is_terminal(),
-        raw_mode,
-    ) {
-        return Reported::nothing();
-    }
-    // `enable_raw_mode` says whether it *was* already on; it is not, from the check above, so this
-    // always puts cooked mode back.
-    let raw = terminal::enable_raw_mode().is_ok();
-    let report = query();
-    if raw {
-        // Anything still in the queue would be read as keystrokes by the interface that is about to
-        // start, and typed into the prompt (D75). Discarding it costs at most one keystroke pressed
-        // in the first 100 ms of a session.
-        discard_pending_input();
-        let _ = terminal::disable_raw_mode();
-    }
-    report
+    parse(&read_replies(&query_sequence()).unwrap_or_default())
 }
 
 /// Throws away whatever is still waiting on stdin: a late reply to a query nobody is listening for
@@ -118,20 +99,48 @@ fn discard_pending_input() {
     }
 }
 
-/// Asks this process's terminal, waiting at most [`TIMEOUT`] (D73).
+/// Writes `sequence` and reads whatever the terminal says back within [`TIMEOUT`], or `None` when
+/// this process has nobody to ask (D73, D75).
 ///
-/// Only called for the `system` theme, and only when stdin is a terminal: a pipe has nobody to answer
-/// and the read would sit until the deadline for nothing.
-pub fn query() -> Reported {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Reported::nothing();
+/// Raw mode is used for the length of the wait only — without it the reply would be echoed over the
+/// screen and the read would wait for a newline — and then put back to cooked, with anything still
+/// in the queue thrown away so the interface does not read a late reply as a keystroke.
+fn read_replies(sequence: &str) -> Option<Vec<u8>> {
+    let raw_mode = terminal::is_raw_mode_enabled().unwrap_or(false);
+    if !may_ask(
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+        raw_mode,
+    ) {
+        return None;
     }
+    // `enable_raw_mode` says whether it *was* already on; it is not, from the check above, so this
+    // always puts cooked mode back.
+    let raw = terminal::enable_raw_mode().is_ok();
+    let bytes = if write_query(sequence) {
+        read_until_quiet()
+    } else {
+        Vec::new()
+    };
+    if raw {
+        // Anything still in the queue would be read as keystrokes by the interface that is about to
+        // start, and typed into the prompt (D75). Discarding it costs at most one keystroke pressed
+        // in the first 100 ms of a session.
+        discard_pending_input();
+        let _ = terminal::disable_raw_mode();
+    }
+    Some(bytes)
+}
+
+/// Writes a query in one burst, or false when stdout says nothing (a pipe, a closed terminal).
+fn write_query(sequence: &str) -> bool {
     let mut out = io::stdout();
-    if out.write_all(query_sequence().as_bytes()).is_err() || out.flush().is_err() {
-        return Reported::nothing();
-    }
-    // A reply arrives as an OSC sequence; read until they stop, or the deadline passes. The caller
-    // has already put the terminal in raw mode, so a byte at a time arrives without a line.
+    out.write_all(sequence.as_bytes()).is_ok() && out.flush().is_ok()
+}
+
+/// Reads what arrives until the terminal falls quiet or [`TIMEOUT`] passes (D73). The caller has put
+/// the terminal in raw mode, so bytes arrive one at a time without a line.
+fn read_until_quiet() -> Vec<u8> {
     let mut bytes = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
     let mut stdin = io::stdin();
@@ -156,7 +165,122 @@ pub fn query() -> Reported {
             _ => break,
         }
     }
-    parse(&bytes)
+    bytes
+}
+
+/// What a terminal is assumed to use for a cell when it will not say. Ten pixels wide and twenty
+/// tall is the usual shape at an ordinary font size; it is what the picture layout was built on
+/// before the terminal was asked (D59).
+pub const ASSUMED_CELL: (u16, u16) = (10, 20);
+
+/// Asks the terminal how many pixels one cell is, once, before the interface starts (D59).
+///
+/// The answer decides how many rows the transcript reserves for a picture and whether it is drawn at
+/// its own size or in a cell box, which is why it is worth a question: a cell is not in the window
+/// size (its pixel fields are zero in practice), and a page of pictures laid out for a cell the
+/// terminal does not use is a page of pictures that overlap the text. A terminal that says nothing —
+/// or reports zeroes, as a pty with no window does — keeps [`ASSUMED_CELL`].
+pub fn cell_px() -> (u16, u16) {
+    measured().unwrap_or(ASSUMED_CELL)
+}
+
+/// One cell's pixels, and whether the terminal is the one that said so: `saddle check` prints both,
+/// because a guess is otherwise indistinguishable from an answer (D59).
+pub fn cell_report() -> ((u16, u16), bool) {
+    match measured() {
+        Some(cell) => (cell, true),
+        None => (ASSUMED_CELL, false),
+    }
+}
+
+/// What the terminal said, asking it once and never twice (D59).
+fn measured() -> Option<(u16, u16)> {
+    let mut kept = match MEASURED.lock() {
+        Ok(kept) => kept,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *kept.get_or_insert_with(measure)
+}
+
+/// The answer this process has, so nothing asks twice (D59); the outer `None` is "not asked yet".
+static MEASURED: Mutex<Option<Option<(u16, u16)>>> = Mutex::new(None);
+
+/// What to write: `CSI 16 t` for the cell itself, `CSI 14 t` for the window it is a fraction of
+/// (D59). Both are asked, because terminals differ about which one they know.
+fn cell_sequence() -> String {
+    "\x1b[16t\x1b[14t".to_owned()
+}
+
+fn measure() -> Option<(u16, u16)> {
+    let pixels = parse_pixels(&read_replies(&cell_sequence())?);
+    if let Some((width, height)) = pixels.cell {
+        // The cell reply is the answer itself; the window's is divided by the cell count.
+        let cell = (u16::try_from(width).ok()?, u16::try_from(height).ok()?);
+        return (cell.0 > 0 && cell.1 > 0).then_some(cell);
+    }
+    cell_from_window(pixels.window?, terminal::size().ok()?)
+}
+
+/// What the two pixel replies said, each `(width, height)` in pixels (D59).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Pixels {
+    /// `CSI 6 t`: one cell.
+    cell: Option<(u32, u32)>,
+    /// `CSI 4 t`: the window the cells are counted in.
+    window: Option<(u32, u32)>,
+}
+
+/// The two replies, in pixels: `CSI 6 ; height ; width t` is a cell and `CSI 4 ; height ; width t`
+/// is the window (D59).
+///
+/// Only a reply that is nothing but numbers and the closing `t` is read: a terminal answers a burst
+/// of questions in one stream, so a device-attributes reply or a keypress may sit between the two
+/// this is looking for, and reading the first `t` in the buffer would swallow the real answer.
+fn parse_pixels(bytes: &[u8]) -> Pixels {
+    let text = String::from_utf8_lossy(bytes);
+    let mut pixels = Pixels::default();
+    let mut rest = text.as_ref();
+    while let Some(at) = rest.find("\x1b[") {
+        let after = &rest[at + 2..];
+        let body: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == ';')
+            .collect();
+        if body.is_empty() || !after[body.len()..].starts_with('t') {
+            rest = after;
+            continue;
+        }
+        let mut fields = body.split(';');
+        let code = fields.next();
+        let height = fields.next().and_then(|v| v.parse::<u32>().ok());
+        let width = fields.next().and_then(|v| v.parse::<u32>().ok());
+        if let (Some(height), Some(width)) = (height, width)
+            && width > 0
+            && height > 0
+        {
+            match code {
+                Some("6") => pixels.cell = Some((width, height)),
+                Some("4") => pixels.window = Some((width, height)),
+                _ => {}
+            }
+        }
+        rest = &after[body.len() + 1..];
+    }
+    pixels
+}
+
+/// A cell size from the window's pixels and the number of cells across and down it (D59).
+fn cell_from_window(window: (u32, u32), cells: (u16, u16)) -> Option<(u16, u16)> {
+    let (width, height) = window;
+    let (cols, rows) = (cells.0 as u32, cells.1 as u32);
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    let cell = (
+        u16::try_from(width / cols).ok()?,
+        u16::try_from(height / rows).ok()?,
+    );
+    (cell.0 > 0 && cell.1 > 0).then_some(cell)
 }
 
 /// Whether a byte is waiting within `limit`. `poll(2)` on stdin, so nothing is consumed by asking.
@@ -340,6 +464,35 @@ mod tests {
     }
 
     #[test]
+    fn the_cell_size_is_read_from_either_reply() {
+        // `CSI 16 t` is the cell itself; the reply is height then width, in pixels (D59).
+        let pixels = parse_pixels(b"\x1b[6;34;17t");
+        assert_eq!(pixels.cell, Some((17, 34)), "width, height");
+        assert_eq!(pixels.window, None);
+        // `CSI 14 t` is the window, which is divided by the cell count.
+        let pixels = parse_pixels(b"\x1b[4;480;1920t");
+        assert_eq!(pixels.cell, None);
+        assert_eq!(pixels.window, Some((1920, 480)));
+        // A terminal with no window reports zeroes, which is not an answer.
+        assert_eq!(parse_pixels(b"\x1b[6;0;0t\x1b[4;0;0t"), Pixels::default());
+        // Other replies in the same burst are skipped, not read as one: a device-attributes reply
+        // and a cursor position report sit between the two this looks for.
+        let pixels = parse_pixels(b"\x1b[?1;2c\x1b[6;34;17t\x1b[12;40R\x1b[4;480;1920t");
+        assert_eq!(pixels.cell, Some((17, 34)));
+        assert_eq!(pixels.window, Some((1920, 480)));
+        assert_eq!(parse_pixels(b""), Pixels::default());
+    }
+
+    #[test]
+    fn a_window_is_divided_into_the_cells_across_and_down_it() {
+        assert_eq!(cell_from_window((1920, 480), (240, 30)), Some((8, 16)));
+        // A cell narrower than a pixel, or a terminal that says it has no cells, is no answer.
+        assert_eq!(cell_from_window((7, 480), (240, 30)), None);
+        assert_eq!(cell_from_window((1920, 480), (0, 30)), None);
+        assert_eq!(cell_from_window((1920, 480), (240, 0)), None);
+    }
+
+    #[test]
     fn the_query_asks_for_the_foreground_background_and_sixteen_colours() {
         let query = query_sequence();
         assert!(query.contains("\x1b]10;?\x07"));
@@ -347,5 +500,14 @@ mod tests {
         for index in 0..16 {
             assert!(query.contains(&format!("\x1b]4;{index};?\x07")), "{index}");
         }
+    }
+
+    #[test]
+    fn the_cell_size_is_asked_for_as_a_cell_and_as_a_window() {
+        // Two questions because terminals differ about which they know: the cell itself (16 t) and
+        // the window it is a fraction of (14 t) (D59).
+        let sequence = cell_sequence();
+        assert!(sequence.contains("\x1b[16t"), "{sequence}");
+        assert!(sequence.contains("\x1b[14t"), "{sequence}");
     }
 }

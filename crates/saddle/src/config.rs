@@ -6,13 +6,9 @@
 //! # goes under [providers.<name>]. A table named after a built-in overrides that preset's fields.
 //! provider = "local"
 //!
-//! [roots]
-//! rustup = "~/.rustup"
-//! cargo = "~/.cargo"
-//!
-//! # Roots every sandboxed command may use on top of the policy's grants (D19).
+//! # Explicit command-only paths supplement granted roots and narrow built-in toolchain reads.
 //! [sandbox]
-//! read = ["rustup", "cargo"]
+//! read = ["~/tools/custom"]
 //! write = []
 //!
 //! [providers.local]
@@ -30,6 +26,8 @@ use crate::paths;
 use crate::plugins::Entry as PluginEntry;
 use crate::standard::{self, Profiles};
 use crate::tools;
+use crate::tui::keys::Keys;
+use crate::tui::notify::Notify;
 use crate::tui::theme::ThemeTables;
 use saddle_cap::sandbox;
 use saddle_cap::sandbox::Include;
@@ -38,7 +36,6 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::ErrorKind;
-use std::iter;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Error as AnyError, Result, bail};
@@ -104,6 +101,9 @@ pub struct UserConfig {
     /// whether any of them runs.
     #[serde(default)]
     pub mcp: McpTable,
+    /// `[keys]`: the few moves with no default key (D169). An empty table means there are none.
+    #[serde(default)]
+    pub keys: Keys,
 }
 
 /// How the TUI starts; ctrl+t and ctrl+o change these for the session only.
@@ -124,6 +124,13 @@ pub struct UiConfig {
     /// How an attached picture is drawn: `kitty`, `iterm2`, `none`, or unset to work it out from
     /// the environment (D59).
     pub images: Option<String>,
+    /// How a turn that ends while the terminal is not focused is announced: `bell`, `osc9`,
+    /// `osc777` or `off` (D164). Unset is `bell`.
+    pub notify: Option<Notify>,
+    /// How large a formula is drawn relative to the size its fonts and the terminal's cell work
+    /// out to: 1.0 is that size, 1.2 a fifth larger (D165). Unset is 1.0, and values outside
+    /// half to four times it are held to those.
+    pub math_scale: Option<f32>,
 }
 
 /// Instruction files (D32).
@@ -197,9 +204,8 @@ pub struct SandboxConfig {
     /// it needs without saddle knowing about each tool (D62).
     #[serde(default)]
     pub include: Vec<IncludeConfig>,
-    /// Whether the rule below is applied. On by default, so an unconfigured machine works: the
-    /// rules in this file are added to it rather than replacing it, which is what "add a
-    /// directory to exclude" means. Set false to have only the rules written here (D62).
+    /// whether the narrow toolchain/config includes are applied (D160). Explicit rules sharing a
+    /// base merge their exclusions; false keeps only the rules written in protected config.
     #[serde(default = "yes", rename = "include-defaults")]
     pub include_defaults: bool,
     /// Whether the built-in tool path is added: `~/.agents`, readable by the tools that only read
@@ -295,8 +301,8 @@ fn yes() -> bool {
     true
 }
 
-/// The credential stores every machine is assumed to have (D62). A pattern that never matches is
-/// harmless, so this errs towards naming stores a particular machine may not have.
+/// known credential patterns relative to home, rebased for .config and retained for explicit
+/// home includes (D62, D160). An unmatched pattern grants nothing by itself.
 pub const DEFAULT_EXCEPTS: &[&str] = &[
     // keys and secret managers
     r"^\.ssh$",
@@ -368,10 +374,36 @@ pub const DEFAULT_EXCEPTS: &[&str] = &[
     r"^\.config/chromium$",
 ];
 
-/// The rule applied when `include-defaults` is on: walk `~` three levels, withhold the usual
-/// credential stores (D62). Not written into `config.toml`, because a copy in the file would be a
-/// second source of truth that drifts from this one.
-pub fn default_include() -> IncludeConfig {
+/// implicit command reads are confined to toolchain/config directories, never all of home (D160).
+pub fn default_includes() -> Vec<IncludeConfig> {
+    vec![
+        IncludeConfig {
+            base: "~/.cargo".to_owned(),
+            depth: default_depth(),
+            except: vec![
+                r"^credentials$".to_owned(),
+                r"^credentials\.toml$".to_owned(),
+            ],
+        },
+        IncludeConfig {
+            base: "~/.rustup".to_owned(),
+            depth: default_depth(),
+            except: Vec::new(),
+        },
+        IncludeConfig {
+            base: "~/.config".to_owned(),
+            depth: default_depth(),
+            except: DEFAULT_EXCEPTS
+                .iter()
+                .filter_map(|pattern| pattern.strip_prefix(r"^\.config/"))
+                .map(|pattern| format!("^{pattern}"))
+                .collect(),
+        },
+    ]
+}
+
+/// preserve the old exclusions only when a person explicitly includes their whole home (D160).
+pub fn explicit_home_defaults() -> IncludeConfig {
     IncludeConfig {
         base: "~".to_owned(),
         depth: default_depth(),
@@ -585,8 +617,7 @@ impl UserConfig {
                     bail!(
                         "config.toml: [sandbox] entry `{written}` names, contains or sits inside \
                          {}, which holds the policy, the audit log and the stored keys; no \
-                         sandbox entry may reach it (D16). A default include rule over ~ leaves \
-                         it out on its own.",
+                         sandbox entry may reach it (D16). Include rules leave it out on their own.",
                         protected.display()
                     );
                 }
@@ -664,30 +695,52 @@ impl UserConfig {
                 }),
             }
         }
-        // The built-in rule first, so a machine with nothing configured still works (D62).
-        let built_in = default_include();
-        let rules: Vec<&IncludeConfig> = if self.sandbox.include_defaults {
-            iter::once(&built_in)
-                .chain(self.sandbox.include.iter())
-                .collect()
-        } else {
-            self.sandbox.include.iter().collect()
+        let include_base = |rule: &IncludeConfig| -> Result<PathBuf> {
+            if let Ok(name) = RootName::new(&rule.base)
+                && let Some(path) = roots.get(&name)
+            {
+                return Ok(path.to_path_buf());
+            }
+            expand(&rule.base)
         };
+        let canonical_home = home
+            .as_ref()
+            .map(|home| home.canonicalize().unwrap_or_else(|_| home.clone()));
+        let mut explicit_home = false;
+        for rule in &self.sandbox.include {
+            let base = include_base(rule)?;
+            let base = base.canonicalize().unwrap_or(base);
+            explicit_home |= canonical_home.as_ref() == Some(&base);
+        }
+        // An explicit home rule keeps its previous merged exclusions. Do not also add overlapping
+        // default rules: those would re-grant children that the explicit home rule excludes.
+        let built_in = if !self.sandbox.include_defaults {
+            Vec::new()
+        } else if explicit_home {
+            vec![explicit_home_defaults()]
+        } else {
+            default_includes()
+        };
+        let rules = built_in
+            .iter()
+            .map(|rule| (rule, true))
+            .chain(self.sandbox.include.iter().map(|rule| (rule, false)));
         // Rules are combined per base rather than enumerated separately, and their `except` lists
         // are merged. Two rules over the same base would otherwise *union*: the broader one grants
         // a directory the narrower one excluded, so a person's extra pattern would do nothing.
         // Adding an exclusion has to narrow (D62).
         let mut by_base: BTreeMap<PathBuf, (usize, Vec<regex::Regex>)> = BTreeMap::new();
-        for rule in rules {
-            // A root name is accepted so a rule can follow the same names as everything else.
-            let base = match RootName::new(&rule.base) {
-                Ok(name) if roots.contains(&name) => roots.get(&name).map(Path::to_path_buf),
-                _ => None,
-            };
-            let base = match base {
-                Some(path) => path,
-                None => expand(&rule.base)?,
-            };
+        for (rule, implicit) in rules {
+            let base = include_base(rule)?;
+            // A conventional include name must not silently follow a symlink to personal data.
+            // Explicit user rules retain their existing canonical-base behavior.
+            if implicit
+                && !explicit_home
+                && fs::symlink_metadata(&base)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                continue;
+            }
             if !base.is_dir() {
                 // Nothing to walk. A missing base grants nothing rather than failing the session,
                 // so a rule for a toolchain on another machine is harmless (D62).
@@ -734,6 +787,7 @@ impl UserConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::keys::Keys;
     use std::fs;
 
     #[test]
@@ -764,6 +818,56 @@ mod tests {
             fs::write(&path, format!("[tool-limits]\n{bad}\n")).unwrap();
             assert!(UserConfig::load(&path).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_maths_scale_is_read_and_a_misspelling_is_refused() {
+        // D165: how large a formula is drawn is the person's setting, like the theme; a key that
+        // does not exist is an error rather than something silently ignored.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[ui]\nmath-scale = 1.25\n").unwrap();
+        assert_eq!(
+            UserConfig::load(&path).unwrap().ui.math_scale,
+            Some(1.25_f32)
+        );
+        fs::write(&path, "[ui]\nmath_scale = 1.25\n").unwrap();
+        assert!(UserConfig::load(&path).is_err());
+        fs::write(&path, "[ui]\nmath-scale = \"big\"\n").unwrap();
+        assert!(UserConfig::load(&path).is_err());
+    }
+
+    #[test]
+    fn a_bound_key_is_read_from_the_file_and_a_misspelt_one_is_an_error() {
+        // D169: the table is the only place a key with no default can come from, so a line that does
+        // not name a key has to fail here rather than become a key that never fires.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[keys]\ntree-next-end = \"ctrl+n\"\ntree-previous-end = \"alt+j\"\n",
+        )
+        .unwrap();
+        let bound = UserConfig::load(&path).unwrap();
+        assert_eq!(
+            bound.keys.ends().as_deref(),
+            Some("ctrl+n/alt+j branch ends")
+        );
+        // Absent is a session with no such key, not an error.
+        fs::write(&path, "").unwrap();
+        let none = UserConfig::load(&path).unwrap();
+        assert_eq!(none.keys, Keys::default());
+        assert_eq!(none.keys.ends(), None);
+        // A spelling this build does not know names the line it was written on.
+        fs::write(&path, "[keys]\ntree-next-end = \"ctrln\"\n").unwrap();
+        // The chain, because the outermost message is only the file: what says `ctrln` is the
+        // parse error inside it, and that is what a person needs to see.
+        let error = format!("{:#}", UserConfig::load(&path).unwrap_err());
+        assert!(error.contains("ctrln"), "{error}");
+        assert!(error.contains("not a key"), "{error}");
+        // And a key this table does not have is refused like any other unknown field.
+        fs::write(&path, "[keys]\ntree-nxt-end = \"ctrl+n\"\n").unwrap();
+        assert!(UserConfig::load(&path).is_err());
     }
 
     #[test]

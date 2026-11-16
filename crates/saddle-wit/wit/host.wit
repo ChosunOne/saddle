@@ -51,9 +51,11 @@ interface tool-paths {
     read-directory: func(path: path, after: string, limit: u32) -> result<page, failure>;
 }
 
-// A query over the active branch, never a handle to the saved database.
+// A query over one conversation's active branch, never a handle to the saved database. The
+// session is empty for the conversation in hand, or names another of this workspace when the
+// transcript-read grant covers them (D163).
 interface transcript-read {
-    query: func(sql: string) -> result<string, string>;
+    query: func(sql: string, session: string) -> result<string, string>;
 }
 
 interface fs-read {

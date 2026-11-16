@@ -26,12 +26,48 @@ pub struct Snapshot(BTreeMap<PathBuf, Entry>);
 /// Directories inside a git dir that never hold hooks or config; skipped for speed.
 const SKIP: &[&str] = &["objects", "refs", "logs", "lfs"];
 
+/// The reserved paths of the workspace's own repository (D23), and whether each is a directory
+/// recorded with everything in it. The engine refuses the same names at any depth; a command's
+/// writes are put back here, at the top of the workspace.
+const FIXED: &[(&str, bool)] = &[
+    (".git/config", false),
+    (".git/config.worktree", false),
+    (".git/hooks", true),
+    (".jj/repo/config.toml", false),
+    (".jj/workspace-config.toml", false),
+    (".jj/repo/store/git_target", false),
+    (".jj/repo/store/git/config", false),
+    (".jj/repo/store/git/hooks", true),
+];
+
 pub fn take(ws: &Dir) -> io::Result<Snapshot> {
     let mut snap = Snapshot::default();
-    record(ws, Path::new(".git/config"), &mut snap, false)?;
-    record(ws, Path::new(".git/hooks"), &mut snap, true)?;
+    for (path, whole) in FIXED {
+        record(ws, Path::new(path), &mut snap, *whole)?;
+    }
+    walk_worktrees(ws, &mut snap)?;
     walk_modules(ws, Path::new(".git/modules"), &mut snap)?;
     Ok(snap)
+}
+
+/// A linked worktree's git dir is `.git/worktrees/<name>`, and git reads its `config.worktree`
+/// once `extensions.worktreeConfig` is on, which `git sparse-checkout` turns on.
+fn walk_worktrees(ws: &Dir, snap: &mut Snapshot) -> io::Result<()> {
+    let dir = Path::new(".git/worktrees");
+    let entries = match ws.read_dir(dir) {
+        Ok(e) => e,
+        Err(e)
+            if e.kind() == io::ErrorKind::NotFound || e.kind() == io::ErrorKind::NotADirectory =>
+        {
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let path = dir.join(entry?.file_name()).join("config.worktree");
+        record(ws, &path, snap, false)?;
+    }
+    Ok(())
 }
 
 /// Submodule git dirs live at any depth under `.git/modules`; each has its own config and hooks.
@@ -50,7 +86,7 @@ fn walk_modules(ws: &Dir, dir: &Path, snap: &mut Snapshot) -> io::Result<()> {
         let name = entry.file_name();
         let path = dir.join(&name);
         match name.to_str() {
-            Some("config") => record(ws, &path, snap, false)?,
+            Some("config" | "config.worktree") => record(ws, &path, snap, false)?,
             Some("hooks") => record(ws, &path, snap, true)?,
             Some(n) if SKIP.contains(&n) => {}
             _ if entry.file_type()?.is_dir() => walk_modules(ws, &path, snap)?,
@@ -167,6 +203,8 @@ fn put(ws: &Dir, path: &Path, entry: &Entry) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use saddle_cap::{Location, RelPath, RootName};
+    use saddle_policy::Reserved;
     use std::fs;
     use std::os::unix::fs as unix_fs;
 
@@ -231,5 +269,75 @@ mod tests {
         restore(&ws, &before).unwrap();
         assert!(root.join(".git/hooks").symlink_metadata().unwrap().is_dir());
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn jj_and_worktree_config_are_put_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".jj/repo/store/git/hooks")).unwrap();
+        fs::create_dir_all(root.join(".git/worktrees/side")).unwrap();
+        fs::write(root.join(".jj/repo/store/git_target"), "git").unwrap();
+        fs::write(root.join(".jj/repo/store/git/config"), "[core]\n").unwrap();
+        let ws = Dir::open_ambient_dir(root, cap_std::ambient_authority()).unwrap();
+        let before = take(&ws).unwrap();
+
+        // jj adopts a repo or workspace config it finds in the tree as the user's own, and
+        // `git_target` names the repository whose config git reads on fetch and push.
+        fs::write(root.join(".jj/repo/config.toml"), "ui.pager = \"evil\"\n").unwrap();
+        fs::write(
+            root.join(".jj/workspace-config.toml"),
+            "ui.pager = \"evil\"\n",
+        )
+        .unwrap();
+        fs::write(root.join(".jj/repo/store/git_target"), "../../../evil").unwrap();
+        fs::write(
+            root.join(".jj/repo/store/git/config"),
+            "[core]\nsshCommand = evil\n",
+        )
+        .unwrap();
+        fs::write(root.join(".jj/repo/store/git/hooks/pre-push"), "evil").unwrap();
+        fs::write(
+            root.join(".git/config.worktree"),
+            "[core]\nfsmonitor = evil\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".git/worktrees/side/config.worktree"),
+            "[core]\nfsmonitor = evil\n",
+        )
+        .unwrap();
+
+        let changes = restore(&ws, &before).unwrap();
+        let paths: Vec<String> = changes
+            .iter()
+            .map(|(p, c)| format!("{c:?} {}", p.display()))
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "Created .git/config.worktree",
+                "Created .git/worktrees/side/config.worktree",
+                "Created .jj/repo/config.toml",
+                "Modified .jj/repo/store/git/config",
+                "Created .jj/repo/store/git/hooks/pre-push",
+                "Modified .jj/repo/store/git_target",
+                "Created .jj/workspace-config.toml",
+            ]
+        );
+        assert_eq!(take(&ws).unwrap(), before);
+    }
+
+    #[test]
+    fn every_path_put_back_is_one_the_engine_refuses() {
+        let reserved = Reserved::new();
+        let paths = FIXED.iter().map(|(path, _)| *path).chain([
+            ".git/worktrees/side/config.worktree",
+            ".git/modules/vendor/config.worktree",
+        ]);
+        for path in paths {
+            let loc = Location::new(RootName::workspace(), RelPath::new(path).unwrap());
+            assert!(reserved.contains(&loc), "{path}");
+        }
     }
 }

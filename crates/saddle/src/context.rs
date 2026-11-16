@@ -22,7 +22,7 @@ use crate::paths::Paths;
 use crate::session::Session;
 
 /// Bytes of one file that go into the prompt; the rest is cut with a note.
-pub const MAX_FILE_BYTES: usize = 64 * 1024;
+pub const MAX_FILE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextFile {

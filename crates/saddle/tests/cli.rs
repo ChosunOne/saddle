@@ -4,6 +4,7 @@
 #[path = "support/sandbox_overrides.rs"]
 mod sandbox_override_tests;
 
+use serde_json::json;
 use std::fs;
 use std::fs::Permissions;
 use std::io::BufRead as _;
@@ -14,6 +15,7 @@ use std::net::TcpListener;
 use std::net::TcpStream;
 use std::os::unix::fs as unix_fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -645,6 +647,42 @@ fn bash_runs_sandboxed_and_reserved_paths_are_restored() {
         serde_json::json!({"command": "sleep 30", "timeout_secs": 1}),
     );
     assert!(!ok && text.contains("timed out"), "{text}");
+}
+
+#[test]
+fn a_provider_key_never_reaches_a_command_even_when_the_exec_grant_names_it() {
+    if let Err(reason) = saddle_sandbox::availability() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let env = ready();
+    env.edit_agent(|agent| {
+        let exec = agent["exec"].as_table_mut().unwrap();
+        exec.insert(
+            "env".into(),
+            toml::Value::Array(vec!["ANTHROPIC_API_KEY".into(), "SADDLE_VISIBLE".into()]),
+        );
+    });
+    // `saddle tool` opens its session without the interactive start-up, which is where the strip
+    // used to be, so it is the path that would show the key (D19).
+    let input = serde_json::json!({
+        "command": "printf '%s|%s' \"${ANTHROPIC_API_KEY-unset}\" \"${SADDLE_VISIBLE-unset}\""
+    });
+    let out = Command::new(env!("CARGO_BIN_EXE_saddle"))
+        .arg("-C")
+        .arg(env.ws.path())
+        .args(["tool", "bash", &input.to_string()])
+        .env("HOME", env.home.path())
+        .env("XDG_STATE_HOME", env.xdg.path().join("state"))
+        .env("XDG_CONFIG_HOME", env.xdg.path().join("config"))
+        .env("ANTHROPIC_API_KEY", "sk-never-shown")
+        .env("SADDLE_VISIBLE", "shown")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(text.contains("unset|shown"), "{text}");
+    assert!(!text.contains("sk-never-shown"), "{text}");
 }
 
 #[test]
@@ -2157,10 +2195,8 @@ fn the_directory_above_home_is_reported_too() {
 }
 
 #[test]
-fn the_default_include_rule_gives_a_child_what_it_needs_and_withholds_credentials() {
-    // D62: no rule names cargo, rustup or git. The default walks home, keeps what does not match
-    // the except patterns, and hands that list to the kernel — so a toolchain works on a machine
-    // saddle has never seen, while the credentials beside it stay out of reach.
+fn default_includes_limit_children_to_toolchains_and_config_and_withhold_credentials() {
+    // D160: default command reads have explicit narrow bases, not an implicit home walk.
     let home = tempfile::tempdir().unwrap();
     let xdg = tempfile::tempdir().unwrap();
     fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
@@ -2228,6 +2264,9 @@ fn an_extra_except_line_takes_one_more_directory_out_of_reach() {
     fs::create_dir_all(h.join("notes/private")).unwrap();
     fs::write(h.join("notes/private/a.txt"), "secret\n").unwrap();
     fs::write(h.join("notes/public.txt"), "fine\n").unwrap();
+    fs::create_dir_all(h.join(".cargo/registry")).unwrap();
+    fs::write(h.join(".cargo/registry/hidden"), "secret").unwrap();
+    fs::write(h.join(".cargo/credentials.toml"), "token").unwrap();
     fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
     fs::write(
         xdg.path().join("config/saddle/config.toml"),
@@ -2235,7 +2274,7 @@ fn an_extra_except_line_takes_one_more_directory_out_of_reach() {
 [[sandbox.include]]
 base = "~"
 depth = 2
-except = ["^notes/private$"]
+except = ["^notes/private$", "^\\.cargo/registry$"]
 "#
         .to_owned()
             + saddle_standard::DEFAULT_PROFILES,
@@ -2267,6 +2306,14 @@ except = ["^notes/private$"]
     assert!(
         !read(&h.join("notes/private/a.txt")),
         "the excluded one does not"
+    );
+    assert!(
+        !read(&h.join(".cargo/registry/hidden")),
+        "default child includes cannot undo an explicit home exclusion"
+    );
+    assert!(
+        !read(&h.join(".cargo/credentials.toml")),
+        "explicit home rules keep the prior credential mask"
     );
 }
 
@@ -2979,11 +3026,13 @@ fn a_config_with_no_sandbox_table_keeps_the_built_in_defaults() {
     doc.remove("sandbox");
     fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
 
+    fs::create_dir_all(home.path().join(".cargo/registry")).unwrap();
+    fs::write(home.path().join(".cargo/registry/probe"), "toolchain").unwrap();
     let out = saddle_in(&env, home.path(), &["check"]);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
         text.contains("exec reads"),
-        "the include rule survived: {text}"
+        "the narrow includes survived: {text}"
     );
     assert!(
         text.contains("tool paths"),
@@ -3371,4 +3420,115 @@ fs-read = [{ root = "workspace" }]
         "check does not paint, so it does not care"
     );
     // The message itself comes from theme::build, which the unit tests cover.
+}
+
+#[test]
+fn default_personal_read_denial_can_be_explicitly_enabled_and_revoked_without_repinning() {
+    let env = Env::new();
+    let home = env.home.path();
+    for relative in [
+        "Pictures/comfyui/render.png",
+        "Documents/private.txt",
+        "other-checkout/main.rs",
+        ".unknown-private/token",
+        ".cargo/credentials",
+        ".cargo/credentials.toml",
+        ".config/gcloud/credentials.db",
+        ".config/op/token",
+        ".config/google-chrome/Default/Cookies",
+        ".config/git/credentials",
+        ".cargo/bin/probe",
+        ".rustup/toolchains/probe",
+        ".config/git/config",
+        ".config/jj/config.toml",
+    ] {
+        let path = home.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "fixture").unwrap();
+    }
+    let read = |path: &Path| {
+        let output = env.saddle(&[
+            "tool",
+            "bash",
+            &json!({"command":format!("cat '{}' > /dev/null", path.display())}).to_string(),
+        ]);
+        output.status.success()
+    };
+    for relative in [
+        "Pictures/comfyui/render.png",
+        "Documents/private.txt",
+        "other-checkout/main.rs",
+        ".unknown-private/token",
+        ".cargo/credentials",
+        ".cargo/credentials.toml",
+        ".config/gcloud/credentials.db",
+        ".config/op/token",
+        ".config/google-chrome/Default/Cookies",
+        ".config/git/credentials",
+    ] {
+        assert!(
+            !read(&home.join(relative)),
+            "{relative} must not be readable by default"
+        );
+    }
+    for relative in [
+        ".cargo/bin/probe",
+        ".rustup/toolchains/probe",
+        ".config/git/config",
+        ".config/jj/config.toml",
+    ] {
+        assert!(read(&home.join(relative)), "{relative} should be readable");
+    }
+    assert!(
+        !read(&env.policy_path()),
+        "protected configuration is never a default read"
+    );
+    let gallery = home.join("Pictures/comfyui");
+    env.write_override(&format!(
+        "[sandbox]\nread = [{:?}]",
+        format!("+{}", gallery.display())
+    ));
+    assert!(read(&gallery.join("render.png")));
+    let file_tool = env.saddle(&[
+        "tool",
+        "read",
+        &json!({"path":gallery.join("render.png")}).to_string(),
+    ]);
+    assert!(
+        !file_tool.status.success(),
+        "a command-only path does not lend file-tool access"
+    );
+    env.write_override("");
+    assert!(!read(&gallery.join("render.png")));
+    let mut config: toml::Table = env.policy().parse().unwrap();
+    config.insert(
+        "sandbox".into(),
+        toml::Value::try_from(json!({"include-defaults":false})).unwrap(),
+    );
+    fs::write(env.policy_path(), toml::to_string(&config).unwrap()).unwrap();
+    assert!(!read(&home.join(".cargo/bin/probe")));
+    assert!(!read(&home.join(".config/git/config")));
+    env.write_override(&format!(
+        "[sandbox]\nread = [{:?}]",
+        format!("+{}", gallery.display())
+    ));
+    assert!(
+        read(&gallery.join("render.png")),
+        "disabling defaults retains explicit paths"
+    );
+}
+
+#[test]
+fn implicit_include_bases_cannot_follow_symlinks_to_unrelated_data() {
+    let env = Env::new();
+    let secret = env.outside.path().join("secret");
+    for name in [".cargo", ".rustup", ".config"] {
+        symlink(env.outside.path(), env.home.path().join(name)).unwrap();
+    }
+    let out = env.saddle(&[
+        "tool",
+        "bash",
+        &json!({"command":format!("cat '{}'",secret.display())}).to_string(),
+    ]);
+    assert!(!out.status.success());
 }

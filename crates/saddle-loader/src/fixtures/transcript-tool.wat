@@ -1,7 +1,7 @@
 (component
   (type $host (instance
     (type $result (result string (error string)))
-    (export "query" (func (param "sql" string) (result $result)))
+    (export "query" (func (param "sql" string) (param "session" string) (result $result)))
   ))
   (import "saddle:host/transcript-read@0.1.0" (instance $host (type $host)))
   (alias export $host "query" (func $query))
@@ -19,11 +19,12 @@
     (memory $memory "memory") (realloc (func $memory "realloc"))))
   (core module $guest
     (import "memory" "memory" (memory 1))
-    (import "host" "query" (func $query (param i32 i32 i32)))
+    (import "host" "query" (func $query (param i32 i32 i32 i32 i32)))
     ;; initialization-probe
     (data (i32.const 128) "session_query")
     (data (i32.const 144) "query branch")
     (data (i32.const 160) "{}")
+    (data (i32.const 176) "s")
     (func (export "describe") (result i32)
       i32.const 0 i32.const 128 i32.store
       i32.const 4 i32.const 13 i32.store
@@ -34,7 +35,8 @@
       i32.const 0)
     (func (export "invoke") (param $sql i32) (param $len i32) (result i32)
       ;; query-probe
-      local.get $sql local.get $len i32.const 32 call $query
+      ;; the session is the empty string: the conversation in hand
+      local.get $sql local.get $len i32.const 176 i32.const 0 i32.const 32 call $query
       i32.const 64 i32.const 36 i32.load i32.store
       i32.const 68 i32.const 40 i32.load i32.store
       i32.const 72 i32.const 32 i32.load8_u i32.store8

@@ -664,6 +664,26 @@ mod tests {
     }
 
     #[test]
+    fn a_formula_is_sent_as_the_tex_and_never_as_a_picture() {
+        // D165: setting a formula is something the person's terminal does. The conversation — and
+        // so the request — carries the source in the words it was written in, so a model reads an
+        // earlier formula back as TeX rather than as a picture it cannot see.
+        let formula = "$$\\int_0^1 x^2 \\, dx = \\frac{1}{3}$$";
+        let items = vec![
+            Item::User(format!("check {formula} please")),
+            Item::Assistant(vec![Part::Text(format!("it follows: {formula}"))]),
+        ];
+        let m = messages(&items);
+        assert_eq!(
+            m[0]["content"][0]["text"],
+            format!("check {formula} please")
+        );
+        assert_eq!(m[1]["content"][0]["text"], format!("it follows: {formula}"));
+        // The only image blocks a request carries are the ones a person attached (D58, D162).
+        assert!(!json!(m).to_string().contains("\"image\""));
+    }
+
+    #[test]
     fn history_renders_with_native_blocks_and_merged_user_turns() {
         let items = vec![
             Item::User("hi".into()),

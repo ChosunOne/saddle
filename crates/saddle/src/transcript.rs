@@ -1,11 +1,13 @@
-//! active-branch transcript SQL behind the gated SDK service, not a native tool (D92, D137, D147).
+//! transcript SQL behind the gated SDK service, not a native tool (D92, D137, D147).
 //!
-//! Three views: the branch's messages, one row per model request with what it used and what
-//! answered it (D94), and the reasoning behind those messages (D98).
+//! Four views over one conversation's active branch: its messages, one row per model request with
+//! what it used and what answered it (D94), the reasoning behind those messages (D98), and the
+//! conversations of this workspace that may be read (D163).
 
 use saddle_limits as budgets;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+use std::time::UNIX_EPOCH;
 
 use anyhow::{Result, bail};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
@@ -13,26 +15,53 @@ use rusqlite::limits::Limit;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, params};
 use saddle_cap::Principal;
+use saddle_cap::policy::Sessions;
 use saddle_policy::Request;
 use serde_json::{Value, json};
 
 use crate::cancel;
 use crate::session::Session;
-use crate::store::Snapshot;
+use crate::store::{Snapshot, Summary};
 
 pub fn execute(
     session: &mut Session,
     who: &Principal,
     sql: &str,
+    selector: &str,
     call: Option<&str>,
     deadline: Option<Instant>,
 ) -> Result<Result<Value, String>> {
-    let id = session
-        .query_conversation
-        .as_deref()
-        .unwrap_or("none")
-        .to_owned();
-    let request = Request::TranscriptQuery { session: &id, sql };
+    let active = session.query_conversation.clone();
+    let mode = session.engine.transcript_sessions(who);
+    let wanted = selector.trim();
+    // A selector names another conversation; that is the part the grant has to cover, and it is
+    // what makes this more than a query of the conversation in hand (D163).
+    let others = !wanted.is_empty();
+    // Only a grant that covers the workspace resolves a selector or lists the others, so a
+    // refusal never says which ids exist (D163).
+    let listed = if others || mode == Some(Sessions::Workspace) {
+        session.transcript_store()?.list()?
+    } else {
+        Vec::new()
+    };
+    let target = match (others, mode) {
+        (false, _) => active.clone(),
+        (true, Some(Sessions::Workspace)) => match resolve(wanted, &listed) {
+            Ok(id) => Some(id.to_owned()),
+            Err(why) => return Ok(Err(why)),
+        },
+        (true, _) => None,
+    };
+    let id = match (&target, others) {
+        (Some(id), _) => id.clone(),
+        (None, true) => wanted.to_owned(),
+        (None, false) => "none".to_owned(),
+    };
+    let request = Request::TranscriptQuery {
+        session: &id,
+        others,
+        sql,
+    };
     let decision = session.engine.decide(who, &request);
     if let Some(call) = call {
         session
@@ -44,11 +73,70 @@ pub fn execute(
     if !decision.allow {
         return Ok(Err(format!("denied: {}", decision.explanation)));
     }
-    let Some(snapshot) = &session.query_snapshot else {
+    // The agent has already built this conversation's snapshot around the call; another
+    // conversation, or one it did not build, is loaded here.
+    let snapshot = if target == active {
+        session.query_snapshot.take()
+    } else {
+        None
+    };
+    let Some(snapshot) = snapshot.or(match target.as_deref() {
+        Some(id) => Some(session.transcript_store()?.snapshot(id)?),
+        None => None,
+    }) else {
         return Ok(Err("no saved conversation is active".into()));
     };
-    Ok(query_bounded(snapshot, sql, deadline)
+    // A grant that covers only this conversation lists only this conversation, so the titles of
+    // the others say nothing (D163).
+    let allowed: Vec<SessionRow> = match mode {
+        Some(Sessions::Workspace) => listed.iter().map(row).collect(),
+        _ => listed
+            .iter()
+            .filter(|s| Some(&s.id) == active.as_ref())
+            .map(row)
+            .collect(),
+    };
+    Ok(query_bounded(&snapshot, &allowed, sql, deadline)
         .map_err(|error| format!("session query failed: {error}")))
+}
+
+/// One row of the `sessions` view: the saved conversations a query may name (D163).
+fn row(summary: &Summary) -> SessionRow {
+    SessionRow {
+        id: summary.id.clone(),
+        name: summary.name.clone().unwrap_or_default(),
+        title: summary.title.clone(),
+        model: summary.model.clone(),
+        updated: summary
+            .updated
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64),
+        messages: summary.messages as i64,
+        forked_from: summary.forked_from.clone().unwrap_or_default(),
+    }
+}
+
+/// The one conversation `selector` names in this workspace, or why it names none or several
+/// (D163). An exact id wins; otherwise the prefix has to be unique, the way `saddle session`
+/// takes one, so a partial id is never a guess between conversations.
+fn resolve<'a>(selector: &str, listed: &'a [Summary]) -> Result<&'a str, String> {
+    if let Some(found) = listed.iter().find(|s| s.id == selector) {
+        return Ok(&found.id);
+    }
+    let matching: Vec<&Summary> = listed
+        .iter()
+        .filter(|s| s.id.starts_with(selector))
+        .collect();
+    match matching.as_slice() {
+        [] => Err(format!(
+            "no conversation in this workspace has an id starting with {selector:?}"
+        )),
+        [one] => Ok(&one.id),
+        many => Err(format!(
+            "{} conversations in this workspace start with {selector:?}: give more of the id",
+            many.len()
+        )),
+    }
 }
 
 fn authorize(ctx: AuthContext<'_>) -> Authorization {
@@ -56,10 +144,11 @@ fn authorize(ctx: AuthContext<'_>) -> Authorization {
         AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
         AuthAction::Read { table_name, .. } => match (table_name, ctx.accessor) {
             // The three views, and the backing table each of them reads (D92, D94, D98).
-            ("messages" | "requests" | "reasoning", _) => Authorization::Allow,
+            ("messages" | "requests" | "reasoning" | "sessions", _) => Authorization::Allow,
             ("message_snapshot", Some("messages"))
             | ("request_snapshot", Some("requests"))
-            | ("reasoning_snapshot", Some("reasoning")) => Authorization::Allow,
+            | ("reasoning_snapshot", Some("reasoning"))
+            | ("session_snapshot", Some("sessions")) => Authorization::Allow,
             _ => Authorization::Deny,
         },
         AuthAction::Function {
@@ -75,7 +164,7 @@ fn authorize(ctx: AuthContext<'_>) -> Authorization {
 
 #[cfg(test)]
 fn query(snapshot: &Snapshot, sql: &str) -> Result<Value> {
-    query_bounded(snapshot, sql, None)
+    query_bounded(snapshot, &[], sql, None)
 }
 
 fn check_deadline(deadline: Option<Instant>) -> Result<()> {
@@ -85,7 +174,23 @@ fn check_deadline(deadline: Option<Instant>) -> Result<()> {
     Ok(())
 }
 
-fn query_bounded(snapshot: &Snapshot, sql: &str, deadline: Option<Instant>) -> Result<Value> {
+/// One saved conversation as the `sessions` view says it (D163).
+struct SessionRow {
+    id: String,
+    name: String,
+    title: String,
+    model: String,
+    updated: i64,
+    messages: i64,
+    forked_from: String,
+}
+
+fn query_bounded(
+    snapshot: &Snapshot,
+    sessions: &[SessionRow],
+    sql: &str,
+    deadline: Option<Instant>,
+) -> Result<Value> {
     check_deadline(deadline)?;
     if sql.len() > budgets::query_bytes() {
         bail!("SQL exceeds configured byte limit");
@@ -105,7 +210,12 @@ fn query_bounded(snapshot: &Snapshot, sql: &str, deadline: Option<Instant>) -> R
             reasoning_tokens, at, after
             FROM request_snapshot;
         CREATE TABLE reasoning_snapshot(ordinal INTEGER, node INTEGER, part INTEGER, text TEXT);
-        CREATE VIEW reasoning AS SELECT ordinal, node, part, text FROM reasoning_snapshot;",
+        CREATE VIEW reasoning AS SELECT ordinal, node, part, text FROM reasoning_snapshot;
+        CREATE TABLE session_snapshot(
+            id TEXT, name TEXT, title TEXT, model TEXT, updated INTEGER, messages INTEGER,
+            forked_from TEXT);
+        CREATE VIEW sessions AS SELECT id, name, title, model, updated, messages, forked_from
+            FROM session_snapshot;",
     )?;
     {
         let mut insert = conn.prepare("INSERT INTO message_snapshot VALUES (?1, ?2, ?3, ?4)")?;
@@ -148,6 +258,21 @@ fn query_bounded(snapshot: &Snapshot, sql: &str, deadline: Option<Instant>) -> R
                 row.node,
                 row.part as i64,
                 row.text
+            ])?;
+        }
+    }
+    {
+        let mut insert =
+            conn.prepare("INSERT INTO session_snapshot VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+        for row in sessions {
+            insert.execute(params![
+                row.id,
+                row.name,
+                row.title,
+                row.model,
+                row.updated,
+                row.messages,
+                row.forked_from
             ])?;
         }
     }
@@ -228,6 +353,7 @@ mod tests {
     use super::*;
     use crate::provider::Usage;
     use crate::store::{ReasoningRow, RequestRow};
+    use std::time::Duration;
 
     fn messages() -> Snapshot {
         Snapshot {
@@ -270,11 +396,76 @@ mod tests {
 
     #[test]
     fn query_checks_its_deadline_and_bounds_escaped_column_names() {
-        let error = query_bounded(&messages(), "SELECT 1", Some(Instant::now())).unwrap_err();
+        let error = query_bounded(&messages(), &[], "SELECT 1", Some(Instant::now())).unwrap_err();
         assert!(error.to_string().contains("timed out"));
         let sql = format!("SELECT 1 AS \"{}\"", "\u{1}".repeat(10_000));
         let error = query(&messages(), &sql).unwrap_err();
         assert!(error.to_string().contains("column names"), "{error}");
+    }
+
+    fn summary(id: &str, title: &str) -> Summary {
+        Summary {
+            id: id.to_owned(),
+            name: None,
+            title: title.to_owned(),
+            prompts: 1,
+            messages: 2,
+            model: "glm".to_owned(),
+            forked_from: None,
+            updated: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        }
+    }
+
+    #[test]
+    fn a_selector_is_an_id_or_a_prefix_that_names_exactly_one_conversation() {
+        // D163: an id is taken exactly, a prefix only when it is the only one, so a partial id is
+        // never a guess between two conversations.
+        let listed = [
+            summary("abcdefghij", "first"),
+            summary("abcxyz", "second"),
+            summary("zzz", "third"),
+        ];
+        assert_eq!(resolve("zzz", &listed).unwrap(), "zzz");
+        assert_eq!(resolve("abcx", &listed).unwrap(), "abcxyz");
+        let ambiguous = resolve("abc", &listed).unwrap_err();
+        assert!(ambiguous.contains("2 conversations"), "{ambiguous}");
+        let none = resolve("nope", &listed).unwrap_err();
+        assert!(none.contains("no conversation"), "{none}");
+    }
+
+    #[test]
+    fn the_sessions_view_names_the_conversations_and_nothing_else_is_readable() {
+        // D163: what a query can find out about the other conversations is what the host put in
+        // the table — id, name, title, model, update time and size — and no table of the database.
+        let rows = [SessionRow {
+            id: "abcdefghij".into(),
+            name: String::new(),
+            title: "remember teal".into(),
+            model: "glm".into(),
+            updated: 1_700_000_000,
+            messages: 4,
+            forked_from: String::new(),
+        }];
+        let out = query_bounded(
+            &messages(),
+            &rows,
+            "SELECT id, title, messages FROM sessions",
+            None,
+        )
+        .unwrap();
+        assert_eq!(out["rows"], json!([["abcdefghij", "remember teal", 4]]));
+        // The backing table has no name of its own to guess at: only the view is authorized.
+        let error = query_bounded(&messages(), &rows, "SELECT * FROM sessions", None)
+            .and_then(|_| {
+                query_bounded(
+                    &messages(),
+                    &rows,
+                    "SELECT * FROM sessions; DROP TABLE sessions",
+                    None,
+                )
+            })
+            .unwrap_err();
+        assert!(!error.to_string().is_empty());
     }
 
     #[test]
@@ -402,6 +593,7 @@ mod tests {
             "SELECT * FROM message_snapshot",
             "SELECT * FROM request_snapshot",
             "SELECT * FROM reasoning_snapshot",
+            "SELECT * FROM session_snapshot",
         ] {
             assert!(query(&snapshot, sql).is_err(), "{sql}");
         }

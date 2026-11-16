@@ -1326,6 +1326,143 @@ fn session_queries_are_scoped_read_only_and_audited() {
     );
 }
 
+/// The first conversation this workspace saved, as the store names it (D163).
+fn first_session(db: &Path) -> String {
+    Connection::open(db)
+        .unwrap()
+        .query_row(
+            "SELECT id FROM sessions ORDER BY rowid LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// A mock whose second request asks `session_query` a list of questions, the first conversation's
+/// id looked up in the database when the request arrives: it does not exist until the first run has
+/// saved it. A question marked `true` asks about that conversation rather than this one (D163).
+fn reading_the_first_conversation(
+    db: Arc<Mutex<PathBuf>>,
+    asked: &'static [(&'static str, bool)],
+) -> (String, Arc<Mutex<Vec<Seen>>>) {
+    serve_dynamic(3, move |index, _| match index {
+        0 => sse_response(&openai_sse("remember teal", &[])),
+        1 => {
+            let id = first_session(&db.lock().unwrap().clone());
+            let calls: Vec<_> = asked
+                .iter()
+                .enumerate()
+                .map(|(i, (sql, other))| {
+                    let input = if *other {
+                        json!({"sql": sql, "session": id})
+                    } else {
+                        json!({"sql": sql})
+                    };
+                    (format!("q{i}"), "session_query", input)
+                })
+                .collect();
+            sse_response(&openai_sse(
+                "",
+                &calls
+                    .iter()
+                    .map(|(a, b, c)| (a.as_str(), *b, c.clone()))
+                    .collect::<Vec<_>>(),
+            ))
+        }
+        _ => sse_response(&openai_sse("done", &[])),
+    })
+}
+
+#[test]
+fn another_conversation_of_this_workspace_is_readable_and_listed() {
+    // D163: the workspace's conversations are one person's work, so a bare `transcript-read`
+    // covers them; the second call in the same turn shows what the `sessions` view says.
+    let db = Arc::new(Mutex::new(PathBuf::new()));
+    let (base, seen) = reading_the_first_conversation(
+        db.clone(),
+        &[
+            ("SELECT text FROM messages WHERE role='user'", true),
+            ("SELECT id, title FROM sessions", false),
+        ],
+    );
+    let env = Env::new(Api::Openai, &base);
+    *db.lock().unwrap() = env.xdg.path().join("state/saddle/sessions.db");
+    env.write_override("[agent]\ntranscript-read = {}\n");
+    assert!(env.saddle(&["run", "remember teal"]).status.success());
+    let out = env.saddle(&["run", "what did we say before"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let seen = seen.lock().unwrap();
+    let results: Vec<_> = seen[2].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .collect();
+    let quoted: Value =
+        serde_json::from_str(tool_text(results[0]["content"].as_str().unwrap())).unwrap();
+    assert_eq!(quoted["rows"], json!([["remember teal"]]), "{quoted}");
+    // The other conversation is listed as well, so an id can be found rather than guessed.
+    let listed: Value =
+        serde_json::from_str(tool_text(results[1]["content"].as_str().unwrap())).unwrap();
+    let rows = listed["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{listed}");
+    assert!(
+        rows.iter().any(|r| r[1] == json!("remember teal")),
+        "the other conversation is named: {listed}"
+    );
+
+    // The same decision, audited against the conversation it read, not just the one it ran in.
+    let records = records(&env.audit_log());
+    let decisions: Vec<_> = records
+        .iter()
+        .filter(|r| r["scope"] == "transcript-read")
+        .collect();
+    let other = decisions
+        .iter()
+        .find(|r| r["args"]["others"] == true)
+        .expect("a query against another conversation is recorded as one");
+    assert_eq!(other["allow"], true);
+    assert_eq!(
+        other["args"]["session"],
+        json!(first_session(
+            &env.xdg.path().join("state/saddle/sessions.db")
+        ))
+    );
+}
+
+#[test]
+fn a_transcript_grant_that_names_this_session_only_refuses_another_one() {
+    // D163: `sessions = "self"` is the narrowing, and it is enforced before anything is resolved
+    // or listed, so a refused query says nothing about which conversations exist.
+    let db = Arc::new(Mutex::new(PathBuf::new()));
+    let (base, seen) = reading_the_first_conversation(db.clone(), &[("SELECT 1", true)]);
+    let env = Env::new(Api::Openai, &base);
+    *db.lock().unwrap() = env.xdg.path().join("state/saddle/sessions.db");
+    env.write_override("[agent]\ntranscript-read = { sessions = \"self\" }\n");
+    assert!(env.saddle(&["run", "remember teal"]).status.success());
+    let out = env.saddle(&["run", "what did we say before"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let seen = seen.lock().unwrap();
+    let results: Vec<_> = seen[2].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .collect();
+    let denied = results[0]["content"].as_str().unwrap();
+    assert!(
+        denied.contains("denied:") && denied.contains("only this conversation"),
+        "{denied}"
+    );
+    let records = records(&env.audit_log());
+    assert!(
+        records.iter().any(|r| r["scope"] == "transcript-read"
+            && r["allow"] == false
+            && r["args"]["others"] == true),
+        "the refusal is recorded"
+    );
+}
+
 #[test]
 fn session_queries_require_a_transcript_grant() {
     let calls = [(
@@ -2730,6 +2867,11 @@ fn the_prompt_and_tool_descriptions_explain_policy_checked_command_networking() 
     let (base, seen) = serve(vec![sse_response(&openai_sse("ok", &[]))]);
     let env = Env::new(Api::Openai, &base);
     env.write_override("\n[agent]\nnet = [{ host = \"registry.example\" }]\n");
+    let home = env.xdg.path().join("home");
+    fs::create_dir_all(home.join(".config")).unwrap();
+    fs::write(home.join(".config/prompt\nmetadata"), "fixture").unwrap();
+    fs::create_dir_all(home.join("Pictures/comfyui")).unwrap();
+    fs::write(home.join("Pictures/comfyui/render.png"), "personal").unwrap();
     let out = env.saddle(&["run", "hi"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
 
@@ -2742,7 +2884,7 @@ fn the_prompt_and_tool_descriptions_explain_policy_checked_command_networking() 
             "builds may download dependencies",
             "If the network namespace or relay cannot start",
             "commands run with no network instead",
-            "A command sees more",
+            "A command inherits its delegated filesystem roots",
         ] {
             assert!(system.contains(required), "missing {required}: {system}");
         }
@@ -2754,6 +2896,17 @@ fn the_prompt_and_tool_descriptions_explain_policy_checked_command_networking() 
     ] {
         assert!(!system.contains(stale), "stale instruction: {system}");
     }
+
+    assert!(
+        system.contains("~/.config/prompt\\nmetadata"),
+        "effective include paths are JSON quoted"
+    );
+    assert!(
+        !system.contains("prompt\nmetadata"),
+        "filenames cannot introduce prompt structure"
+    );
+    assert!(!system.contains("Pictures/comfyui"));
+    assert!(!system.contains("your home directory with the credential stores left out"));
 
     let tools = body["tools"].as_array().unwrap();
     let description = |name: &str| {

@@ -323,6 +323,23 @@ mod tests {
     use crate::provider::Image;
     use crate::provider::{Api, Auth, CacheRetention, ToolResult};
 
+    #[test]
+    fn a_formula_is_sent_as_the_tex_and_never_as_a_picture() {
+        // D165: the typesetting happens on the person's screen. What the request carries is the
+        // source, unwrapped and unescaped, so a formula in an earlier turn is readable to the model.
+        let formula = "$$\\oint \\mathbf{B} \\cdot d\\mathbf{l} = \\mu_0 I$$";
+        let items = [
+            Item::User(format!("is this right? {formula}")),
+            Item::Assistant(vec![Part::Text(format!("it is: {formula}"))]),
+        ];
+        let m = messages("sys", &items);
+        assert_eq!(m[1]["content"], format!("is this right? {formula}"));
+        assert_eq!(m[2]["content"], format!("it is: {formula}"));
+        // A picture in a chat-completions request is an `image_url` part, and only an attached one
+        // ever becomes that (D58, D162).
+        assert!(!json!(m).to_string().contains("image_url"));
+    }
+
     fn config(base_url: &str) -> ProviderConfig {
         ProviderConfig {
             api: Api::Openai,
