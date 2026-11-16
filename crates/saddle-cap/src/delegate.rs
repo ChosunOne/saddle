@@ -31,7 +31,13 @@ pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationEr
         }
         if matches!(
             scope,
-            Scope::TranscriptRead | Scope::EventPublish | Scope::EventSubscribe
+            Scope::TranscriptRead
+                | Scope::EventPublish
+                | Scope::EventSubscribe
+                | Scope::Veto
+                | Scope::ContextContribute
+                | Scope::Ui
+                | Scope::Persist
         ) && !agent.scopes().contains(&scope)
         {
             return Err(DelegationError::Scope(scope));
@@ -43,6 +49,19 @@ pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationEr
         tool_write: plugin.tool_write.clone(),
         ..Grants::default()
     };
+    if let Some(want) = &plugin.model_invoke {
+        let parent = agent
+            .model_invoke
+            .as_ref()
+            .ok_or(DelegationError::Scope(Scope::ModelInvoke))?;
+        let mut grant = want.clone();
+        grant.tokens_per_session = want.tokens_per_session.min(parent.tokens_per_session);
+        grant.cost_per_session = match (want.cost_per_session, parent.cost_per_session) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        out.model_invoke = Some(grant);
+    }
     if let Some(want) = &plugin.exec {
         let parent = agent
             .exec
@@ -203,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_scopes_are_refused_even_without_importing_a_service() {
+    fn extension_capabilities_are_supported_but_require_the_parent_grant() {
         for scope in [
             Scope::Persist,
             Scope::Veto,
@@ -220,7 +239,16 @@ mod tests {
                 "[agent]\n{scope}={value}\n[plugin.reader]\ntool={{}}\n{scope}={value}\n"
             ));
             assert!(
-                matches!(read_tool(&agent, &plugin), Err(DelegationError::Unsupported(refused)) if refused == scope)
+                read_tool(&agent, &plugin)
+                    .unwrap()
+                    .scopes()
+                    .contains(&scope)
+            );
+            let (agent, plugin) = grants(&format!(
+                "[plugin.sibling]\n{scope}={value}\n[plugin.reader]\ntool={{}}\n{scope}={value}\n"
+            ));
+            assert!(
+                matches!(read_tool(&agent, &plugin), Err(DelegationError::Scope(refused)) if refused == scope)
             );
         }
         assert!(!runtime_supports_scope(Scope::Mcp));

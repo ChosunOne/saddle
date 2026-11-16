@@ -8,7 +8,10 @@
 //! treat a non-zero exit as a host failure.
 
 use crate::cancel;
+use crate::plugins::services::ModelUsage;
+use crate::plugins::services::panel::PanelView;
 use crate::provider::Image;
+use crate::provider::{Contribution, visible_tool_text};
 use crate::term;
 use std::io;
 use std::io::Write;
@@ -159,6 +162,32 @@ impl Sink for Output {
 }
 
 impl Ui for Output {
+    fn contribution(&mut self, value: &Contribution) {
+        match self {
+            Output::Human(terminal) => terminal.info(&format!(
+                "[{} contribution]\n{}",
+                value.provenance.principal,
+                visible_tool_text(&value.content, Some(&value.provenance))
+            )),
+            Output::Json(output) => {
+                output.emit(json!({"type":"plugin-contribution","contribution":value}))
+            }
+        }
+    }
+    fn panels(&mut self, panels: &[PanelView]) {
+        match self {
+            Output::Human(terminal) => {
+                for panel in panels {
+                    terminal.info(&panel.text());
+                }
+            }
+            Output::Json(output) => output.emit(json!({"type":"plugin-panels","panels":panels})),
+        }
+    }
+    fn plugin_usage(&mut self, used: &ModelUsage) {
+        match self { Output::Human(terminal) => terminal.info(&format!("[{} model request] {} input, {} output tokens",used.principal,used.usage.input,used.usage.output)), Output::Json(output) => output.emit(json!({"type":"plugin-usage","principal":used.principal,"call_id":used.call_id,"provider":used.provider,"model":used.model,"usage":used.usage,"cost":used.cost})) }
+    }
+
     fn call(&mut self, call: &ToolCall) {
         match self {
             Output::Human(t) => t.call(call),

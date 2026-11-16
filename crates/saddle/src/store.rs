@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{Item, Part, ToolResult, Usage, reasoning_text};
+use crate::provider::{Contribution, Item, Part, ToolResult, Usage, reasoning_text};
 
 /// What a node holds. Every node is one of these, and the kind is a column so a query can pick
 /// one out without parsing the body.
@@ -83,6 +83,7 @@ pub enum RequestKind {
     Reply,
     /// A compaction's summary, which is a request the person paid for (D78).
     Summary,
+    Plugin,
 }
 
 impl RequestKind {
@@ -90,6 +91,7 @@ impl RequestKind {
         match self {
             RequestKind::Reply => "reply",
             RequestKind::Summary => "summary",
+            RequestKind::Plugin => "plugin",
         }
     }
 }
@@ -345,7 +347,27 @@ impl Store {
 
     /// Records one model request: what it used, what it cost, and what answered it (D94).
     pub fn request(&self, session: &str, request: &Request) -> Result<()> {
-        let body = serde_json::json!({
+        self.request_attributed(session, request, None)
+    }
+
+    /// retain plugin identity and invocation alongside usage on the saved branch (D156).
+    pub fn plugin_request(
+        &self,
+        session: &str,
+        request: &Request,
+        principal: &str,
+        call: &str,
+    ) -> Result<()> {
+        self.request_attributed(session, request, Some((principal, call)))
+    }
+
+    fn request_attributed(
+        &self,
+        session: &str,
+        request: &Request,
+        origin: Option<(&str, &str)>,
+    ) -> Result<()> {
+        let mut body = serde_json::json!({
             "kind": request.kind.as_str(),
             "provider": request.provider,
             "model": request.model,
@@ -354,6 +376,10 @@ impl Store {
             "dropped": request.dropped,
             "reasoning_tokens": request.reasoning_tokens,
         });
+        if let Some((principal, call)) = origin {
+            body["principal"] = principal.into();
+            body["call_id"] = call.into();
+        }
         self.push(session, kind::USAGE, &body.to_string())?;
         Ok(())
     }
@@ -430,6 +456,7 @@ impl Store {
                 let ordinal = out.len() + 1;
                 let (role, text) = match item {
                     Item::User(text) | Item::Attached { text, .. } => ("user", text),
+                    Item::Contribution(value) => ("plugin", value.content),
                     Item::Summary(text) => ("summary", text),
                     Item::Assistant(parts) => {
                         // D98: the thinking is kept whole to replay it, and only its prose is
@@ -662,6 +689,19 @@ impl Store {
         Ok(out)
     }
 
+    /// correction ownership includes pre-compaction facts, but only on this saved branch (D156).
+    pub fn contributions(&self, session: &str) -> Result<Vec<Contribution>> {
+        let mut facts = Vec::new();
+        for node in self.branch(session)? {
+            if node.kind == kind::ITEM
+                && let Ok(Item::Contribution(value)) = serde_json::from_str::<Item>(&node.body)
+            {
+                facts.push(*value);
+            }
+        }
+        Ok(facts)
+    }
+
     /// One node as a row: its kind, a one-line preview, and the text a user message would be
     /// edited as. `None` for the bookkeeping nodes (`turn`, `usage`), which are not conversation.
     fn point(&self, node: &Node, leaf: Option<i64>) -> Result<Option<Point>> {
@@ -684,6 +724,11 @@ impl Store {
                     };
                     (PointKind::Tool, label, String::new())
                 }
+                Ok(Item::Contribution(value)) => (
+                    PointKind::Tool,
+                    format!("{} contribution", value.provenance.principal),
+                    String::new(),
+                ),
                 Ok(Item::Summary(t)) => (PointKind::Summary, first_line(&t), String::new()),
                 Ok(Item::Attached { text, images }) => {
                     let mut preview = first_line(&text);

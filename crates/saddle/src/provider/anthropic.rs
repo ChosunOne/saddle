@@ -80,6 +80,9 @@ pub fn messages(items: &[Item]) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for item in items {
         let (role, content): (&str, Vec<Value>) = match item {
+            Item::Contribution(value) => {
+                ("user", vec![json!({"type":"text","text":value.content})])
+            }
             Item::User(text) => ("user", vec![json!({ "type": "text", "text": text })]),
             // The pictures come after the text, in the same message (D58).
             Item::Attached { text, images } => {

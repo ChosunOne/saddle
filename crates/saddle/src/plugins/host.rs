@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use crate::tasks;
 use anyhow::{Context, Error as HostError, Result, anyhow};
 use saddle_cap::{Location, Principal, RelPath, RootName, Scope};
-use saddle_loader::{HostServices, Invocation, Prepared, TaskOperation};
+use saddle_loader::{HostServices, Invocation, Prepared, Service, ServiceReply, TaskOperation};
 use saddle_policy::audit::sha256_hex;
 use saddle_policy::{Kind, Request};
 use saddle_wit::events::exports::saddle::plugin::plugin_events::{
@@ -31,12 +31,14 @@ use saddle_wit::saddle::host::fs_read::{Failure, Path};
 use saddle_wit::saddle::host::fs_read_range::Chunk;
 use saddle_wit::saddle::host::fs_write::Change;
 use saddle_wit::saddle::host::tool_result::ImageInfo;
+use saddle_wit::saddle::widgets::types::Panel;
+use saddle_wit::veto::exports::saddle::plugin::veto::{Decision as VetoDecision, PendingToolCall};
 use serde_json::json;
 
-use super::{filesystem, hooks, mutations};
+use super::{filesystem, hooks, mutations, services};
 use crate::execution;
 use crate::network::Operation;
-use crate::provider::Image;
+use crate::provider::{Image, Provenance};
 use crate::session::Session;
 use crate::tools::timeout;
 use crate::{cancel, fs_access, transcript};
@@ -52,12 +54,16 @@ pub enum Job {
     EventSubscriptions,
     Observe(HarnessEvent),
     Receive(PluginEvent),
+    Veto(PendingToolCall),
+    Render,
 }
 pub enum Reply {
     Description(Definition),
     HarnessSubscriptions(Vec<HarnessKind>),
     EventSubscriptions(Vec<Subscription>),
     Handled(Result<(), String>),
+    Veto(VetoDecision),
+    Panel(Result<Panel, String>),
     Output {
         output: Output,
         images: Vec<Image>,
@@ -82,6 +88,13 @@ impl StdError for Fatal {
 type HostReply<T, E = Failure> = Result<Result<T, E>, String>;
 type FileReply = HostReply<Chunk>;
 enum Event {
+    Service {
+        who: Principal,
+        origin: Provenance,
+        deadline: Instant,
+        service: Service,
+        answer: SyncSender<HostReply<ServiceReply, String>>,
+    },
     Emit {
         who: Principal,
         deadline: Instant,
@@ -176,6 +189,9 @@ enum Event {
 
 pub struct Host {
     events: SyncSender<Event>,
+    call_id: String,
+    version: String,
+    component_sha256: String,
 }
 impl Host {
     fn request_search(
@@ -201,6 +217,34 @@ impl Host {
     }
 }
 impl HostServices for Host {
+    fn service(
+        &mut self,
+        call: &Invocation,
+        service: Service,
+    ) -> Result<Result<ServiceReply, String>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        let origin = Provenance {
+            principal: call.principal().to_string(),
+            scope: services::scope(&service),
+            call_id: self.call_id.clone(),
+            component_sha256: self.component_sha256.clone(),
+            version: self.version.clone(),
+        };
+        self.events
+            .send(Event::Service {
+                who: call.principal().clone(),
+                origin,
+                deadline: call.deadline(),
+                service,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        result
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(|_| anyhow!("extension service timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
+
     fn emit_event(
         &mut self,
         call: &Invocation,
@@ -555,7 +599,11 @@ fn execute_inner(
     job: Job,
     call: &str,
 ) -> Result<Result<Reply, String>> {
-    let invoking = matches!(job, Job::Invoke(_) | Job::Observe(_) | Job::Receive(_));
+    let invoking = matches!(
+        job,
+        Job::Invoke(_) | Job::Observe(_) | Job::Receive(_) | Job::Veto(_)
+    );
+    let rendering = matches!(job, Job::Render);
     let mut filesystem_effects = false;
     let mut execution_effects = false;
     let mut network_effects = false;
@@ -564,6 +612,13 @@ fn execute_inner(
     let (events, pending) = mpsc::sync_channel(1);
     let host = Host {
         events: events.clone(),
+        call_id: call.into(),
+        version: prepared.version().into(),
+        component_sha256: prepared
+            .hash()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
     };
     let cancelled = Arc::new(AtomicBool::new(cancel::FLAG.load(Ordering::Relaxed)));
     let flag = cancelled.clone();
@@ -578,6 +633,8 @@ fn execute_inner(
         .name("saddle-plugin".into())
         .spawn(move || {
             let result = match job {
+                Job::Veto(call) => prepared.veto(host, call, flag, deadline).map(Reply::Veto),
+                Job::Render => prepared.render(host, flag, deadline).map(Reply::Panel),
                 Job::Describe => prepared.describe(host, flag).map(Reply::Description),
                 Job::HarnessSubscriptions => prepared
                     .harness_subscriptions(host, flag)
@@ -613,6 +670,22 @@ fn execute_inner(
             cancelled.store(true, Ordering::Relaxed);
         }
         match pending.recv_timeout(Duration::from_millis(10)) {
+            Ok(Event::Service {
+                who,
+                origin,
+                deadline,
+                service,
+                answer,
+            }) => {
+                let permitted = fatal.is_none()
+                    && (invoking || (rendering && matches!(&service, Service::PersistGet(_))));
+                respond(
+                    services::execute(session, &who, origin, service, permitted, deadline),
+                    answer,
+                    &mut fatal,
+                    &cancelled,
+                );
+            }
             Ok(Event::Emit {
                 who,
                 deadline,

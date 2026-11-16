@@ -7,6 +7,7 @@ use serde_json::{Value, from_str, from_value, to_value};
 wit_bindgen::generate!({
     path: "../saddle-wit/wit",
     world: "read-tool",
+    with: { "saddle:widgets/types@0.1.0": generate },
     pub_export_macro: true,
 });
 
@@ -56,6 +57,85 @@ pub mod events {
     });
     pub use crate::saddle::host::plugin_events::emit;
     pub use exports::saddle::plugin::plugin_events::{Event, Guest as Handler, Subscription};
+}
+
+/// append attributed facts, never system instructions or history rewrites (D156).
+pub mod context {
+    pub use crate::saddle::host::context_contribute::{
+        Body, Contribution, Diagnostic, Severity, append,
+    };
+    pub fn note(text: &str) -> Result<String, String> {
+        append(&Contribution {
+            body: Body::Note(text.into()),
+            corrects: None,
+        })
+    }
+    pub fn diagnostic(value: Diagnostic) -> Result<String, String> {
+        append(&Contribution {
+            body: Body::Diagnostic(value),
+            corrects: None,
+        })
+    }
+}
+
+/// bounded atomic private storage, not filesystem access (D156).
+pub mod persist {
+    pub use crate::saddle::host::persist::{Change, Expectation, apply, get};
+    pub fn put(key: &str, value: &[u8]) -> Result<(), String> {
+        apply(&[Change {
+            key: key.into(),
+            value: Some(value.into()),
+            expected: Expectation::Any,
+        }])
+        .map(|_| ())
+    }
+    pub fn remove(key: &str) -> Result<(), String> {
+        apply(&[Change {
+            key: key.into(),
+            value: None,
+            expected: Expectation::Any,
+        }])
+        .map(|_| ())
+    }
+    pub fn compare_exchange(
+        key: &str,
+        expected: Option<&[u8]>,
+        value: Option<&[u8]>,
+    ) -> Result<bool, String> {
+        apply(&[Change {
+            key: key.into(),
+            value: value.map(Into::into),
+            expected: expected.map_or(Expectation::Missing, |bytes| {
+                Expectation::Value(bytes.into())
+            }),
+        }])
+    }
+}
+
+/// isolated host-provider requests; replies never execute tools (D156).
+pub mod model {
+    pub use crate::saddle::host::model_invoke::{Message, Reply, Request, Role, Usage, invoke};
+}
+
+/// pre-tool checks can only abstain or deny (D156).
+pub mod veto {
+    wit_bindgen::generate!({
+        path: "../saddle-wit/wit", world: "veto-hook",
+        pub_export_macro: true, export_macro_name: "export_veto",
+    });
+    pub use exports::saddle::plugin::veto::{Decision, Guest as Veto, PendingToolCall};
+}
+
+/// host-framed widgets, with no input or arbitrary terminal access (D156).
+pub mod ui {
+    wit_bindgen::generate!({
+        path: "../saddle-wit/wit", world: "ui-hook",
+        pub_export_macro: true, export_macro_name: "export_ui",
+        with: { "saddle:widgets/types@0.1.0": crate::saddle::widgets::types },
+    });
+    pub use crate::saddle::host::ui::{clear, publish};
+    pub use crate::saddle::widgets::types::{Pair, Panel, Progress, Span, Style, Widget};
+    pub use exports::saddle::plugin::ui::Guest as Ui;
 }
 
 /// read resource budgets from the host before a standard guest workflow starts (D145).

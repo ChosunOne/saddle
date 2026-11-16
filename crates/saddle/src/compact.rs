@@ -126,6 +126,7 @@ pub enum Event {
 /// Characters an item adds to a request, for estimating tokens.
 pub fn chars(item: &Item) -> usize {
     match item {
+        Item::Contribution(value) => value.content.len(),
         Item::User(t) | Item::Summary(t) => t.len(),
         Item::Attached { text, images } => text.len() + images.len() * 64,
         Item::Assistant(parts) => parts
@@ -205,6 +206,9 @@ pub fn serialize(items: &[Item], max_chars: usize) -> String {
     for item in items {
         let mut s = String::new();
         match item {
+            Item::Contribution(value) => {
+                let _ = write!(s, "[Plugin fact]: {}", value.content);
+            }
             Item::User(t) => {
                 let _ = write!(s, "[User]: {t}");
             }

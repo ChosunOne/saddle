@@ -38,9 +38,10 @@ use super::settings::{Change, SettingsDialog, SettingsOutcome};
 use crate::agent::call_detail;
 use crate::agent::{End, Resumed};
 use crate::compact::Event as CompactEvent;
+use crate::plugins::services::panel::PanelView;
 use crate::provider::ModelsError;
 use crate::provider::Usage;
-use crate::provider::{Item, Part};
+use crate::provider::{Contribution, Item, Part};
 use crate::term::clean;
 use crate::tui::permissions::Outcome as PermissionOutcome;
 use crate::tui::themes::Outcome as ThemeOutcome;
@@ -49,6 +50,13 @@ use crate::tui::tree::TreeOutcome;
 /// Sent by the agent thread.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
+    Contribution(Contribution),
+    Panels(Vec<PanelView>),
+    /// isolated plugin spending does not replace the main conversation's context estimate (D156).
+    PluginUsage {
+        usage: Usage,
+        cost: f64,
+    },
     Text(String),
     /// Reasoning from a thinking model, shown dimmed above its answer.
     Reasoning(String),
@@ -281,6 +289,7 @@ const PICKER_REFRESH: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoteKind {
+    Plugin,
     Info,
     Warn,
     Error,
@@ -490,6 +499,7 @@ pub struct App {
     /// back to the agent thread (D69). The text was read and recorded at discovery.
     pub skills: Vec<Skill>,
     pub entries: Vec<Entry>,
+    pub plugin_panels: Vec<PanelView>,
     /// Parallel to `entries`; `None` means re-render.
     pub cache: Vec<Option<Cached>>,
     pub editor: Editor,
@@ -620,6 +630,7 @@ impl App {
             header,
             skills: Vec::new(),
             entries: Vec::new(),
+            plugin_panels: Vec::new(),
             cache: Vec::new(),
             editor: Editor::default(),
             queue: VecDeque::new(),
@@ -1739,6 +1750,10 @@ impl App {
             }
             // The list comes back from the agent thread, which owns the session, so the `/` menu
             // and `/skill:` see what discovery just read (D70).
+            AgentEvent::Panels(panels) => self.plugin_panels = panels,
+            AgentEvent::Contribution(value) => {
+                self.push(Entry::Note(NoteKind::Plugin, contribution_text(&value)))
+            }
             AgentEvent::Skills(skills) => self.skills = skills,
             AgentEvent::Note(s) => self.push(Entry::Note(NoteKind::Warn, display(&s))),
             AgentEvent::Call { name, detail } => {
@@ -1784,6 +1799,13 @@ impl App {
                 }
                 self.scroll = 0;
                 self.push(Entry::User(display(&text)));
+            }
+            AgentEvent::PluginUsage { usage: u, cost } => {
+                self.usage.input += u.input;
+                self.usage.output += u.output;
+                self.usage.cache_read += u.cache_read;
+                self.usage.cache_write += u.cache_write;
+                self.cost += cost;
             }
             AgentEvent::Reply { usage: u, cost } => {
                 self.usage.input += u.input;
@@ -1932,6 +1954,9 @@ pub fn entries_from(items: &[Item]) -> Vec<Entry> {
     let mut out = Vec::new();
     for item in items {
         match item {
+            Item::Contribution(value) => {
+                out.push(Entry::Note(NoteKind::Plugin, contribution_text(value)))
+            }
             Item::User(text) => out.push(Entry::User(display(text))),
             // A resumed conversation shows the prompt and what was attached to it (D58).
             Item::Attached { text, images } => {
@@ -1996,6 +2021,14 @@ pub fn entries_from(items: &[Item]) -> Vec<Entry> {
         }
     }
     out
+}
+
+fn contribution_text(value: &Contribution) -> String {
+    format!(
+        "[{} contribution]\n{}",
+        value.provenance.principal,
+        display(visible_tool_text(&value.content, Some(&value.provenance)))
+    )
 }
 
 /// 950, 12k, 1.2M.
@@ -2164,6 +2197,25 @@ mod tests {
         // arrived; the controller re-reads the sources and moves the header and the loop (D34).
         let mut a = app();
         assert_eq!(a.agent(AgentEvent::Listed), Some(Action::SettleWindow));
+    }
+
+    #[test]
+    fn isolated_plugin_usage_adds_spending_without_replacing_main_context() {
+        let mut app = app();
+        app.context = 1234;
+        app.agent(AgentEvent::PluginUsage {
+            usage: Usage {
+                input: 10,
+                output: 5,
+                cache_read: 2,
+                cache_write: 1,
+            },
+            cost: 0.25,
+        });
+        assert_eq!(app.context, 1234);
+        assert_eq!(app.usage.input, 10);
+        assert_eq!(app.usage.output, 5);
+        assert_eq!(app.cost, 0.25);
     }
 
     #[test]

@@ -127,16 +127,18 @@ catalogue!(HostInterface {
     ToolResult => ("saddle:host/tool-result", Requirement::Scope(Scope::Tool), true),
     Budgets => ("saddle:host/budgets", Requirement::Ambient, true),
     TranscriptRead => ("saddle:host/transcript-read", Requirement::Scope(Scope::TranscriptRead), true),
-    ContextContribute => ("saddle:host/context-contribute", Requirement::Scope(Scope::ContextContribute), false),
-    ModelInvoke => ("saddle:host/model-invoke", Requirement::Scope(Scope::ModelInvoke), false),
-    Persist => ("saddle:host/persist", Requirement::Scope(Scope::Persist), false),
+    ContextContribute => ("saddle:host/context-contribute", Requirement::Scope(Scope::ContextContribute), true),
+    ModelInvoke => ("saddle:host/model-invoke", Requirement::Scope(Scope::ModelInvoke), true),
+    Widgets => ("saddle:widgets/types", Requirement::Ambient, true),
+    Ui => ("saddle:host/ui", Requirement::Scope(Scope::Ui), true),
+    Persist => ("saddle:host/persist", Requirement::Scope(Scope::Persist), true),
 });
 catalogue!(PluginExport {
     Tool => ("saddle:plugin/tool", Requirement::Scope(Scope::Tool), true),
     Observer => ("saddle:plugin/observer", Requirement::Scope(Scope::TranscriptRead), true),
     PluginEvents => ("saddle:plugin/plugin-events", Requirement::Scope(Scope::EventSubscribe), true),
-    Veto => ("saddle:plugin/veto", Requirement::Scope(Scope::Veto), false),
-    Ui => ("saddle:plugin/ui", Requirement::Scope(Scope::Ui), false),
+    Veto => ("saddle:plugin/veto", Requirement::Scope(Scope::Veto), true),
+    Ui => ("saddle:plugin/ui", Requirement::Scope(Scope::Ui), true),
 });
 catalogue!(WasiInterface {
     Environment => ("wasi:cli/environment", Requirement::Ambient, true),
@@ -319,11 +321,24 @@ mod tests {
                 "/../saddle-wit/wit"
             )))
             .unwrap();
-        let host_names: BTreeSet<_> = resolve.packages[host]
+        let mut host_names: BTreeSet<_> = resolve.packages[host]
             .interfaces
             .keys()
             .map(|name| format!("saddle:host/{name}"))
             .collect();
+        let (_, widgets) = resolve
+            .packages
+            .iter()
+            .find(|(_, package)| {
+                package.name.namespace == "saddle" && package.name.name == "widgets"
+            })
+            .unwrap();
+        host_names.extend(
+            widgets
+                .interfaces
+                .keys()
+                .map(|name| format!("saddle:widgets/{name}")),
+        );
         let catalogue_host: BTreeSet<_> = HostInterface::ALL
             .iter()
             .filter(|i| i.implemented())
@@ -366,15 +381,21 @@ mod tests {
                 .collect()
         );
         assert_eq!(
-            ["read-tool", "harness-hook", "plugin-event-handler"]
-                .into_iter()
-                .flat_map(|name| world_names(
-                    resolve.worlds[resolve.packages[host].worlds[name]]
-                        .exports
-                        .values()
-                        .collect()
-                ))
-                .collect::<BTreeSet<_>>(),
+            [
+                "read-tool",
+                "harness-hook",
+                "plugin-event-handler",
+                "veto-hook",
+                "ui-hook"
+            ]
+            .into_iter()
+            .flat_map(|name| world_names(
+                resolve.worlds[resolve.packages[host].worlds[name]]
+                    .exports
+                    .values()
+                    .collect()
+            ))
+            .collect::<BTreeSet<_>>(),
             catalogue_exports
                 .iter()
                 .map(|name| format!("{name}@0.1.0"))

@@ -43,11 +43,12 @@ rebuilding a component or changing its digest (D139). MCP servers run on both tr
 per-server narrowed reach, discovered OAuth, lazily declared tools and their own failures refused by
 name (D103–D123).
 
-**The first hook slice is built (D155):** harness observers and custom plugin events have separate
+**The hook surface is built (D155–D156):** harness observers and custom plugin events have separate
 SDK registration and delivery channels, with explicit grants and bounded session-owned dispatch.
-`veto`, `ui`, `persist`, `model-invoke` and `context-contribute` still have no host interface, so a
-component that imports one is refused at load. Section 8 lists them with the rest of the deferred work, and
-section 6 marks every extension point's state. Sections 3 to 6 are settled and can be built against.
+Typed `veto`, `ui`, `persist`, `model-invoke` and `context-contribute` interfaces add narrowing checks,
+closed host panels, isolated KV, budgeted provider requests and attributed append-only facts.
+Section 8 lists remaining deferred work; section 6 marks every extension point's state.
+Sections 3 to 6 are settled and can be built against.
 
 ## 3. Settled decisions
 
@@ -3586,6 +3587,54 @@ across close/restart, and neither custom event payloads nor handler errors are i
 context or trusted UI notices. Audit records include channel, publisher, name, byte count, content hash,
 recipient principal and call id, not raw payloads.
 
+**D156.** The remaining extension capabilities have separate typed interfaces. They do not enlarge
+D155's event return value, expose arbitrary host commands, rewrite policy or acquire another
+principal's reach. Every operational capability is explicitly delegated within the agent's current
+reach and manifest ceiling; `tool` remains registration rather than operational authority.
+
+- `saddle:plugin/veto.before-tool` returns `continue` or `deny(reason)`. Only real tool dispatch
+  invokes it, not custom events. Continue grants nothing; the ordinary resource checks still run.
+  A callback trap, deadline or oversized reply denies that call, with plugin provenance. Arguments
+  are immutable copies, not a rewritten request. Callback errors are not converted to permission.
+- `saddle:host/context-contribute` appends a note or structured root/path/line-range diagnostic.
+  The host assigns an id and provenance, sanitizes its authenticated frame and saves a separate
+  contribution item on the active branch, never in the system prompt. Corrections may reference only
+  this plugin's earlier contributions on that branch and append rather than replace. Contributions
+  are drained only at message-safe points, never between a model's tool calls and their results.
+  Standalone calls without a conversation refuse instead of selecting another saved session.
+- `saddle:host/persist` exposes private KV get and atomic compare-and-apply batches, plus SDK
+  put/remove/CAS conveniences. Protected storage is keyed by canonical workspace and plugin identity,
+  not guest filesystem paths. SQL parameters, a write transaction, bounded values/keys/total size and
+  optimistic preconditions provide cross-process atomicity. Namespace data survives reload/restart;
+  revocation denies SDK access without silently deleting it. No credential or policy store is exposed.
+- `saddle:host/model-invoke` uses the session's selected provider and refreshed host credentials for
+  an isolated, tool-free request. No main transcript, opaque reasoning payload, provider selector,
+  credential or endpoint reaches the guest. Text, prose reasoning and usage are returned; requested
+  tools are never run. Admission atomically reserves parent and plugin token/cost budgets. Reported
+  usage reconciles reservations; failed/unmetered requests retain theirs. Optional `cost-per-session`
+  refuses unknown pricing rather than inventing a subscription bill. Reservation uses a conservative
+  input-byte/framing estimate and output ceiling; provider-reported overruns are charged and block
+  further requests, not claimed to undo remote billing. Deadlines cancel local waits and remote
+  cancellation is best effort. Credential-refresh HTTP and mutex waits also respect the caller deadline.
+  SDK requests are attributed and recorded with principal/call id as plugin usage on the branch.
+- `saddle:plugin/ui.render` returns a panel of closed text-span styles, lists, key/value tables and
+  progress bars. Rendering is read-only: metadata, authorized file/transcript reads and private KV
+  reads are available, but mutation, networking, execution, publication, contributions and model
+  spending are refused in that phase. `saddle:host/ui.publish/clear` lets ordinary authorized callbacks
+  update only their own panel. Widgets are shared data-only WIT types, not an authority interface.
+  The host sanitizes controls and labels every frame with the real plugin identity. TUI panels and
+  line/JSON UI events are not model context or saved conversation messages. There are no input widgets,
+  raw terminal handles, arbitrary colours or approval-shaped host actions. Render runs at turn start
+  (and initial standalone tool use), not on the TUI drawing thread; publication updates at safe points.
+
+Resource defaults live in `saddle-limits`: contribution bytes/count, persistent key/value/count/total
+and batch bounds, model input/output/reply bounds, and UI bytes/widgets/rows. Existing plugin CPU,
+host wait, cancellation, event-drain and caller deadlines still apply. Registration cannot perform
+these effects. Reload clears pending contributions/panels, rechecks registrations and preserves model
+spending and stored KV data; branch changes rebuild correction ownership. Fatal host/audit failures
+never run another callback. Persistent Wasm instances, input widgets and independent compilation
+isolation remain deferred.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
@@ -3603,7 +3652,7 @@ recipient principal and call id, not raw payloads.
 | `tool` | registering tools the model can call | `saddle:plugin/tool` export | load-time check, catalogue rendering (D26) |
 | `veto` | denying a pending tool call | `saddle:plugin/veto` export | policy per call (D21) |
 | `model-invoke` | spending tokens on the session provider | `saddle:host/model-invoke` import | policy per call, against a budget |
-| `ui` | rendering widgets in the terminal | `saddle:plugin/ui` export | widget vocabulary (D27) |
+| `ui` | rendering widgets in the terminal | `saddle:plugin/ui` export, `saddle:host/ui` import | per call, read-only render phase and closed widget vocabulary (D27, D156) |
 | `persist` | storing state between calls | `saddle:host/persist` import | per-plugin storage namespace |
 | `mcp` | reaching a declared MCP server, and calling the tools of it that a grant names | `mcp` grant (D103) | policy per call |
 
@@ -3634,8 +3683,8 @@ the network through `curl` in a child process.
 ## 6. Extension surface, from the parity benchmarks
 
 Roughly the union of what pi and opencode let an extension do, with the scope each maps to and what
-exists today. A point marked "no host interface" is refused at load rather than silently ignored: the
-scope is defined, and nothing behind it decides a call yet (section 8).
+exists today. Each operational interface is typed before initialization and checked against its own
+delegation on every call; registration and event interest never grant its authority.
 
 | extension point | scope | today |
 | --- | --- | --- |
@@ -3644,13 +3693,13 @@ scope is defined, and nothing behind it decides a call yet (section 8).
 | read and write files | `fs-read`, `fs-write` | built: one filesystem SDK, each read and write decided per resource (D131, D138–D141) |
 | reach the network | `net` | built: `saddle:host/http` and `web-search`, every request decided (D143) |
 | read the transcript | `transcript-read` | built: bounded, read-only branch SQL and snapshots (D137) |
-| contribute text into the context | `context-contribute` | no host interface |
+| contribute text into the context | `context-contribute` | built: attributed notes, diagnostics and append-only corrections (D156) |
 | observe turn/tool lifecycle events | `transcript-read` | built: typed `observer` subscriptions and bounded delivery (D155) |
 | custom plugin events | `event-publish`, `event-subscribe` | built: disjoint publishing/subscription APIs (D155) |
-| block a pending tool call | `veto` | no host interface |
-| invoke the model | `model-invoke` | no host interface |
-| render UI | `ui` | no host interface |
-| persist state | `persist` | no host interface |
+| block a pending tool call | `veto` | built: fail-closed deny/abstain callbacks (D156) |
+| invoke the model | `model-invoke` | built: isolated requests with shared parent/plugin budgets (D156) |
+| render UI | `ui` | built: closed widgets in labelled host panels (D156) |
+| persist state | `persist` | built: workspace/plugin-isolated transactional KV (D156) |
 
 ## 7. Milestones
 
@@ -3675,11 +3724,11 @@ provenance wrapper went in *before* the first model-visible plugin tool rather t
 unlabelled third-party text ever reached a conversation (D128). Presentation is shared with the TUI,
 which draws a human diff and an image as metadata rather than as model text (D134, D146).
 
-**v3 — the hook surface (partly built).** D155 delivers harness observers and a disjoint custom
-event channel first, superseding the original persistence-first ordering. Remaining: `persist`,
-`veto`, `context-contribute`, `model-invoke` and `ui`. Each needs its own typed, per-call-checked
-interface; an event return is not a generic escape hatch for those authorities. `ui` remains last,
-because the core must own the rendering contract a guest draws inside.
+**v3 — the hook surface (built).** D155 delivers harness observers and a disjoint custom
+event channel, superseding the original persistence-first ordering. D156 adds `persist`, `veto`,
+`context-contribute`, `model-invoke` and `ui` as separate typed, per-call-checked capabilities.
+An event return is not a generic escape hatch for those authorities. The core owns the closed,
+read-only UI rendering contract; persistent instances and input widgets remain deferred.
 
 The v1 refusal remains the thesis: a component with no eligible filesystem capability must not
 initialize filesystem imports. D139–D141 distinguish bindings from per-operation authority: linking
@@ -3687,12 +3736,6 @@ read bindings under a write capability must never let that principal read a file
 
 ## 8. Deferred
 
-- The remaining hook scopes: `veto`, `ui`, `persist`, `model-invoke`,
-  `context-contribute`. Harness observer/custom events are implemented under D155. The scopes are defined and the load
-  check names their interfaces, and the loader refuses them by name ("not implemented by the
-  runtime"), so a component that expects one fails at load rather than at its first call. `ui` also
-  carries "input widgets" below; a plugin is not given the terminal before the core owns the contract
-  it draws inside.
 - Long-lived plugin instances (`lifetime = "session"`, D13).
 - Isolating component compilation under independent time/memory limits before automatic loading
   of untrusted artifacts; D127 caps input bytes but fuel/epochs bound execution, not the compiler.

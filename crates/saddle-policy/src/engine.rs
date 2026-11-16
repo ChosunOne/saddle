@@ -50,9 +50,18 @@ pub enum Request<'a> {
     ModelInvoke {
         tokens: u64,
     },
+    ModelReserve {
+        tokens: u64,
+        cost: Option<f64>,
+    },
     TranscriptQuery {
         session: &'a str,
         sql: &'a str,
+    },
+    PluginService {
+        scope: Scope,
+        operation: &'a str,
+        arguments: &'a Value,
     },
     /// host-attributed hook delivery or custom-event publication (D155).
     Hook {
@@ -76,9 +85,11 @@ impl Request<'_> {
             Request::FsWrite { .. } => Scope::FsWrite,
             Request::Exec { .. } | Request::ExecTask { .. } => Scope::Exec,
             Request::Net { .. } => Scope::Net,
-            Request::ModelInvoke { .. } => Scope::ModelInvoke,
+            Request::ModelInvoke { .. } | Request::ModelReserve { .. } => Scope::ModelInvoke,
             Request::TranscriptQuery { .. } => Scope::TranscriptRead,
-            Request::Plain(s) | Request::Hook { scope: s, .. } => *s,
+            Request::Plain(s)
+            | Request::Hook { scope: s, .. }
+            | Request::PluginService { scope: s, .. } => *s,
         }
     }
 
@@ -117,6 +128,9 @@ impl Request<'_> {
                 args
             }
             Request::ModelInvoke { tokens } => json!({ "tokens": tokens }),
+            Request::ModelReserve { tokens, cost } => {
+                json!({"operation":"model-reserve","tokens":tokens,"cost":cost})
+            }
             Request::TranscriptQuery { session, sql } => json!({ "session": session, "sql": sql }),
             Request::Hook {
                 operation,
@@ -128,6 +142,11 @@ impl Request<'_> {
             } => {
                 json!({"operation":operation,"channel":channel,"publisher":publisher,"name":name,"bytes":data.len(),"sha256":sha256_hex(data.as_bytes())})
             }
+            Request::PluginService {
+                operation,
+                arguments,
+                ..
+            } => json!({"operation":operation,"arguments":arguments}),
             Request::Plain(_) => json!({}),
         }
     }
@@ -228,6 +247,7 @@ pub struct Engine {
     policy: Policy,
     reserved: Reserved,
     spent: Mutex<BTreeMap<Principal, u64>>,
+    money: Mutex<BTreeMap<Principal, f64>>,
 }
 
 /// One narrowed list of net grants against one request (D110). A component or a server has a list
@@ -255,6 +275,92 @@ impl Engine {
             policy,
             reserved: Reserved::new(),
             spent: Mutex::new(BTreeMap::new()),
+            money: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn model_owners(who: &Principal) -> Vec<Principal> {
+        if matches!(who, Principal::Plugin(_)) {
+            vec![Principal::Agent, who.clone()]
+        } else {
+            vec![who.clone()]
+        }
+    }
+    fn reserve_model(&self, who: &Principal, tokens: u64, cost: Option<f64>) -> Decision {
+        if cost.is_some_and(|value| !value.is_finite() || value < 0.0) {
+            return Decision::deny(
+                Scope::ModelInvoke,
+                "model price estimate must be finite and nonnegative".into(),
+            );
+        }
+        let mut spent = self.spent.lock().unwrap_or_else(|error| error.into_inner());
+        let mut money = self.money.lock().unwrap_or_else(|error| error.into_inner());
+        for owner in Self::model_owners(who) {
+            let Some(grant) = self
+                .policy
+                .grants(&owner)
+                .and_then(|grants| grants.model_invoke.as_ref())
+            else {
+                return Decision::deny(
+                    Scope::ModelInvoke,
+                    format!("{owner} has no model-invoke grant"),
+                );
+            };
+            if spent
+                .get(&owner)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(tokens)
+                > grant.tokens_per_session
+            {
+                return Decision::deny(
+                    Scope::ModelInvoke,
+                    format!("{owner} model token budget exceeded"),
+                );
+            }
+            if grant.cost_per_session.is_some_and(|limit| {
+                cost.is_none_or(|cost| {
+                    !cost.is_finite()
+                        || cost < 0.0
+                        || money.get(&owner).copied().unwrap_or(0.0) + cost > limit
+                })
+            }) {
+                return Decision::deny(
+                    Scope::ModelInvoke,
+                    format!("{owner} model cost budget exceeded or price is unknown"),
+                );
+            }
+        }
+        for owner in Self::model_owners(who) {
+            *spent.entry(owner.clone()).or_default() += tokens;
+            *money.entry(owner).or_default() += cost.unwrap_or(0.0);
+        }
+        match self
+            .policy
+            .grants(who)
+            .and_then(|grants| grants.model_invoke.as_ref())
+        {
+            Some(grant) => Decision::allow(Scope::ModelInvoke, &grant.rule, &grant.why),
+            None => Decision::deny(Scope::ModelInvoke, "model-invoke is not granted".into()),
+        }
+    }
+    /// reconcile reported usage; unknown/failed usage retains its reservation (D156).
+    pub fn settle_model(
+        &self,
+        who: &Principal,
+        reserved: u64,
+        reserved_cost: Option<f64>,
+        actual: u64,
+        actual_cost: Option<f64>,
+    ) {
+        let mut spent = self.spent.lock().unwrap_or_else(|error| error.into_inner());
+        let mut money = self.money.lock().unwrap_or_else(|error| error.into_inner());
+        for owner in Self::model_owners(who) {
+            let used = spent.entry(owner.clone()).or_default();
+            *used = used.saturating_sub(reserved).saturating_add(actual);
+            let used = money.entry(owner).or_default();
+            *used = (*used - reserved_cost.unwrap_or(0.0)).max(0.0)
+                + actual_cost.or(reserved_cost).unwrap_or(0.0);
         }
     }
 
@@ -342,6 +448,7 @@ impl Engine {
                     format!("{who} has no net grant covering {scheme}://{host}:{port}"),
                 ),
             },
+            Request::ModelReserve { tokens, cost } => self.reserve_model(who, *tokens, *cost),
             Request::ModelInvoke { tokens } => {
                 let Some(g) = &grants.model_invoke else {
                     return Decision::deny(scope, format!("{who} has no model-invoke grant"));
@@ -363,7 +470,9 @@ impl Engine {
             Request::TranscriptQuery { .. } => {
                 self.decide(who, &Request::Plain(Scope::TranscriptRead))
             }
-            Request::Plain(s) | Request::Hook { scope: s, .. } => match grants.plain.get(s) {
+            Request::Plain(s)
+            | Request::Hook { scope: s, .. }
+            | Request::PluginService { scope: s, .. } => match grants.plain.get(s) {
                 Some(g) => Decision::allow(scope, &g.rule, &g.why),
                 None => Decision::deny(scope, format!("{who} has no {s} grant")),
             },
@@ -428,6 +537,77 @@ mod tests {
                     &who,
                     &Request::FsRead {
                         loc: &Location::new(RootName::workspace(), RelPath::new("file").unwrap())
+                    }
+                )
+                .allow
+        );
+    }
+
+    #[test]
+    fn model_reservations_share_parent_and_preserve_spending_on_reload() {
+        let ws = tempfile::tempdir().unwrap();
+        let roots = Roots::resolve([(RootName::workspace(), ws.path().into())], &[]).unwrap();
+        let source = "version=1\n[agent]\nmodel-invoke={tokens-per-session=100,cost-per-session=1.0}\n[plugin.first]\nmodel-invoke={tokens-per-session=100,cost-per-session=1.0}\n[plugin.second]\nmodel-invoke={tokens-per-session=100,cost-per-session=1.0}\n";
+        let mut engine = Engine::new(Policy::parse(source, &roots).unwrap());
+        let first = Principal::Plugin(PluginId::new("first").unwrap());
+        let second = Principal::Plugin(PluginId::new("second").unwrap());
+        let request = Request::ModelReserve {
+            tokens: 60,
+            cost: Some(0.6),
+        };
+        assert!(engine.decide(&first, &request).allow);
+        assert!(!engine.decide(&second, &request).allow);
+        engine.replace_policy(Policy::parse(source, &roots).unwrap());
+        assert!(!engine.decide(&second, &request).allow);
+        engine.settle_model(&first, 60, Some(0.6), 20, Some(0.2));
+        assert!(engine.decide(&second, &request).allow);
+        assert!(
+            !engine
+                .decide(
+                    &first,
+                    &Request::ModelReserve {
+                        tokens: 1,
+                        cost: Some(0.3)
+                    }
+                )
+                .allow
+        );
+        assert!(
+            !engine
+                .decide(
+                    &first,
+                    &Request::ModelReserve {
+                        tokens: 1,
+                        cost: None
+                    }
+                )
+                .allow
+        );
+        // Rejected admissions did not charge either owner.
+        assert!(
+            engine
+                .decide(
+                    &first,
+                    &Request::ModelReserve {
+                        tokens: 20,
+                        cost: Some(0.1)
+                    }
+                )
+                .allow
+        );
+    }
+
+    #[test]
+    fn model_reservation_requires_parent_authority_even_with_a_child_grant() {
+        let (_ws, engine) = engine();
+        let who = Principal::Plugin(PluginId::new("web-search").unwrap());
+        assert!(
+            !engine
+                .decide(
+                    &who,
+                    &Request::ModelReserve {
+                        tokens: 1,
+                        cost: Some(0.0)
                     }
                 )
                 .allow

@@ -36,6 +36,9 @@ use crate::mcp;
 use crate::plugins;
 use crate::plugins::HostFailure;
 use crate::plugins::hooks;
+use crate::plugins::services::ModelUsage;
+use crate::plugins::services::panel::PanelView;
+use crate::provider::Contribution;
 use crate::provider::{
     Cancelled, Conversation, Item, Part, Provider, Quota, Reply, Sink, Stop, ToolCall, ToolDef,
     ToolResult, Usage,
@@ -49,6 +52,10 @@ use saddle_wit::harness::exports::saddle::plugin::observer::Kind as HarnessKind;
 pub const RESULT_LIMIT: usize = 100 * 1024;
 
 pub trait Ui: Sink {
+    fn contribution(&mut self, _value: &Contribution) {}
+    fn panels(&mut self, _panels: &[PanelView]) {}
+    fn plugin_usage(&mut self, _usage: &ModelUsage) {}
+
     fn call(&mut self, call: &ToolCall);
     /// A message the user sent while the turn was running entered the conversation (D149). Line
     /// mode has no one to tell: nothing arrives there while a turn runs.
@@ -407,6 +414,7 @@ pub struct Agent {
     compaction: compact::Settings,
     /// Messages sent while a turn is running, taken between requests (D149).
     steering: Steer,
+    shown_panels: Vec<PanelView>,
     /// Tokens in the context at the last reply, and how many items it covered.
     context_tokens: u64,
     measured: usize,
@@ -442,6 +450,7 @@ impl Agent {
             saved: None,
             compaction,
             steering: Steer::default(),
+            shown_panels: Vec::new(),
             context_tokens: 0,
             measured: 0,
             turn_usage: Usage::default(),
@@ -473,7 +482,9 @@ impl Agent {
         self.system = format!("{}{grants}", self.base);
     }
 
-    pub fn refresh_extensions(&mut self, session: &Session) {
+    pub fn refresh_extensions(&mut self, session: &Session, ui: &mut dyn Ui) {
+        self.shown_panels.clear();
+        ui.panels(&[]);
         self.base = base_prompt(session, &self.context);
         self.set_grants(grants_section(session));
         self.refresh_tools(session.declared_tools());
@@ -1580,17 +1591,74 @@ impl Agent {
     }
 
     pub fn turn(&mut self, session: &mut Session, prompt: &str, ui: &mut dyn Ui) -> Result<End> {
-        // An unexpected host/store/audit error must not trigger further guest effects, even if
-        // a later audit write might succeed. Ordinary model failures return an End instead.
-        let end = self.turn_inner(session, prompt, ui)?;
-        if self.provider.is_some() {
-            self.turn_hook(
-                session,
-                HarnessKind::TurnEnd,
-                json!({"end":format!("{end:?}").to_ascii_lowercase()}),
-            )?;
+        session
+            .extensions
+            .begin(&self.items, self.provider.as_ref().map(Provider::twin));
+        if let (Some(store), Some(id)) = (&self.store, &self.saved) {
+            for fact in store.contributions(id)? {
+                session
+                    .extensions
+                    .known
+                    .insert(fact.id, fact.provenance.principal);
+            }
         }
-        Ok(end)
+        let result = (|| {
+            let end = self.turn_inner(session, prompt, ui)?;
+            if self.provider.is_some() {
+                self.turn_hook(
+                    session,
+                    HarnessKind::TurnEnd,
+                    json!({"end":format!("{end:?}").to_ascii_lowercase()}),
+                )?;
+            }
+            self.flush_extensions(session, ui)?;
+            Ok(end)
+        })();
+        session.extensions.active = false;
+        if result.is_err() {
+            session.extensions.pending.clear();
+        }
+        result
+    }
+
+    fn flush_extensions(&mut self, session: &mut Session, ui: &mut dyn Ui) -> Result<()> {
+        while let Some(mut fact) = session.extensions.pending.pop_front() {
+            fact.content = session
+                .plugins
+                .frame_principal(&fact.provenance.principal, &fact.content);
+            ui.contribution(&fact);
+            self.record(Item::Contribution(Box::new(fact)), ui);
+        }
+        let panels: Vec<_> = session.extensions.panels.values().cloned().collect();
+        if panels != self.shown_panels {
+            ui.panels(&panels);
+            self.shown_panels = panels;
+        }
+        for used in session.extensions.usage.drain(..) {
+            self.cost += used.cost.unwrap_or(0.0);
+            self.turn_usage.input += used.usage.input;
+            self.turn_usage.output += used.usage.output;
+            self.turn_usage.cache_read += used.usage.cache_read;
+            self.turn_usage.cache_write += used.usage.cache_write;
+            ui.plugin_usage(&used);
+            if let (Some(store), Some(id)) = (&self.store, &self.saved) {
+                let request = StoreRequest {
+                    kind: RequestKind::Plugin,
+                    provider: used.provider,
+                    model: used.model,
+                    usage: used.usage,
+                    cost: used.cost.unwrap_or(0.0),
+                    dropped: 0,
+                    reasoning_tokens: used.reasoning_tokens,
+                };
+                if let Err(error) =
+                    store.plugin_request(id, &request, &used.principal, &used.call_id)
+                {
+                    self.saving_failed(error, ui);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn turn_hook(&self, session: &mut Session, kind: HarnessKind, data: Value) -> Result<()> {
@@ -1652,6 +1720,7 @@ impl Agent {
                 ));
                 return Ok(End::StepLimit);
             }
+            self.flush_extensions(session, ui)?;
             requests += 1;
             if ui.cancelled() {
                 return Ok(End::Cancelled);
@@ -1813,6 +1882,7 @@ impl Agent {
                 outputs.push(seen);
             }
             self.record(Item::ToolResults(results), ui);
+            self.flush_extensions(session, ui)?;
             // D109: what a search declared goes on the branch beside the results, so a resume, a
             // fork or a jump in the tree brings it back — and a rewind to before this point
             // forgets it with everything else.

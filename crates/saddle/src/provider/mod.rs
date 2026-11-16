@@ -36,7 +36,12 @@ use crate::auth::AuthStore;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
+use std::thread;
+use std::time::Duration;
+
+use crate::cancel;
+use crate::tools::timeout;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -118,9 +123,32 @@ pub struct ToolResult {
     pub diff: Option<String>,
 }
 
+/// a structured plugin-supplied location; naming a file does not authorize reading it (D156).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Diagnostic {
+    pub root: String,
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub severity: String,
+    pub message: String,
+}
+
+/// a branch-local, append-only plugin fact; its origin is assigned by the host (D156).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Contribution {
+    pub id: String,
+    pub corrects: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<Diagnostic>,
+    pub provenance: Provenance,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Item {
+    Contribution(Box<Contribution>),
     User(String),
     /// A prompt with images attached: the text, then the pictures (D58). Its own variant rather
     /// than a flag so that every place that matches on an item has to decide what an attachment
@@ -1176,6 +1204,8 @@ pub struct Provider {
     key: Option<String>,
     oauth: Option<OAuthState>,
     agent: ureq::Agent,
+    pub response_bytes: Option<usize>,
+    pub retry_requests: bool,
     window: u64,
     source: WindowSource,
     price: Option<Price>,
@@ -1218,6 +1248,8 @@ impl Provider {
             config,
             key,
             agent: http::agent(),
+            response_bytes: None,
+            retry_requests: true,
             window,
             source,
             price,
@@ -1237,6 +1269,8 @@ impl Provider {
             key: self.key.clone(),
             oauth: self.oauth.clone(),
             agent: http::agent(),
+            response_bytes: self.response_bytes,
+            retry_requests: self.retry_requests,
             window: self.window,
             source: self.source,
             price: self.price,
@@ -1382,10 +1416,20 @@ impl Provider {
             return Ok(());
         };
         let settings = oauth.flow.settings()?;
-        let mut tokens = oauth
-            .tokens
-            .lock()
-            .map_err(|_| anyhow::anyhow!("the OAuth token state was poisoned"))?;
+        // D156: a plugin deadline also bounds waiting behind another credential refresh.
+        let mut tokens = loop {
+            timeout::remaining(Duration::from_secs(60))?;
+            if cancel::requested() {
+                return Err(Cancelled.into());
+            }
+            match oauth.tokens.try_lock() {
+                Ok(tokens) => break tokens,
+                Err(TryLockError::Poisoned(_)) => bail!("the OAuth token state was poisoned"),
+                Err(TryLockError::WouldBlock) => {
+                    thread::sleep(timeout::remaining(Duration::from_millis(10))?);
+                }
+            }
+        };
         if tokens.usable(120, oauth::now()) {
             return Ok(());
         }

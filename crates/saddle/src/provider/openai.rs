@@ -69,6 +69,7 @@ pub fn messages(system: &str, items: &[Item]) -> Vec<Value> {
     let mut out = vec![json!({ "role": "system", "content": system })];
     for item in items {
         match item {
+            Item::Contribution(value) => out.push(json!({"role":"user","content":value.content})),
             Item::User(text) => out.push(json!({ "role": "user", "content": text })),
             // OpenAI carries an image as a second content part with a data URL, which is the only
             // shape it accepts for an inline picture (D58).

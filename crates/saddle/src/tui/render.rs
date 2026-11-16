@@ -1,5 +1,6 @@
 //! Drawing: the transcript, the queue, the activity line, the editor and the status line.
 
+use crate::plugins::services::panel::{PanelView, Row as PanelRow, Tone};
 use crate::provider;
 use crate::provider::Image;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -820,6 +821,7 @@ fn entry_rows(entry: &Entry, view: View, theme: &Theme) -> Vec<Row> {
         Entry::Note(kind, text) => {
             let style = match kind {
                 NoteKind::Info => dim(theme),
+                NoteKind::Plugin => Style::new().fg(theme.tool_output),
                 NoteKind::Warn => Style::new().fg(theme.warning),
                 NoteKind::Error => Style::new().fg(theme.error),
             };
@@ -1294,6 +1296,70 @@ pub(super) fn home_relative(path: &Path) -> String {
     }
 }
 
+fn draw_panels(frame: &mut Frame<'_>, panels: &[PanelView], area: Rect, theme: &Theme) {
+    let mut y = area.y;
+    for panel in panels {
+        if y >= area.bottom() {
+            break;
+        }
+        let height = (panel.rows.len() as u16)
+            .saturating_add(2)
+            .min(area.bottom() - y);
+        let room = area.width.saturating_sub(4) as usize;
+        let lines: Vec<Line> = panel
+            .rows
+            .iter()
+            .map(|row| match row {
+                PanelRow::Text(spans) => Line::from(
+                    spans
+                        .iter()
+                        .map(|span| {
+                            let style = match span.tone {
+                                Tone::Text => Style::new().fg(theme.tool_output),
+                                Tone::Muted => dim(theme),
+                                Tone::Success => Style::new().fg(theme.success),
+                                Tone::Warning => Style::new().fg(theme.warning),
+                                Tone::Error => Style::new().fg(theme.error),
+                                Tone::Emphasis => {
+                                    Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
+                                }
+                            };
+                            Span::styled(span.text.clone(), style)
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                PanelRow::Progress {
+                    completed,
+                    total,
+                    label,
+                } => {
+                    let width = room.saturating_sub(label.width().saturating_add(3));
+                    let filled = if *total == 0 {
+                        0
+                    } else {
+                        ((*completed as u128 * width as u128) / *total as u128).min(width as u128)
+                            as usize
+                    };
+                    Line::from(vec![
+                        Span::raw(format!("{label} [")),
+                        Span::styled("━".repeat(filled), Style::new().fg(theme.accent)),
+                        Span::styled("─".repeat(width.saturating_sub(filled)), dim(theme)),
+                        Span::raw("]"),
+                    ])
+                }
+            })
+            .collect();
+        let block = Block::bordered()
+            .title(format!("{} · {}", panel.plugin, panel.title))
+            .border_style(Style::new().fg(theme.border_muted));
+        frame.render_widget(
+            Paragraph::new(lines).block(block),
+            Rect::new(area.x, y, area.width, height),
+        );
+        y = y.saturating_add(height);
+    }
+}
+
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let inner_width = area.width.saturating_sub(2) as usize;
@@ -1302,14 +1368,22 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // What is waiting to be delivered, the sooner one first: a steer enters at the next request,
     // a queued prompt only after the turn (D149).
     let queue_rows = (app.steering.len() + app.queue.len()).min(3);
+    let panel_rows = app
+        .plugin_panels
+        .iter()
+        .map(|panel| panel.rows.len() + 2)
+        .sum::<usize>()
+        .min(area.height as usize / 3);
     let [
         transcript_area,
+        panels_area,
         queue_area,
         activity_area,
         editor_area,
         status_area,
     ] = Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(panel_rows as u16),
         Constraint::Length(queue_rows as u16),
         Constraint::Length(1),
         Constraint::Length(editor_rows as u16 + 2),
@@ -1318,6 +1392,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     .areas(area);
 
     draw_transcript(frame, app, transcript_area);
+    draw_panels(frame, &app.plugin_panels, panels_area, &app.theme);
 
     let pending = |label: &'static str, text: &String| {
         let first = text.lines().next().unwrap_or_default();
@@ -2539,6 +2614,30 @@ mod tests {
             width: w,
             height: h,
         }
+    }
+
+    #[test]
+    fn plugin_panels_draw_in_labelled_frames_and_clear_without_transcript_entries() {
+        let mut app = bare_app();
+        let entries = app.entries.len();
+        app.agent(AgentEvent::Panels(vec![PanelView {
+            plugin: "plugin.features".into(),
+            title: "background work".into(),
+            rows: vec![PanelRow::Progress {
+                completed: 1,
+                total: 2,
+                label: "index".into(),
+            }],
+        }]));
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("plugin.features · background work"));
+        assert!(rendered.contains("index ["));
+        assert_eq!(app.entries.len(), entries);
+        app.agent(AgentEvent::Panels(Vec::new()));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("plugin.features"));
     }
 
     #[test]

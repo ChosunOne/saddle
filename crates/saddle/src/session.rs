@@ -45,6 +45,7 @@ use crate::fs_access;
 use crate::mcp::Transport;
 use crate::paths::{Paths, find_workspace};
 use crate::plugins::hooks::Queue as EventQueue;
+use crate::plugins::services::State as ExtensionState;
 use crate::plugins::{Entry as PluginEntry, HostFailure, Registry as PluginRegistry};
 use crate::provider::ToolDef;
 use crate::store::Snapshot;
@@ -516,6 +517,7 @@ fn configured_tool_roots(setup: &Setup) -> Vec<ToolRoot> {
 }
 
 pub struct Session {
+    pub extensions: ExtensionState,
     pub plugin_events: EventQueue,
     pub tasks: Tasks,
     pub file_roots: BTreeMap<RootName, Dir>,
@@ -608,6 +610,7 @@ impl Session {
             Registry::new(grants, user.mcp, host_env.clone(), tmp)
         };
         let mut session = Self {
+            extensions: Default::default(),
             plugin_events: Default::default(),
             tasks: Tasks::default(),
             file_roots,
@@ -678,6 +681,7 @@ impl Session {
         tasks::stop_all(self)?;
         self.tasks = Tasks::default();
         self.plugin_events = Default::default();
+        self.extensions = Default::default();
         let before = self.setup.policy_sha256.clone();
         self.setup = fresh;
         search_transport::trim_cache(self);

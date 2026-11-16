@@ -97,6 +97,8 @@ pub fn stream(
     let stop = Arc::new(AtomicBool::new(false));
     let request = Request {
         agent: p.agent.clone(),
+        body_limit: p.response_bytes.map_or(BODY_LIMIT, |bytes| bytes as u64),
+        attempts: if p.retry_requests { ATTEMPTS } else { 1 },
         name: p.name.clone(),
         url,
         headers,
@@ -118,6 +120,8 @@ pub fn stream(
 }
 
 struct Request {
+    attempts: u32,
+    body_limit: u64,
     agent: ureq::Agent,
     name: String,
     url: String,
@@ -178,7 +182,7 @@ impl Request {
                     let reader = resp
                         .into_body()
                         .into_with_config()
-                        .limit(BODY_LIMIT)
+                        .limit(self.body_limit)
                         .reader();
                     return Ok(Some(BufReader::new(reader)));
                 }
@@ -192,12 +196,12 @@ impl Request {
                     let text = resp
                         .body_mut()
                         .with_config()
-                        .limit(64 * 1024)
+                        .limit(self.body_limit.min(64 * 1024))
                         .read_to_string()
                         .unwrap_or_default();
                     (status, retry_after, text)
                 }
-                Err(e) if transient(&e) && attempt < ATTEMPTS => {
+                Err(e) if transient(&e) && attempt < self.attempts => {
                     let wait = backoff(attempt, None);
                     self.note(format!("{e}; retrying in {}s", wait.as_secs()));
                     self.pause(wait);
@@ -206,7 +210,7 @@ impl Request {
                 Err(e) => return Err(e).with_context(|| format!("POST {url}")),
             };
             let message = error_message(&text);
-            if retryable(status) && attempt < ATTEMPTS {
+            if retryable(status) && attempt < self.attempts {
                 let wait = backoff(attempt, retry_after);
                 self.note(format!(
                     "{} returned {status} ({message}); retrying in {}s",

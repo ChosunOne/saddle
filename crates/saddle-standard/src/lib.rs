@@ -46,3 +46,7 @@ pub const SDK_HOOKS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sdk-hooks
 #[doc(hidden)]
 pub const SDK_EVENT_LISTENER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/sdk-event-listener.wasm"));
+
+/// extension SDK fixture, never automatically enabled.
+#[doc(hidden)]
+pub const SDK_FEATURES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sdk-features.wasm"));

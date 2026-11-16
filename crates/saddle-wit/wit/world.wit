@@ -3,6 +3,11 @@ package saddle:host@0.1.0;
 // A standard tool world; the historical name is retained for SDK compatibility.
 world read-tool {
     import budgets;
+    import context-contribute;
+    import persist;
+    import model-invoke;
+    import ui;
+    import saddle:widgets/types@0.1.0;
     import plugin-events;
     import http;
     import web-search;

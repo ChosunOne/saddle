@@ -51,6 +51,11 @@ fn complete_at(
     // D125: a successful send does not prove the socket is alive. Recover read-time failures too,
     // but only before output. The second attempt always uses HTTP and the whole input, not a delta.
     retry::once(sink, |retry, sink| {
+        if retry && !p.retry_requests {
+            return Err(anyhow!(
+                "automatic retries are disabled for bounded plugin requests"
+            ));
+        }
         let mut pending = None;
         let streamed = match ws_url.filter(|_| !retry) {
             Some(ws_url) => match ws::stream(conv.session, ws_url, &headers, &body) {
@@ -137,6 +142,7 @@ pub fn input(items: &[Item]) -> Vec<Value> {
     let mut out = Vec::new();
     for item in items {
         match item {
+            Item::Contribution(value) => out.push(message("user", &[text_part(&value.content)])),
             Item::User(text) => out.push(message("user", &[text_part(text)])),
             Item::Attached { text, images } => {
                 let mut content = vec![text_part(text)];

@@ -14,3 +14,14 @@ interface plugin-events {
     subscriptions: func() -> list<subscription>;
     receive: func(event: event) -> result<_, string>;
 }
+
+interface veto {
+    record pending-tool-call { name: string, arguments: string }
+    variant decision { continue, deny(string) }
+    before-tool: func(call: pending-tool-call) -> decision;
+}
+
+interface ui {
+    use saddle:widgets/types@0.1.0.{panel};
+    render: func() -> result<panel, string>;
+}

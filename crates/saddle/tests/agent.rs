@@ -2,6 +2,8 @@
 //! asks for tool calls, and the test checks what the policy let through, what went back to the
 //! model, and what reached the audit log.
 
+#[path = "support/features.rs"]
+mod feature_tests;
 #[path = "support/hooks.rs"]
 mod hook_tests;
 #[path = "support/http.rs"]

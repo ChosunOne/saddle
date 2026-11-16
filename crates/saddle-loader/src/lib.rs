@@ -22,6 +22,7 @@ use saddle_wit::harness::exports::saddle::plugin::observer::{
     Event as HarnessEvent, Kind as HarnessKind,
 };
 use saddle_wit::saddle::host::budgets::{self as budgets_interface, Host as BudgetsHost};
+use saddle_wit::saddle::host::context_contribute::{self, Contribution, Host as ContextHost};
 use saddle_wit::saddle::host::exec::{self, Command, Host as ExecHost, Reply as ExecReply};
 use saddle_wit::saddle::host::exec_tasks::{self, Host as TasksHost, Task};
 use saddle_wit::saddle::host::fs_list::EntryKind;
@@ -34,6 +35,10 @@ use saddle_wit::saddle::host::fs_write::{self, Change, Expectation, Host as Writ
 use saddle_wit::saddle::host::http::{
     self, Host as HttpHost, Request as HttpRequest, Response as HttpResponse,
 };
+use saddle_wit::saddle::host::model_invoke::{
+    self, Host as ModelHost, Reply as ModelReply, Request as ModelRequest,
+};
+use saddle_wit::saddle::host::persist::{self, Change as PersistChange, Host as PersistHost};
 use saddle_wit::saddle::host::plugin_events::{self, Host as EventsHost};
 use saddle_wit::saddle::host::tool_paths::{
     self, Chunk as ToolChunk, Entry as ToolEntry, EntryKind as ToolEntryKind,
@@ -41,7 +46,10 @@ use saddle_wit::saddle::host::tool_paths::{
 };
 use saddle_wit::saddle::host::tool_result::{self, Host as ResultHost, ImageInfo};
 use saddle_wit::saddle::host::transcript_read::{self, Host as TranscriptHost};
+use saddle_wit::saddle::host::ui::{self, Host as UiHost};
 use saddle_wit::saddle::host::web_search::{self, Host as SearchHost, Snapshot as SearchSnapshot};
+use saddle_wit::saddle::widgets::types::{self as widget_types, Panel};
+use saddle_wit::veto::exports::saddle::plugin::veto::{Decision as VetoDecision, PendingToolCall};
 use sha2::{Digest, Sha256};
 use wasmtime::component::types::{Component as ComponentType, ComponentItem};
 use wasmtime::component::{
@@ -151,6 +159,23 @@ pub enum TaskOperation {
     Cancel(String),
 }
 
+/// typed effects, never an arbitrary host command or JSON protocol (D156).
+pub enum Service {
+    Contribute(Contribution),
+    PersistGet(String),
+    PersistApply(Vec<PersistChange>),
+    Model(ModelRequest),
+    PublishPanel(Panel),
+    ClearPanel,
+}
+pub enum ServiceReply {
+    Contribution(String),
+    Value(Option<Vec<u8>>),
+    Applied(bool),
+    Model(ModelReply),
+    Unit,
+}
+
 /// the binary supplies policy/audit/file operations; the loader never depends on its session.
 ///
 /// Implementations must decide and audit using `call.principal()` and `call.grants()`, validate
@@ -159,6 +184,14 @@ pub enum TaskOperation {
 /// filesystem callbacks may hold any filesystem capability; determine authority per operation/path,
 /// never from the existence of a linked interface (D139, D140).
 pub trait HostServices: Send + 'static {
+    fn service(
+        &mut self,
+        _call: &Invocation,
+        _service: Service,
+    ) -> anyhow::Result<Result<ServiceReply, String>> {
+        Ok(Err("host does not implement extension services".into()))
+    }
+
     /// enqueue a custom event; the host attaches the publishing principal (D155).
     fn emit_event(
         &mut self,
@@ -380,6 +413,66 @@ impl<H: HostServices> State<H> {
         result
     }
 }
+
+impl<H: HostServices> State<H> {
+    fn service(&mut self, service: Service) -> anyhow::Result<Result<ServiceReply, String>> {
+        self.host_wait(
+            Duration::from_secs(budgets::host_wait_seconds() as u64),
+            |host, call, _| host.service(call, service),
+        )
+    }
+}
+impl<H: HostServices> ContextHost for State<H> {
+    fn append(&mut self, value: Contribution) -> anyhow::Result<Result<String, String>> {
+        match self.service(Service::Contribute(value))? {
+            Ok(ServiceReply::Contribution(id)) => Ok(Ok(id)),
+            Err(why) => Ok(Err(why)),
+            _ => Err(anyhow!("wrong typed extension reply")),
+        }
+    }
+}
+impl<H: HostServices> PersistHost for State<H> {
+    fn get(&mut self, key: String) -> anyhow::Result<Result<Option<Vec<u8>>, String>> {
+        match self.service(Service::PersistGet(key))? {
+            Ok(ServiceReply::Value(value)) => Ok(Ok(value)),
+            Err(why) => Ok(Err(why)),
+            _ => Err(anyhow!("wrong typed extension reply")),
+        }
+    }
+    fn apply(&mut self, changes: Vec<PersistChange>) -> anyhow::Result<Result<bool, String>> {
+        match self.service(Service::PersistApply(changes))? {
+            Ok(ServiceReply::Applied(value)) => Ok(Ok(value)),
+            Err(why) => Ok(Err(why)),
+            _ => Err(anyhow!("wrong typed extension reply")),
+        }
+    }
+}
+impl<H: HostServices> ModelHost for State<H> {
+    fn invoke(&mut self, request: ModelRequest) -> anyhow::Result<Result<ModelReply, String>> {
+        match self.service(Service::Model(request))? {
+            Ok(ServiceReply::Model(value)) => Ok(Ok(value)),
+            Err(why) => Ok(Err(why)),
+            _ => Err(anyhow!("wrong typed extension reply")),
+        }
+    }
+}
+impl<H: HostServices> UiHost for State<H> {
+    fn publish(&mut self, panel: Panel) -> anyhow::Result<Result<(), String>> {
+        match self.service(Service::PublishPanel(panel))? {
+            Ok(ServiceReply::Unit) => Ok(Ok(())),
+            Err(why) => Ok(Err(why)),
+            _ => Err(anyhow!("wrong typed extension reply")),
+        }
+    }
+    fn clear(&mut self) -> anyhow::Result<Result<(), String>> {
+        match self.service(Service::ClearPanel)? {
+            Ok(ServiceReply::Unit) => Ok(Ok(())),
+            Err(why) => Ok(Err(why)),
+            _ => Err(anyhow!("wrong typed extension reply")),
+        }
+    }
+}
+impl<H: HostServices> widget_types::Host for State<H> {}
 
 impl<H: HostServices> EventsHost for State<H> {
     fn emit(&mut self, name: String, data: String) -> anyhow::Result<Result<(), String>> {
@@ -1102,9 +1195,18 @@ impl Loader {
                     )?;
                 }
                 PluginExport::Tool => {}
-                PluginExport::Veto | PluginExport::Ui => {
-                    return Err(Error::Refused("unsupported plugin export".into()));
-                }
+                PluginExport::Veto => check_function::<(PendingToolCall,), (VetoDecision,)>(
+                    engine,
+                    &ty,
+                    export.name(),
+                    "before-tool",
+                )?,
+                PluginExport::Ui => check_function::<(), (Result<Panel, String>,)>(
+                    engine,
+                    &ty,
+                    export.name(),
+                    "render",
+                )?,
             }
         }
         let pre = linker
@@ -1120,6 +1222,7 @@ impl Loader {
             pre,
             tool,
             exports,
+            version: manifest.version.clone(),
             principal: Principal::Plugin(manifest.id.clone()),
             grants: Arc::new(grants),
             hash: Sha256::digest(bytes).into(),
@@ -1167,11 +1270,16 @@ fn bind_host<H: HostServices>(
         HostInterface::Budgets => {
             budgets_interface::add_to_linker::<State<H>, HasSelf<State<H>>>(linker, |state| state)
         }
-        HostInterface::ContextContribute | HostInterface::ModelInvoke | HostInterface::Persist => {
-            Err(anyhow!(
-                "host adapter is not implemented: {}",
-                interface.name()
-            ))
+        HostInterface::ContextContribute => {
+            context_contribute::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
+        }
+        HostInterface::Persist => persist::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
+        HostInterface::ModelInvoke => {
+            model_invoke::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
+        }
+        HostInterface::Ui => ui::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
+        HostInterface::Widgets => {
+            widget_types::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
         }
     }
 }
@@ -1255,6 +1363,7 @@ pub struct Prepared<H: HostServices> {
     pre: InstancePre<State<H>>,
     tool: Option<ReadToolPre<State<H>>>,
     exports: Vec<PluginExport>,
+    version: String,
     principal: Principal,
     grants: Arc<Grants>,
     hash: [u8; 32],
@@ -1262,6 +1371,10 @@ pub struct Prepared<H: HostServices> {
 }
 
 impl<H: HostServices> Prepared<H> {
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
     pub fn exports(&self) -> &[PluginExport] {
         &self.exports
     }
@@ -1399,6 +1512,48 @@ impl<H: HostServices> Prepared<H> {
         )?;
         self.hook_result(result)
     }
+    pub fn veto(
+        &self,
+        host: H,
+        call: PendingToolCall,
+        cancelled: Arc<AtomicBool>,
+        deadline: Option<Instant>,
+    ) -> Result<VetoDecision, Error> {
+        if call.name.len().saturating_add(call.arguments.len()) > self.limits.input_bytes {
+            return Err(Error::Size(self.limits.input_bytes));
+        }
+        let (decision,): (VetoDecision,) = self.hook(
+            host,
+            cancelled,
+            PluginExport::Veto,
+            "before-tool",
+            (call,),
+            deadline,
+        )?;
+        if matches!(&decision, VetoDecision::Deny(reason) if reason.len() > self.limits.output_bytes)
+        {
+            return Err(Error::Size(self.limits.output_bytes));
+        }
+        Ok(decision)
+    }
+    pub fn render(
+        &self,
+        host: H,
+        cancelled: Arc<AtomicBool>,
+        deadline: Option<Instant>,
+    ) -> Result<Result<Panel, String>, Error> {
+        let (result,): (Result<Panel, String>,) =
+            self.hook(host, cancelled, PluginExport::Ui, "render", (), deadline)?;
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|why| why.len() > self.limits.output_bytes)
+        {
+            return Err(Error::Size(self.limits.output_bytes));
+        }
+        Ok(result)
+    }
+
     fn hook_result(&self, result: Result<(), String>) -> Result<Result<(), String>, Error> {
         if result
             .as_ref()

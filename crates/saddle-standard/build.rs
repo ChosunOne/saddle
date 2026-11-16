@@ -97,6 +97,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             .validate(true)
             .encode()?,
     )?;
+    let features =
+        fs::read(guest_target.join("wasm32-unknown-unknown/release/examples/features.wasm"))?;
+    fs::write(
+        out.join("sdk-features.wasm"),
+        ComponentEncoder::default()
+            .module(&features)?
+            .validate(true)
+            .encode()?,
+    )?;
     let target = env::var("TARGET")?;
     let mut generated = String::from(
         "/// immutable components shipped with this binary.\npub static ARTIFACTS: &[Artifact] = &[\n",

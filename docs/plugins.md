@@ -398,6 +398,97 @@ into model context or trusted notices. Publication/delivery audits record identi
 content bytes/hash, recipient and call id, not payload bodies. The public budgets SDK is available to
 hook-only components without an unrelated tool grant; it is metadata, not operational authority.
 
+## Typed extension capabilities (D156)
+
+These are separate APIs, not permissions implied by an observer or custom event registration.
+`crates/saddle-sdk/examples/features.rs` is a compiled example combining all five with a tool export.
+A hook-only component may export veto/UI without registering an agent tool. Keep each scope in the
+manifest ceiling and explicitly delegate it from the parent. For example, these protected config
+entries enable the five capabilities for an installed plugin named `features`:
+
+```toml
+[agent]
+veto = {}
+context-contribute = {}
+persist = {}
+ui = {}
+model-invoke = { tokens-per-session = 200000, cost-per-session = 1.0 }
+
+[plugin.features]
+veto = {}
+context-contribute = {}
+persist = {}
+ui = {}
+model-invoke = { tokens-per-session = 100000, cost-per-session = 0.5 }
+```
+
+These snippets extend existing tables; they do not replace ordinary file/network grants. The optional
+cost ceiling is in the provider's configured price units (normally USD), and unknown pricing refuses
+admission when a cost ceiling exists. Subscription quota is not a known API price.
+
+### Veto pending tools
+
+Implement `saddle_sdk::veto::Veto::before_tool(PendingToolCall) -> Decision` and export it with
+`export_veto!(Extension with_types_in veto_bindings)` using `saddle_sdk::veto as veto_bindings`.
+The pending call contains its name and immutable JSON arguments. Return `Decision::Continue` to
+abstain or `Decision::Deny(reason)` to refuse. Continue grants no authority: the usual tool policy
+still decides every resource. Traps, timeouts and oversized replies fail closed. Reasons are untrusted,
+framed plugin content, not host advice. Veto callbacks use their own delegated grants.
+
+### Append notes, diagnostics and corrections
+
+`saddle_sdk::context::note(text)` returns a host-assigned contribution id. `diagnostic(Diagnostic)`
+accepts a known root, relative path, positive line range, severity and message. It does not read the
+named file or grant filesystem access. Use `append(&Contribution { body, corrects: Some(id) })` for a
+correction to your own earlier contribution on the active branch. The earlier item stays intact.
+
+The host saves separate provenance-bearing items and sends framed text at message-safe points,
+never as system instructions or between tool calls and their results. Standalone tool calls without
+an active conversation refuse contributions. Resume/fork rebuilds correction ownership from that
+branch, not another conversation. Size and pending-count bounds apply.
+
+### Private persistence
+
+`saddle_sdk::persist::{get, put, remove, compare_exchange}` operates on byte values. Keys are opaque
+strings, not paths. `apply(&[Change { key, value, expected }])` checks every `Expectation::{Any,
+Missing, Value(bytes)}` and commits the whole batch atomically; a failed precondition returns `false`
+without writes. `value: None` deletes. Duplicate keys are refused. SQLite namespaces are keyed by
+canonical workspace and plugin identity, so siblings and other workspaces cannot read them. Storage
+survives restart/reload; revocation denies access without deleting data. Quotas bound keys, values,
+batches and total bytes. After a quota reduction, shrinking/deleting data remains possible.
+
+### Explicit model invocation
+
+`saddle_sdk::model::invoke(&Request { instructions, messages, max_output_tokens })` uses the session's
+selected provider and host-managed credentials. Messages have `Role::User` or `Role::Assistant`.
+The independent request receives only this input, not the main conversation; it has no tools.
+`Reply` contains text, prose reasoning, model name and usage (including optional cost), never keys or
+opaque reasoning payloads. Returned tool calls are refused and never executed. A standalone call
+without a session provider refuses instead of selecting a provider itself.
+
+Admission reserves conservative input-byte/framing and output-token estimates against **both** the
+plugin and shared parent session budgets, including optional spend ceilings. Successful metered replies
+reconcile with reported usage; failures and unmetered replies retain reservations. Provider overruns
+are charged and block later requests, not claimed to undo remote billing. Reload does not reset
+spending. Explicit requests appear as `plugin` request usage on the saved branch. No automatic retry
+can duplicate a plugin request; deadlines stop local waiting, with remote cancellation best effort.
+
+### Labelled read-only UI panels
+
+Implement `saddle_sdk::ui::Ui::render() -> Result<Panel, String>` and use its `export_ui!` macro with
+that module's binding alias. Panels contain `Widget::{Text, Items, KeyValue, Progress}`; text spans use
+closed `Style::{Text, Muted, Success, Warning, Error, Emphasis}` values. Progress requires a positive
+total and completed <= total. The host strips terminal controls, bounds bytes/widgets/rows and labels
+each panel with the authenticated plugin identity. There are no raw terminal handles, arbitrary
+colours, input widgets or host approval actions.
+
+Rendering runs at turn start (also initial standalone tool dispatch), not inside the TUI drawing
+thread. It allows authorized reads, including private KV reads, but refuses mutations, execution,
+networking, event publication, contributions and model spending. Ordinary authorized callbacks may
+`ui::publish(&panel)` or `ui::clear()` their own frame. Frames update at safe points in TUI and
+line/JSON events; they are not model context or saved conversation items. Reload clears panels and
+rechecks current grants. Failed rendering retains the previous frame.
+
 ## Runtime resource budgets (D145)
 
 Set `[tool-limits]` in protected config, then `/reload`; `saddle check` prints the resolved profile.
@@ -429,6 +520,19 @@ All available keys and defaults (bytes unless a key names another unit):
 plugin-component-bytes = 4194304
 plugin-manifest-bytes = 16384
 plugin-count = 16
+contribution-bytes = 16384
+contribution-count = 32
+persist-key-bytes = 256
+persist-value-bytes = 65536
+persist-keys = 1024
+persist-total-bytes = 4194304
+persist-changes = 32
+model-input-bytes = 65536
+model-output-tokens = 4096
+model-reply-bytes = 65536
+ui-bytes = 16384
+ui-widgets = 32
+ui-rows = 12
 event-queue = 64
 event-deliveries = 128
 event-bytes = 16384
@@ -541,8 +645,9 @@ The SDK reader compatibility fixture is built by the same package build and its 
 in the default suite, so nothing needs a manual component build or an ignored-test opt-in.
 
 Third-party compilation remains an explicit local operation: input bytes are bounded but execution
-fuel/epochs are not independent compiler CPU/memory limits. Compilation isolation, persistent instances,
-plugin storage and the remaining hook scopes (`veto`, `ui`, `persist`, `model-invoke`,
-`context-contribute`) remain deferred; plan §8 lists them. MCP prompts, MCP resources, `codemode` and
+fuel/epochs are not independent compiler CPU/memory limits. Compilation isolation, persistent instances
+and input widgets remain deferred; plan §8 lists them. D156's typed extension tests use the packaged
+SDK fixture for veto fail-closed behavior, append-only contributions, isolated KV/CAS and runtime quotas,
+isolated model transport and cancellation, and labelled read-only UI panels. MCP prompts, MCP resources, `codemode` and
 images in a tool result are refused by decision (D119), not deferred. This migration does not introduce
 automatic plugin updates, an authority picker, ambient native access or a second policy engine.

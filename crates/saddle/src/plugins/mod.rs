@@ -4,6 +4,7 @@ mod filesystem;
 pub mod hooks;
 mod host;
 mod mutations;
+pub mod services;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -119,7 +120,10 @@ impl Registry {
     /// hook callbacks query only the active branch snapshot supplied by the agent (D155).
     pub fn hooks_read_transcript(&self) -> bool {
         self.loaded.values().any(|loaded| {
-            (!loaded.harness.is_empty() || !loaded.subscriptions.is_empty())
+            (!loaded.harness.is_empty()
+                || !loaded.subscriptions.is_empty()
+                || loaded.prepared.exports().contains(&PluginExport::Veto)
+                || loaded.prepared.exports().contains(&PluginExport::Ui))
                 && loaded
                     .prepared
                     .grants()
@@ -374,7 +378,8 @@ impl Registry {
                 PluginExport::Tool => Scope::Tool,
                 PluginExport::Observer => Scope::TranscriptRead,
                 PluginExport::PluginEvents => Scope::EventSubscribe,
-                PluginExport::Veto | PluginExport::Ui => bail!("unsupported export"),
+                PluginExport::Veto => Scope::Veto,
+                PluginExport::Ui => Scope::Ui,
             };
             let registration = session
                 .decide(&who, &Request::Plain(scope))
@@ -505,6 +510,13 @@ impl Registry {
             .replace(&open, "[plugin delimiter removed]")
             .replace(&close, "[plugin delimiter removed]");
         format!("{open} plugin=\"{id}\">\n{clean}\n{close}>")
+    }
+
+    pub fn frame_principal(&self, principal: &str, text: &str) -> String {
+        match principal.strip_prefix("plugin.").and_then(PluginId::new) {
+            Some(id) => self.wrap(&id, text),
+            None => text.to_owned(),
+        }
     }
 
     pub fn call(&mut self, session: &mut Session, name: &str, input: &Value) -> Result<ToolOutput> {

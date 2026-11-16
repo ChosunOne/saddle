@@ -1,10 +1,14 @@
-//! disjoint host and plugin event channels; bounded, non-reentrant delivery (D155).
+//! disjoint event channels, narrowing vetoes and bounded host-framed rendering (D155, D156).
 
 use std::collections::VecDeque;
 use std::mem;
 use std::time::{Duration, Instant};
 
+use super::services::panel;
+use crate::provider::Provenance;
+use crate::tools::ToolOutput;
 use anyhow::{Context, Result};
+use saddle_cap::component::PluginExport;
 use saddle_cap::{Principal, Scope};
 use saddle_limits::Budgets;
 use saddle_policy::{Kind, Request};
@@ -12,6 +16,7 @@ use saddle_wit::events::exports::saddle::plugin::plugin_events::Event as PluginE
 use saddle_wit::harness::exports::saddle::plugin::observer::{
     Event as HarnessEvent, Kind as HarnessKind,
 };
+use saddle_wit::veto::exports::saddle::plugin::veto::{Decision as VetoDecision, PendingToolCall};
 use serde_json::{Value, json};
 
 use super::host::{Job, Reply, execute};
@@ -106,7 +111,95 @@ pub fn harness(session: &mut Session, kind: HarnessKind, data: Value) -> Result<
     })
 }
 
+/// a denied callback (including a trap/timeout) can only narrow the proposed operation.
+pub fn veto(session: &mut Session, name: &str, arguments: &Value) -> Result<Option<ToolOutput>> {
+    let mut registry = mem::take(&mut session.plugins);
+    let result = registry.check_vetoes(session, name, arguments.to_string());
+    session.plugins = registry;
+    result.map_err(|error| {
+        if error.is::<HostFailure>() {
+            error
+        } else {
+            HostFailure(error).into()
+        }
+    })
+}
+
 impl Registry {
+    fn check_vetoes(
+        &mut self,
+        session: &mut Session,
+        name: &str,
+        arguments: String,
+    ) -> Result<Option<ToolOutput>> {
+        let deadline =
+            Instant::now() + Duration::from_secs(session.setup.tool_limits.event_seconds as u64);
+        let deadline = timeout::deadline().map_or(deadline, |current| current.min(deadline));
+        let targets: Vec<_> = self
+            .loaded
+            .iter()
+            .filter(|(_, loaded)| loaded.prepared.exports().contains(&PluginExport::Veto))
+            .map(|(id, _)| id.clone())
+            .collect();
+        timeout::using(Some(deadline), || {
+            for id in targets {
+                let who = Principal::Plugin(id.clone());
+                let call = self.next_call();
+                let request = Request::Hook {
+                    scope: Scope::Veto,
+                    operation: "before-tool",
+                    channel: "veto",
+                    publisher: "saddle",
+                    name,
+                    data: &arguments,
+                };
+                let decision = session.engine.decide(&who, &request);
+                session
+                    .audit
+                    .decision_for_call(&who, &request, &decision, &call)?;
+                if !decision.allow {
+                    continue;
+                }
+                let loaded = self.loaded.get(&id).context("veto disappeared")?;
+                let origin = Provenance {
+                    principal: who.to_string(),
+                    scope: Scope::Veto,
+                    call_id: call.clone(),
+                    component_sha256: loaded.sha256.clone(),
+                    version: loaded.version.clone(),
+                };
+                let result = execute(
+                    loaded.prepared.clone(),
+                    session,
+                    Job::Veto(PendingToolCall {
+                        name: name.into(),
+                        arguments: arguments.clone(),
+                    }),
+                    &call,
+                )?;
+                let reason = match result {
+                    Ok(Reply::Veto(VetoDecision::Continue)) => continue,
+                    Ok(Reply::Veto(VetoDecision::Deny(reason))) => reason,
+                    Err(reason) => format!("veto failed closed: {reason}"),
+                    Ok(_) => "veto failed closed: invalid callback reply".into(),
+                };
+                session.audit.event(
+                    Kind::Decision,
+                    Some(&who),
+                    Some(Scope::Veto),
+                    Some(false),
+                    json!({"operation":"veto-deny","tool":name,"call_id":call}),
+                    "plugin veto denied the tool; reason is untrusted plugin content",
+                )?;
+                let mut output = ToolOutput::denied(&format!("plugin {id} veto: {reason}"));
+                output.content = self.wrap(&id, &output.content);
+                output.provenance = Some(Box::new(origin));
+                return Ok(Some(output));
+            }
+            Ok(None)
+        })
+    }
+
     fn dispatch_hooks(
         &mut self,
         session: &mut Session,
@@ -122,6 +215,66 @@ impl Registry {
         let deadline = timeout::deadline().map_or(deadline, |current| current.min(deadline));
         timeout::using(Some(deadline), || {
             let mut deliveries = 0;
+            let renderers: Vec<_> = self
+                .loaded
+                .iter()
+                .filter(|(_, loaded)| loaded.prepared.exports().contains(&PluginExport::Ui))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in renderers {
+                let label = Principal::Plugin(id.clone()).to_string();
+                if kind != HarnessKind::TurnStart && session.extensions.rendered.contains(&label) {
+                    continue;
+                }
+                session.extensions.rendered.insert(label);
+                if deliveries >= limit || Instant::now() >= deadline {
+                    break;
+                }
+                let who = Principal::Plugin(id.clone());
+                let call = self.next_call();
+                let request = Request::Hook {
+                    scope: Scope::Ui,
+                    operation: "render",
+                    channel: "ui",
+                    publisher: "saddle",
+                    name: "panel",
+                    data: "",
+                };
+                let decision = session.engine.decide(&who, &request);
+                session
+                    .audit
+                    .decision_for_call(&who, &request, &decision, &call)?;
+                if !decision.allow {
+                    continue;
+                }
+                deliveries += 1;
+                let prepared = self
+                    .loaded
+                    .get(&id)
+                    .context("renderer disappeared")?
+                    .prepared
+                    .clone();
+                let result = execute(prepared, session, Job::Render, &call)?;
+                let result = match result {
+                    Ok(Reply::Panel(Ok(value))) => {
+                        panel::validate(&who.to_string(), value, &session.setup.tool_limits)
+                    }
+                    Ok(Reply::Panel(Err(why))) | Err(why) => Err(why),
+                    Ok(_) => Err("invalid panel callback reply".into()),
+                };
+                if let Ok(value) = result {
+                    session.extensions.panels.insert(who.to_string(), value);
+                } else {
+                    session.audit.event(
+                        Kind::Decision,
+                        Some(&who),
+                        Some(Scope::Ui),
+                        Some(false),
+                        json!({"operation":"render-failed","call_id":call}),
+                        "plugin renderer failed; previous frame retained",
+                    )?;
+                }
+            }
             let targets: Vec<_> = self
                 .loaded
                 .iter()

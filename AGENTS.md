@@ -105,8 +105,14 @@ The observer export needs `transcript-read`; custom publication/subscription nee
 constructs harness events. Custom events carry host-assigned publisher identity, exact subscriptions,
 bounded queued delivery and the handler's own grants, never the publisher's. Hook-only plugins need
 no tool export. `plugins/hooks` owns dispatch; reload clears pending events and rebuilds registrations.
-The other hook scopes — `veto`, `ui`, `persist`, `model-invoke`, `context-contribute` — remain deferred,
-and the loader refuses a component that imports one by name.
+D156 adds separate typed `veto`, `context-contribute`, `persist`, `model-invoke` and `ui`
+interfaces. Vetoes only deny/abstain and fail closed; contributions append attributed branch items
+with same-plugin corrections; private transactional KV is isolated by workspace/plugin identity.
+Explicit model requests use host credentials and shared parent/plugin token and optional cost budgets;
+failed or unmetered requests retain reservations. UI panels use closed widgets in labelled host frames,
+not model messages, and rendering is read-only. `plugins/services` owns these host effects; the SDK's
+`examples/features.rs` exercises their separate APIs. Each requires its own runtime delegation and
+manifest ceiling. Reload preserves model spending and KV while clearing queued contributions/panels.
 Persistent instances and automatic updates remain deferred; no repository auto-loading or
 plugin-to-MCP adapter exists. MCP
 prompts, MCP resources, `codemode` and images in a tool result are refused rather than missing
@@ -146,7 +152,7 @@ one run. It queries only the active conversation branch, including pre-compactio
 three in-memory views:
 `messages(ordinal, id, role, text)`, `requests(ordinal, node, kind, provider, model, input,
 output, cache_read, cache_write, cached, cost, reasoning_dropped, reasoning_tokens, at, after)` —
-one row per model request, `kind` being `reply` or `summary`, `cached` 1 when the prompt came from
+one row per model request, `kind` being `reply`, `summary` or `plugin`, `cached` 1 when the prompt came from
 the provider's cache, `reasoning_dropped` the reasoning items the provider said it removed from the
 prompt (D97), `reasoning_tokens` how much of `output` was thinking (D99), and `after` the ordinal
 of the last message before it (D92, D94) — and `reasoning(ordinal, node,
@@ -390,7 +396,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D155 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D156 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

@@ -258,6 +258,7 @@ pub struct BudgetGrant {
     pub rule: RuleId,
     pub why: String,
     pub tokens_per_session: u64,
+    pub cost_per_session: Option<f64>,
 }
 
 /// One MCP server, and the tools of it the model may reach (D103). The server's own tool list is
@@ -545,6 +546,7 @@ struct RawMcp {
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct RawBudget {
     tokens_per_session: u64,
+    cost_per_session: Option<f64>,
     #[serde(default)]
     why: Option<String>,
 }
@@ -813,11 +815,20 @@ fn lower(who: &Principal, raw: RawGrants, roots: &Roots) -> Result<Grants, Polic
     }
 
     if let Some(b) = raw.model_invoke {
+        if b.cost_per_session
+            .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
+        {
+            return Err(PolicyError::Invalid {
+                at: "model-invoke.cost-per-session".into(),
+                msg: "must be finite and nonnegative".into(),
+            });
+        }
         let rule = RuleId::new(who, Scope::ModelInvoke, None);
         grants.model_invoke = Some(BudgetGrant {
             why: why(b.why),
             rule,
             tokens_per_session: b.tokens_per_session,
+            cost_per_session: b.cost_per_session,
         });
     }
 

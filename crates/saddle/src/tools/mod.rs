@@ -123,7 +123,10 @@ pub fn call(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutp
                 HarnessKind::ToolStart,
                 json!({"tool":name,"arguments":input}),
             )?;
-            let output = call_inner(session, name, input)?;
+            let output = match hooks::veto(session, name, input)? {
+                Some(denied) => denied,
+                None => call_inner(session, name, input)?,
+            };
             hooks::harness(
                 session,
                 HarnessKind::ToolEnd,

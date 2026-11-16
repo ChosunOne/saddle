@@ -23,5 +23,9 @@ crate-type = ["cdylib"]
 name = "event_listener"
 crate-type = ["cdylib"]
 
+[[example]]
+name = "features"
+crate-type = ["cdylib"]
+
 [lints]
 workspace = true

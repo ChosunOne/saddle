@@ -7,6 +7,9 @@ use crate::compact::Settings;
 use crate::config::Overrides;
 use crate::context;
 use crate::plugins::HostFailure;
+use crate::plugins::services::ModelUsage;
+use crate::plugins::services::panel::PanelView;
+use crate::provider::Contribution;
 use crate::provider::Image;
 use crate::provider::Price;
 use crate::provider::Quota;
@@ -380,7 +383,7 @@ fn work(
                 Ok(()) => {
                     // The prompt is sent with every request, so replacing its grants section is
                     // what tells the model (D47).
-                    agent.refresh_extensions(&session);
+                    agent.refresh_extensions(&session, &mut ChannelUi(events.clone()));
                     let _ = events.send(AgentEvent::Note(
                         "grants reloaded; the model is told on its next request".into(),
                     ));
@@ -403,7 +406,7 @@ fn work(
             // arriving rather than the next reply simply obeying a rule that appeared from nowhere.
             Command::Reload => {
                 match session.reload_policy() {
-                    Ok(()) => agent.refresh_extensions(&session),
+                    Ok(()) => agent.refresh_extensions(&session, &mut ChannelUi(events.clone())),
                     Err(error) if error.is::<HostFailure>() => {
                         let message = format!("{error:#}");
                         let _ = events.send(AgentEvent::Fatal(message.clone()));
@@ -681,6 +684,19 @@ impl Sink for ChannelUi {
 }
 
 impl Ui for ChannelUi {
+    fn contribution(&mut self, value: &Contribution) {
+        let _ = self.0.send(AgentEvent::Contribution(value.clone()));
+    }
+    fn panels(&mut self, panels: &[PanelView]) {
+        let _ = self.0.send(AgentEvent::Panels(panels.to_vec()));
+    }
+    fn plugin_usage(&mut self, used: &ModelUsage) {
+        let _ = self.0.send(AgentEvent::PluginUsage {
+            usage: used.usage,
+            cost: used.cost.unwrap_or(0.0),
+        });
+    }
+
     fn steered(&mut self, text: &str) {
         let _ = self.0.send(AgentEvent::Steered(text.to_owned()));
     }

@@ -658,7 +658,7 @@ fn line_turn(
             End::Answered
         } else if text == "/reload" {
             session.reload_policy()?;
-            agent.refresh_extensions(session);
+            agent.refresh_extensions(session, out);
             // Everything the prompt and the interface were built from, read again (D70). Skills and
             // instruction files reach the model on its next request; a newly added instruction file
             // is also handed to the conversation, so the transcript shows it arriving.

@@ -1,0 +1,11 @@
+package saddle:widgets@0.1.0;
+
+// Shared data only, with no functions or resources (D156).
+interface types {
+    enum style { text, muted, success, warning, error, emphasis }
+    record span { text: string, style: style }
+    record pair { key: string, value: string }
+    record progress { completed: u64, total: u64, label: string }
+    variant widget { text(list<span>), items(list<string>), key-value(list<pair>), progress(progress) }
+    record panel { title: string, widgets: list<widget> }
+}

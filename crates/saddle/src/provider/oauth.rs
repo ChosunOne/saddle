@@ -29,6 +29,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::tools::timeout;
+
 /// The OpenAI endpoints, as its own first-party clients use them (D85).
 ///
 /// The client id is ChatGPT's own published one for its CLI, and the login this uses is the device
@@ -747,7 +749,7 @@ pub fn refresh(flow: &Settings, tokens: &Tokens) -> Result<Tokens> {
 fn post_json(url: &str, body: &str) -> Result<(u16, String)> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(60)))
+        .timeout_global(Some(timeout::remaining(Duration::from_secs(60))?))
         .user_agent(concat!("saddle/", env!("CARGO_PKG_VERSION")))
         .build()
         .into();
@@ -790,7 +792,7 @@ fn post_form(url: &str, form: &[(String, String)]) -> Result<Tokens> {
         .join("&");
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(60)))
+        .timeout_global(Some(timeout::remaining(Duration::from_secs(60))?))
         .user_agent(concat!("saddle/", env!("CARGO_PKG_VERSION")))
         .build()
         .into();
@@ -858,6 +860,30 @@ mod tests {
     use super::*;
     use crate::auth::AuthStore;
     use std::path::PathBuf;
+    use std::time::Instant;
+
+    #[test]
+    fn token_requests_inherit_the_plugin_deadline() {
+        for form in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                thread::sleep(Duration::from_secs(30));
+                drop(stream);
+            });
+            let started = Instant::now();
+            let result = timeout::using(Some(started + Duration::from_millis(100)), || {
+                if form {
+                    post_form(&url, &[]).map(|_| ())
+                } else {
+                    post_json(&url, "{}").map(|_| ())
+                }
+            });
+            assert!(result.is_err());
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+    }
 
     fn flow() -> Settings {
         Flow {

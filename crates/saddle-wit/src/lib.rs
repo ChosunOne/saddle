@@ -20,3 +20,12 @@ pub mod events {
         world: "plugin-event-handler",
     });
 }
+
+/// pre-tool denial callbacks; no argument rewriting or authority granting (D156).
+pub mod veto {
+    wasmtime::component::bindgen!({ path: "wit", world: "veto-hook" });
+}
+/// read-only rendering callbacks (D156).
+pub mod ui {
+    wasmtime::component::bindgen!({ path: "wit", world: "ui-hook", with: { "saddle:widgets/types@0.1.0": crate::saddle::widgets::types } });
+}

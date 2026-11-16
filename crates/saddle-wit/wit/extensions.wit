@@ -1,0 +1,34 @@
+package saddle:host@0.1.0;
+
+interface context-contribute {
+    enum severity { information, warning, error }
+    record diagnostic { root: string, path: string, start-line: u32, end-line: u32, severity: severity, message: string }
+    variant body { note(string), diagnostic(diagnostic) }
+    record contribution { body: body, corrects: option<string> }
+    append: func(value: contribution) -> result<string, string>;
+}
+
+interface persist {
+    variant expectation { any, missing, value(list<u8>) }
+    record change { key: string, value: option<list<u8>>, expected: expectation }
+    get: func(key: string) -> result<option<list<u8>>, string>;
+    apply: func(changes: list<change>) -> result<bool, string>;
+}
+
+interface model-invoke {
+    enum role { user, assistant }
+    record message { role: role, text: string }
+    record request { instructions: string, messages: list<message>, max-output-tokens: u32 }
+    record usage { input: u64, output: u64, cache-read: u64, cache-write: u64, cost: option<f64> }
+    record reply { text: string, reasoning: string, model: string, usage: usage }
+    invoke: func(request: request) -> result<reply, string>;
+}
+
+interface ui {
+    use saddle:widgets/types@0.1.0.{panel};
+    publish: func(panel: panel) -> result<_, string>;
+    clear: func() -> result<_, string>;
+}
+
+world veto-hook { export saddle:plugin/veto@0.1.0; }
+world ui-hook { import saddle:widgets/types@0.1.0; export saddle:plugin/ui@0.1.0; }
