@@ -341,7 +341,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Some(Cmd::Check) => check(&cli.dir, &overrides),
+        Some(Cmd::Check) => check(&cli.dir, &overrides, &session),
         Some(Cmd::Tool { name, input }) => {
             tool(&cli.dir, &name, &input, &session, &paths, &overrides)
         }
@@ -657,7 +657,16 @@ fn line_turn(
             }
             End::Answered
         } else if text == "/reload" {
-            session.reload_policy()?;
+            match session.reload_policy() {
+                Err(error) if !error.is::<HostFailure>() => {
+                    out.info(&format!(
+                        "could not reload policy/plugins; previous setup retained: {error:#}"
+                    ));
+                    out.turn_end(&End::Failed);
+                    return Ok(End::Failed);
+                }
+                result => result?,
+            }
             agent.refresh_extensions(session, out);
             // Everything the prompt and the interface were built from, read again (D70). Skills and
             // instruction files reach the model on its next request; a newly added instruction file
@@ -1004,9 +1013,9 @@ fn session_cmd(cmd: SessionCmd, paths: &paths::Paths) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
+fn check(dir: &Path, overrides: &config::Overrides, id: &str) -> Result<ExitCode> {
     let tmp = PrivateTmp::create(&session_id())?;
-    let setup = Setup::load(dir, tmp.path(), overrides)?;
+    let setup = Setup::load_for_session(dir, tmp.path(), overrides, Some(id))?;
     // The layering happens in `Setup::load`, so an invalid project file is reported here rather
     // than on the first tool call.
     println!("workspace  {}", setup.workspace.display());
@@ -1096,9 +1105,15 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
         }
     }
     // A pattern is an input; this list is the authority a command actually runs under (D62).
-    if !setup.extras.include.is_empty() {
+    if !setup.extras.include.is_empty() || !setup.extras.read.is_empty() {
         println!("exec reads");
-        for path in &setup.extras.include {
+        for path in setup.extras.include.iter().chain(&setup.extras.read) {
+            println!("  {}", path.display());
+        }
+    }
+    if !setup.extras.write.is_empty() {
+        println!("exec writes explicit [sandbox] paths, in addition to granted roots");
+        for path in &setup.extras.write {
             println!("  {}", path.display());
         }
     }

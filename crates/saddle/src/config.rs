@@ -22,6 +22,8 @@
 //! # api-key-env = "LOCAL_KEY"          # omit when the server takes no key
 //! ```
 
+pub mod sandbox_overrides;
+
 use crate::defaults;
 use crate::mcp;
 use crate::paths;
@@ -416,8 +418,9 @@ pub fn edit(
         .with_context(|| format!("{}", path.display()))?;
     change(&mut doc)?;
     let out = doc.to_string();
-    toml::from_str::<UserConfig>(&out)
+    let config = toml::from_str::<UserConfig>(&out)
         .with_context(|| format!("the change would leave {} invalid", path.display()))?;
+    sandbox_overrides::validate_global(&config.sandbox)?;
     let dir = path.parent().context("config path has no parent")?;
     fs::create_dir_all(dir)?;
     let tmp = dir.join(".config.toml.tmp");
@@ -461,6 +464,8 @@ impl UserConfig {
             Err(e) if e.kind() == ErrorKind::NotFound => Self::default(),
             Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
         };
+        sandbox_overrides::validate_global(&config.sandbox)
+            .with_context(|| format!("{}", path.display()))?;
         standard::validate(&config.standard_tools)?;
         if config
             .plugins

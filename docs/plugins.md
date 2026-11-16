@@ -489,6 +489,51 @@ networking, event publication, contributions and model spending. Ordinary author
 line/JSON events; they are not model context or saved conversation items. Reload clears panels and
 rechecks current grants. Failed rendering retains the previous frame.
 
+## Session-only sandbox overrides (D157)
+
+Command paths normally come from the protected global `[sandbox]` settings. To add a cache for one
+session identity without replacing the inherited list, create a file at
+`$XDG_CONFIG_HOME/saddle/session-overrides/<session-id>.toml` (normally
+`~/.config/saddle/session-overrides/<session-id>.toml`):
+
+```toml
+workspace = "/home/me/source/project" # the exact canonical workspace path
+
+[sandbox]
+write = ["+~/.dylint_drivers"]
+```
+
+The intro prints the selected file; `saddle --session <id> check` also names it and prints resolved
+command paths. Edit it yourself and use `/reload`. A normal new session chooses a new id and does
+not load another id's file. Explicitly reusing an id reuses the file; removing it and reloading
+restores the global lists. The file stays yours—session close does not delete it. This is separate
+from persistent `policies/<workspace>.toml`, which still overrides resource grants, not sandbox paths.
+Session files require the matching `workspace` line and accept only `[sandbox] read` and `write`.
+
+List semantics are:
+
+| value | meaning |
+| --- | --- |
+| omitted | inherit the global list |
+| `["+~/cache", "-~/old-cache"]` | inherit, then add/remove paths in order |
+| `["~/cache"]` | replace the inherited list |
+| `[]` | replace with an empty list |
+
+Every path in a modifying list needs an operator. Mixing plain and prefixed entries is invalid.
+Prefixes in **global config** are invalid too: the global file has no inherited list. Errors refuse
+startup; a failed `/reload` reports the invalid configuration and keeps the entire previous setup.
+A table entry can put the operator on `path`, for example
+`read = [{ path = "+~/notes", tools = ["read"] }]`; ordinary tool-name checks and delegated D66 roles
+still apply. Symlinked override files/directories are refused so repository content cannot become
+configuration authority. State/config paths and their aliases remain forbidden.
+
+Subtraction removes matching explicit entries in that list; it is not a deny rule. Removing a child
+path cannot carve it out of another parent-directory claim, a default include rule or a policy root
+grant. These overrides do not change workspace/tmp grants, roots, credentials, plugin delegation or
+other global settings. A bare path remains command-only. Directories must exist before the kernel
+can grant access: create a new cache directory in your own terminal first, rather than granting its
+parent. Session-start/reload audits retain the source path/hash and effective explicit command lists.
+
 ## Runtime resource budgets (D145)
 
 Set `[tool-limits]` in protected config, then `/reload`; `saddle check` prints the resolved profile.

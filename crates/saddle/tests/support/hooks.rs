@@ -348,3 +348,151 @@ fn custom_only_listener_can_receive_without_transcript_or_publish_grants() {
             .any(|row| row["principal"] == "plugin.listener" && row["scope"] == "transcript-read")
     );
 }
+
+#[test]
+fn session_sandbox_overrides_enable_revoke_and_keep_invalid_reloads_atomic() {
+    let (base, seen) = serve(
+        (0..7)
+            .map(|_| sse_response(&openai_sse("done", &[])))
+            .collect(),
+    );
+    let env = Env::new(Api::Openai, &base);
+    configure(&env, "tool-read={tools=['read']}\n");
+    let external = tempfile::tempdir().unwrap();
+    let target = external.path().join("external.txt");
+    fs::write(&target, "session-only content").unwrap();
+    fs::write(env.ws.path().join("sample"), "workspace content").unwrap();
+    fs::write(env.ws.path().join(".env"), "excluded content").unwrap();
+    let config = env.xdg.path().join("config/saddle/config.toml");
+    let mut table: Table = fs::read_to_string(&config).unwrap().parse().unwrap();
+    table["agent"].as_table_mut().unwrap().insert(
+        "tool-read".into(),
+        TomlValue::try_from(json!({"tools":["read"]})).unwrap(),
+    );
+    // Keep the parent read role available without declaring the external directory yet.
+    table.insert(
+        "sandbox".into(),
+        TomlValue::try_from(json!({"read":[{"path":env.ws.path(),"tools":["read"]}]})).unwrap(),
+    );
+    fs::write(&config, toml::to_string(&table).unwrap()).unwrap();
+    let directory = config.parent().unwrap().join("session-overrides");
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("scoped.toml");
+    let override_text = format!(
+        "workspace={:?}\n[sandbox]\nread=[{{path={:?},tools=['read']}}]\n",
+        env.ws.path().canonicalize().unwrap().display().to_string(),
+        format!("+{}", external.path().display())
+    );
+    let mut child = env
+        .command(&["--session", "scoped", "run", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let wait = |count| {
+        let end = Instant::now() + Duration::from_secs(20);
+        while seen.lock().unwrap().len() < count {
+            assert!(Instant::now() < end, "waiting for request {count}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let output_file = env.ws.path().join("hook-output");
+    writeln!(child.stdin.as_mut().unwrap(), "sample").unwrap();
+    wait(1);
+    assert!(
+        fs::read_to_string(&output_file)
+            .unwrap_or_else(|error| panic!(
+                "{error}; audit: {:?}",
+                records(&env.audit_log())
+                    .into_iter()
+                    .filter(|row| row["allow"] == false)
+                    .collect::<Vec<_>>()
+            ))
+            .contains("workspace content")
+    );
+    fs::remove_file(&output_file).unwrap();
+    writeln!(child.stdin.as_mut().unwrap(), "{}", target.display()).unwrap();
+    wait(2);
+    assert!(!output_file.exists());
+    fs::write(&path, &override_text).unwrap();
+    writeln!(
+        child.stdin.as_mut().unwrap(),
+        "/reload\n{}",
+        target.display()
+    )
+    .unwrap();
+    wait(3);
+    assert!(
+        fs::read_to_string(&output_file)
+            .unwrap_or_else(|error| panic!(
+                "{error}; audit: {:?}",
+                records(&env.audit_log())
+                    .into_iter()
+                    .filter(|row| row["allow"] == false)
+                    .collect::<Vec<_>>()
+            ))
+            .contains("session-only content")
+    );
+    fs::remove_file(&output_file).unwrap();
+    assert_success(&env.saddle(&["--session", "other", "run", target.to_str().unwrap()]));
+    assert_eq!(seen.lock().unwrap().len(), 4);
+    assert!(!output_file.exists());
+    fs::write(
+        &path,
+        format!(
+            "workspace={:?}\n[sandbox]\nread=['+/one','/two']",
+            env.ws.path().display().to_string()
+        ),
+    )
+    .unwrap();
+    writeln!(
+        child.stdin.as_mut().unwrap(),
+        "/reload\n{}",
+        target.display()
+    )
+    .unwrap();
+    wait(5);
+    assert!(
+        fs::read_to_string(&output_file)
+            .unwrap_or_else(|error| panic!(
+                "{error}; audit: {:?}",
+                records(&env.audit_log())
+                    .into_iter()
+                    .filter(|row| row["allow"] == false)
+                    .collect::<Vec<_>>()
+            ))
+            .contains("session-only content")
+    );
+    fs::remove_file(&output_file).unwrap();
+    writeln!(child.stdin.as_mut().unwrap(), ".env").unwrap();
+    wait(6);
+    assert!(!output_file.exists());
+    fs::remove_file(&path).unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "/reload\n{}\n/quit",
+        target.display()
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output);
+    assert!(!output_file.exists());
+    assert!(text(&output.stdout).contains("cannot mix prefixed and unprefixed"));
+    assert_eq!(seen.lock().unwrap().len(), 7);
+    assert_eq!(
+        fs::read(
+            config
+                .parent()
+                .unwrap()
+                .join("plugins/hooks/component.wasm")
+        )
+        .unwrap(),
+        SDK_HOOKS
+    );
+    let rows = records(&env.audit_log());
+    assert!(
+        rows.iter()
+            .any(|row| row["args"]["sandbox-config"]["override"]["sha256"].is_string())
+    );
+}

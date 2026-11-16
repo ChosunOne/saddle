@@ -1,6 +1,9 @@
 //! End to end through the binary: the policy in force, decisions, reserved paths, the exec sandbox,
 //! network grants and the audit log, in a throwaway workspace with its own XDG directories.
 
+#[path = "support/sandbox_overrides.rs"]
+mod sandbox_override_tests;
+
 use std::fs;
 use std::fs::Permissions;
 use std::io::BufRead as _;

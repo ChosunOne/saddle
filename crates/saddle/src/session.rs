@@ -38,9 +38,10 @@ use saddle_cap::sandbox::SandboxExtras;
 use saddle_cap::{Location, PluginId, Policy, Principal, RootName, Roots, Scope, names_host};
 use saddle_policy::audit::sha256_hex;
 use saddle_policy::{AuditLog, Decision, Engine, Kind, Request, net_decision};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::config::UserConfig;
+use crate::config::sandbox_overrides::{self, Source as SandboxSource};
 use crate::fs_access;
 use crate::mcp::Transport;
 use crate::paths::{Paths, find_workspace};
@@ -93,6 +94,8 @@ pub fn roots_for_validation() -> Result<Roots> {
 /// Everything needed to parse the policy. `check` stops here; a session goes on to open the audit
 /// log.
 pub struct Setup {
+    pub session_id: Option<String>,
+    pub sandbox_override: Option<SandboxSource>,
     pub standard_tools: Profiles,
     pub tool_limits: Budgets,
     pub plugins: BTreeMap<PluginId, PluginEntry>,
@@ -119,7 +122,8 @@ pub struct Setup {
     /// This run's grant overrides, kept so a policy reload does not silently drop them (D63).
     pub overrides: Overrides,
     /// Directories the file tools may reach outside every root, and the tools allowed on each
-    /// (D66). From `[sandbox]` in the user's config only, so no workspace policy can add one.
+    /// (D66, D157). From protected global/session sandbox settings only; workspace policies cannot
+    /// declare these directories.
     pub tool_paths: Vec<ToolPath>,
     /// Whether and how many skills to look for (D64), read with the rest of the config.
     pub skills: SkillsConfig,
@@ -139,12 +143,21 @@ impl Setup {
     /// `tmp` is the directory to use as the `tmp` root. `overrides` are this run's `--grant` and
     /// `--revoke`, which are not stored (D63).
     pub fn load(start: &Path, tmp: &Path, overrides: &Overrides) -> Result<Self> {
+        Self::load_for_session(start, tmp, overrides, None)
+    }
+
+    pub fn load_for_session(
+        start: &Path,
+        tmp: &Path,
+        overrides: &Overrides,
+        id: Option<&str>,
+    ) -> Result<Self> {
         let paths = Paths::from_env()?;
         let start = start
             .canonicalize()
             .with_context(|| format!("{}", start.display()))?;
         let workspace = find_workspace(&start);
-        let user = UserConfig::load(&paths.user_config())?;
+        let mut user = UserConfig::load(&paths.user_config())?;
         // Reported before a root is resolved: this is a warning, not a rule about workspaces (D60).
         let exposed = paths::exposed(&workspace, &paths::sensitive_dirs());
 
@@ -154,6 +167,9 @@ impl Setup {
         ];
         entries.extend(user.root_entries()?);
         let roots = Roots::resolve(entries, &paths.protected())?;
+        let sandbox_override = id
+            .map(|id| sandbox_overrides::apply(&mut user, &paths, &roots, &workspace, id))
+            .transpose()?;
         // The include rules are enumerated here, where the protected directories are known, so
         // what a child may reach is a list rather than a pattern (D62).
         let (extras, tool_paths) = user.sandbox_extras(&roots, &paths.protected())?;
@@ -162,7 +178,17 @@ impl Setup {
         // scopes it names (D63). Both live outside every root, protected by the kernel (D42).
         let config_path = paths.user_config();
         let mut notes = Vec::new();
-        let user = UserConfig::load(&config_path)?;
+        if let Some(source) = &sandbox_override {
+            notes.push(format!(
+                "session sandbox overrides: {} ({})",
+                source.path.display(),
+                if source.sha256.is_some() {
+                    "loaded"
+                } else {
+                    "not present"
+                }
+            ));
+        }
         let skills_cfg = user.skills.clone();
         let context_cfg = user.context.clone();
         // This workspace's own grants are their own file (D63), so a directory's authority is
@@ -325,6 +351,8 @@ impl Setup {
             .as_bytes(),
         );
         Ok(Self {
+            session_id: id.map(str::to_owned),
+            sandbox_override,
             standard_tools: user.standard_tools,
             tool_limits: user.tool_limits,
             plugins: user.plugins,
@@ -348,6 +376,11 @@ impl Setup {
             skills: skills_cfg,
             context: context_cfg,
         })
+    }
+
+    /// resolved explicit command paths and their protected session source (D157).
+    pub fn sandbox_audit(&self) -> Value {
+        json!({"read":self.extras.read,"write":self.extras.write,"tool_paths":self.tool_paths.iter().map(|entry|json!({"path":entry.dir,"tools":entry.tools})).collect::<Vec<_>>(),"override":self.sandbox_override.as_ref().map(|source|json!({"path":source.path,"sha256":source.sha256}))})
     }
 
     pub fn parse_policy(&self) -> Result<Policy> {
@@ -562,7 +595,7 @@ impl Session {
         let id = id.map(str::to_owned).unwrap_or_else(session_id);
         let run = format!("{id}-{}", session_id());
         let tmp = PrivateTmp::create(&run)?;
-        let setup = Setup::load(start, tmp.path(), overrides)?;
+        let setup = Setup::load_for_session(start, tmp.path(), overrides, Some(&id))?;
         let policy = setup.parse_policy()?;
         let sandbox = saddle_sandbox::availability();
 
@@ -584,6 +617,7 @@ impl Session {
                     "path": setup.policy_path,
                     "sha256": setup.policy_sha256,
                 },
+                "sandbox-config": setup.sandbox_audit(),
                 "sandbox": match &sandbox { Ok(abi) => json!({ "landlock-abi": abi }), Err(e) => json!({ "unavailable": e }) },
             }),
             "session opened",
@@ -671,7 +705,12 @@ impl Session {
     /// reloads grants and plugins without resetting model spending (D47, D129). Invalid settings
     /// leave the previous configuration in force; a host/audit failure after replacement is fatal.
     pub fn reload_policy(&mut self) -> Result<()> {
-        let fresh = Setup::load(&self.setup.start, self._tmp.path(), &self.setup.overrides)?;
+        let fresh = Setup::load_for_session(
+            &self.setup.start,
+            self._tmp.path(),
+            &self.setup.overrides,
+            self.setup.session_id.as_deref(),
+        )?;
         let policy = fresh.parse_policy()?;
         let file_roots = fresh
             .roots
@@ -695,6 +734,7 @@ impl Session {
                 None,
                 None,
                 json!({
+                    "sandbox-config": self.setup.sandbox_audit(),
                     "policy": {
                         "path": self.setup.policy_path,
                         "sha256": self.setup.policy_sha256,
@@ -785,7 +825,7 @@ impl Session {
                 };
                 let loc = Location::new(root.name.clone(), rel);
                 let explanation = format!(
-                    "`{tool}` on {} is allowed by config.toml [sandbox]",
+                    "`{tool}` on {} is allowed by protected [sandbox] settings",
                     root.written
                 );
                 self.audit
@@ -801,7 +841,7 @@ impl Session {
                 return Ok(Ok(loc));
             }
             let explanation = format!(
-                "`{tool}` is not one of the tools config.toml allows on {} ({})",
+                "`{tool}` is not one of the tools protected [sandbox] settings allow on {} ({})",
                 root.written,
                 root.tools.join(", ")
             );

@@ -3635,6 +3635,38 @@ spending and stored KV data; branch changes rebuild correction ownership. Fatal 
 never run another callback. Persistent Wasm instances, input widgets and independent compilation
 isolation remain deferred.
 
+**D157.** Sandbox path lists can be overridden for one session identity without copying the base.
+The source is `$XDG_CONFIG_HOME/saddle/session-overrides/<session-id>.toml`, never a repository file
+or a workspace grants file. It must name the canonical `workspace` it governs and accepts only a
+`[sandbox]` table with `read` and `write`. No roots, providers, plugin ceilings, grants or include
+rules come from this file. The source is opened beneath a pinned protected config directory with
+no-follow traversal; a symlinked file or intermediate directory is refused. A missing file inherits
+all settings, and a normal new session has a new id. Explicitly reusing an id reuses its override;
+Saddle never deletes a person's config file on close.
+
+- An absent list inherits the global list. A plain list, including `[]`, replaces that list.
+- A list whose paths all start with `+` or `-` starts from the global list and applies those operations
+  in order. `+path` adds a claim, `-path` removes all matching explicit claims in that list; a missing
+  removal is a no-op. Paths are resolved through the ordinary sandbox validator, and removal matches
+  normalized/canonical locations, not just spelling. Table entries use the prefix on their `path`;
+  the normal D66 validator and role union still apply. There is no second `write-append` key.
+- Mixing prefixed and plain paths is invalid, as is an empty operator. Operators in the global
+  config are invalid because there is no inherited list there. Startup reports invalid configuration;
+  reload reports the error and retains the entire previous setup rather than applying a partial list.
+- These are list operations, not deny rules: subtraction does not carve a hole in another parent
+  directory claim, an include rule or the workspace/tmp grants. Other global settings and resource
+  grants are unchanged. Paths remain command-only unless a D66 tool role is explicitly declared and
+  operationally delegated. No toolchain/cache path becomes a root nameable by a policy.
+- This extends D66's protected configuration sources with a session-specific file, not with sandbox
+  tables in workspace policies. D16's config/state protection and D23 reservations are unchanged.
+  Additions and replacements are checked against protected paths, including their resolved aliases.
+  Configured directories must already exist for the kernel to grant access; the host never grants
+  a parent merely to create a missing cache directory.
+- `check --session <id>` and the session intro name the selected file, even when absent. `/reload`
+  re-reads the same identity's file against the current global base; deleting it restores inheritance.
+  Session-start/reload audit records include the source path/hash and resolved explicit read/write
+  lists. Ordinary file/exec effects still use the existing engine, delegation and sandbox lowering.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
