@@ -77,6 +77,7 @@ pub const NAMES: &[&str] = &[
     "websearch",
     "session_query",
     "tool_search",
+    "config_help",
 ];
 
 /// The tools as the model sees them. The descriptions say when to use each one.
@@ -151,13 +152,15 @@ pub fn call(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutp
 
 fn call_inner(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutput> {
     match name {
-        name if NAMES.contains(&name) && name != "tool_search" => {
+        // `tool_search` is the one name that is the host's rather than a component's: it declares
+        // what a granted MCP server offers, and decides nothing (D108).
+        "tool_search" => tool_search::search(session, input),
+        name if NAMES.contains(&name) => {
             let mut registry = mem::take(&mut session.plugins);
             let out = registry.call(session, name, input);
             session.plugins = registry;
             out
         }
-        "tool_search" => tool_search::search(session, input),
         _ if name.starts_with(plugins::PREFIX) => {
             let mut registry = mem::take(&mut session.plugins);
             let out = registry.call(session, name, input);

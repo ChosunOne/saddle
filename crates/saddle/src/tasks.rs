@@ -4,7 +4,7 @@ use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use saddle_cap::{Principal, RootName, Scope};
@@ -30,6 +30,10 @@ struct Task {
     worker: Option<JoinHandle<Result<Completed>>>,
     bridge: Option<Bridge>,
     output: Option<Reply>,
+    /// When the command was started, and when its reply landed (D172). The transcript times it from
+    /// these rather than from when it first drew the task.
+    started: Instant,
+    stopped: Option<Instant>,
     denials: Vec<String>,
     announced: bool,
     shown: bool,
@@ -76,6 +80,33 @@ pub struct View {
     pub id: String,
     pub call: Option<String>,
     pub state: State,
+    /// When it started, and when it stopped: a running task's elapsed time is measured from the
+    /// first, not from when the interface first saw it (D172).
+    pub started: Instant,
+    pub stopped: Option<Instant>,
+}
+
+impl View {
+    /// How long the command has been running, or did run (D172).
+    pub fn elapsed(&self, now: Instant) -> Duration {
+        self.stopped
+            .unwrap_or(now)
+            .saturating_duration_since(self.started)
+    }
+}
+
+/// `0.4s`, `12s`, `1m 05s`, `1h 02m`: a duration as a person reads a stopwatch (D172).
+pub fn elapsed_text(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if elapsed.as_secs_f64() < 10.0 {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    } else if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {:02}m", seconds / 3600, seconds % 3600 / 60)
+    }
 }
 
 #[derive(Default)]
@@ -103,6 +134,8 @@ impl Tasks {
             .map(|task| View {
                 id: task.id.clone(),
                 call: task.ui_call.clone(),
+                started: task.started,
+                stopped: task.stopped,
                 state: match &task.output {
                     None => State::Running,
                     Some(output) if output.timed_out => State::TimedOut,
@@ -193,6 +226,7 @@ pub fn service(session: &mut Session) -> Result<()> {
                     completed,
                     mem::take(&mut task.denials),
                 )?);
+                task.stopped = Some(Instant::now());
             }
         }
         Ok(())
@@ -269,6 +303,8 @@ pub fn start(
         .context("starting task monitor")?;
     let task = Task {
         ui_call: None,
+        started: Instant::now(),
+        stopped: None,
         id,
         owner: who.clone(),
         call: call.into(),
@@ -418,16 +454,61 @@ pub fn human(session: &mut Session, argument: &str) -> Result<String> {
         .iter()
         .map(|task| {
             format!(
-                "{}  {}  {}",
+                "{}  {}  {}  {}",
                 task.id,
                 task.owner,
                 if task.worker.is_some() {
                     "running"
                 } else {
                     "finished"
-                }
+                },
+                elapsed_text(
+                    task.stopped
+                        .unwrap_or_else(Instant::now)
+                        .saturating_duration_since(task.started)
+                )
             )
         })
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_duration_reads_as_a_stopwatch() {
+        assert_eq!(elapsed_text(Duration::from_millis(400)), "0.4s");
+        assert_eq!(elapsed_text(Duration::from_secs(9)), "9.0s");
+        assert_eq!(elapsed_text(Duration::from_secs(10)), "10s");
+        assert_eq!(elapsed_text(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(elapsed_text(Duration::from_secs(3725)), "1h 02m");
+    }
+
+    #[test]
+    fn a_running_task_is_timed_against_the_frame_and_a_finished_one_keeps_its_total() {
+        let now = Instant::now();
+        let started = now - Duration::from_secs(4);
+        let running = View {
+            id: "task-1".into(),
+            call: None,
+            state: State::Running,
+            started,
+            stopped: None,
+        };
+        assert_eq!(running.elapsed(now), Duration::from_secs(4));
+        assert_eq!(running.elapsed(now + Duration::from_secs(1)).as_secs(), 5);
+        let finished = View {
+            state: State::Succeeded,
+            stopped: Some(started + Duration::from_secs(3)),
+            ..running
+        };
+        // A finished task shows how long it ran, not how long ago it finished.
+        assert_eq!(finished.elapsed(now), Duration::from_secs(3));
+        assert_eq!(
+            finished.elapsed(now + Duration::from_secs(60)),
+            Duration::from_secs(3)
+        );
+    }
 }

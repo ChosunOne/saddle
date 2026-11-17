@@ -468,6 +468,7 @@ fn tool_loop(api: Api) {
         [
             "tool_search",
             "bash",
+            "config_help",
             "edit",
             "find",
             "grep",
@@ -3205,4 +3206,67 @@ fs-read = [{ root = "workspace", exclude = [".env*"], why = "reads the repo" }]
         ),
         "{saved}"
     );
+}
+
+/// D170: `!cmd` shares the command and its output as one user message. It goes to the model and to
+/// the saved conversation without the host's `plugin-output` frame, which belongs on a tool result
+/// rather than on a prompt, and a resumed transcript reads the shape back as the block the run drew.
+#[test]
+fn a_shared_bang_command_carries_no_plugin_frame() {
+    let api = Api::Openai;
+    let (base, seen) = serve(vec![sse_response(&api.reply("noted", &[]))]);
+    let env = Env::new(api, &base);
+    let mut child = env
+        .command(&["run"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"!printf shared-marker\nand then this\n/exit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+
+    // What the model was sent: the command on its `$ ` line, its output, and no delimiter.
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let mut sent = String::new();
+    strings(&seen[0].body, &mut sent);
+    // The tool descriptions are framed, so the frame's absence is checked on the user turn itself.
+    let start = sent
+        .find("I ran a command in the workspace:")
+        .unwrap_or_else(|| panic!("{sent}"));
+    let turn = &sent[start..];
+    let end = turn
+        .find("and then this")
+        .expect("the next prompt follows it");
+    assert!(turn[..end].contains("$ printf shared-marker"), "{turn}");
+    assert!(turn[..end].contains("shared-marker"), "{turn}");
+    assert!(!turn[..end].contains("<plugin-output-"), "{}", &turn[..end]);
+
+    // What was saved: the same message, which is what a resume reads back.
+    let conn = Connection::open(env.xdg.path().join("state/saddle/sessions.db")).unwrap();
+    let saved: Vec<String> = conn
+        .prepare("SELECT body FROM nodes WHERE kind = 'item'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let shared = saved
+        .iter()
+        .find(|body| body.contains("shared-marker"))
+        .unwrap_or_else(|| panic!("{saved:?}"));
+    assert!(
+        shared.contains("I ran a command in the workspace:\\n$ printf shared-marker\\n"),
+        "{shared}"
+    );
+    assert!(!shared.contains("<plugin-output-"), "{shared}");
+    // It is a prompt, not a tool result: the model sees a user turn (D170).
+    assert!(shared.starts_with("{\"user\":"), "{shared}");
 }

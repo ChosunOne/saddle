@@ -7,9 +7,10 @@ shipped standard tools and MCP; the loader, canonical WIT and SDK are separate l
 `docs/plan.md` is the specification; read it before changing behaviour in the policy, sandbox or tool
 layer.
 
-There is no README. `docs/plan.md` is the design document, the rationale and the milestone list, and
+There is no README. `docs/plan.md` is the design document, the rationale and the milestone list,
 `docs/plugins.md` is the tool surface a person uses: the delegation table, the budgets, the mutation
-contracts and how to build and install a third-party component.
+contracts and how to build and install a third-party component, and `docs/settings.md` is the
+configuration reference a person edits by hand and `config_help` returns to any session (D171).
 
 This file is one of the instruction files saddle loads into its own prompt (the workspace root
 `AGENTS.md`; `crates/saddle/src/context.rs`, D32). Keep it accurate — a stale instruction file is worse than none,
@@ -26,7 +27,7 @@ because it is followed.
 | `crates/saddle-wit` | canonical read-tool WIT and generated host bindings (D127) |
 | `crates/saddle-loader` | actual component inspection, bounded delegation, typed checked-import binding with exhaustive adapters (D150), fresh bounded instances and a narrow host-services trait, without a dependency on the binary's session (D126, D127) |
 | `crates/saddle-sdk` | guest bindings generated from the same WIT, so a guest can call only the host services it imports; no `std::fs` authority, no ambient filesystem or socket (D12, D127, D140) |
-| `crates/saddle-tools` | standard guest tools: text/image reads, pagination, listing, traversal/search, transcript queries, write/edit/patch, shell and HTTP/search workflows; uses runtime-gated SDK services, not native filesystem/database access. Mutations and reads cover policy roots and delegated D66 directories; guests emit minimal human-only hunks and guarded preimages (D131–D147) |
+| `crates/saddle-tools` | standard guest tools: text/image reads, pagination, listing, traversal/search, transcript queries, write/edit/patch, shell and HTTP/search workflows, and the configuration reference compiled from `docs/settings.md` (D171); uses runtime-gated SDK services, not native filesystem/database access. Mutations and reads cover policy roots and delegated D66 directories; guests emit minimal human-only hunks and guarded preimages (D131–D147) |
 | `crates/saddle-ignore` | authority-free ignore-file parsing, shared by skill discovery, the editor's file-name completion and the guest search components (D68, D133) |
 | `crates/saddle-sandbox` | applies a sandbox spec to the current process and execs the target, including the command's own network namespace and the relay in it (D79); starts a long-lived child whose stdin and stdout belong to the caller, with the spec on fd 3 (D106); also builds the `saddle-sandbox` helper binary used by its own tests |
 | `crates/saddle` | the binary: tool dispatch, model providers, the model loop, the TUI |
@@ -70,9 +71,12 @@ intercepts `__sandbox` before clap parses anything — that is the helper proces
 first in `main`.
 
 The ordinary tool names are `read`, `write`, `edit`, `patch`, `ls`, `find`, `grep`, `bash`, `fetch`,
-`websearch` and `session_query` (`tools::NAMES`); each runs a shipped WASI component chosen by the
-protected `[standard-tools]` table, and the binary holds no native implementation of any of them
-(D146, D147). The twelfth name, `tool_search`, is host MCP discovery rather than a component.
+`websearch`, `session_query` and `config_help` (`tools::NAMES`); each runs a shipped WASI component
+chosen by the protected `[standard-tools]` table, and the binary holds no native implementation of any
+of them (D146, D147). `config_help` is `docs/settings.md` compiled into a guest that imports only the
+budgets snapshot, so its entry delegates no scope: `config_help = []` (D171). The one name that is
+the host's rather than a component's is `tool_search`, which is MCP discovery and decides nothing
+(D108).
 `patch` applies one apply-patch document across several files, deciding
 every path before writing any of them, and refuses the whole patch if one is denied (D56).
 `fetch` gets a URL that is already known and `websearch` finds one that is not: the request is carried
@@ -139,7 +143,8 @@ and remote MCP work cannot be guaranteed cancelled. Omission retains existing de
 `"list"` or `"cancel"` with `task_id` as appropriate (D153). The guest owns these workflows; the
 additive `exec-tasks` SDK service is bounded by the existing `exec` grant and isolates principals.
 D159 keeps running task launch blocks on the theme's pending background with a spinner and updates
-them from host state at completion. Interactive TUI/line-mode sessions start one normal follow-up
+them from host state at completion; a running `bash` call and each background task say how long they
+have been going, the first from the frame's clock and the second from its own start (D172). Interactive TUI/line-mode sessions start one normal follow-up
 turn for unconsumed completions from model tool calls when idle; active turns receive notices at
 safe request points. This may spend a model request, but idle ticks and consumed notices never do.
 Hook-only tasks do not trigger automatic model spending. Output still requires owning-tool access.
@@ -392,7 +397,7 @@ exists to prevent. Two concrete consequences worth restating, because they are t
   because a root is nameable by any workspace policy. Content the harness chooses — the global
   `AGENTS.md`, an attachment — is host-read with no root at all; a skill is not, since `read` loads
   it (D67).
-- No tool is privileged. The eleven ordinary ones run as bounded component principals, so each passes
+- No tool is privileged. The twelve ordinary ones run as bounded component principals, so each passes
   through the same engine, the same audit log, the same budgets and the same sandbox as a third-party
   plugin call (D17, D126, D139): a `[standard-tools]` entry selects a fixed shipped component and the
   operation scopes in it delegate the agent's current reach, never reach of their own. `ls`, `find` and
@@ -412,7 +417,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D160 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D171 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

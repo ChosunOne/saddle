@@ -24,6 +24,7 @@ const NAMES: &[&str] = &[
     "fetch",
     "websearch",
     "session_query",
+    "config_help",
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {

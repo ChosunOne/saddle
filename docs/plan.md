@@ -3406,7 +3406,7 @@ option offered by standard tool schemas. Publication still has D140's documented
 limits; this is not a filesystem-wide compare-and-swap transaction.
 
 **D147.** Standard-tool delivery is part of the executable, not runtime repository discovery or
-manual artifacts under `target`. `saddle-standard` builds the eleven guest sources with the same
+manual artifacts under `target`. `saddle-standard` builds the twelve guest sources with the same
 locked dependencies in an independent Cargo target directory, componentizes them and embeds both
 the raw components/digests and build-produced native Wasmtime artifacts. This requires the Rust
 `wasm32-unknown-unknown` target for developers/package builders, not end users. Cargo tracks SDK,
@@ -4182,6 +4182,84 @@ it, and one inside a line of text in cells of that line, on its baseline.
   already has, and nothing outside `/tree`. Adding another entry is a small change to this table
   when a second move earns one; a general layer is a feature with its own decisions, and this is
   not it.
+
+**D170.** A `!` command shares one user message, and a resume draws it as the block the run drew.
+- **Two commands, one grant.** `!cmd` runs under the same `exec` grant, sandbox and network as the
+  `bash` tool (D19, D79), because it is the same command through the same component; `!!cmd` is the
+  same run with the output kept out of the conversation, which is what a person wants for a command
+  whose output is for their eyes. Nothing about `!` is a second path to a command.
+- **What sharing means.** With `!cmd` the conversation gains one user item: the sentence "I ran a
+  command in the workspace:", the command on a `$ ` line, then the output. It is a **user turn** and
+  not a tool result because no model call asked for it — the person did — and a fabricated tool
+  result would be a claim about a call that never happened.
+- **The output is the text a person sees, not the framed text.** A plugin result carries the host's
+  `<plugin-output-… plugin="…">` frame, which binds the content to the principal that produced it
+  (D25). Re-using that frame inside a prompt would be a delimiter no provenance backs: it tells the
+  model "tool output, authenticated" about a command the person typed. It is stripped before the
+  message is recorded (`ToolOutput::visible_content`), so the delimiters reach neither the saved
+  conversation, the request, nor a resume.
+- **A resume shows the block.** The live view draws a `bash` tool block for the run, and the saved
+  message is the one thing a resume has. It recognises the fixed shape — the sentence, then a `$ `
+  line — and draws the same block, so the same command does not look like two different things
+  depending on whether the session was resumed. A prompt that merely begins with the sentence does
+  not match, because the `$ ` line is part of the shape. A message saved before this decision has
+  the frame inside its output, and the reader drops it on the way in: the stored text is what the
+  model was sent and is not rewritten, and only the drawing is affected.
+- **The status is what the output says.** A saved message keeps no exit status of its own, so the
+  block's success is the `exit code 0` line the `bash` guest writes first (D131). It is presentation
+  only: what the model was told is the same text either way.
+- **No stored item type.** The item stays `Item::User`, so a replay is exactly what the model saw and
+  the store gains no variant every provider renderer would have to learn.
+
+**D171.** A session can read saddle's own configuration reference with `config_help`, and it is a
+shipped WASI component.
+- **The gap.** A session opened in someone else's project has no copy of saddle's documentation, so
+  "how do I configure this?" could only be answered from a model's memory of this repository — and a
+  confidently wrong `[sandbox]` key is worse than no answer. `docs/settings.md` is the reference, and
+  `config_help` returns it from every workspace.
+- **A component, not a host tool.** The obvious cheaper shape was a function in the binary, as
+  `tool_search` is. It is refused: the core is where the session's authority lives (path resolution,
+  the policy engine, the audit log, credentials), and a tool the core implements for a job that needs
+  none of that is native tool surface added for convenience — one more place where a mistake is a
+  host-level one. A guest that embeds the text cannot reach past what it was given, and the boundary
+  D146/D147 draws stays where it is: the core runs no ordinary tool.
+- **What it imports is nothing.** The reference is compiled in with `include_str!`, so the text is
+  the one in this build and cannot disagree with it; the guest imports the budgets snapshot, which
+  is ambient and carries no authority (D145, D150), and nothing else. Its `[standard-tools]` entry
+  therefore delegates no scope — `config_help = []` — which is also why it works in a workspace
+  where every grant has been revoked, and a test holds it to that.
+- **The machine-specific parts it keeps.** The budgets it prints are the ones this session is
+  running under, so a limit that is not its default is visible rather than assumed; the paths it
+  names are the documented `$XDG_CONFIG_HOME` ones, and `saddle check` prints their resolved forms,
+  because resolving them is the host's knowledge and the guest is not given it.
+- **Compiled in, so the schema and the file agree.** A test fails when the tool offers a section the
+  reference does not have, and when a section's body swallows the heading after it. Like every other
+  standard component, it runs only where the protected table selects it (`saddle tools --config`
+  prints the table, `saddle check` the selection), and an absent entry is a denial naming the
+  missing entry rather than a silent absence.
+- **It describes the files, and never reads them.** `config.toml` may carry an MCP header value or an
+  endpoint's own secret, and the whole point of the config and state directories being outside every
+  root is that nothing the agent runs can read them (D16, D42).
+
+**D172.** A `bash` call in flight and each background task carry an elapsed timer.
+- **One clock per frame.** `App::now` is advanced by the tick that already runs while anything is
+  working — the spinner's (D159) — so the number moves with the redraws the interface is doing
+  anyway rather than from a second timer, and a test sets "now" instead of sleeping.
+- **A call keeps its total.** The block is timed from the call to its answer, and the instant becomes
+  a duration on the answer: `· 12s` stays put under a finished command instead of a counter going on
+  under it. Nothing is written down, so the store gains no duration field and a resumed block shows
+  none — what was said is recorded, not how long it took.
+- **A background task is timed where it starts.** The session records when the task was started and
+  when its reply landed, and the view carries both, so a task started before this interface drew it
+  — or surviving a `/reload` — is still measured from its own start rather than from when a row first
+  appeared. `/tasks` prints the same numbers.
+- **Only a command is timed.** A `read`, `ls` or `grep` is a call into the session's own state that
+  takes milliseconds, and a number on every block is noise; `bash` is the call a person waits on and
+  the one that starts background work. The timer is a property of the tool's name, in one place.
+- **What it is not.** No total in the audit log, the saved conversation or the model's prompt; no
+  second source of state; no countdown or estimate. It is presentation of instants the host already
+  has, rounded as a stopwatch reads — tenths under ten seconds, then seconds, then `1m 05s` and
+  `1h 02m`.
 
 ## 4. Scope enumeration
 

@@ -1067,13 +1067,16 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
     }
     println!("standard tools explicit protected delegation; absent entries are disabled");
     for (name, scopes) in &setup.standard_tools {
+        let said = scopes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        // A tool that delegates nothing — the configuration reference — is present without a line
+        // of nothing after its colon.
         println!(
             "  {name}: {}",
-            scopes
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
+            if said.is_empty() { "no scopes" } else { &said }
         );
     }
     if setup.standard_tools.is_empty() {

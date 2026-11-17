@@ -1,10 +1,12 @@
 # WASI tools and plugins
 
-Saddle's eleven ordinary tools run shipped WASI components (D146–D147). There is no native fallback
-or native/plugin implementation picker. `tool_search` remains a host MCP catalogue operation.
-Filesystem effects, path resolution, permissions, audit, sandbox execution, HTTP/credentials and
-branch-only transcript SQL remain privileged core services. Guests own schemas, workflows, parsing,
-matching/traversal, pagination, minimal diffs and presentation.
+Saddle's twelve ordinary tools run shipped WASI components (D146–D147), including `config_help`,
+which returns the configuration reference compiled from `docs/settings.md` and imports only the
+budgets snapshot, so its profile delegates no scope (D171). There is no native fallback or
+native/plugin implementation picker, and `tool_search` is the one name that remains a host MCP
+catalogue operation. Filesystem effects, path resolution, permissions, audit, sandbox execution,
+HTTP/credentials and branch-only transcript SQL remain privileged core services. Guests own schemas,
+workflows, parsing, matching/traversal, pagination, minimal diffs and presentation.
 
 ## Using the shipped tools
 
@@ -38,6 +40,7 @@ bash = ["exec", "fs-read", "fs-write", "net"]
 fetch = ["net"]
 websearch = ["net"]
 session_query = ["transcript-read"]
+config_help = []                 # the reference: nothing to delegate
 ```
 
 Presence authorizes registration of that fixed shipped component only. Each listed operation scope

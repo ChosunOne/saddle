@@ -277,6 +277,7 @@ fn every_shipped_tool_accepts_the_optional_host_timeout_without_guest_schema_cha
             false,
         ),
         ("tool_search", serde_json::json!({"query":""}), true),
+        ("config_help", serde_json::json!({}), true),
     ] {
         input["timeout_secs"] = serde_json::json!(5);
         let (ok, text) = env.tool(name, input);
@@ -294,6 +295,37 @@ fn every_shipped_tool_accepts_the_optional_host_timeout_without_guest_schema_cha
     assert!(!ok && text.contains("positive integer"), "{text}");
     assert!(!env.path("never-created").exists());
     assert!(env.tool("read", serde_json::json!({"path":"README"})).0);
+}
+
+/// D171: the configuration reference is a shipped component with no reach at all, so it answers in a
+/// workspace whose grants allow nothing — which is also the evidence that it is not a host tool.
+#[test]
+fn config_help_answers_from_a_component_that_holds_no_authority() {
+    let env = ready();
+    let (ok, text) = env.tool("config_help", serde_json::json!({"section": "agent"}));
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("fs-read") && text.contains("transcript-read"),
+        "{text}"
+    );
+    let (ok, text) = env.tool("config_help", serde_json::json!({"section": "nonsense"}));
+    assert!(!ok && text.contains("the sections are:"), "{text}");
+
+    // Nothing granted, and it still answers: the guest imports the budgets snapshot and nothing
+    // that reaches a file, a host or another conversation.
+    env.edit_agent(toml::Table::clear);
+    let (ok, text) = env.tool("config_help", serde_json::json!({}));
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("## tool-limits") && text.contains("query-rows ="),
+        "{text}"
+    );
+    assert!(
+        text.contains("in force for this session"),
+        "the budgets it was given: {text}"
+    );
+    let (ok, text) = env.tool("read", serde_json::json!({"path": "README"}));
+    assert!(!ok && text.contains("denied:"), "{text}");
 }
 
 #[test]
@@ -439,7 +471,10 @@ fn shipped_tool_inventory_and_delegation_template_do_not_modify_existing_config(
     let template = env.saddle(&["tools", "--config"]);
     assert!(template.status.success(), "{}", stderr(&template));
     let config: toml::Table = String::from_utf8_lossy(&template.stdout).parse().unwrap();
-    assert_eq!(config["standard-tools"].as_table().unwrap().len(), 11);
+    assert_eq!(
+        config["standard-tools"].as_table().unwrap().len(),
+        saddle_standard::ARTIFACTS.len()
+    );
     assert_eq!(fs::read(env.policy_path()).unwrap(), before);
 }
 

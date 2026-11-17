@@ -1102,10 +1102,11 @@ impl Agent {
         }
         if share {
             self.start_turn(session, ui);
-            let shared = format!(
-                "I ran a command in the workspace:\n$ {command}\n{}",
-                limit(out.content)
-            );
+            // What joins the conversation is the output as a person sees it: the authenticated
+            // `plugin-output` frame is the host's marker on a tool result, and a user message is
+            // not one. Leaving it in put raw delimiters in the transcript and in the model's
+            // source (D170).
+            let shared = shell_shared(command, &limit(out.visible_content().to_owned()));
             self.record(Item::User(shared), ui);
         } else {
             ui.note("the output stays out of the conversation");
@@ -2085,6 +2086,56 @@ fn run_call(session: &mut Session, call: &ToolCall, ui: &mut dyn Ui) -> Result<T
     Ok(out)
 }
 
+/// The first line of what a shared `!` command becomes in the conversation (D170): the command on
+/// a `$ ` line, then the output. The shape is fixed so a resumed transcript can show the block the
+/// run showed rather than a prompt that happens to look like one.
+pub const SHELL_SHARED: &str = "I ran a command in the workspace:";
+
+fn shell_shared(command: &str, output: &str) -> String {
+    format!("{SHELL_SHARED}\n$ {command}\n{output}")
+}
+
+/// The command and its output from a shared `!` message, or `None` for any other prompt. A message
+/// saved before D170 carries the host's frame inside its output, so it is removed here too: what a
+/// transcript shows is the text.
+pub fn shared_shell(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix(SHELL_SHARED)?.strip_prefix("\n$ ")?;
+    let (command, output) = rest.split_once('\n').unwrap_or((rest, ""));
+    Some((command, without_frame(output)))
+}
+
+/// The text inside a `<plugin-output-… plugin="…">` frame, for a reader that has no provenance to
+/// authenticate it with and only wants to show what it holds (D25, D170). Anything that is not that
+/// exact shape is returned unchanged.
+fn without_frame(text: &str) -> &str {
+    let Some((header, body)) = text.split_once('\n') else {
+        return text;
+    };
+    let Some(rest) = header.strip_prefix("<plugin-output-") else {
+        return text;
+    };
+    let Some((nonce, _)) = rest
+        .strip_suffix('>')
+        .and_then(|rest| rest.split_once(" plugin="))
+    else {
+        return text;
+    };
+    if nonce.is_empty() || !nonce.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+        return text;
+    }
+    body.strip_suffix(&format!("\n</plugin-output-{nonce}>"))
+        .unwrap_or(text)
+}
+
+/// Whether a saved command succeeded, from the status line the `bash` guest writes first: the
+/// message keeps the output and nothing else, so the exit status it printed is what is left.
+pub fn shell_ok(output: &str) -> bool {
+    output
+        .lines()
+        .next()
+        .is_some_and(|line| line.trim() == "exit code 0")
+}
+
 fn limit(mut content: String) -> String {
     if content.is_empty() {
         return "(no output)".into();
@@ -2316,6 +2367,40 @@ mod tests {
     use crate::provider::ToolCall;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn a_shared_command_splits_back_into_the_command_and_its_output() {
+        let shared = shell_shared("cargo build", "exit code 0\n--- stdout ---\nok");
+        let (command, output) = shared_shell(&shared).expect("the shape it just wrote");
+        assert_eq!(command, "cargo build");
+        assert_eq!(output, "exit code 0\n--- stdout ---\nok");
+        assert!(shell_ok(output));
+        // A prompt that begins the same way is not the shape: the `$ ` line is part of it.
+        assert_eq!(shared_shell(SHELL_SHARED), None);
+        assert_eq!(
+            shared_shell("I ran a command in the workspace: yesterday"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_saved_command_written_before_d170_loses_its_frame_on_the_way_in() {
+        // The frame is the host's marker on a tool result (D25); one saved inside a prompt is shown
+        // as the text it holds, and anything not of that exact shape is left alone.
+        let framed = "<plugin-output-9f8e plugin=\"standard-bash\">\nexit code 1\n--- stdout ---\nno\n</plugin-output-9f8e>";
+        assert_eq!(without_frame(framed), "exit code 1\n--- stdout ---\nno");
+        let shared = format!("{SHELL_SHARED}\n$ false\n{framed}");
+        let (command, output) = shared_shell(&shared).expect("the shape");
+        assert_eq!(command, "false");
+        assert_eq!(output, "exit code 1\n--- stdout ---\nno");
+        assert!(!shell_ok(output));
+        assert_eq!(without_frame("exit code 0\nplain"), "exit code 0\nplain");
+        assert_eq!(
+            without_frame("<plugin-output-x plugin=\"a\">\ntext"),
+            "<plugin-output-x plugin=\"a\">\ntext",
+            "no closing delimiter"
+        );
+    }
 
     /// A `Ui` that remembers what it was told, for the tests that never reach a provider.
     #[derive(Default)]

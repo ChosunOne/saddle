@@ -61,5 +61,9 @@ crate-type = ["cdylib"]
 name = "websearch"
 crate-type = ["cdylib"]
 
+[[example]]
+name = "config_help"
+crate-type = ["cdylib"]
+
 [lints]
 workspace = true

@@ -32,6 +32,7 @@ bash = ["exec", "fs-read", "fs-write", "net"]
 fetch = ["net"]
 websearch = ["net"]
 session_query = ["transcript-read"]
+config_help = []
 "#;
 
 /// sdk compatibility fixture, built automatically alongside the standard tools.

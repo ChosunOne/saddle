@@ -1,6 +1,8 @@
 //! TUI state and input handling. Nothing here touches the terminal, so it is tested directly.
 
 use super::files;
+use crate::agent::shared_shell;
+use crate::agent::shell_ok;
 use crate::provider;
 use crate::provider::Image;
 use crate::provider::Quota;
@@ -349,6 +351,25 @@ pub enum NoteKind {
     Error,
 }
 
+/// How long a tool call has been going (D172): the instant it started, or, once it has answered,
+/// the duration it took. Frozen on the answer, so a finished block keeps its total instead of
+/// counting up for as long as it is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spent {
+    Running(Instant),
+    Took(Duration),
+}
+
+impl Spent {
+    /// How long it has run, or did run.
+    pub fn elapsed(self, now: Instant) -> Duration {
+        match self {
+            Self::Running(started) => now.saturating_duration_since(started),
+            Self::Took(took) => took,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
     User(String),
@@ -364,6 +385,9 @@ pub enum Entry {
         result: Option<(bool, String)>,
         /// The file change, for edit and write.
         diff: Option<String>,
+        /// How long the call has been running (D172). Only a `bash` call is timed, and a resumed
+        /// one shows none: the store keeps what was said, not how long it took.
+        spent: Option<Spent>,
     },
     Note(NoteKind, String),
     /// An image attached to the prompt above it (D58). Drawn where the terminal can, and as this
@@ -655,6 +679,9 @@ pub struct App {
     /// Tokens in the context at the last reply.
     pub context: u64,
     pub spinner: usize,
+    /// The frame's one clock, advanced by the tick that runs while something is working: a running
+    /// call's elapsed time is measured against this, so a redraw and a test agree on "now" (D172).
+    pub now: Instant,
     pub quit: bool,
     /// The /login dialog, drawn over everything else while open.
     pub login: Option<Login>,
@@ -769,6 +796,7 @@ impl App {
             quota: None,
             context: 0,
             spinner: 0,
+            now: Instant::now(),
             quit: false,
             login: None,
             resume: None,
@@ -939,6 +967,7 @@ impl App {
 
     pub fn tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
+        self.now = Instant::now();
     }
 
     /// Commands matching what is typed, while the editor holds only a command name: those that
@@ -1958,13 +1987,19 @@ impl App {
             AgentEvent::Note(s) => self.push(Entry::Note(NoteKind::Warn, display(&s))),
             AgentEvent::Call { id, name, detail } => {
                 self.busy = Some(Activity::Tool(display(&name)));
+                let name = display(&name);
+                // A command is the call whose duration a person is waiting on, and the one that can
+                // start background work; a file read that took 2 ms is not worth a number on every
+                // block (D172).
+                let spent = (name == "bash").then(|| Spent::Running(Instant::now()));
                 self.push(Entry::Tool {
                     id,
                     tasks: Vec::new(),
-                    name: display(&name),
+                    name,
                     detail: display(&detail),
                     result: None,
                     diff: None,
+                    spent,
                 });
             }
             AgentEvent::Result {
@@ -1983,9 +2018,21 @@ impl App {
                     .iter_mut()
                     .rposition(|e| matches!(e, Entry::Tool { result: None, .. }));
                 if let Some(i) = running {
-                    if let Entry::Tool { result, diff, .. } = &mut self.entries[i] {
+                    let now = Instant::now();
+                    if let Entry::Tool {
+                        result,
+                        diff,
+                        spent,
+                        ..
+                    } = &mut self.entries[i]
+                    {
                         *result = Some((ok, display(&content)));
                         *diff = change.as_deref().map(display);
+                        // The block keeps the total it took, rather than a timer that goes on
+                        // counting under a finished call (D172).
+                        *spent = Some(Spent::Took(
+                            spent.map_or(Duration::ZERO, |spent| spent.elapsed(now)),
+                        ));
                     }
                     self.cache[i] = None;
                 }
@@ -2197,7 +2244,22 @@ pub fn entries_from(items: &[Item]) -> Vec<Entry> {
             Item::Contribution(value) => {
                 out.push(Entry::Note(NoteKind::Plugin, contribution_text(value)))
             }
-            Item::User(text) => out.push(Entry::User(display(text))),
+            Item::User(text) => {
+                // A `!` command that was shared is a prompt carrying the run's output, and it
+                // comes back as the block the run showed rather than as prose (D170).
+                match shared_shell(text) {
+                    Some((command, output)) => out.push(Entry::Tool {
+                        id: String::new(),
+                        tasks: Vec::new(),
+                        name: "bash".into(),
+                        detail: format!("$ {command}"),
+                        result: Some((shell_ok(output), display(output))),
+                        diff: None,
+                        spent: None,
+                    }),
+                    None => out.push(Entry::User(display(text))),
+                }
+            }
             // A resumed conversation shows the prompt and what was attached to it (D58).
             Item::Attached { text, images } => {
                 out.push(Entry::User(display(text)));
@@ -2228,6 +2290,7 @@ pub fn entries_from(items: &[Item]) -> Vec<Entry> {
                                 detail: display(&call_detail(c)),
                                 result: found.map(|(ok, content, _)| (*ok, display(content))),
                                 diff: found.and_then(|(_, _, d)| d.map(display)),
+                                spent: None,
                             });
                         }
                         Part::Image(image) => {
@@ -3161,6 +3224,91 @@ mod tests {
     }
 
     #[test]
+    fn a_running_call_counts_up_and_keeps_its_total_once_it_answers() {
+        let mut a = app();
+        a.agent(AgentEvent::Call {
+            id: "c1".into(),
+            name: "bash".into(),
+            detail: "sleep 1".into(),
+        });
+        let Some(Entry::Tool {
+            spent: Some(Spent::Running(started)),
+            ..
+        }) = a.entries.last()
+        else {
+            panic!("a call in flight is timed");
+        };
+        // The frame's clock is what a running block is measured against, so a tick moves it.
+        let started = *started;
+        a.now = started + Duration::from_secs(3);
+        assert_eq!(
+            Spent::Running(started).elapsed(a.now),
+            Duration::from_secs(3)
+        );
+        a.agent(AgentEvent::Result {
+            ok: true,
+            content: "exit code 0".into(),
+            diff: None,
+            images: Vec::new(),
+        });
+        let Some(Entry::Tool {
+            spent: Some(Spent::Took(took)),
+            ..
+        }) = a.entries.last()
+        else {
+            panic!("an answered call keeps the time it took");
+        };
+        assert!(*took < Duration::from_secs(1), "{}", took.as_secs_f64());
+        // Whatever the clock does afterwards, the block no longer counts up.
+        let frozen = *took;
+        a.now += Duration::from_secs(60);
+        assert_eq!(Spent::Took(frozen).elapsed(a.now), frozen);
+    }
+
+    #[test]
+    fn a_resumed_shared_shell_command_is_the_block_the_run_drew() {
+        // What a `!` command leaves in the conversation is a prompt carrying the output (D170), and
+        // the transcript shows it as the block the run showed rather than as prose with a `$` line.
+        let items = [
+            Item::User(
+                "I ran a command in the workspace:\n$ printf hi\nexit code 0\n--- stdout ---\nhi"
+                    .into(),
+            ),
+            // One saved before D170 kept the host's frame in its output, which the block drops.
+            Item::User(
+                "I ran a command in the workspace:\n$ false\n<plugin-output-abc plugin=\"standard-bash\">\nexit code 1\n</plugin-output-abc>"
+                    .into(),
+            ),
+            // The sentence alone is not the shape: a person may type it, and stays a prompt.
+            Item::User("I ran a command in the workspace: yesterday".into()),
+        ];
+        assert_eq!(
+            entries_from(&items),
+            [
+                Entry::Tool {
+                    id: String::new(),
+                    tasks: Vec::new(),
+                    name: "bash".into(),
+                    detail: "$ printf hi".into(),
+                    result: Some((true, "exit code 0\n--- stdout ---\nhi".into())),
+                    diff: None,
+                    spent: None,
+                },
+                Entry::Tool {
+                    id: String::new(),
+                    tasks: Vec::new(),
+                    name: "bash".into(),
+                    detail: "$ false".into(),
+                    result: Some((false, "exit code 1".into())),
+                    diff: None,
+                    spent: None,
+                },
+                Entry::User("I ran a command in the workspace: yesterday".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn a_resumed_session_is_redrawn_from_its_items() {
         let items = vec![
             Item::User("fix it".into()),
@@ -3208,6 +3356,7 @@ mod tests {
                     detail: "src/x.rs".into(),
                     result: Some((true, "fn x() {}".into())),
                     diff: None,
+                    spent: None,
                 },
                 Entry::Assistant("Done.".into()),
             ]
@@ -3656,6 +3805,8 @@ mod tests {
             id: "task-host-id".into(),
             call: Some("launch".into()),
             state,
+            started: Instant::now(),
+            stopped: Some(Instant::now()),
         };
         a.agent(AgentEvent::Tasks(vec![view(TaskState::Running)]));
         a.agent(AgentEvent::TurnEnd(End::Answered));

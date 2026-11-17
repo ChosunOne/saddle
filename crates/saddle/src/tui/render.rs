@@ -3,6 +3,7 @@
 use crate::plugins::services::panel::{PanelView, Row as PanelRow, Tone};
 use crate::provider;
 use crate::provider::Image;
+use crate::tasks::elapsed_text as tasks_elapsed_text;
 use crate::tasks::{State as TaskState, View as TaskView};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::Frame;
@@ -15,7 +16,7 @@ use std::env;
 use std::iter;
 use std::mem;
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
@@ -1354,6 +1355,7 @@ fn background_block(
     bg: &mut Color,
     tasks: &[TaskView],
     spinner: usize,
+    now: Instant,
     theme: &Theme,
 ) {
     if tasks.is_empty() {
@@ -1381,8 +1383,14 @@ fn background_block(
             );
         }
         for task in tasks {
+            // Each task is timed from when it started, not from when the interface drew it (D172).
             row.spans.push(Span::styled(
-                format!("  [{}: {}]", task.id, task.state.label()),
+                format!(
+                    "  [{}: {} · {}]",
+                    task.id,
+                    task.state.label(),
+                    tasks_elapsed_text(task.elapsed(now))
+                ),
                 dim(theme),
             ));
         }
@@ -1396,10 +1404,12 @@ fn tool_block(
     detail: &str,
     result: Option<&(bool, String)>,
     diff: Option<&str>,
-    expand: bool,
-    spinner: usize,
+    view: &View,
+    // How long it has been running, or took once it answered (D172).
+    elapsed: Option<&str>,
     theme: &Theme,
 ) -> (Vec<Row>, Color) {
+    let (expand, spinner) = (view.expand, view.spinner);
     let bold = Style::new().add_modifier(Modifier::BOLD);
     // The tool's own name has a role of its own, so a theme can quiet the titles without touching
     // the accent everywhere else (D72).
@@ -1422,6 +1432,11 @@ fn tool_block(
         header.push(Span::styled(name.to_owned(), accent));
         header.push(Span::raw(" "));
         header.push(Span::styled(first, bold));
+    }
+    // A stopwatch beside the call: running while it works, and the total once it has answered, so a
+    // command that took a minute says so afterwards (D172).
+    if let Some(elapsed) = elapsed {
+        header.push(Span::styled(format!(" · {elapsed}"), dim(theme)));
     }
     let mut rows = vec![Row::plain(header)];
     let more: Vec<&str> = detail_lines.collect();
@@ -1644,18 +1659,20 @@ fn transcript_with_images(app: &mut App, width: u16) -> (Vec<Line<'static>>, Vec
                     detail,
                     result,
                     diff,
+                    spent,
                     ..
                 } => {
+                    let elapsed = spent.map(|spent| tasks_elapsed_text(spent.elapsed(app.now)));
                     let (mut rows, mut bg) = tool_block(
                         name,
                         detail,
                         result.as_ref(),
                         diff.as_deref(),
-                        view.expand,
-                        view.spinner,
+                        &view,
+                        elapsed.as_deref(),
                         &app.theme,
                     );
-                    background_block(&mut rows, &mut bg, tasks, view.spinner, &app.theme);
+                    background_block(&mut rows, &mut bg, tasks, view.spinner, app.now, &app.theme);
                     shaded(&rows, bg, width as usize)
                 }
                 Entry::Compaction(v) => {
@@ -3298,7 +3315,7 @@ mod tests {
     use crate::provider::Usage;
     use crate::store::{Point, PointKind, Summary};
     use crate::tui::app::{Action, Cell, Selection};
-    use crate::tui::app::{AgentEvent, Header};
+    use crate::tui::app::{AgentEvent, Header, Spent};
     use crate::tui::keys::Keys;
     use crate::tui::notify::Notify;
     use crate::tui::permissions::{Kind, Permissions, Row as PermissionRow};
@@ -3985,6 +4002,18 @@ mod tests {
         );
     }
 
+    /// Render options for a block drawn by a test: a width, and whether it is expanded.
+    fn view(expand: bool) -> View {
+        View {
+            expand,
+            thinking: false,
+            spinner: 0,
+            room: (80, image::MAX_ROWS),
+            images: false,
+            scale: 1.0,
+        }
+    }
+
     #[test]
     fn tool_blocks_show_the_call_and_the_useful_end_of_the_output() {
         let block = |name: &str, detail: &str, ok: bool, content: &str, expand: bool| {
@@ -3993,8 +4022,8 @@ mod tests {
                 detail,
                 Some(&(ok, content.into())),
                 None,
-                expand,
-                0,
+                &view(expand),
+                None,
                 &Theme::default(),
             );
             let lines: Vec<String> = rows.iter().flat_map(|r| text(&wrap(r, 80))).collect();
@@ -4033,15 +4062,23 @@ mod tests {
         let (lines, _) = block("write", "a.txt", true, "wrote 2 bytes to a.txt", false);
         assert_eq!(lines, ["write a.txt", "", "wrote 2 bytes to a.txt"]);
 
-        let (rows, bg) = tool_block("bash", "sleep 9", None, None, false, 0, &Theme::default());
+        let (rows, bg) = tool_block(
+            "bash",
+            "sleep 9",
+            None,
+            None,
+            &view(false),
+            None,
+            &Theme::default(),
+        );
         let diff = "~\n-12 old line\n+12 new line, long enough to wrap around\n 13 next\n";
         let (edit_rows, _) = tool_block(
             "edit",
             "src/x.rs",
             Some(&(true, "edited src/x.rs at line 12".into())),
             Some(diff),
-            false,
-            0,
+            &view(false),
+            None,
             &Theme::default(),
         );
         let shown: Vec<String> = edit_rows.iter().flat_map(|r| text(&wrap(r, 30))).collect();
@@ -4059,6 +4096,99 @@ mod tests {
         );
         assert_eq!(bg, Theme::default().tool_pending_bg);
         assert_eq!(text(&wrap(&rows[0], 80)), ["⠋ $ sleep 9"]);
+    }
+
+    #[test]
+    fn the_transcript_ticks_a_running_command_and_a_running_task_from_its_own_start() {
+        // The whole path, not just the block: the frame's clock times a call in flight (D172), and a
+        // task is timed from when the session started it, which may be before this interface drew a
+        // row for it.
+        let mut app = bare_app();
+        let now = Instant::now();
+        app.now = now;
+        app.agent(AgentEvent::Call {
+            id: "c1".into(),
+            name: "bash".into(),
+            detail: "sleep 9".into(),
+        });
+        if let Some(Entry::Tool { spent, .. }) = app.entries.last_mut() {
+            *spent = Some(Spent::Running(now - Duration::from_secs(5)));
+        }
+        let (lines, _) = transcript_with_images(&mut app, 80);
+        let shown = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
+        assert!(shown.contains("⠋ $ sleep 9 · 5.0s"), "{shown}");
+
+        // The launch answered, and the work it started is still going with its own timer.
+        app.agent(AgentEvent::Result {
+            ok: true,
+            content: "started task-1".into(),
+            diff: None,
+            images: Vec::new(),
+        });
+        app.agent(AgentEvent::Tasks(vec![TaskView {
+            id: "task-1".into(),
+            call: Some("c1".into()),
+            state: TaskState::Running,
+            started: now - Duration::from_secs(12),
+            stopped: None,
+        }]));
+        app.now = now;
+        let (lines, _) = transcript_with_images(&mut app, 120);
+        let shown = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
+        assert!(shown.contains("[task-1: running · 12s]"), "{shown}");
+        assert!(shown.contains("⠋ $ sleep 9"), "still pending: {shown}");
+
+        // Once it lands, the task keeps the time it ran rather than counting on.
+        app.agent(AgentEvent::Tasks(vec![TaskView {
+            id: "task-1".into(),
+            call: Some("c1".into()),
+            state: TaskState::Succeeded,
+            started: now - Duration::from_secs(12),
+            stopped: Some(now - Duration::from_secs(2)),
+        }]));
+        app.now = now + Duration::from_secs(30);
+        let (lines, _) = transcript_with_images(&mut app, 120);
+        let shown = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
+        assert!(shown.contains("[task-1: completed · 10s]"), "{shown}");
+    }
+
+    #[test]
+    fn a_call_in_flight_and_a_finished_one_both_show_how_long_it_took() {
+        // D172: the stopwatch sits after the call, on the header row, and the spinner still leads it
+        // while it runs.
+        let (rows, bg) = tool_block(
+            "bash",
+            "sleep 9",
+            None,
+            None,
+            &view(false),
+            Some("5.0s"),
+            &Theme::default(),
+        );
+        assert_eq!(text(&wrap(&rows[0], 80)), ["⠋ $ sleep 9 · 5.0s"]);
+        assert_eq!(bg, Theme::default().tool_pending_bg);
+        let (rows, bg) = tool_block(
+            "bash",
+            "cargo test",
+            Some(&(true, "exit code 0".into())),
+            None,
+            &view(false),
+            Some("1m 05s"),
+            &Theme::default(),
+        );
+        assert_eq!(text(&wrap(&rows[0], 80)), ["$ cargo test · 1m 05s"]);
+        assert_eq!(bg, Theme::default().tool_success_bg);
+        // A resumed call has no timing of its own, so it shows none.
+        let (rows, _) = tool_block(
+            "bash",
+            "cargo test",
+            Some(&(true, "exit code 0".into())),
+            None,
+            &view(false),
+            None,
+            &Theme::default(),
+        );
+        assert_eq!(text(&wrap(&rows[0], 80)), ["$ cargo test"]);
     }
 
     #[test]
@@ -5516,10 +5646,11 @@ mod tests {
                 "sleep 9",
                 Some(&(true, "launch succeeded".into())),
                 None,
-                false,
-                0,
+                &view(false),
+                None,
                 &theme,
             );
+            let now = Instant::now();
             background_block(
                 &mut rows,
                 &mut bg,
@@ -5527,12 +5658,18 @@ mod tests {
                     id: "task-host".into(),
                     call: Some("call".into()),
                     state,
+                    started: now - Duration::from_secs(5),
+                    stopped: Some(now - Duration::from_secs(3)),
                 }],
                 0,
+                now,
                 &theme,
             );
             assert_eq!(bg, expected);
-            assert!(text(&wrap(&rows[0], 200)).join(" ").contains(state.label()));
+            let line = text(&wrap(&rows[0], 200)).join(" ");
+            assert!(line.contains(state.label()), "{line}");
+            // Each task says how long it ran, from its own start to its own stop (D172).
+            assert!(line.contains("2.0s"), "{line}");
         }
     }
 }

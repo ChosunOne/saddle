@@ -1,0 +1,4 @@
+id = "reference"
+version = "0.1.0"
+component = "config_help.component.wasm"
+scopes = ["tool"]
