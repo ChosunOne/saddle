@@ -439,6 +439,9 @@ struct Markdown {
     pictures: bool,
     /// The formulas this block reserved rows for, in the order their markers appear.
     images: Vec<Formula>,
+    /// A fence tagged `typst-math` while its body is being collected: what is between the fences is
+    /// a formula in Typst's own notation, and it is read as maths rather than as markdown (D165).
+    math_block: Option<String>,
     /// `[ui] math-scale`, which is 1.0 unless someone asked for larger or smaller formulas (D165).
     scale: f32,
     /// Whether the last row pushed is the blank a block break asked for (D165).
@@ -465,6 +468,7 @@ impl Default for Markdown {
             base: Style::default(),
             pictures: false,
             images: Vec::new(),
+            math_block: None,
             // Not a type's zero: the size the fonts and the cell work out to is the default, and
             // zero would draw a formula half-size (D165).
             scale: 1.0,
@@ -550,7 +554,7 @@ impl Markdown {
     /// The rows are blank in the end, and the first of them carries a marker: the picture is placed
     /// at that row, so the layout and the drawing pass agree even though the rows around it are
     /// wrapped and counted later.
-    fn formula(&mut self, source: &str) {
+    fn formula(&mut self, source: &str, notation: math::Notation) {
         // A block break puts a blank row above the block, and a picture's ink starts at the very top
         // of its box: that row reads as a hole above a formula, where above a paragraph of text its
         // own line leading fills the same gap. A formula brings its own room — the padding inside
@@ -568,7 +572,12 @@ impl Markdown {
             scale: self.scale,
         };
         let formula = if self.pictures {
-            math::render(source, &room)
+            match notation {
+                // One reading, decided by how the formula was invoked: a `$…$` body is LaTeX and a
+                // fence tagged `typst-math` is Typst's own maths (D165).
+                math::Notation::Latex => math::render(source, &room),
+                math::Notation::Typst => math::render_typst(source, &room),
+            }
         } else {
             None
         };
@@ -579,17 +588,33 @@ impl Markdown {
             // what makes its source readable, and a row of text holds no line break at all —
             // `$$…$$` written on three lines came out on one, which is how a real transcript
             // showed it.
-            let style = self.code_style();
-            let lines: Vec<&str> = source
+            //
+            // LaTeX's source is marked with the delimiters it was written in, so it is read back as
+            // a formula where it is pasted; a fence's body is shown as the block of code it is,
+            // since a fence is what says "Typst" and the copy keeps the fence (D166).
+            let is_latex = notation == math::Notation::Latex;
+            let style = if is_latex {
+                self.code_style()
+            } else {
+                self.block_style()
+            };
+            let body = match is_latex {
+                true => source,
+                false => source.trim_end_matches(['\n', '\r']),
+            };
+            let lines: Vec<&str> = body
                 .split('\n')
                 .map(|line| line.trim_end_matches('\r'))
                 .collect();
             for (i, line) in lines.iter().enumerate() {
-                if i == 0 {
+                if i == 0 && is_latex {
                     self.line.push(Span::styled("$$", style));
                 }
+                if !is_latex {
+                    self.line.push(Span::styled("  ".to_owned(), style));
+                }
                 self.line.push(Span::styled((*line).to_owned(), style));
-                if i + 1 == lines.len() {
+                if i + 1 == lines.len() && is_latex {
                     self.line.push(Span::styled("$$", style));
                 }
                 self.flush();
@@ -679,6 +704,13 @@ impl Markdown {
                     self.flush();
                 }
             }
+            // A fence tagged `typst-math` holds a formula, and its body is taken as it is written:
+            // markdown inside maths would be read as emphasis, and a formula is not prose (D165).
+            Event::Text(t) if self.math_block.is_some() => {
+                if let Some(body) = &mut self.math_block {
+                    body.push_str(&t);
+                }
+            }
             Event::Text(t) => {
                 let style = self.style();
                 self.text(&t, style);
@@ -686,7 +718,7 @@ impl Markdown {
             Event::Code(t) => self.text(&t, self.code_style()),
             // A display formula is typeset and placed as a picture, and so is one inside a line:
             // both are drawn in the cells the layout reserves for them (D165).
-            Event::DisplayMath(t) => self.formula(&t),
+            Event::DisplayMath(t) => self.formula(&t, math::Notation::Latex),
             Event::InlineMath(t) => self.inline(&t),
             Event::SoftBreak | Event::HardBreak => self.flush(),
             Event::Rule => {
@@ -733,14 +765,23 @@ impl Markdown {
                 self.styles.push(style);
             }
             Tag::CodeBlock(kind) => {
-                self.start_block();
-                self.code = true;
-                self.lang = match kind {
+                let lang = match kind {
                     CodeBlockKind::Fenced(tag) => Language::parse(&tag),
                     // An indented block names no language, so there is nothing to look up.
                     CodeBlockKind::Indented => Language::Plain,
                 };
-                self.code_state = State::default();
+                self.start_block();
+                // The one fence tag that is not code: Typst's own maths, which is a formula rather
+                // than the highlighted text a language tag gives (D165). `typst` itself stays code,
+                // because a tag that meant both would leave the same body read as maths when it
+                // happens to parse and as code when it does not.
+                if matches!(&lang, Language::Tagged(tag) if tag == math::TYPST) {
+                    self.math_block = Some(String::new());
+                } else {
+                    self.code = true;
+                    self.lang = lang;
+                    self.code_state = State::default();
+                }
             }
             Tag::BlockQuote(_) => {
                 self.start_block();
@@ -810,13 +851,16 @@ impl Markdown {
                 self.flush();
                 self.blank_before_next_block = true;
             }
-            TagEnd::CodeBlock => {
-                self.code = false;
-                self.lang = Language::Plain;
-                self.code_state = State::default();
-                self.flush();
-                self.blank_before_next_block = true;
-            }
+            TagEnd::CodeBlock => match self.math_block.take() {
+                Some(body) => self.formula(&body, math::Notation::Typst),
+                None => {
+                    self.code = false;
+                    self.lang = Language::Plain;
+                    self.code_state = State::default();
+                    self.flush();
+                    self.blank_before_next_block = true;
+                }
+            },
             TagEnd::BlockQuote(_) => {
                 self.flush();
                 self.quote = self.quote.saturating_sub(1);
@@ -1630,11 +1674,14 @@ struct At {
     /// The picture, and the cells it is drawn in. An attachment states its own size; a formula's
     /// cells are the rows the layout reserved for it (D165).
     picture: Picture,
-    /// The TeX a formula was typeset from, which is what a copy of it takes (D166). Empty for a
-    /// picture an attachment brings, which has no source in the conversation.
+    /// The formula as it was written, which is what a copy of it takes (D166). Empty for a picture
+    /// an attachment brings, which has no source in the conversation.
     tex: String,
     /// Whether the formula sits inside a line: `$…$` when it is copied, `$$…$$` when it is a block.
     inline: bool,
+    /// Whether it was written in Typst's own notation, in which case a copy carries the fence that
+    /// asks for it rather than TeX's delimiters (D166).
+    typst: bool,
     /// The id the terminal knows it by: the entry's position gives it, so the same picture keeps
     /// the same id every frame and does not have to be re-sent (D59).
     id: u32,
@@ -1732,6 +1779,7 @@ fn transcript_with_images(app: &mut App, width: u16) -> (Vec<Line<'static>>, Vec
                 // An attachment has no source in the conversation: it *is* the content.
                 tex: String::new(),
                 inline: false,
+                typst: false,
                 id: picture_id(i, 0),
             });
         }
@@ -1775,6 +1823,7 @@ fn transcript_with_images(app: &mut App, width: u16) -> (Vec<Line<'static>>, Vec
                 column,
                 tex: image.source.clone(),
                 inline: image.inline,
+                typst: image.notation == math::Notation::Typst,
                 // The cells the formula says it occupies, asked for as a box: the terminal scales
                 // the picture into them, whatever its own pixels are (D165).
                 picture: Picture {
@@ -3258,6 +3307,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             rows: at.picture.cells.rows.max(1),
             cols: at.picture.cells.cols.max(1),
             inline: at.inline,
+            typst: at.typst,
             tex: at.tex.clone(),
         })
         .collect();
@@ -4902,6 +4952,88 @@ mod tests {
         // not there either.
         assert!(!text.contains("$$"), "{text:?}");
         assert_eq!(text.matches("x^2").count(), 1, "{text:?}");
+    }
+
+    #[test]
+    fn a_fence_that_says_typst_math_is_a_formula_and_a_plain_typst_fence_is_code() {
+        // D165: the same body cannot be both. `$…$` and `$$…$$` are LaTeX and only LaTeX, so the
+        // notation that would otherwise be read as six letters there has an invocation of its own —
+        // and a fence tagged `typst`, which is how Typst code is shown, stays code.
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Kitty;
+        app.entries.push(Entry::Assistant(
+            "the rule\n\n```typst-math\nfrac(a, b)\n```\n\nand\n\n```typst\nfrac(a, b)\n```\n"
+                .into(),
+        ));
+        app.cache.push(None);
+        let (lines, at) = transcript_with_images(&mut app, 80);
+        assert_eq!(at.len(), 1, "one fence is a formula");
+        let shown: Vec<String> = lines.iter().map(plain).collect();
+        assert_eq!(
+            shown.iter().filter(|l| l.contains("frac(a, b)")).count(),
+            1,
+            "the code block still shows the text it was written with: {shown:?}"
+        );
+        assert!(
+            shown
+                .iter()
+                .any(|l| l.starts_with("  ") && l.contains("frac(a, b)")),
+            "it is drawn as a code block, in the block's own colour and indent: {shown:?}"
+        );
+        assert!(
+            shown.iter().all(|l| !l.contains(math::TYPST)),
+            "the tag itself is markdown, not content: {shown:?}"
+        );
+    }
+
+    #[test]
+    fn a_typst_formula_that_cannot_be_typeset_is_shown_as_the_block_it_was_written_as() {
+        // D165: what cannot be drawn is drawn as its source. For a body in Typst's notation that
+        // source is a block of Typst, so that is what is shown — never the TeX delimiters of the
+        // other invocation, which would name a notation it was not written in.
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Kitty;
+        app.entries
+            .push(Entry::Assistant("```typst-math\nzzz qqq\n```\n".into()));
+        app.cache.push(None);
+        let (lines, at) = transcript_with_images(&mut app, 80);
+        assert!(at.is_empty(), "nothing was typeset, so nothing is placed");
+        let shown: Vec<String> = lines.iter().map(plain).collect();
+        assert!(
+            shown.iter().any(|l| l.trim_end() == "  zzz qqq"),
+            "{shown:?}"
+        );
+        assert!(
+            shown
+                .iter()
+                .all(|l| !l.contains("$$") && !l.contains("\\[")),
+            "not the other invocation's delimiters: {shown:?}"
+        );
+    }
+
+    #[test]
+    fn a_copy_of_a_typst_formula_is_the_fence_that_asks_for_it() {
+        // D166: a Typst body is not LaTeX, so copying it in TeX's delimiters would paste it back as
+        // letters. What travels with the copy is the invocation it was drawn from.
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Kitty;
+        app.entries.push(Entry::Assistant(
+            "so\n\n```typst-math\nfrac(a, b)\n```\n".into(),
+        ));
+        app.cache.push(None);
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let seen = app.seen.clone().expect("the transcript was drawn");
+        assert_eq!(seen.pictures.len(), 1, "{:?}", seen.pictures);
+        let last = seen.lines.len() - 1;
+        app.selection = Some(Selection {
+            anchor: Cell { line: 0, ch: 0 },
+            focus: Cell { line: last, ch: 60 },
+            dragging: false,
+        });
+        let text = app.selected_text().expect("a copy");
+        assert!(text.contains("```typst-math\nfrac(a, b)\n```"), "{text:?}");
+        assert!(!text.contains("\\["), "not TeX's delimiters: {text:?}");
     }
 
     #[test]

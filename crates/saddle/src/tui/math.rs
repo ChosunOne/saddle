@@ -9,10 +9,12 @@
 //! drawn that way is a picture of a picture.
 //!
 //! Both `$…$` spellings arrive already parsed from the markdown parser (`Options::ENABLE_MATH`).
-//! LaTeX's commands are translated to Typst's math syntax by [`latex`], so `\frac{a}{b}`,
-//! `\sqrt[3]{x}`, `\begin{pmatrix}…\end{pmatrix}` and `\alpha` all work, and the same text also
-//! passes through when it is already written the Typst way. A formula this front-end cannot
-//! translate is drawn as its source, never as something wrong.
+//! Their content is **LaTeX**, and only LaTeX: `\frac{a}{b}`, `\sqrt[3]{x}`,
+//! `\begin{pmatrix}…\end{pmatrix}` and `\alpha` are translated into Typst's math syntax by
+//! [`latex`], and a letter run is letters, as TeX sets it. Typst's own notation is a different
+//! invocation — a fence tagged `typst-math` — so no body is ever read as both languages and read
+//! the wrong way. A formula this front-end cannot translate is drawn as its source, never as
+//! something wrong.
 //!
 //! The size is derived from the terminal's own cell (D59): a line of maths is a shade larger than a
 //! line of text, so one image pixel is one screen pixel and the terminal never scales the picture.
@@ -148,6 +150,27 @@ impl Room {
     }
 }
 
+/// What a formula was written in, which is how it is read and how a copy of it is spelled (D166).
+///
+/// The two are separate notations and never the same text read twice: `$…$` and `$$…$$` are LaTeX
+/// and only LaTeX, while Typst's own maths arrives in a fence that says so. A body that read as
+/// either would be a body that can be read the wrong way, silently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Notation {
+    /// `$…$` in a sentence, `$$…$$` on its own line, `\(…\)` and `\[…\]`: LaTeX, translated by
+    /// [`latex`].
+    Latex,
+    /// A fence tagged [`TYPST`], whose body is Typst's own maths and is handed to the typesetter as
+    /// written.
+    Typst,
+}
+
+/// The fence tag that asks for a formula written the Typst way (D165).
+///
+/// Not `typst`, which is how a block of Typst *code* is tagged: the tag has to say maths, or the
+/// same block would be a formula when it happens to parse and code when it does not.
+pub const TYPST: &str = "typst-math";
+
 /// A typeset formula: the picture, and the cells of the transcript it is drawn in.
 ///
 /// The two are separate on purpose (D165). The cells are the size — the rows the layout reserves and
@@ -160,6 +183,8 @@ pub struct Formula {
     /// Whether the formula is drawn inside a line of text rather than as a block of its own: it is
     /// then one row tall, and it is placed on its row at a column instead of at the row's start.
     pub inline: bool,
+    /// What the source was written in, which decides the delimiters a copy of it gets (D166).
+    pub notation: Notation,
     /// The formula as it was written, which is what a copy of the picture takes: the picture is what
     /// is on screen, but the words are what goes in a paper (D166).
     ///
@@ -168,26 +193,53 @@ pub struct Formula {
     pub source: String,
 }
 
-/// Typesets one formula into a picture the transcript can place, or `None` when it cannot be
-/// typeset — in which case the caller draws the source (D165).
+/// Typesets one formula written in LaTeX — `$…$`, `$$…$$`, `\(…\)`, `\[…\]` — into a picture the
+/// transcript can place, or `None` when it cannot be typeset, in which case the caller draws the
+/// source (D165).
 pub fn render(source: &str, room: &Room) -> Option<Formula> {
     let body = latex(source)?;
+    place(&body, source, Notation::Latex, room, false)
+}
+
+/// Typesets one formula written the Typst way, which is what a fence tagged [`TYPST`] asks for
+/// (D165).
+///
+/// The body goes to the typesetter as written: there is nothing to translate, and no second reading
+/// of a body that LaTeX would also have accepted.
+pub fn render_typst(source: &str, room: &Room) -> Option<Formula> {
+    place(source.trim(), source, Notation::Typst, room, false)
+}
+
+/// One picture, drawn from a body and remembering where its words came from (D165, D166).
+fn place(
+    body: &str,
+    source: &str,
+    notation: Notation,
+    room: &Room,
+    inline: bool,
+) -> Option<Formula> {
     let key = (
-        body.clone(),
+        body.to_owned(),
         room.cell,
         room.cols,
         room.rows,
         room.colour,
         room.scale.to_bits(),
-        false,
+        inline,
     );
     if let Some(mut formula) = cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
         // The picture is shared between spellings; the words are not (D166).
         formula.source = source.to_owned();
+        formula.notation = notation;
         return Some(formula);
     }
-    let mut formula = typeset(&body, room)?;
+    let mut formula = if inline {
+        typeset_inline(body, room)?
+    } else {
+        typeset(body, room)?
+    };
     formula.source = source.to_owned();
+    formula.notation = notation;
     if let Ok(mut cache) = cache().lock() {
         // A transcript re-renders a message on every width change; a formula is a few kilobytes and
         // the map is bounded by the number of distinct formulas the session has shown.
@@ -248,6 +300,8 @@ fn typeset(body: &str, room: &Room) -> Option<Formula> {
     Some(Formula {
         cells,
         inline: false,
+        // Filled in by `place`, which is the one thing that knows where the words came from (D166).
+        notation: Notation::Latex,
         source: String::new(),
         image: Image {
             media_type: "image/png".to_owned(),
@@ -268,25 +322,7 @@ fn typeset(body: &str, room: &Room) -> Option<Formula> {
 /// refused instead when shrinking would leave it unreadable.
 pub fn render_inline(source: &str, room: &Room) -> Option<Formula> {
     let body = latex(source)?;
-    let key = (
-        body.clone(),
-        room.cell,
-        room.cols,
-        room.rows,
-        room.colour,
-        room.scale.to_bits(),
-        true,
-    );
-    if let Some(mut formula) = cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
-        formula.source = source.to_owned();
-        return Some(formula);
-    }
-    let mut formula = typeset_inline(&body, room)?;
-    formula.source = source.to_owned();
-    if let Ok(mut cache) = cache().lock() {
-        cache.insert(key, formula.clone());
-    }
-    Some(formula)
+    place(&body, source, Notation::Latex, room, true)
 }
 
 /// The inline half of [`typeset`]: the picture is a crop of a page whose baseline is known.
@@ -361,6 +397,7 @@ fn typeset_inline(body: &str, room: &Room) -> Option<Formula> {
     Some(Formula {
         cells: (cols, 1),
         inline: true,
+        notation: Notation::Latex,
         source: String::new(),
         image: Image {
             media_type: "image/png".to_owned(),
@@ -407,21 +444,12 @@ fn frame(data: &[u8], from: u32, top: u32, rows: u32, width: u32) -> Option<Vec<
 
 /// One compile of one formula, `inline` or as a block of its own (D165).
 ///
-/// LaTeX has no multi-letter variable — `dx` is `d` times `x` — while Typst reads it as a name that
-/// does not exist, so a formula written the way people write it is refused rather than drawn. The
-/// body is tried as written first, because that is the form Typst's own spellings need; only a
-/// refusal is worth a second attempt.
+/// One reading, and only one: the body is what the notation said it was, so a refusal is the
+/// answer — the caller draws the source rather than trying the same text as the other language.
 fn compile(body: &str, room: &Room, inline: bool) -> Option<PagedDocument> {
-    layout(body, room, inline).or_else(|| {
-        let split = split_letters(body);
-        (split != body)
-            .then(|| layout(&split, room, inline))
-            .flatten()
-    })
+    layout(body, room, inline)
 }
 
-/// One compile of one snippet. `None` means Typst refused it, which is the caller's cue to try the
-/// formula another way rather than to give up on it.
 ///
 /// The two spellings of a formula are also two modes of Typst's own: `$ … $` with the spaces set
 /// aside from the delimiters is display maths, which is a block set large with its limits above and
@@ -449,232 +477,6 @@ fn layout(body: &str, room: &Room, inline: bool) -> Option<PagedDocument> {
     let world = Snippet::new(&text);
     typst::compile(&world).output.ok()
 }
-
-/// The same formula with its multi-letter runs separated, for a body Typst refused (D165).
-///
-/// Spaces mean nothing in Typst's math, so `d x` is `dx` set exactly as TeX sets it. A run that is
-/// a call (`frac(`), the member of a dotted name (`epsilon.alt`), or a name Typst has and this file
-/// emits (`alpha`, `delim`) is left alone, and a quoted string is text rather than maths. Being
-/// generous with that list is safe: a name wrongly kept is a formula left to its source, while a
-/// name wrongly split would be drawn as letters.
-fn split_letters(body: &str) -> String {
-    let chars: Vec<char> = body.chars().collect();
-    let mut out = String::with_capacity(body.len() + 8);
-    let mut i = 0;
-    let mut quoted = false;
-    while i < chars.len() {
-        let c = chars[i];
-        if quoted {
-            out.push(c);
-            if c == '\\' && matches!(chars.get(i + 1), Some('"' | '\\')) {
-                out.push(chars[i + 1]);
-                i += 2;
-                continue;
-            }
-            quoted = c != '"';
-            i += 1;
-            continue;
-        }
-        if c == '"' {
-            quoted = true;
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        if c.is_ascii_alphabetic() {
-            let start = i;
-            while i < chars.len() && chars[i].is_ascii_alphabetic() {
-                i += 1;
-            }
-            let run: String = chars[start..i].iter().collect();
-            let member = start > 0 && chars[start - 1] == '.';
-            let keep = run.len() == 1
-                || member
-                || matches!(chars.get(i), Some('(' | '.'))
-                || KEEP.contains(&run.as_str());
-            if keep {
-                out.push_str(&run);
-            } else {
-                for (n, letter) in run.chars().enumerate() {
-                    if n > 0 {
-                        out.push(' ');
-                    }
-                    out.push(letter);
-                }
-            }
-            continue;
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
-
-/// The names [`split_letters`] never separates: whatever Typst has for a symbol, function or
-/// call this file emits, and the words people write in Typst's own notation (D165).
-const KEEP: &[&str] = &[
-    // Greek, the roots of the variants (`epsilon.alt`, `phi.alt`, …), and the capitals, which are
-    // the same names with the first letter raised (`Omega`, `Gamma`).
-    "alpha",
-    "beta",
-    "gamma",
-    "delta",
-    "epsilon",
-    "zeta",
-    "eta",
-    "theta",
-    "iota",
-    "kappa",
-    "lambda",
-    "mu",
-    "nu",
-    "xi",
-    "omicron",
-    "pi",
-    "rho",
-    "sigma",
-    "tau",
-    "upsilon",
-    "phi",
-    "chi",
-    "psi",
-    "omega",
-    "Alpha",
-    "Beta",
-    "Gamma",
-    "Delta",
-    "Epsilon",
-    "Zeta",
-    "Eta",
-    "Theta",
-    "Iota",
-    "Kappa",
-    "Lambda",
-    "Mu",
-    "Nu",
-    "Xi",
-    "Pi",
-    "Rho",
-    "Sigma",
-    "Tau",
-    "Upsilon",
-    "Phi",
-    "Chi",
-    "Psi",
-    "Omega",
-    // Functions and the words that stand upright.
-    "arcsin",
-    "arccos",
-    "arctan",
-    "arcsinh",
-    "arccosh",
-    "arctanh",
-    "sin",
-    "cos",
-    "tan",
-    "cot",
-    "sec",
-    "csc",
-    "sinh",
-    "cosh",
-    "tanh",
-    "sech",
-    "csch",
-    "log",
-    "ln",
-    "lg",
-    "exp",
-    "lim",
-    "liminf",
-    "limsup",
-    "det",
-    "gcd",
-    "lcm",
-    "max",
-    "min",
-    "sup",
-    "inf",
-    "arg",
-    "dim",
-    "ker",
-    "hom",
-    "deg",
-    "mod",
-    "bmod",
-    "op",
-    "upright",
-    // Operators and relations Typst names.
-    "sum",
-    "product",
-    "integral",
-    "union",
-    "sect",
-    "without",
-    "subset",
-    "supset",
-    "in",
-    "not",
-    "and",
-    "or",
-    "times",
-    "div",
-    "dot",
-    "plus",
-    "minus",
-    "eq",
-    "lt",
-    "gt",
-    "approx",
-    "equiv",
-    "infinity",
-    "emptyset",
-    "forall",
-    "exists",
-    "nabla",
-    "partial",
-    "diff",
-    "grad",
-    "aleph",
-    "hbar",
-    "ell",
-    "planck",
-    "angle",
-    "arrow",
-    "none",
-    "auto",
-    // The calls and keywords this file writes into a body.
-    "frac",
-    "dfrac",
-    "tfrac",
-    "binom",
-    "sqrt",
-    "root",
-    "mat",
-    "cases",
-    "delim",
-    "lr",
-    "abs",
-    "norm",
-    "floor",
-    "ceil",
-    "round",
-    "bb",
-    "bold",
-    "cal",
-    "frak",
-    "italic",
-    "sans",
-    "mono",
-    "hat",
-    "tilde",
-    "overline",
-    "underline",
-    "accent",
-    "attach",
-    "quad",
-    "wide",
-    "zws",
-];
 
 /// The pixmap as a PNG, with the premultiplied alpha a rasteriser produces undone: the terminal
 /// composites the picture over its own background, so an edge pixel must carry its own colour.
@@ -832,13 +634,15 @@ fn emit(out: &mut Emitted, text: &str) {
     }
 }
 
-/// Translates LaTeX's math commands into Typst's, so the same formula can be written either way
+/// Translates one LaTeX formula into Typst's maths, which is the only reading a `$…$` body gets
 /// (D165). `None` means "this front-end does not know that", and the caller draws the source.
 ///
-/// The two notations agree about more than they disagree about — `x^2`, `_i`, `+`, `(`, and the
-/// letters themselves are the same — so this is a rewrite of the commands, not a second parser:
-/// `\frac{a}{b}` becomes `frac(a, b)`, `\sqrt[3]{x}` becomes `root(3, x)`, `\alpha` becomes
-/// `alpha`, and an environment becomes the Typst call that draws it.
+/// The two notations agree about the characters — `x^2`, `_i`, `+`, `(`, and the letters themselves
+/// — so this is a rewrite of the commands rather than a second parser: `\frac{a}{b}` becomes
+/// `frac(a, b)`, `\sqrt[3]{x}` becomes `root(3, x)`, `\alpha` becomes `alpha`, and an environment
+/// becomes the Typst call that draws it. What it is not is a guess: a body written the Typst way is
+/// read as LaTeX, because LaTeX is what the delimiters mean — `frac(a, b)` is six letters there —
+/// and Typst's own notation has an invocation of its own ([`TYPST`]).
 pub fn latex(source: &str) -> Option<String> {
     let chars: Vec<char> = source.chars().collect();
     let mut out = Emitted::default();
@@ -895,6 +699,26 @@ pub fn latex(source: &str) -> Option<String> {
             '~' => {
                 emit(&mut out, " ");
                 i += 1;
+            }
+            // A letter run is letters: LaTeX has no multi-letter variable, so `dx` is `d` times
+            // `x`, and Typst would read `dx` as a name it does not have and refuse the whole
+            // formula. A space in maths is not drawn, so writing the letters apart is how TeX sets
+            // the same run (D165). It is also what makes this LaTeX and not the other notation: in
+            // Typst `alpha` is a name, here it is five letters, and the way to write the name is
+            // `\alpha`.
+            c if c.is_ascii_alphabetic() => {
+                let start = i;
+                while i < chars.len() && chars[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                let mut run = String::new();
+                for (n, letter) in chars[start..i].iter().enumerate() {
+                    if n > 0 {
+                        run.push(' ');
+                    }
+                    run.push(*letter);
+                }
+                emit(&mut out, &run);
             }
             // Everything else means the same thing in both notations.
             _ => {
@@ -1047,7 +871,9 @@ fn command(name: &str, chars: &[char], i: &mut usize, out: &mut Emitted) -> bool
 
 /// A LaTeX environment: the ones Typst has an equivalent for, and nothing else.
 fn environment(chars: &[char], i: &mut usize, out: &mut Emitted) -> bool {
-    let Some(name) = argument(chars, i) else {
+    // The name is read as it is written, not as maths: `matrix` is one word naming an environment,
+    // and a letter run put through [`latex`] is `m a t r i x` (D165).
+    let Some(name) = literal(chars, i) else {
         return false;
     };
     let name = name.trim();
@@ -1459,8 +1285,11 @@ mod tests {
         assert_eq!(latex(r"\alpha \cdot \beta").unwrap(), "alpha dot beta");
         assert_eq!(latex(r"x^2 + y_i").unwrap(), "x^2 + y_i");
         assert_eq!(latex(r"\sin^2 x").unwrap(), "sin^2 x");
-        // A thin space is a space; `dx` stays two letters, which is what Typst draws anyway.
-        assert_eq!(latex(r"\int_0^1 f(x)\,dx").unwrap(), "integral_0^1 f(x) dx");
+        // A thin space is a space, and `dx` is two letters written apart, as TeX sets them.
+        assert_eq!(
+            latex(r"\int_0^1 f(x)\,dx").unwrap(),
+            "integral_0^1 f(x) d x"
+        );
         assert_eq!(latex(r"\mathbb{R}").unwrap(), "bb(R)");
         assert_eq!(latex(r"\hat{x}").unwrap(), "hat(x)");
         // The transpose and perpendicular signs are the same glyphs in both notations, and both
@@ -1473,10 +1302,10 @@ mod tests {
             "a \\ b",
             "a line break stays one"
         );
-        // A formula written the Typst way already has nothing to translate.
+        // A group is grouping in both, so the argument of a command keeps its shape.
         assert_eq!(
-            latex("frac(a, b) + sqrt(x)").unwrap(),
-            "frac(a, b) + sqrt(x)"
+            latex(r"\frac{\alpha+\beta}{2}").unwrap(),
+            "frac(alpha+beta, 2)"
         );
     }
 
@@ -1510,7 +1339,7 @@ mod tests {
             None
         );
         // `\ll` and `\gg` are what physics is written with, and are symbols like any other.
-        assert_eq!(latex(r"ka\ll 1"), Some("ka lt.double 1".into()));
+        assert_eq!(latex(r"ka\ll 1"), Some("k a lt.double 1".into()));
         assert_eq!(latex(r"x\gg y"), Some("x gt.double y".into()));
     }
 
@@ -1703,19 +1532,24 @@ mod tests {
     }
 
     #[test]
-    fn a_letter_run_is_read_as_letters_and_a_name_is_not() {
-        // LaTeX has no multi-letter variable, so `dx` is `d` times `x`; Typst reads it as a name
-        // that does not exist and refuses the formula. Spaces are not drawn, so separating the
-        // letters is what TeX does too (D165).
-        assert_eq!(split_letters("x^2 dx"), "x^2 d x");
-        // A name Typst has, a call, a dotted member and a quoted string are left alone.
-        assert_eq!(split_letters("alpha + Omega"), "alpha + Omega");
-        assert_eq!(split_letters("frac(1, 2)"), "frac(1, 2)");
-        assert_eq!(split_letters("epsilon.alt"), "epsilon.alt");
-        assert_eq!(split_letters("\"if and only if\""), "\"if and only if\"");
-        // A body with nothing to separate is returned unchanged, which is what stops the second
-        // attempt from costing a compile it cannot use.
-        assert_eq!(split_letters("E = m c^2"), "E = m c^2");
+    fn a_letter_run_in_latex_is_letters_and_the_typst_name_is_a_command() {
+        // LaTeX has no multi-letter variable, so `dx` is `d` times `x`; Typst reads `dx` as a name
+        // it does not have and refuses the formula. A space in maths is not drawn, so the letters
+        // are written apart — and that is also what makes the reading unambiguous (D165).
+        assert_eq!(latex("x^2 dx"), Some("x^2 d x".into()));
+        assert_eq!(latex("alpha"), Some("a l p h a".into()));
+        assert_eq!(latex(r"\alpha"), Some("alpha".into()));
+        // A call written where LaTeX is meant is the letters it spells — `frac(a, b)` is `f r a c`
+        // of a bracketed `a`, `b`, which is what TeX sets — while the same text in the invocation
+        // that means Typst draws the fraction. No body is read both ways (D165).
+        assert_eq!(latex("frac(a, b)"), Some("f r a c(a, b)".into()));
+        assert!(render_typst("frac(a, b)", &room()).is_some());
+        let latex = render(r"\frac{a}{b}", &room()).expect("the LaTeX fraction");
+        let typst = render_typst("frac(a, b)", &room()).expect("the Typst fraction");
+        assert_eq!(
+            latex.cells, typst.cells,
+            "the two invocations reach the same picture"
+        );
     }
 
     #[test]
@@ -1745,8 +1579,8 @@ mod tests {
         assert_eq!(latex(r"n\to\infty"), Some("n arrow.r infinity".into()));
         assert_eq!(latex(r"\alpha x"), Some("alpha x".into()));
         assert_eq!(latex(r"\alpha\beta"), Some("alpha beta".into()));
-        // Two characters are already two variables, so nothing is inserted between them.
-        assert_eq!(latex("ab"), Some("ab".into()));
+        // Two characters are two variables, written apart so that Typst does not read a name.
+        assert_eq!(latex("ab"), Some("a b".into()));
         // A growing delimiter keeps its bracket, and `\left.` keeps none.
         assert_eq!(latex(r"\left( x \right)^n"), Some("( x )^n".into()));
         assert_eq!(latex(r"\left\{ x \right."), Some("brace.l x".into()));

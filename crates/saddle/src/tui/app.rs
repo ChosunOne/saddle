@@ -13,6 +13,7 @@ use crate::store::Point;
 use crate::tui::image::Fit;
 use crate::tui::image::Protocol;
 use crate::tui::keys::Keys;
+use crate::tui::math;
 use crate::tui::math::Formula;
 use crate::tui::notify::Notify;
 use crate::tui::permissions::Change as PermissionsChange;
@@ -274,6 +275,9 @@ pub struct Source {
     pub cols: u16,
     /// Whether it is drawn inside a line, which decides the delimiters a copy wraps it in.
     pub inline: bool,
+    /// Whether the formula was written in Typst's own notation, which a copy says with the fence
+    /// that asks for it instead of TeX's delimiters (D166).
+    pub typst: bool,
     pub tex: String,
 }
 
@@ -2392,14 +2396,24 @@ fn selected(
     (out, block)
 }
 
-/// The delimiters a copy of a formula gets: `\(…\)` for one inside a line, `\[…\]` for a block
+/// The invocation a copy of a formula carries: `\(…\)` for one inside a line, `\[…\]` for a block
 /// (D166).
 ///
 /// TeX's own spelling rather than `$…$`, because what the copy is for is a paper: `amsmath`
 /// discourages `$$`, which is a plain TeX construct, and these are what a document gets. They are
 /// also what this front end reads back, so pasting a copy into saddle draws it again (D165).
+///
+/// A formula written in Typst's own notation is copied with the fence that asks for it, and for the
+/// same reason: its body is not LaTeX, and in TeX's delimiters it would be read as letters — so the
+/// one spelling that means the same thing where it is pasted is the one it was written in (D165).
 fn delimited(picture: &Source) -> String {
-    if picture.inline {
+    if picture.typst {
+        format!(
+            "```{}\n{}\n```",
+            math::TYPST,
+            picture.tex.trim_end_matches(['\n', '\r'])
+        )
+    } else if picture.inline {
         format!("\\({}\\)", picture.tex)
     } else {
         format!("\\[{}\\]", picture.tex)
@@ -3389,6 +3403,7 @@ mod tests {
                     rows: 3,
                     cols: 10,
                     inline: false,
+                    typst: false,
                     tex: r"\int u\,dv=uv-\int v\,du".into(),
                 },
                 Source {
@@ -3397,6 +3412,7 @@ mod tests {
                     rows: 1,
                     cols: 6,
                     inline: true,
+                    typst: false,
                     tex: "x^2".into(),
                 },
             ],

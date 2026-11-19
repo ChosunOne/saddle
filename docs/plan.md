@@ -3941,22 +3941,33 @@ it, and one inside a line of text in cells of that line, on its baseline.
   machine. It is a large dependency and that is the price of TeX-quality layout rather than a drawing
   of one; the alternative, shelling out to `typst` or `latex`, would make the interface depend on a
   toolchain and on `exec`.
-- `$…$` and `$$…$$` arrive already parsed (`Options::ENABLE_MATH`), which is also Typst's own
-  delimiter. LaTeX spelling is translated to Typst's math syntax by `tui::math::latex` —
-  `\frac{a}{b}`, `\sqrt[3]{x}`, `\begin{pmatrix}…\end{pmatrix}`, `\alpha`, `\text{…}`, `\left(…\right)`
-  — so both notations work and text already written the Typst way passes through. A command the
-  front-end does not know, or a formula with no legible room left, is drawn as its **source**, never
-  as something wrong.
+- **Two notations, two invocations, and no body read as both.** `$…$` and `$$…$$` arrive already
+  parsed (`Options::ENABLE_MATH`), which is also Typst's own delimiter — and that coincidence is the
+  whole problem, because the two languages disagree about what the text inside means *and* neither
+  one fails when handed the other's. LaTeX spelling is translated to Typst's math syntax by
+  `tui::math::latex` — `\frac{a}{b}`, `\sqrt[3]{x}`, `\begin{pmatrix}…\end{pmatrix}`, `\alpha`,
+  `\text{…}`, `\left(…\right)` — and **those delimiters mean LaTeX and nothing else**. Typst's own
+  notation has an invocation of its own: a fenced block tagged `typst-math`, whose body goes to the
+  typesetter as written. Not `typst`, which is how a block of Typst *code* is tagged and stays code:
+  a tag that meant both would leave the same body drawn as maths when it happens to parse and shown
+  as code when it does not, which is the guessing this decision exists to refuse. So `frac(a, b)` in
+  `$…$` is the six letters TeX would set, the same text in a `typst-math` fence is the fraction, and
+  a reader of either is never in doubt which one was written. The first version of this had one
+  invocation: a body was tried as Typst and, failing that, read as LaTeX, which made every honest
+  formula a candidate for a silent misreading.
 - **A letter run is letters.** LaTeX has no multi-letter variable: `dx` is `d` times `x`, while Typst
   reads it as a name that does not exist and refuses the whole formula — which is how the first
-  integral anyone writes came out as its source on the first day of this decision. So the body is
-  tried as written (that is the form Typst's own spellings need) and, only if Typst refuses it,
-  tried again with every multi-letter run separated: `d x` is `dx` set as TeX sets it, because a
-  space in math is not drawn. A run that is a call (`frac(`), the member of a dotted name
-  (`epsilon.alt`), a name Typst has or this file emits (`alpha`, `Omega`, `delim`) or inside a quoted
-  string is left alone, and a name wrongly kept costs the source while a name wrongly split would
-  draw letters. `\ll` and `\gg` are symbols like any other (`lt.double`, `gt.double`), because that
-  is how physics is written.
+  integral anyone writes came out as its source on the first day of this decision. The translator
+  therefore writes every bare run of letters apart as it reads it — `d x`, and `frac(a, b)` as
+  `f r a c(a, b)` — because a space in math is not drawn and Typst's parser needs the separation it
+  would otherwise read as a name. Splitting inside the translator is also what keeps the *emitted*
+  names whole: `alpha` and `mat(delim: …)` are written by this file, after the run it came from was
+  read. That is the second thing the one-invocation version got wrong, and it needed a second compile
+  of every formula to do it: it tried the body as written, and on refusal tried again with the runs
+  separated, keeping a list of the names not to split. There is one compile now. An environment's
+  name is read as written for the same reason — `matrix` is one word naming an environment, not
+  `m a t r i x`. `\ll` and `\gg` are symbols like any other (`lt.double`, `gt.double`), because
+  that is how physics is written.
 - **An environment is all or nothing.** A matrix or a `cases` with one cell this front end cannot
   translate refuses the whole environment rather than leaving that cell blank: a matrix with a hole
   in it is a formula drawn wrong, and the rule is that what cannot be drawn is drawn as its source.
@@ -4113,6 +4124,11 @@ it, and one inside a line of text in cells of that line, on its baseline.
   back into saddle is drawn again rather than read as prose. The stored conversation keeps whatever
   was typed, `$$…$$` and `\[…\]` included: what a copy takes is the text that was *drawn*, in one
   canonical spelling, not the text that was saved.
+- **A formula written in Typst's notation copies as the fence that asks for it.** TeX's delimiters
+  would be the wrong invocation for a body that is not LaTeX: pasted back they would be read as
+  letters, which is a copy that does not reproduce what it was copied from. So the copy is the
+  ```` ```typst-math ```` block itself — the one spelling of that formula that means the same thing
+  where it is pasted — and the block's empty rows are dropped exactly as a display formula's are.
 - **A block's source goes where the block begins, and its empty rows are dropped.** The rows of a
   block's box below the first hold the picture and nothing else, so the copy puts the source on the
   box's first row and leaves those rows out, and a paste has no gap in the middle of it. A drag that
