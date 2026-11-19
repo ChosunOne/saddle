@@ -574,10 +574,26 @@ impl Markdown {
         };
         let Some(formula) = formula else {
             // The rule that keeps the transcript honest: what cannot be typeset is drawn as the
-            // source, never as something wrong (D165).
-            self.line
-                .push(Span::styled(format!("$${source}$$"), self.code_style()));
-            self.flush();
+            // source, never as something wrong (D165). A formula written over several lines keeps
+            // them: a line break is a space to TeX, but the shape a writer gives a long formula is
+            // what makes its source readable, and a row of text holds no line break at all —
+            // `$$…$$` written on three lines came out on one, which is how a real transcript
+            // showed it.
+            let style = self.code_style();
+            let lines: Vec<&str> = source
+                .split('\n')
+                .map(|line| line.trim_end_matches('\r'))
+                .collect();
+            for (i, line) in lines.iter().enumerate() {
+                if i == 0 {
+                    self.line.push(Span::styled("$$", style));
+                }
+                self.line.push(Span::styled((*line).to_owned(), style));
+                if i + 1 == lines.len() {
+                    self.line.push(Span::styled("$$", style));
+                }
+                self.flush();
+            }
             self.blank_before_next_block = true;
             return;
         };
@@ -618,7 +634,9 @@ impl Markdown {
         };
         let Some(formula) = formula else {
             let style = self.code_style();
-            self.text(&format!("${source}$"), style);
+            // A formula inside a line has no rows of its own, so a break in its source — a
+            // paragraph's soft break inside `$…$` — is written as the space TeX reads there.
+            self.text(&format!("${}$", source.replace(['\n', '\r'], " ")), style);
             return;
         };
         let mut reserved = String::with_capacity(formula.cells.0.max(1) as usize);
@@ -5671,5 +5689,54 @@ mod tests {
             // Each task says how long it ran, from its own start to its own stop (D172).
             assert!(line.contains("2.0s"), "{line}");
         }
+    }
+
+    #[test]
+    fn a_formula_with_a_transpose_in_it_is_drawn_rather_than_shown_as_its_source() {
+        // Reported from a real terminal: two of the formulas in one paragraph were left as their
+        // source while the ones around them were typeset. The whole formula is refused when one
+        // command is not translated (`\top` was not), so a single absent symbol costs the picture
+        // — and the paragraph reads as if `$$` and `$…$` were not supported at all (D165).
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Kitty;
+        app.entries.push(Entry::Assistant(
+            "a push moves it by \\(\\delta\\). The very same fixed rule\nbecomes\n$$\nr^\\top \\delta > b-r^\\top h_q.\n$$\n\nand the rule could be $r^\\top h>b(c)$ itself".into(),
+        ));
+        app.cache.push(None);
+        let (lines, at) = transcript_with_images(&mut app, 80);
+        assert_eq!(at.len(), 3, "one in a line, one block, one more in a line");
+        assert!(
+            lines.iter().all(|l| !plain(l).contains("\\top")),
+            "the source is not what is shown: {:?}",
+            lines.iter().map(plain).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_display_formula_left_to_its_source_keeps_the_lines_it_was_written_on() {
+        // A row of text holds no line break — the drawing pass drops a control character — so a
+        // source written over three lines used to reach the screen as one line. The shape a writer
+        // gives a long formula is what makes its source readable (D165).
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Text;
+        app.entries.push(Entry::Assistant(
+            "becomes\n$$\nr^\\foo > b\n\\qquad \\bar{y} < c\n$$".into(),
+        ));
+        app.cache.push(None);
+        let (lines, at) = transcript_with_images(&mut app, 80);
+        assert!(at.is_empty(), "a terminal with no pictures places none");
+        let shown: Vec<String> = lines
+            .iter()
+            .map(|l| plain(l).trim_end().to_owned())
+            .collect();
+        assert!(
+            shown.ends_with(&[
+                "$$".to_owned(),
+                "r^\\foo > b".to_owned(),
+                "\\qquad \\bar{y} < c".to_owned(),
+                "$$".to_owned(),
+            ]),
+            "{shown:?}"
+        );
     }
 }

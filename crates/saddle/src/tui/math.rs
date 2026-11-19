@@ -1407,6 +1407,10 @@ fn symbol(name: &str) -> Option<&'static str> {
         "prime" => "prime",
         "degree" => "degree",
         "angle" => "angle",
+        // The transpose and perpendicular signs, which are the same two glyphs in both notations
+        // and are in every paragraph about a projection.
+        "top" => "top",
+        "bot" => "bot",
         // The delimiters `\left` and `\right` can name, in the symbols that draw them: Typst's
         // own `{` groups, `|` is a binary operator, and `\|` is a single bar character.
         "langle" => "chevron.l",
@@ -1459,6 +1463,10 @@ mod tests {
         assert_eq!(latex(r"\int_0^1 f(x)\,dx").unwrap(), "integral_0^1 f(x) dx");
         assert_eq!(latex(r"\mathbb{R}").unwrap(), "bb(R)");
         assert_eq!(latex(r"\hat{x}").unwrap(), "hat(x)");
+        // The transpose and perpendicular signs are the same glyphs in both notations, and both
+        // notations spell them the same way.
+        assert_eq!(latex(r"r^\top h").unwrap(), "r^top h");
+        assert_eq!(latex(r"a \bot b").unwrap(), "a bot b");
         assert_eq!(latex(r"\text{if } x>0").unwrap(), "\"if \" x>0");
         assert_eq!(
             latex(r"a \\ b").unwrap(),
@@ -1721,6 +1729,7 @@ mod tests {
             r"\sqrt[3]{\frac{\alpha + \beta}{2}} \le \lim_{n\to\infty} \left(1 + \frac{1}{n}\right)^n",
             r"\frac{\partial^2 u}{\partial t^2} = c^2 \nabla^2 u + \frac{1}{\rho} \int_{\Omega} f \, dV",
             r"\{ x \in \mathbb{R} : x > 0 \}",
+            r"r^\top \delta > b-r^\top h_q",
         ] {
             assert!(
                 render(formula, &room()).is_some(),

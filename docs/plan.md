@@ -4078,6 +4078,21 @@ it, and one inside a line of text in cells of that line, on its baseline.
   real terminal, and a backtick with no partner is treated the same way. The rewrite is presentation
   like the rest of this: what is stored, copied and sent is the text as it was typed, delimiters and
   all.
+- **One command the translator does not know costs the whole formula.** The rule above is that what
+  cannot be drawn is drawn as its source, and the unit of that is the formula: a symbol that means
+  something different in the two notations cannot be passed through, and one drawn right beside nine
+  it got wrong is worse than nine honest sources. The cost is that a gap in the symbol table looks
+  like a gap in the delimiters — the report that prompted this bullet was “`$$` and `$…$` are not
+  rendered”, and what was missing was `\top`, in two formulas about a projection whose five
+  neighbours were typeset. `\top` and `\bot` are in the table now. A symbol is added only with the
+  name Typst's own symbol table gives it, never by letting an unknown name through to the
+  typesetter: a name Typst happens to have and LaTeX spells the same way would draw something
+  wrong, which is the one thing the source fallback exists to prevent.
+- **A source written over several lines keeps them.** A row of text holds no line break — the
+  terminal's buffer drops a control character — so `$$…$$` written on three lines reached the screen
+  as one, which is what the same report showed. A display formula that is left to its source is laid
+  out one row per line of it, in the shape the writer gave it; a formula *inside* a line has no rows
+  of its own, so a paragraph's soft break in one is written as the space TeX reads there.
 - A terminal with no graphics protocol gets the source for every formula, since a picture there would
   be a marker and nothing else.
 
