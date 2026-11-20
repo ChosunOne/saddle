@@ -37,6 +37,19 @@ struct Task {
     denials: Vec<String>,
     announced: bool,
     shown: bool,
+    /// Whether finishing should resume the agent, as the launch or a `wait` said (D174).
+    wake: Wake,
+}
+
+impl Task {
+    /// Whether this task's completion is worth a follow-up turn (D159, D174).
+    fn wakes(&self) -> bool {
+        match self.wake {
+            Wake::Armed => true,
+            Wake::Quiet => false,
+            Wake::Unsaid => self.ui_call.is_some(),
+        }
+    }
 }
 
 impl Drop for Task {
@@ -49,6 +62,18 @@ impl Drop for Task {
             bridge.finish();
         }
     }
+}
+
+/// What a task's completion should do about the agent (D174). A task started by a model tool call
+/// wakes the agent unless that call declined; `wait` arms one that declined, and nothing else wakes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Wake {
+    /// Nothing was said, so the general rule decides: the task a model tool call started wakes the
+    /// agent when it finishes (D159), and work with no such call does not.
+    #[default]
+    Unsaid,
+    Armed,
+    Quiet,
 }
 
 /// host-owned presentation state, never parsed from a tool's output (D159).
@@ -147,10 +172,29 @@ impl Tasks {
             .collect()
     }
 
+    /// Whether a completion is waiting to be shown to the agent (D159, D174).
     pub fn pending(&self) -> bool {
         self.entries
             .iter()
-            .any(|task| task.ui_call.is_some() && task.output.is_some() && !task.announced)
+            .any(|task| task.wakes() && task.output.is_some() && !task.announced)
+    }
+
+    /// Whether some task will resume the agent when it finishes, so a session with nothing else to
+    /// do has a reason to stay open (D174).
+    pub fn waiting(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|task| task.wakes() && task.worker.is_some())
+    }
+
+    /// Says whether finishing one of this principal's tasks should resume the agent (D174).
+    fn set_wake(&mut self, id: &str, who: &Principal, wake: bool) -> Option<&Task> {
+        let task = self
+            .entries
+            .iter_mut()
+            .find(|task| task.id == id && &task.owner == who)?;
+        task.wake = if wake { Wake::Armed } else { Wake::Quiet };
+        Some(task)
     }
 
     pub fn active(&self) -> bool {
@@ -316,6 +360,7 @@ pub fn start(
         denials: Vec::new(),
         announced: false,
         shown: false,
+        wake: Wake::Unsaid,
     };
     let reply = snapshot(&task)?;
     session.tasks.entries.push(task);
@@ -379,6 +424,54 @@ pub fn access(
         return Ok(Err("unknown task for this principal".into()));
     }
     Ok(Ok(replies))
+}
+
+/// says whether finishing one of this principal's tasks should resume the agent (D174).
+///
+/// It answers at once with the task as it stands: the wake is the session's, so nothing here waits
+/// for the task, and a task that has already finished answers with its output instead.
+pub fn wake(
+    session: &mut Session,
+    who: &Principal,
+    call: &str,
+    id: &str,
+    wake: bool,
+) -> Result<Result<Vec<TaskReply>, String>> {
+    let request = Request::ExecTask {
+        operation: "task-wake",
+        id: Some(id),
+    };
+    let decision = session.engine.decide(who, &request);
+    session.audit.decision_for_call_details(
+        who,
+        &request,
+        &decision,
+        call,
+        json!({"operation":"task-wake","task":id,"wake":wake}),
+    )?;
+    if !decision.allow {
+        return Ok(Err(format!("denied: {}", decision.explanation)));
+    }
+    service(session)?;
+    let Some(task) = session.tasks.set_wake(id, who, wake) else {
+        session.audit.event(
+            Kind::Decision,
+            Some(who),
+            Some(Scope::Exec),
+            Some(false),
+            json!({"call_id":call,"operation":"task-ownership","task":id}),
+            "unknown task for this principal",
+        )?;
+        return Ok(Err("unknown task for this principal".into()));
+    };
+    let reply = snapshot(task)?;
+    Ok(Ok(vec![reply]))
+}
+
+/// whether a session with nothing else to do has a task that will resume it (D174).
+pub fn waiting(session: &mut Session) -> Result<bool> {
+    service(session)?;
+    Ok(session.tasks.waiting())
 }
 
 /// an idle turn is needed only for an unconsumed completion, not a running task.
@@ -453,7 +546,7 @@ pub fn human(session: &mut Session, argument: &str) -> Result<String> {
         .entries
         .iter()
         .map(|task| {
-            format!(
+            let mut line = format!(
                 "{}  {}  {}  {}",
                 task.id,
                 task.owner,
@@ -467,7 +560,12 @@ pub fn human(session: &mut Session, argument: &str) -> Result<String> {
                         .unwrap_or_else(Instant::now)
                         .saturating_duration_since(task.started)
                 )
-            )
+            );
+            // Whether the agent asked to be resumed by it, which is what will happen next (D174).
+            if task.wakes() {
+                line.push_str("  wake");
+            }
+            line
         })
         .collect::<Vec<_>>()
         .join("\n"))

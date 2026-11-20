@@ -4332,6 +4332,35 @@ is.
   on the `workspace` line every workspace file has, which made every change from the editor a
   refusal in a real workspace even though the policy-shaped files in its tests passed.
 
+**D174.** The agent can ask to be woken by a background task, and a one-shot run waits for it.
+
+- **The choice belongs to the task.** `bash` with `background: true` says what its completion should
+  do about the session: `wake` defaults to true, `wake: false` declines, and `action: "wait"` arms a
+  task later — the three together are "fire it off, keep working, be resumed when it lands". The
+  decision is recorded through `saddle:host/exec-tasks`'s `set-wake(id, wake)`, added rather than
+  folded into `start`, so that record's shape is unchanged for components built against it.
+- **A wake is not a wait.** `set-wake` answers at once with the task's snapshot: the resumption
+  belongs to the session, so no tool call blocks on a command and the model keeps working while it
+  runs. The follow-up carries the same host-owned notification as before (D159) — an id and a state,
+  never the command's output — and the model reads the output through `status`.
+- **One-shot runs stay open for it.** `saddle run` has no idle tick, so before this a background task
+  was killed by the process leaving. A run now services the session until every task that will wake
+  the agent has finished, runs the follow-up turn, and repeats while the conversation leaves more of
+  them behind; the exit code is the last turn's. Ctrl+C ends the wait, and the session still closes
+  through its own cleanup. This supersedes D159's "no session is kept alive merely to wait for its
+  jobs": nothing keeps one alive *merely* — a wake is a request that was made, and the task's own
+  lifetime bounds the wait.
+- **Still not automatic spending.** A task nothing asked about — hook work — keeps D159's rule and
+  wakes nobody. A plugin that arms a wake is spending the session's requests deliberately, under the
+  `exec` grant it needs for the task at all; that is written down here rather than left to be found.
+- **Declining is visible and reversible.** A declined completion still produces the person's notice
+  and still stops its launch block spinning; it just starts no model turn. `/tasks` marks a task that
+  will resume the agent with `wake`, so the person can see what the agent arranged.
+- **The flag is per task, per owner, and audited.** Arming or disarming goes through the same
+  authorization as observation and cancellation — the task's own principal, under the same `exec`
+  scope — and the audit records it as `task-wake` with the task and whether it was armed. A task one
+  principal cannot see (D153) is one it cannot arm either.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

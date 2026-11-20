@@ -9,7 +9,7 @@ use saddle_sdk::ExecReply;
 #[cfg(target_arch = "wasm32")]
 use saddle_sdk::{
     Command, Definition, Output, Task, Tool, cancel_task, execute, inspect_task, list_tasks,
-    start_task,
+    start_task, wake_task,
 };
 use serde::Deserialize;
 #[cfg(target_arch = "wasm32")]
@@ -24,6 +24,9 @@ pub struct Arguments {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub background: bool,
+    /// Whether finishing should resume the session, which is the default (D174). Only meaningful
+    /// with `background`, and a task that declined can be armed later with `action: "wait"`.
+    pub wake: Option<bool>,
     #[serde(default)]
     pub action: Action,
     pub task_id: Option<String>,
@@ -37,6 +40,7 @@ pub enum Action {
     Status,
     List,
     Cancel,
+    Wait,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -56,8 +60,10 @@ fn format_task(task: &Task) -> String {
 
 #[cfg(target_arch = "wasm32")]
 fn invoke_task(args: Arguments) -> Result<(String, bool), String> {
-    if !matches!(args.action, Action::Run) && (args.command.is_some() || args.background) {
-        return Err("command and background are only valid for action run".into());
+    if !matches!(args.action, Action::Run)
+        && (args.command.is_some() || args.background || args.wake.is_some())
+    {
+        return Err("command, background and wake are only valid for action run".into());
     }
     match args.action {
         Action::Run => {
@@ -72,11 +78,37 @@ fn invoke_task(args: Arguments) -> Result<(String, bool), String> {
                 argv: vec!["sh".into(), "-c".into(), command],
                 timeout_secs: args.timeout_secs.unwrap_or(budgets::exec_seconds() as u64),
             };
-            if args.background {
-                start_task(&request).map(|task| (format_task(&task), true))
-            } else {
-                execute(&request).map(|reply| format_reply(&reply))
+            if !args.background {
+                if args.wake.is_some() {
+                    return Err("wake is only valid with background: true".into());
+                }
+                return execute(&request).map(|reply| format_reply(&reply));
             }
+            // The launch says what its completion should do about the session (D174), rather than
+            // leaving the session to infer it from the call's own association.
+            let wake = args.wake.unwrap_or(true);
+            let started = start_task(&request)?;
+            let task = wake_task(&started.id, wake)?;
+            let mut text = format_task(&task);
+            text.push_str(if wake {
+                "\nthe session will be resumed when this finishes; read its output with action=status"
+            } else {
+                "\nthe session will not be resumed when this finishes; arm it with action=wait, or read it with action=status"
+            });
+            Ok((text, true))
+        }
+        // D174: arm a wake for a task that was started without one. It answers at once, because the
+        // wait belongs to the session rather than to this call.
+        Action::Wait => {
+            let id = args.task_id.ok_or("wait requires task_id")?;
+            let task = wake_task(&id, true)?;
+            let mut text = format_task(&task);
+            text.push_str(if task.running {
+                "\narmed: the session will be resumed when this finishes; the notification carries no output, so read it with action=status"
+            } else {
+                "\nit has already finished, so there is nothing to wait for; its output is above"
+            });
+            Ok((text, true))
         }
         Action::Status | Action::Cancel => {
             let id = args.task_id.ok_or("status/cancel requires task_id")?;
@@ -163,8 +195,8 @@ impl Tool for Bash {
     fn describe() -> Definition {
         Definition {
             name:"bash".into(),
-            description:"run sh -c in the workspace through the delegated exec sandbox. Filesystem/environment/net reach comes from this plugin's runtime grants and protected sandbox configuration, not the agent's broader grants. Network uses the policy proxy or falls back to none. Set background=true to start a session-owned task and return its id promptly. Use action=status/list/cancel and task_id to inspect bounded live output or stop it. Only one shell command per workspace may run at a time; cancel or finish it before another. Tasks stop on session exit/reload. Timeout bounds the task lifetime, never increases grants or configured limits. Captures at most the configured per-stream capture budget; presentation is separately host-configurable. Cancellation kills the process group; reserved Git paths are restored.".into(),
-            input_schema:json!({"type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":"integer","minimum":1},"background":{"type":"boolean"},"action":{"type":"string","enum":["run","status","list","cancel"]},"task_id":{"type":"string"}},"additionalProperties":false}).to_string(),
+            description:"run sh -c in the workspace through the delegated exec sandbox. Filesystem/environment/net reach comes from this plugin's runtime grants and protected sandbox configuration, not the agent's broader grants; network uses the policy proxy or falls back to none. background=true starts a session-owned task and returns its id promptly, and the session resumes you when it finishes unless wake=false, so you can do other work meanwhile; action=wait arms a task started with wake=false, answers at once and never blocks the call. action=status/list/cancel with task_id inspect bounded live output or stop it. Only one shell command per workspace may run at a time. Tasks stop on session exit/reload. Timeout bounds the task lifetime, never raises grants or configured limits. Capture is bounded per stream; presentation is host-configurable. Cancellation kills the process group; reserved Git paths are restored.".into(),
+            input_schema:json!({"type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":"integer","minimum":1},"background":{"type":"boolean"},"wake":{"type":"boolean","description":"with background: whether the session resumes you when the task finishes (default true)"},"action":{"type":"string","enum":["run","status","list","cancel","wait"]},"task_id":{"type":"string"}},"additionalProperties":false}).to_string(),
         }
     }
     fn invoke(arguments: String) -> Output {

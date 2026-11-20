@@ -334,7 +334,8 @@ The settings a session can change for itself, and where they are written:
   (D70).
 - `/compact` — summarize now, at the next turn, or the conversation in hand (D33).
 - `/mcp` — the servers, their restart, and their state for this session (D118).
-- `/tasks` — background commands and how to cancel one (D153).
+- `/tasks` — background commands, whether finishing one resumes the agent, and how to cancel one
+  (D153, D174).
 - `/help` — the keys and every command, from the interface itself.
 
 Outside the interface, `saddle check`, `saddle tools`, `saddle tools --config`, `saddle plugin

@@ -97,11 +97,25 @@ It returns a task id promptly. Continue working with file tools, then inspect or
 {"action":"cancel", "task_id":"task-<id>"}
 ```
 
+The completion of a task started here **resumes the agent**, so the work it began does not have to be
+polled: `background: true, "wake": false` declines that, and `action: "wait"` arms a task later
+(D174):
+
+```json
+{"action":"wait", "task_id":"task-<id>"}
+```
+
+`wait` answers at once with the task as it stands — it never blocks the call, because the resumption
+belongs to the session. A one-shot `saddle run` waits for a task it will be woken by instead of
+exiting and killing it; in an interactive session the wake is the follow-up turn D159 describes.
+`/tasks` marks a task that will resume the agent with `wake`.
+
 Status returns a bounded snapshot of available stdout/stderr, exit status and timeout/cancellation
 state. Repeated polls return the captured prefix again, not an ever-growing log. Cancellation is
 requested promptly; a task may still report running until process-group cleanup and reserved-path
-restoration finish. The tool that started it is its owner: another plugin cannot read or cancel it.
-A start's timeout bounds the **task lifetime**; a timeout on a status call only bounds that call.
+restoration finish. The tool that started it is its owner: another plugin cannot read or cancel it,
+nor arm a wake on it. A start's timeout bounds the **task lifetime**; a timeout on a status call only
+bounds that call.
 
 **One shell command may be active per workspace.** Foreground and background commands, including
 other Saddle processes in that workspace, share an exclusive reservation lock. A second start
@@ -120,6 +134,8 @@ unconsumed completions from model tool calls. This spends a normal model request
 repeated idle ticks do not. Hook-only jobs without an originating model tool invocation do not
 trigger automatic spending. A queued human prompt takes priority. Notices contain only host-owned
 identity/state, not untrusted command output. The agent must use the owning tool to inspect output.
+A task whose launch declined with `wake: false` wakes nothing until it is armed with
+`action: "wait"` (D174); the person still gets the notice either way.
 
 Tasks stop on session exit or any successful permission/settings reload. Reload drains cleanup and
 audit under the old grants before replacing them. Task ids/outputs are not persisted across restarts;
@@ -129,7 +145,8 @@ alone is not a request to cancel every task; use `/tasks cancel` or exit the ses
 
 No extra delegation scope is needed: existing explicit bash `exec` delegation applies. SDK users
 can import `saddle:host/exec-tasks` under their existing `exec` ceiling/reach; the interface never
-lends a sibling's permissions. `[tool-limits] exec-tasks` defaults to 16 retained task records;
+lends a sibling's permissions, and its `set-wake` effect is authorized, audited and isolated exactly
+as inspect and cancel are (D174). `[tool-limits] exec-tasks` defaults to 16 retained task records;
 completed records are evicted oldest-first when full. Capture and presentation use the existing
 execution budgets. Normal sandbox/no-network fallback and escaped-process-group limitations apply.
 New proxy decisions are serviced during model I/O and idle waits, but a blocking native host

@@ -644,12 +644,14 @@ fn background_network_is_attributed_or_fails_closed_during_model_and_input_waits
 
 #[test]
 fn background_output_and_completed_task_retention_are_bounded_by_runtime_budgets() {
+    // Both starts decline a wake (D174), so the run ends with its turn: the budgets, not the
+    // resumption, are what this test is about.
     let (base, _) = serve_dynamic(5, |index, body| {
         let calls = match index {
             0 => vec![(
                 "start",
                 "bash",
-                json!({"command":"printf 1234567890123456789012345678901234567890; printf error >&2", "background":true}),
+                json!({"command":"printf 1234567890123456789012345678901234567890; printf error >&2", "background":true, "wake":false}),
             )],
             1 => {
                 thread::sleep(Duration::from_millis(150));
@@ -669,7 +671,7 @@ fn background_output_and_completed_task_retention_are_bounded_by_runtime_budgets
                 vec![(
                     "second",
                     "bash",
-                    json!({"command":"printf second", "background":true}),
+                    json!({"command":"printf second", "background":true, "wake":false}),
                 )]
             }
             3 => vec![(
@@ -946,8 +948,187 @@ fn background_completion_wakes_idle_sessions_once_without_new_input() {
     }
 }
 
+/// D174: a background task the agent asked to be woken by keeps a one-shot run alive, so the work it
+/// started is not killed by the process leaving, and the completion arrives as its own turn.
+#[test]
+fn a_one_shot_run_waits_for_a_task_it_will_be_woken_by() {
+    let (base, seen) = serve_dynamic(4, |index, body| match index {
+        0 => sse_response(&openai_sse(
+            "",
+            &[(
+                "start",
+                "bash",
+                json!({
+                    "command":"while [ ! -f finish ]; do sleep 0.01; done; printf PRIVATE-TASK-OUTPUT",
+                    "background":true,"timeout_secs":10
+                }),
+            )],
+        )),
+        // The turn ends here, with the task still running: only a run that waits reaches request 2.
+        1 => {
+            let started = result_text(body, "start");
+            assert!(started.contains("will be resumed"), "{started}");
+            sse_response(&openai_sse("started", &[]))
+        }
+        2 => {
+            let notices: Vec<_> = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["content"].as_str())
+                .filter(|text| text.starts_with("[saddle background task notification]"))
+                .collect();
+            assert_eq!(notices.len(), 1, "{notices:?}");
+            assert!(notices[0].contains("completed"), "{}", notices[0]);
+            assert!(!notices[0].contains("PRIVATE-TASK-OUTPUT"));
+            sse_response(&openai_sse(
+                "",
+                &[(
+                    "status",
+                    "bash",
+                    json!({"action":"status","task_id":background_id(body)}),
+                )],
+            ))
+        }
+        _ => {
+            assert!(result_text(body, "status").contains("PRIVATE-TASK-OUTPUT"));
+            sse_response(&openai_sse("finished", &[]))
+        }
+    });
+    let env = Env::new(Api::Openai, &base);
+    // The task is released only once the first turn is over, so the run has to wait for it rather
+    // than reading a completion that was already there.
+    let released = seen.clone();
+    let workspace = env.ws.path().to_path_buf();
+    let release = thread::spawn(move || {
+        while released.lock().unwrap().len() < 2 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(workspace.join("finish"), "go").unwrap();
+    });
+    let out = env.saddle(&["run", "wait for the build"]);
+    release.join().unwrap();
+    assert!(
+        out.status.success(),
+        "{} {}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    assert_eq!(seen.lock().unwrap().len(), 4);
+}
+
+/// The other half of the same choice: a declined wake ends the run with its turn, and `wait` is how
+/// the agent arms one later (D174).
+#[test]
+fn a_declined_wake_ends_the_run_and_wait_arms_one_later() {
+    let (base, seen) = serve_dynamic(2, |index, body| match index {
+        0 => sse_response(&openai_sse(
+            "",
+            &[(
+                "start",
+                "bash",
+                json!({"command":"sleep 30","background":true,"wake":false,"timeout_secs":10}),
+            )],
+        )),
+        _ => {
+            let started = result_text(body, "start");
+            assert!(started.contains("will not be resumed"), "{started}");
+            sse_response(&openai_sse("started", &[]))
+        }
+    });
+    let env = Env::new(Api::Openai, &base);
+    let start = Instant::now();
+    let out = env.saddle(&["run", "quiet background"]);
+    assert!(
+        out.status.success(),
+        "{} {}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(20),
+        "a declined wake does not hold the run open"
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "no follow-up turn for a declined wake"
+    );
+
+    // The same start, armed afterwards with `wait`, is waited for.
+    let (base, seen) = serve_dynamic(5, |index, body| match index {
+        0 => sse_response(&openai_sse(
+            "",
+            &[(
+                "start",
+                "bash",
+                json!({
+                    "command":"while [ ! -f finish ]; do sleep 0.01; done; printf PRIVATE-TASK-OUTPUT",
+                    "background":true,"wake":false,"timeout_secs":10
+                }),
+            )],
+        )),
+        1 => sse_response(&openai_sse(
+            "",
+            &[(
+                "armed",
+                "bash",
+                json!({"action":"wait","task_id":background_id(body)}),
+            )],
+        )),
+        2 => {
+            let armed = result_text(body, "armed");
+            assert!(armed.contains("armed:"), "{armed}");
+            sse_response(&openai_sse("started", &[]))
+        }
+        3 => {
+            let notices: Vec<_> = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["content"].as_str())
+                .filter(|text| text.starts_with("[saddle background task notification]"))
+                .collect();
+            assert_eq!(notices.len(), 1, "{notices:?}");
+            assert!(!notices[0].contains("PRIVATE-TASK-OUTPUT"));
+            sse_response(&openai_sse(
+                "",
+                &[(
+                    "status",
+                    "bash",
+                    json!({"action":"status","task_id":background_id(body)}),
+                )],
+            ))
+        }
+        _ => {
+            assert!(result_text(body, "status").contains("PRIVATE-TASK-OUTPUT"));
+            sse_response(&openai_sse("finished", &[]))
+        }
+    });
+    let env = Env::new(Api::Openai, &base);
+    let released = seen.clone();
+    let workspace = env.ws.path().to_path_buf();
+    let release = thread::spawn(move || {
+        while released.lock().unwrap().len() < 3 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(workspace.join("finish"), "go").unwrap();
+    });
+    let out = env.saddle(&["run", "arm the wake later"]);
+    release.join().unwrap();
+    assert!(
+        out.status.success(),
+        "{} {}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    assert_eq!(seen.lock().unwrap().len(), 5);
+}
+
 #[test]
 fn closing_a_session_cancels_background_work_and_restores_before_the_audit_closes() {
+    // The task declines a wake (D174), so the run leaves while it is still running and closing the
+    // session is what stops it — which is what this test is about.
     let (base, _) = serve_dynamic(2, |index, _| {
         if index == 0 {
             sse_response(&openai_sse(
@@ -955,7 +1136,7 @@ fn closing_a_session_cancels_background_work_and_restores_before_the_audit_close
                 &[(
                     "start",
                     "bash",
-                    json!({"command":"printf changed > .git/config; printf ready > ready; sleep 30; printf leaked > leaked", "background":true}),
+                    json!({"command":"printf changed > .git/config; printf ready > ready; sleep 30; printf leaked > leaked", "background":true, "wake":false}),
                 )],
             ))
         } else {

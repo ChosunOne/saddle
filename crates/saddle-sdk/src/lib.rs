@@ -14,7 +14,8 @@ wit_bindgen::generate!({
 pub use exports::saddle::plugin::tool::{Definition, Guest as Tool, Output};
 pub use saddle::host::exec::{Command, Reply as ExecReply, run as execute};
 pub use saddle::host::exec_tasks::{
-    Task, cancel as cancel_task, inspect as inspect_task, list as list_tasks, start as start_task,
+    Task, cancel as cancel_task, inspect as inspect_task, list as list_tasks,
+    set_wake as wake_task, start as start_task,
 };
 pub use saddle::host::fs_list::read_directory;
 pub use saddle::host::fs_list::{Entry as DirectoryEntry, EntryKind, Page as DirectoryPage};

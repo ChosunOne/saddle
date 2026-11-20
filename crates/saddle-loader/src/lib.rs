@@ -157,6 +157,8 @@ pub enum TaskOperation {
     Inspect(String),
     List,
     Cancel(String),
+    /// Whether finishing this task should resume the agent (D174).
+    Wake(String, bool),
 }
 
 /// typed effects, never an arbitrary host command or JSON protocol (D156).
@@ -544,7 +546,7 @@ impl<H: HostServices> State<H> {
             {
                 return Ok(Err("invalid command or exceeds argument bounds".into()));
             }
-            TaskOperation::Inspect(id) | TaskOperation::Cancel(id)
+            TaskOperation::Inspect(id) | TaskOperation::Cancel(id) | TaskOperation::Wake(id, _)
                 if id.len() > budgets::metadata_bytes() =>
             {
                 return Ok(Err("task id exceeds byte budget".into()));
@@ -598,6 +600,9 @@ impl<H: HostServices> TasksHost for State<H> {
     }
     fn cancel(&mut self, id: String) -> anyhow::Result<Result<Task, String>> {
         self.one_task(TaskOperation::Cancel(id))
+    }
+    fn set_wake(&mut self, id: String, wake: bool) -> anyhow::Result<Result<Task, String>> {
+        self.one_task(TaskOperation::Wake(id, wake))
     }
 }
 

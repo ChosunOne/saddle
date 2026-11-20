@@ -34,6 +34,9 @@ interface exec-tasks {
     inspect: func(id: string) -> result<task, string>;
     %list: func() -> result<list<task>, string>;
     cancel: func(id: string) -> result<task, string>;
+    // Say whether finishing this task should resume the agent (D174). It answers at once: the wake
+    // belongs to the session, so this call never waits for the task.
+    set-wake: func(id: string, wake: bool) -> result<task, string>;
 }
 
 // Independent D138 types are kept for binary compatibility.

@@ -580,7 +580,13 @@ fn converse(
     theme: Option<&str>,
 ) -> Result<ExitCode> {
     if let Some(prompt) = prompt {
-        return Ok(match line_turn(agent, session, out, &prompt, theme)? {
+        let mut end = line_turn(agent, session, out, &prompt, theme)?;
+        // D174: work the agent asked to be woken by keeps a one-shot run going, so a background
+        // task it started is not killed by the process leaving. Each completion is one more turn.
+        if let Some(last) = wake_turns(agent, session, out)? {
+            end = last;
+        }
+        return Ok(match end {
             End::Answered => ExitCode::SUCCESS,
             _ => ExitCode::from(1),
         });
@@ -633,6 +639,49 @@ fn converse(
         line_turn(agent, session, out, text, theme)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Waits for the background work the agent asked to be woken by, and runs the follow-up turns that
+/// show it the completions (D174).
+///
+/// A one-shot run has no idle tick to do this, so a task the agent is waiting on would otherwise be
+/// killed when the process leaves. Answers with the last turn's end when a turn ran, and with none
+/// when there was nothing left to wait for.
+fn wake_turns(
+    agent: &mut Agent,
+    session: &mut Session,
+    out: &mut output::Output,
+) -> Result<Option<End>> {
+    let mut last = None;
+    let _sigint = cancel::SigintGuard::install();
+    loop {
+        // A run the person interrupted stays interrupted: the wait ends, and no follow-up turn is
+        // started on their behalf.
+        if cancel::requested() {
+            return Ok(last);
+        }
+        while tasks::waiting(session)? {
+            // The monitors, the proxy and the audit are serviced from here, as they are on an idle
+            // tick (D153, D159). Ctrl+C ends the wait, not the process: the session still closes
+            // through its own cleanup.
+            if cancel::requested() {
+                return Ok(last);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if !tasks::pending(session)? {
+            return Ok(last);
+        }
+        // The turn consumes the completion itself: it notes it to the person and puts the
+        // host-owned notification in front of the model (D159).
+        cancel::reset();
+        let Some(end) = agent.background_turn(session, out)? else {
+            return Ok(last);
+        };
+        out.usage(agent.turn_usage);
+        out.turn_end(&end);
+        last = Some(end);
+    }
 }
 
 /// One line-mode prompt: `!cmd` and `!!cmd` run a command, `/compact` compacts, anything else is

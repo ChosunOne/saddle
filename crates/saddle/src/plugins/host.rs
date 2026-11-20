@@ -821,6 +821,9 @@ fn execute_inner(
                         TaskOperation::Cancel(id) => {
                             tasks::access(session, &who, call, Some(&id), true)
                         }
+                        TaskOperation::Wake(id, wake) => {
+                            tasks::wake(session, &who, call, &id, wake)
+                        }
                     }
                 };
                 respond(result, answer, &mut fatal, &cancelled);
