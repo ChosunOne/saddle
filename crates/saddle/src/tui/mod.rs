@@ -1836,23 +1836,27 @@ impl Controller {
     /// Writes one change into this workspace's own policy file (D45). The global policy is never
     /// touched: a change made while working in a project is a change to that project.
     fn grant(&self, app: &mut App, change: permissions::Change) {
-        if let Err(e) = self.apply_grant(app, &change) {
-            // Reported in the dialog, which is where the person is looking.
-            if let Some(dialog) = &mut app.permissions {
-                dialog.error = Some(format!("{e:#}"));
-            }
-            return;
+        let setup = Setup::load(
+            &app.header.workspace,
+            &env::temp_dir(),
+            &Overrides::default(),
+        );
+        let setup = match setup {
+            Ok(setup) => setup,
+            Err(e) => return Self::grant_failed(app, &change, e),
+        };
+        if let Err(e) = self.apply_grant(&setup, app, &change) {
+            return Self::grant_failed(app, &change, e);
         }
         if let Some(dialog) = &mut app.permissions {
             dialog.error = None;
         }
-        // Rows are rebuilt from the file, so what is on screen is what the file now says.
-        match self.permission_rows(app) {
-            Ok(rows) => {
+        // Rows and the file's own text are rebuilt, so what is on screen is what the file now says
+        // and the prompt re-checks the line being typed against it (D173).
+        match self.permissions_snapshot(&setup) {
+            Ok((rows, text)) => {
                 if let Some(dialog) = &mut app.permissions {
-                    let selected = dialog.selected.min(rows.len().saturating_sub(1));
-                    dialog.rows = rows;
-                    dialog.selected = selected;
+                    dialog.reload(rows, text);
                 }
             }
             Err(e) => app.note(NoteKind::Error, &format!("{e:#}")),
@@ -1862,26 +1866,37 @@ impl Controller {
         self.send(app, Command::ReloadPolicy);
     }
 
-    fn apply_grant(&self, app: &mut App, change: &permissions::Change) -> Result<()> {
-        let setup = Setup::load(
-            &app.header.workspace,
-            &env::temp_dir(),
-            &Overrides::default(),
-        )?;
+    /// A refused change is reported where the person is looking, with what was typed back in the
+    /// prompt so a typo is fixed rather than retyped (D173).
+    fn grant_failed(app: &mut App, change: &permissions::Change, e: anyhow::Error) {
+        if let Some(dialog) = &mut app.permissions {
+            match change {
+                permissions::Change::Add(what) => dialog.retry(what.clone()),
+                permissions::Change::Exclude { patterns, .. } => {
+                    dialog.editing = Some(patterns.join(", "));
+                }
+                permissions::Change::Toggle { .. } => {}
+            }
+            dialog.error = Some(format!("{e:#}"));
+        }
+    }
+
+    fn apply_grant(
+        &self,
+        setup: &Setup,
+        app: &mut App,
+        change: &permissions::Change,
+    ) -> Result<()> {
         // The roots the session would resolve, so the write is validated as a session would.
         let roots = session::roots_for_validation()?;
         if let permissions::Change::Add(what) = change {
-            let added = grant::add(&setup.workspace_policy_path, None, what, &roots)?;
-            app.note(
-                NoteKind::Info,
-                &format!(
-                    "added {added} to {}; it applies from the next session",
-                    setup.workspace_policy_path.display()
-                ),
-            );
+            let added = grant::add(&setup.workspace_policy_path, what, &roots)?;
+            // The policy is read again below and takes effect at once (D47), so this says what was
+            // added rather than promising when it applies.
+            app.note(NoteKind::Info, &format!("added {}", added.summary));
             return Ok(());
         }
-        grant::edit(&setup.workspace_policy_path, None, change, &roots)
+        grant::edit(&setup.workspace_policy_path, change, &roots)
     }
 
     fn open_settings(&self, app: &mut App) -> Result<()> {
@@ -2206,12 +2221,7 @@ impl Controller {
     /// The grants this session is running with, as editable rows (D45). What is not editable is
     /// still listed: seeing that `exec` is on, and that it is not changed from a menu, is the point
     /// of showing it.
-    fn permission_rows(&self, app: &App) -> Result<Vec<Row>> {
-        let setup = Setup::load(
-            &app.header.workspace,
-            &env::temp_dir(),
-            &Overrides::default(),
-        )?;
+    fn permission_rows(&self, setup: &Setup) -> Result<Vec<Row>> {
         let policy = setup.parse_policy()?;
         let Some(grants) = policy.grants(&saddle_cap::Principal::Agent) else {
             return Ok(Vec::new());
@@ -2249,16 +2259,19 @@ impl Controller {
             });
         }
         for n in &grants.net {
+            // The URL rather than the host alone: a grant allows one scheme and one port, and a
+            // host that names neither reaches https on 443 only (D40, D173).
+            let port = n.port.unwrap_or(n.scheme.default_port());
             rows.push(Row {
                 rule: n.rule.to_string(),
                 kind: Kind::Net,
-                root: n.host.to_string(),
+                root: format!("{}://{}:{port}", n.scheme.as_str(), n.host),
                 exclude: String::new(),
                 on: true,
                 editable: false,
                 locked: Some(
-                    "a host is granted in the policy file, so it is written down where it can be \
-                     read. Edit the file for this one."
+                    "press `a` and type `net <host>` or a url to add another host; a host that is \
+                     already granted is removed in the policy file"
                         .into(),
                 ),
             });
@@ -2295,17 +2308,32 @@ impl Controller {
         Ok(rows)
     }
 
+    /// The rows the editor lists and this project's grants file as it reads now, so the add prompt
+    /// can check a line against the file the write would land in (D173).
+    fn permissions_snapshot(&self, setup: &Setup) -> Result<(Vec<Row>, String)> {
+        let text = fs::read_to_string(&setup.workspace_policy_path)
+            .with_context(|| format!("reading {}", setup.workspace_policy_path.display()))?;
+        Ok((self.permission_rows(setup)?, text))
+    }
+
     fn open_permissions(&self, app: &mut App) -> Result<()> {
-        let rows = self.permission_rows(app)?;
         let setup = Setup::load(
             &app.header.workspace,
             &env::temp_dir(),
             &Overrides::default(),
         )?;
+        let (rows, text) = self.permissions_snapshot(&setup)?;
         app.permissions = Some(Permissions::new(
             rows,
-            render::home_relative(&setup.policy_path),
-            render::home_relative(&self.paths.user_config()),
+            permissions::Source {
+                policy_path: render::home_relative(&setup.workspace_policy_path),
+                global_path: render::home_relative(&self.paths.user_config()),
+                text,
+                base: setup.global_text.clone(),
+            },
+            // The set a write is validated against, so what the prompt says will land is what
+            // lands (D45, D173).
+            session::roots_for_validation()?,
         ));
         Ok(())
     }

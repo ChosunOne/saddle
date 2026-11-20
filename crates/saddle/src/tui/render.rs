@@ -24,7 +24,7 @@ use super::app::{
     Placed, Seen, Source,
 };
 use super::login::{Login, MODEL_ROWS, Purpose, Stage, matching};
-use super::permissions::{ADD_HELP, Kind, Permissions};
+use super::permissions::{ADD_HELP, Draft, Kind, Permissions};
 use super::sessions::{ROWS as SESSION_ROWS, SessionPicker, age};
 use super::settings::{ROWS, SettingsDialog};
 use super::themes::{ROWS as THEME_ROWS, ThemePicker};
@@ -3140,19 +3140,54 @@ fn draw_permissions(
     }
     lines.push(Line::default());
     if let Some(typed) = &dialog.adding {
-        // The prompt replaces the help line, so the forms are visible while typing.
         lines.push(Line::from(vec![
-            Span::styled("add  › ", Style::new().fg(theme.accent)),
+            Span::styled("add  › ", accent),
             Span::styled(
                 typed.clone(),
                 Style::new().add_modifier(Modifier::UNDERLINED),
             ),
         ]));
         cursor = Some((lines.len() - 1, 2 + 5 + typed.width()));
-        lines.push(Line::from(Span::styled(
-            keep_tail(ADD_HELP, inner),
-            dim(theme),
-        )));
+        // The entry the line would write, or what is wrong with it, is on screen as it is typed
+        // (D173), so nothing is written to find out.
+        match &dialog.draft {
+            Draft::Ready(preview) => {
+                lines.push(Line::from(Span::styled(
+                    keep_head(&preview.line, inner),
+                    accent,
+                )));
+                lines.push(Line::from(Span::styled(
+                    keep_head(&preview.summary, inner),
+                    dim(theme),
+                )));
+                if let Some(note) = &preview.note {
+                    lines.push(Line::from(Span::styled(keep_head(note, inner), dim(theme))));
+                }
+            }
+            Draft::Invalid(e) => lines.push(Line::from(Span::styled(
+                keep_head(e, inner),
+                Style::new().fg(theme.error),
+            ))),
+            Draft::Empty => {
+                for line in ADD_HELP {
+                    lines.push(Line::from(Span::styled(keep_tail(line, inner), dim(theme))));
+                }
+            }
+        }
+        if let Some(hint) = dialog.hint() {
+            lines.push(Line::from(Span::styled(
+                keep_head(&hint, inner),
+                dim(theme),
+            )));
+        }
+        // A write can still fail for a reason the line cannot show, such as a file that changed
+        // underneath the prompt.
+        if let Some(e) = &dialog.error {
+            lines.push(Line::from(Span::styled(
+                keep_tail(e, inner),
+                Style::new().fg(theme.error),
+            )));
+        }
     } else {
         let help = match &dialog.error {
             Some(e) => Span::styled(keep_tail(e, inner), Style::new().fg(theme.error)),
@@ -3163,12 +3198,14 @@ fn draw_permissions(
     lines.push(Line::from(Span::styled(
         format!(
             "{} · {}",
-            keep_tail(&dialog.policy_path, inner / 2),
-            keep_tail(&dialog.global_path, inner / 2)
+            keep_tail(&dialog.source.policy_path, inner / 2),
+            keep_tail(&dialog.source.global_path, inner / 2)
         ),
         dim(theme),
     )));
-    let keys = if dialog.editing.is_some() {
+    let keys = if dialog.adding.is_some() {
+        "enter add · tab complete · esc cancel"
+    } else if dialog.editing.is_some() {
         "enter save · esc cancel"
     } else {
         "↑↓ choose · enter change · esc close"
@@ -3386,7 +3423,9 @@ mod tests {
     use crate::tui::app::{AgentEvent, Header, Spent};
     use crate::tui::keys::Keys;
     use crate::tui::notify::Notify;
-    use crate::tui::permissions::{Kind, Permissions, Row as PermissionRow};
+    use crate::tui::permissions::{
+        Kind, Permissions, Row as PermissionRow, Source as PermissionSource,
+    };
     use crate::tui::settings::Values;
     use crate::tui::status;
     use crate::tui::status::Template;
@@ -5419,8 +5458,13 @@ mod tests {
                     locked: Some("exec is granted in the policy file".into()),
                 },
             ],
-            "~/.config/saddle/policies/home%me%proj.toml".into(),
-            "~/.config/saddle/policy.toml".into(),
+            PermissionSource {
+                policy_path: "~/.config/saddle/policies/home%me%proj.toml".into(),
+                global_path: "~/.config/saddle/policy.toml".into(),
+                text: "version = 1\n".into(),
+                base: String::new(),
+            },
+            saddle_cap::Roots::default(),
         ));
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -5443,6 +5487,49 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let all = screen(&terminal);
         assert!(all.contains("exec is granted in the policy file"), "{all}");
+    }
+
+    #[test]
+    fn the_add_prompt_shows_the_entry_before_it_is_written() {
+        // D173: the grant a line would add, and what it reaches, are on screen while it is typed.
+        let mut app = bare_app();
+        app.permissions = Some(Permissions::new(
+            Vec::new(),
+            PermissionSource {
+                policy_path: "~/.config/saddle/policies/home%me%proj.toml".into(),
+                global_path: "~/.config/saddle/policy.toml".into(),
+                text: "version = 1\n".into(),
+                base: "[agent]\nnet = [{ host = \"*\" }]\n".into(),
+            },
+            saddle_cap::Roots::default(),
+        ));
+        if let Some(dialog) = &mut app.permissions {
+            dialog.begin_add();
+            for c in "net https://api.example.com/v2/catalogue".chars() {
+                dialog.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let all = screen(&terminal);
+        for want in [
+            "add  › net https://api.example.com/v2/catalogue",
+            r#"[[agent.net]]  host = "api.example.com""#,
+            r#"scheme = "https""#,
+            "net grant for https://api.example.com:443",
+            // The base grants a list this project's own would replace, which the entry cannot say.
+            "own list replaces config.toml's 1 `net` entry",
+            "enter add · tab complete · esc cancel",
+        ] {
+            assert!(all.contains(want), "missing {want:?} in\n{all}");
+        }
+        // A line that cannot be a grant says so instead, and nothing is drawn as if it could.
+        if let Some(dialog) = &mut app.permissions {
+            dialog.retry("net https://".into());
+        }
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let all = screen(&terminal);
+        assert!(all.contains("needs a host"), "{all}");
     }
 
     #[test]

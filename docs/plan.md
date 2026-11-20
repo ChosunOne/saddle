@@ -694,6 +694,8 @@ works offline, so it reports what a session would open with.
   api.example.com` and read the line `saddle check` shows. The editor still does not offer a menu of
   capabilities to toggle (D45); it offers a prompt in which the person states the grant, which is the
   smallest thing that removes the need to hunt for the file without making a capability a keypress.
+- The prompt was given more to say in D173: it takes a URL as well as a host, writes the scheme and
+  the port into the entry, and shows that entry — or what is wrong with the line — as it is typed.
 
 **D47.** A grant changed from the editor takes effect at once, and the model is told.
 
@@ -4291,6 +4293,44 @@ shipped WASI component.
   second source of state; no countdown or estimate. It is presentation of instants the host already
   has, rounded as a stopwatch reads — tenths under ten seconds, then seconds, then `1m 05s` and
   `1h 02m`.
+
+**D173.** The add prompt says what a line will write, and a network grant is named the way a request
+is.
+
+- **The entry before the file.** As the line is typed, `a` in `/permissions` (D46) shows the policy
+  entry it becomes and a sentence naming what the grant reaches; a line that cannot be a grant is a
+  message beside it rather than a refusal after enter. The preview runs the writer's own code against
+  this project's file and against the base it is laid over (D63), so the two cannot disagree: what
+  the prompt draws is what lands. The path at the foot of the dialog is the file the editor writes;
+  it named `config.toml` twice before, since the two paths it printed were the same one.
+- **A URL for a host.** `net` accepts what a request names — `https://api.example.com/v2/catalogue?q=1`,
+  `api.example.com`, `api.example.com:8443`, `*.example.com`, `*`, `127.0.0.1:8080` — and reads the
+  scheme, the host and the port out of it. A path, a query, a fragment and `user:pass@` are dropped,
+  because a grant names a host rather than a document. Writing `http://` is the only way to grant
+  http: a host on its own is https.
+- **The entry spells out what it reaches.** A `net` grant added from the menu carries `host`,
+  `scheme` and `port` even where they are the defaults, because a grant that names no port allows
+  only the scheme's own. `net api.example.com` reads like "that host" and is
+  `https://api.example.com:443` alone. A row in the list shows the same URL, so what is in force is
+  legible rather than inferred. An address that is not one — `ftp://…`, `host:abc`, a port of 0, a
+  malformed host — is refused while it is typed, with the part to fix named.
+- **The base is not replaced silently.** A project's own `net` list replaces the base's rather than
+  adding to it (D63), so the prompt says so the first time a list is written here, with how many
+  entries the base grants. Adding one host and finding the others gone is the failure this prevents.
+- **Tab completes, and a refused line comes back.** Tab walks the forms and then the session's root
+  names — the list a `root`, `read` or `write` line may name (D30) — which is also printed as a hint.
+  A change the write refuses for a reason the preview could not see, such as a file changed
+  underneath the prompt, leaves what was typed in the prompt with the message beside it, so a typo is
+  fixed rather than retyped.
+- **What this is not.** Not a menu of capabilities: no keypress adds a grant, the argument is still
+  typed, and enter still writes a line a person read (D45). No removal from the menu either: a scope
+  or a host that comes from the base cannot be narrowed by the project's own file, so offering to
+  delete one would promise something the layering cannot keep.
+- **The check reduces the file the way a session does.** The validation before every write keeps
+  `version`, `agent` and `plugin` and drops the rest — the `workspace` line that names the directory
+  and the `[sandbox]` lists — because that is what `Setup::load` reads. Parsing the file whole failed
+  on the `workspace` line every workspace file has, which made every change from the editor a
+  refusal in a real workspace even though the policy-shaped files in its tests passed.
 
 ## 4. Scope enumeration
 

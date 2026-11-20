@@ -323,7 +323,9 @@ most often wants:
 The settings a session can change for itself, and where they are written:
 
 - `/settings` — provider, model, reasoning effort, limits and display; writes `config.toml`.
-- `/permissions` — the grants this workspace has; writes its file under `policies/` (D45).
+- `/permissions` — the grants this workspace has; writes its file under `policies/` (D45). `a`
+  adds one by typing it, and the prompt shows the entry and what it reaches while it is typed
+  — `net https://api.example.com/` is a grant for that host on https, port 443 (D46, D173).
 - `/model` — the model for this session only; ctrl+s in the list saves the default (D91).
 - `/theme` — a theme for this session, saved when chosen by name (D74).
 - `/thinking` — reasoning effort for this session (D57).
