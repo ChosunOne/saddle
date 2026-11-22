@@ -4361,6 +4361,32 @@ is.
   scope — and the audit records it as `task-wake` with the task and whether it was armed. A task one
   principal cannot see (D153) is one it cannot arm either.
 
+**D175.** Grants can be kept in named profiles, and a session switches between them.
+
+- **A profile is a base, not an addition.** `[profiles.<name>]` in the protected config holds what
+  `[agent]` holds, and the profile in force *is* the base a workspace's own file is layered on
+  (D63). So it replaces `[agent]` entirely — an empty profile grants nothing, and a scope the
+  workspace names still replaces that scope, narrower or wider. None of the lowering changes: a
+  profile is a choice of document, so it is still checked before instantiation, decided per call and
+  turned into a sandbox spec exactly as the base is. Nothing selects authority; it selects which
+  grants the one representation is built from.
+- **Which one is in force.** `profile = "name"` at the top of `config.toml` is what a session starts
+  on; unset means `[agent]` as written, and `none` names that explicitly. A name that is not defined
+  is refused where it is read and where it is switched, with the defined names listed — never a
+  fallback to `[agent]`. A mistyped switch that silently kept the wider grants is the worst way for
+  this to fail, so it is the one way it cannot.
+- **Switching is not writing.** `--profile <name>` chooses one for a run and `/profile <name>` for
+  the session; `/profile` alone reports. Neither writes a file: the choice travels in the same per-run
+  `Overrides` that `--grant` and `--revoke` use (D63), which is also why a `/reload` keeps it. Saving
+  a default stays a hand edit of a file nothing the agent runs can write (D42).
+- **A switch is a policy change.** `/profile` goes through the reload `/reload` uses (D47):
+  background tasks stop first, because they were started under the grants being replaced (D153), the
+  model is told on its next request, and a switch that cannot be made leaves the session exactly as
+  it was rather than half-changed.
+- **What a profile does not hold.** `[plugin.<id>]` grants and the `[sandbox]` read/write lists stay
+  global. Those are separate authority surfaces with their own rules (D66, D128), and letting a
+  session-scoped switch redefine the command sandbox would put the protected lists behind it.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

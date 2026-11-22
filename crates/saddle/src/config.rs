@@ -62,6 +62,15 @@ pub struct UserConfig {
     /// under `[agent]` here.
     #[serde(default)]
     pub agent: Option<toml::Value>,
+    /// Named grant sets a person switches between instead of editing `[agent]` each time (D175):
+    /// `[profiles.<name>]`, each holding what `[agent]` holds. The profile in force *is* the base a
+    /// workspace's own grants are layered on, so this selects authority rather than adding to it.
+    #[serde(default)]
+    pub profiles: BTreeMap<String, toml::Value>,
+    /// The profile used unless `--profile` or `/profile` picks another (D175). `none` means `[agent]`
+    /// as written. A name that is not defined is refused rather than falling back to `[agent]`.
+    #[serde(default)]
+    pub profile: Option<String>,
     /// Accepted and ignored: one version briefly kept workspace grants here as a table, and a
     /// config written then is split back into `policies/<key>.toml` by `migrate` (D63). Read by
     /// `migrate` through the raw document rather than through this field, which exists only so a
@@ -489,7 +498,74 @@ pub fn provider_table<'a>(
         .with_context(|| format!("`providers.{name}` in config.toml must be a table"))
 }
 
+/// The profile name that means "[agent] as written" rather than a table of its own (D175). Reserved,
+/// so `/profile none` always has somewhere to go back to.
+pub const NONE_PROFILE: &str = "none";
+
+/// A profile name must be typable after `/profile` and usable as a TOML key (D175).
+fn validate_profile_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("a profile name is 1-64 letters, digits, `-` or `_`; `{name}` is not one");
+    }
+    if name == NONE_PROFILE {
+        bail!("`{NONE_PROFILE}` cannot be a profile name: it means [agent] as written");
+    }
+    Ok(())
+}
+
 impl UserConfig {
+    /// The profile this run's base grants come from: what `--profile` or `/profile` chose, else the
+    /// file's own default, else none at all (D175).
+    ///
+    /// A name that is not defined is an error rather than a fallback to `[agent]`: a switch that
+    /// silently kept the wider grants would be the worst possible way for this to fail.
+    pub fn profile_in_force(&self, chosen: Option<&str>) -> Result<Option<String>> {
+        let Some(name) = chosen.or(self.profile.as_deref()) else {
+            return Ok(None);
+        };
+        if name == NONE_PROFILE {
+            return Ok(None);
+        }
+        validate_profile_name(name)?;
+        if !self.profiles.contains_key(name) {
+            bail!(
+                "no profile named `{name}` in config.toml{}; `{NONE_PROFILE}` is [agent] as written",
+                match self.profiles.keys().map(String::as_str).collect::<Vec<_>>() {
+                    names if names.is_empty() => String::new(),
+                    names => format!(", which defines `{}`", names.join("`, `")),
+                }
+            );
+        }
+        Ok(Some(name.to_owned()))
+    }
+
+    /// A profile is only ever read as an `[agent]` table, so a name that cannot be typed and a
+    /// definition that is not a table are refused where they are written (D175).
+    fn validate_profiles(&self) -> Result<()> {
+        for (name, grants) in &self.profiles {
+            validate_profile_name(name)?;
+            if !grants.is_table() {
+                bail!("profile `{name}` must be a table of grants, the way [agent] is");
+            }
+        }
+        if let Some(name) = &self.profile
+            && name != NONE_PROFILE
+        {
+            validate_profile_name(name)?;
+            if !self.profiles.contains_key(name) {
+                bail!(
+                    "`profile = \"{name}\"` names no [profiles.{name}]; `{NONE_PROFILE}` is [agent] as written"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let config: Self = match fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text).with_context(|| format!("{}", path.display()))?,
@@ -497,6 +573,9 @@ impl UserConfig {
             Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
         };
         sandbox_overrides::validate_global(&config.sandbox)
+            .with_context(|| format!("{}", path.display()))?;
+        config
+            .validate_profiles()
             .with_context(|| format!("{}", path.display()))?;
         standard::validate(&config.standard_tools)?;
         if config
@@ -536,15 +615,21 @@ impl UserConfig {
             .collect()
     }
 
-    /// The grant document every workspace inherits, as the policy parser reads it (D63).
-    pub fn global_policy(&self) -> toml::Value {
-        // No `[agent]` at all is "not configured yet", so the built-in grants apply. An `[agent]`
-        // table that is present and empty is a decision, and is taken as written (D63).
-        let agent = match self.agent.clone() {
-            Some(agent) => Some(agent),
-            None => toml::from_str::<toml::Value>(defaults::DEFAULT_AGENT)
-                .ok()
-                .map(|v| toml::Value::Table(v.as_table().cloned().unwrap_or_default())),
+    /// The grant document every workspace inherits, as the policy parser reads it (D63), from the
+    /// profile in force when one is named (D175).
+    pub fn global_policy(&self, profile: Option<&str>) -> toml::Value {
+        // A profile *replaces* `[agent]` rather than being added to it: it is the base this
+        // workspace's own grants are layered on. No `[agent]` at all is "not configured yet", so
+        // the built-in grants apply; an `[agent]` table that is present and empty is a decision and
+        // is taken as written (D63). An empty profile is that same decision, and an unknown one
+        // grants nothing rather than falling back to the base.
+        let agent = match profile {
+            Some(name) => self.profiles.get(name).cloned(),
+            None => self.agent.clone().or_else(|| {
+                toml::from_str::<toml::Value>(defaults::DEFAULT_AGENT)
+                    .ok()
+                    .map(|v| toml::Value::Table(v.as_table().cloned().unwrap_or_default()))
+            }),
         };
         let mut document = policy_document(agent);
         if let toml::Value::Table(table) = &mut document {
@@ -790,6 +875,92 @@ mod tests {
     use crate::tui::keys::Keys;
     use std::fs;
 
+    /// A profile is a base, not an addition: what it names is the whole `[agent]` for a session
+    /// that chose it (D175).
+    #[test]
+    fn a_profile_replaces_the_base_grants_and_an_unknown_one_grants_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[agent]\nexec = { timeout-secs = 20 }\n\n[profiles.locked]\nfs-read = [{ root = \"workspace\" }]\n\n[profiles.empty]\n",
+        )
+        .unwrap();
+        let config = UserConfig::load(&path).unwrap();
+        let agent = |profile: Option<&str>| {
+            config.global_policy(profile)["agent"]
+                .as_table()
+                .cloned()
+                .unwrap()
+        };
+        assert!(agent(None).contains_key("exec"));
+        let locked = agent(Some("locked"));
+        assert!(locked.contains_key("fs-read"));
+        assert!(
+            !locked.contains_key("exec"),
+            "a profile is not the base plus a profile: {locked:?}"
+        );
+        // An empty profile is the decision to grant nothing, never the built-in defaults.
+        assert!(agent(Some("empty")).is_empty());
+        // Unknown names never reach `global_policy`, and if one did it grants nothing rather than
+        // falling back to `[agent]`.
+        assert!(agent(Some("missing")).is_empty());
+    }
+
+    /// Which profile a run uses, and what a name that does not exist does (D175).
+    #[test]
+    fn the_profile_in_force_is_the_runs_choice_else_the_files_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "profile = \"locked\"\n\n[profiles.locked]\n\n[profiles.open]\n",
+        )
+        .unwrap();
+        let config = UserConfig::load(&path).unwrap();
+        assert_eq!(
+            config.profile_in_force(None).unwrap().as_deref(),
+            Some("locked")
+        );
+        assert_eq!(
+            config.profile_in_force(Some("open")).unwrap().as_deref(),
+            Some("open"),
+            "a run or a session may choose another"
+        );
+        assert_eq!(
+            config.profile_in_force(Some(NONE_PROFILE)).unwrap(),
+            None,
+            "`none` is [agent] as written"
+        );
+        let refused = config
+            .profile_in_force(Some("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("no profile named `nope`"), "{refused}");
+        assert!(
+            refused.contains("locked"),
+            "the alternatives are named: {refused}"
+        );
+    }
+
+    /// A name that cannot be typed after `/profile`, and a definition that is not a table, are
+    /// refused where they are written (D175).
+    #[test]
+    fn a_profile_name_and_body_are_validated_where_they_are_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (text, expected) in [
+            ("[profiles.\"two words\"]\n", "1-64 letters"),
+            ("[profiles.none]\n", "cannot be a profile name"),
+            ("profiles = { build = true }\n", "must be a table of grants"),
+            ("profile = \"missing\"\n", "names no [profiles.missing]"),
+        ] {
+            fs::write(&path, text).unwrap();
+            let error = format!("{:#}", UserConfig::load(&path).unwrap_err());
+            assert!(error.contains(expected), "{text}: {error}");
+        }
+    }
+
     #[test]
     fn resource_overrides_are_strict_validated_and_do_not_create_grants() {
         let dir = tempfile::tempdir().unwrap();
@@ -804,7 +975,7 @@ mod tests {
             Budgets::default().mutation_bytes
         );
         assert!(
-            config.global_policy()["agent"]
+            config.global_policy(None)["agent"]
                 .as_table()
                 .unwrap()
                 .is_empty()
@@ -955,9 +1126,15 @@ pub struct Overrides {
     pub grant: Vec<String>,
     /// A scope whose grants are dropped for this session, as in `--revoke net`.
     pub revoke: Vec<String>,
+    /// The profile this run or session chose, from `--profile` or `/profile` (D175). It travels
+    /// here because it has the same lifetime as the two above — a run's choice, never written — and
+    /// because a reload reads it again from the same place, so a switch survives one.
+    pub profile: Option<String>,
 }
 
 impl Overrides {
+    /// Whether a grant was changed by hand. A profile is not one: it selects the base those grants
+    /// come from, so it does not turn on the merge below.
     pub fn is_empty(&self) -> bool {
         self.grant.is_empty() && self.revoke.is_empty()
     }
@@ -970,6 +1147,9 @@ impl Overrides {
         }
         for r in &self.revoke {
             parts.push(format!("-{r}"));
+        }
+        if let Some(profile) = &self.profile {
+            parts.push(format!("profile {profile}"));
         }
         parts.join(" ")
     }

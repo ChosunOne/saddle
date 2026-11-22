@@ -43,6 +43,7 @@ environment variables are not what you think.
 | `provider` | unset | the provider a new session starts with; unset asks on first run |
 | `max-steps` | unset, no limit | model requests one prompt may take before the loop stops and waits (D37) |
 | `allow-sensitive` | `false` | skip the allowance a workspace that holds credentials needs (D60) |
+| `profile` | unset, `[agent]` as written | which `[profiles.<name>]` set of grants a session starts on; `none` names `[agent]` (D175) |
 
 `/model` chooses for one session and never writes this file; ctrl+s in the model list saves both the
 provider and the model, and is the only thing that changes what a new session starts with (D91).
@@ -90,6 +91,40 @@ net = [{ host = "api.example.com", why = "the project's API" }]
 ```
 
 `version = 1` is the base document's own line and is accepted in either file.
+
+### profiles
+
+A profile is a set of grants kept under its own name, so switching what the agent may do does not
+mean editing `[agent]` and editing it back (D175). Each `[profiles.<name>]` is written exactly as
+`[agent]` is, and the one in force **replaces** `[agent]` rather than adding to it: it is the base a
+workspace's own file is layered on, so a scope the workspace names still replaces that scope.
+
+```toml
+profile = "build"            # the default; `none` is [agent] as written
+
+[profiles.build]
+fs-read  = [{ root = "workspace" }]
+fs-write = [{ root = "workspace", exclude = [".env*"] }]
+exec     = { timeout-secs = 300 }
+net      = [{ host = "*.crates.io" }]
+
+[profiles.review]            # read-only: no exec, no net
+fs-read  = [{ root = "workspace" }]
+fs-write = []
+```
+
+| how | what it does |
+| --- | --- |
+| `profile = "name"` | what a new session starts on; unset means `[agent]` |
+| `--profile <name>` | one run only, nothing written |
+| `/profile` | report the sets in force and the ones defined |
+| `/profile <name>` | switch this session at once — the model is told on its next request, and background tasks stop first because they were started under the replaced grants (D153) |
+
+Names are 1-64 letters, digits, `-` or `_`, and `none` is reserved for `[agent]` as written. A name
+that is not defined is refused, at load and at a switch, with the defined ones listed: a mistyped
+switch never falls back to the wider base. `saddle check` prints the profile in force and the
+alternatives. `[plugin.<id>]` grants and `[sandbox]` lists stay global — a profile is the agent's
+grants, not a second copy of the command sandbox's authority.
 
 ## roots
 
@@ -336,6 +371,8 @@ The settings a session can change for itself, and where they are written:
 - `/mcp` — the servers, their restart, and their state for this session (D118).
 - `/tasks` — background commands, whether finishing one resumes the agent, and how to cancel one
   (D153, D174).
+- `/profile` — the set of grants in force; `/profile <name>` switches this session to one of
+  config.toml's `[profiles.<name>]` sets, and `none` goes back to `[agent]` (D175).
 - `/help` — the keys and every command, from the interface itself.
 
 Outside the interface, `saddle check`, `saddle tools`, `saddle tools --config`, `saddle plugin
@@ -352,6 +389,8 @@ The failures that look like bugs and are settings:
   `[sandbox]` shows up as one (`tool paths`), a root as a name.
 - **`denied:` on a host** — `net` is a list of host names, and `*` does not cover loopback or
   private addresses; those need the address named (D40).
+- **`no profile named …`** — `--profile` or `/profile` named a set config.toml does not define; the
+  error lists the ones it does, and `none` goes back to `[agent]` (D175).
 - **A tool is missing** — `[standard-tools]` has no entry for it, or its configuration scopes are
   absent: `saddle tools --config` prints the table to add.
 - **A plugin's tool is missing** — installed is not enabled, and enabled is not granted:

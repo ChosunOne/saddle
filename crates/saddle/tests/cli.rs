@@ -479,6 +479,87 @@ fn shipped_tool_inventory_and_delegation_template_do_not_modify_existing_config(
 }
 
 #[test]
+fn a_profile_names_the_grants_a_run_starts_with() {
+    // D175: `[profiles.<name>]` is a set of grants chosen by name, and the choice is the base this
+    // workspace's own file is layered on — so switching does not mean editing `[agent]` each time.
+    let env = Env::new();
+    env.write_policy(POLICY);
+    let path = env.policy_path();
+    let mut doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+    doc.insert(
+        "profiles".into(),
+        toml::Value::Table(
+            "[locked]\nfs-read = [{ root = \"workspace\" }]\n"
+                .parse::<toml::Table>()
+                .unwrap(),
+        ),
+    );
+    let write = |doc: &toml::Table| fs::write(&path, toml::to_string(doc).unwrap()).unwrap();
+    write(&doc);
+
+    // `[agent]` as written, with the alternatives named.
+    let out = env.saddle(&["check"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        text.contains("profile    none ([agent] as written)"),
+        "{text}"
+    );
+    assert!(text.contains("(defined: locked)"), "{text}");
+    assert!(text.contains("agent.exec = timeout 20s"), "{text}");
+
+    // A profile replaces the base rather than adding to it: nothing runs under `locked`.
+    let out = env.saddle(&["--profile", "locked", "check"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("profile    locked"), "{text}");
+    assert!(text.contains("agent.fs-read"), "{text}");
+    assert!(
+        !text.contains("agent.exec"),
+        "a profile is not the base plus a profile: {text}"
+    );
+    let out = env.saddle(&[
+        "--profile",
+        "locked",
+        "tool",
+        "bash",
+        r#"{"command":"echo hi"}"#,
+    ]);
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out));
+    assert!(said.contains("denied"), "{said}");
+
+    // It is still the base, so this workspace's own file replaces a scope of it (D63).
+    env.write_override("version = 1\n[agent]\nexec = { timeout-secs = 7 }\n");
+    let out = env.saddle(&["--profile", "locked", "check"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("agent.exec = timeout 7s"), "{text}");
+
+    // A name that is not defined is refused, never quietly replaced by `[agent]`.
+    let out = env.saddle(&["--profile", "nope", "check"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("no profile named `nope`"),
+        "{}",
+        stderr(&out)
+    );
+
+    // The file's own default is what a session starts on, and `none` goes back to `[agent]`.
+    doc.insert("profile".into(), toml::Value::String("locked".into()));
+    write(&doc);
+    let out = env.saddle(&["check"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("profile    locked"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let out = env.saddle(&["--profile", "none", "check"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("profile    none ([agent] as written)"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
 fn a_workspace_layers_its_own_file_on_the_base() {
     // D63: one `config.toml`. `[agent]` is the base every workspace inherits, and
     // `[workspaces."<key>"]` is this workspace's own, replacing a key it lists and inheriting the

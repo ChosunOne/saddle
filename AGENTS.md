@@ -301,7 +301,8 @@ lifetime, the WebSocket and the originator, each of them conditional (D100, D101
 
 To change what every workspace allows, edit `[agent]` in `config.toml`; to change one workspace, edit
 its file under `policies/` — what it sets replaces the base grant for that scope, narrower or wider,
-and takes effect in the next session. `--grant`/`--revoke` do it for one run. `/permissions` in the TUI edits the same file, and `a`
+and takes effect in the next session. `--grant`/`--revoke` do it for one run, and `--profile`/`/profile` pick one of the config's named
+grant sets for a run or a session without editing anything (D175). `/permissions` in the TUI edits the same file, and `a`
 there adds a grant by typing what it is (`net <host>`, `root <name>`, `exec`, …); it is a person's
 tool and no tool exposes it (D45, D46), and a change there applies at once, with the model told on
 its next request (D47). Editing `saddle.toml` in a repository has no effect (D42, D43).
@@ -487,7 +488,9 @@ Treat these as load-bearing, not stylistic. If a task appears to require changin
 rather than loosening it.
 
 - **The policy is not in the tree.** The base grants are `[agent]` in
-  `$XDG_CONFIG_HOME/saddle/config.toml`, and a workspace's own are `policies/--<path>--.toml` beside it
+  `$XDG_CONFIG_HOME/saddle/config.toml` — or one of its `[profiles.<name>]` sets, chosen by a
+  top-level `profile = "…"` and swapped for one run or one session with `--profile`/`/profile`
+  (D175) — and a workspace's own are `policies/--<path>--.toml` beside it
   (D63), layered on the base (D42, D43); each grants file carries a `workspace = "…"` line and a
   session refuses one that names a different directory, since the filename encoding is lossy. A `saddle.toml` in the repository is not read and a session
   says so once. A workspace file may narrow or widen a base grant: it is the authority for that

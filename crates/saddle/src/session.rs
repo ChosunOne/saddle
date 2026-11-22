@@ -77,6 +77,33 @@ pub const WORKSPACE_POLICY_HEADER: &str = r#"# This workspace's overrides, laid 
 # list with +path/-path entries. These overrides apply to every session in this workspace.
 "#;
 
+/// What `/profile` reports: the base in force and the ones the file defines (D175).
+pub fn profile_report(setup: &Setup) -> String {
+    let mut text = format!(
+        "profile: {}",
+        setup
+            .profile
+            .as_deref()
+            .unwrap_or("none ([agent] as written)")
+    );
+    if setup.profiles.is_empty() {
+        text.push_str(
+            "\nconfig.toml defines no [profiles]; a profile is a table of the grants [agent] takes",
+        );
+        return text;
+    }
+    for name in &setup.profiles {
+        let mark = if setup.profile.as_deref() == Some(name.as_str()) {
+            "   in force"
+        } else {
+            ""
+        };
+        text.push_str(&format!("\n  {name}{mark}"));
+    }
+    text.push_str("\n`/profile <name>` switches this session; `none` is [agent] as written");
+    text
+}
+
 /// What a workspace's own policy file starts as (D43): a comment saying what it is for, and nothing
 /// The roots a policy edit is validated against, without opening a session: the same set
 /// `Setup::load` resolves, so a change that would not load is caught before it is written (D45).
@@ -118,6 +145,11 @@ pub struct Setup {
     pub global_sha256: String,
     /// The base grants as TOML, so a policy reload re-layers without reading the file twice.
     pub global_text: String,
+    /// The profile this session's base grants come from, if it named one; `None` is `[agent]` as
+    /// written (D175).
+    pub profile: Option<String>,
+    /// The profiles config.toml defines, so `check` and `/profile` can name the alternatives.
+    pub profiles: Vec<String>,
     /// Notes for the session intro, such as a workspace `saddle.toml` that is no longer read.
     pub notes: Vec<String>,
     /// This run's grant overrides, kept so a policy reload does not silently drop them (D63).
@@ -149,6 +181,11 @@ impl Setup {
             .with_context(|| format!("{}", start.display()))?;
         let workspace = find_workspace(&start);
         let mut user = UserConfig::load(&paths.user_config())?;
+        // Which base the grants come from (D175): `--profile` or `/profile` if this run chose one,
+        // else the file's own default. Resolved before anything is layered, and refused rather than
+        // falling back, so a mistyped switch cannot quietly keep the wider grants.
+        let profile = user.profile_in_force(overrides.profile.as_deref())?;
+        let profiles: Vec<String> = user.profiles.keys().cloned().collect();
         // Reported before a root is resolved: this is a warning, not a rule about workspaces (D60).
         let exposed = paths::exposed(&workspace, &paths::sensitive_dirs());
 
@@ -222,7 +259,7 @@ impl Setup {
         };
         // All path claims use the same resolver after the one workspace override is applied.
         let (extras, tool_paths) = user.sandbox_extras(&roots, &paths.protected())?;
-        let global = user.global_policy();
+        let global = user.global_policy(profile.as_deref());
         if !overrides.is_empty() {
             // Applied to the *merged* grants, not to the workspace's own: `--revoke exec` has to
             // remove a grant that came from the base, and a workspace-level edit could only
@@ -246,7 +283,6 @@ impl Setup {
                 overrides.describe()
             ));
         }
-        let global = user.global_policy();
         let global_text = toml::to_string(&global).context("reading the grants")?;
         let policy_text = match &own {
             Some(doc) => toml::to_string(doc).context("reading this workspace's grants")?,
@@ -347,6 +383,8 @@ impl Setup {
             merged: merged_lines,
             global_sha256: sha256_hex(global_text.as_bytes()),
             global_text,
+            profile,
+            profiles,
             notes,
             exposed,
             overrides: overrides.clone(),
@@ -704,6 +742,23 @@ impl Session {
         let loaded = registry.load(self);
         self.plugins = registry;
         loaded
+    }
+
+    /// Puts this session on another profile, or back on `[agent]` with `None` (D175).
+    ///
+    /// A profile is the base the grants come from, so switching one is a policy change like any
+    /// other: it goes through the same reload a `/reload` does — applied at once, the model told on
+    /// its next request (D47), background tasks stopped first because they were started under the
+    /// grants being replaced (D153). A switch that cannot be made leaves the session exactly as it
+    /// was, rather than half-changed.
+    pub fn switch_profile(&mut self, name: Option<&str>) -> Result<()> {
+        let previous = self.setup.overrides.profile.clone();
+        self.setup.overrides.profile = name.map(str::to_owned);
+        if let Err(error) = self.reload_policy() {
+            self.setup.overrides.profile = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// reloads grants and plugins without resetting model spending (D47, D129). Invalid settings

@@ -189,6 +189,9 @@ pub enum Action {
     /// `/mcp`: what the granted servers are doing, or `restart <name>` for one of them (D118).
     Mcp(String),
     Tasks(String),
+    /// `/profile`: report the base grants in force, or switch this session to another profile
+    /// (D175). Empty is the report.
+    Profile(String),
     BackgroundTurn,
     /// Remove a saved conversation (D55).
     DeleteSession(String),
@@ -541,6 +544,11 @@ pub const COMMANDS: &[SlashCommand] = &[
         name: "/permissions",
         args: "",
         about: "the grants this project has: exclusions, and which scopes are on",
+    },
+    SlashCommand {
+        name: "/profile",
+        args: "[name]",
+        about: "the set of grants in force: list config.toml's profiles, or switch to one",
     },
     SlashCommand {
         name: "/new",
@@ -1887,6 +1895,7 @@ impl App {
             "/session" => Some(Action::SessionInfo),
             "/mcp" => Some(Action::Mcp(text["/mcp".len()..].trim().to_owned())),
             "/tasks" => Some(Action::Tasks(text["/tasks".len()..].trim().to_owned())),
+            "/profile" => Some(Action::Profile(text["/profile".len()..].trim().to_owned())),
             "/clone" if self.busy.is_some() => {
                 self.info("/clone waits for the turn to end; esc cancels it");
                 None

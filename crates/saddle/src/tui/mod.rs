@@ -143,6 +143,8 @@ enum Command {
     /// `/mcp`: report the servers, or start one again (D118).
     Mcp(String),
     Tasks(String),
+    /// `/profile`: report the base grants in force, or switch this session to another one (D175).
+    Profile(String),
     /// Remove a saved conversation (D55).
     Delete(String),
     /// Change the reasoning effort (D57).
@@ -432,6 +434,34 @@ fn work(
                 agent.clear();
                 session.mcp.restore(&[]);
                 agent.refresh_tools(session.declared_tools());
+            }
+            // `/profile`: the report needs no policy change; a switch is one, applied the way any
+            // grant change is (D47, D175).
+            Command::Profile(name) if name.is_empty() => {
+                let _ = events.send(AgentEvent::Note(session::profile_report(&session.setup)));
+            }
+            Command::Profile(name) => {
+                let chosen = (name != config::NONE_PROFILE).then_some(name.as_str());
+                match session.switch_profile(chosen) {
+                    Ok(()) => {
+                        agent.refresh_extensions(&session, &mut ChannelUi(events.clone()));
+                        let _ = events.send(AgentEvent::Note(format!(
+                            "profile: {}; the model is told on its next request",
+                            session.setup.profile.as_deref().unwrap_or("none")
+                        )));
+                    }
+                    Err(error) if error.is::<HostFailure>() => {
+                        let message = format!("{error:#}");
+                        let _ = events.send(AgentEvent::Fatal(message.clone()));
+                        fatal = Some(message);
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = events.send(AgentEvent::Note(format!(
+                            "the profile was not switched, so this session keeps its grants: {error:#}"
+                        )));
+                    }
+                }
             }
             Command::SetMaxSteps(n) => agent.set_max_steps(n),
             Command::SetWindow(window) => agent.set_window(window),
@@ -1369,6 +1399,10 @@ impl Controller {
             }
             Action::Tasks(arg) => {
                 self.send(app, Command::Tasks(arg));
+                Ok(())
+            }
+            Action::Profile(arg) => {
+                self.send(app, Command::Profile(arg));
                 Ok(())
             }
             Action::Mcp(arg) => {

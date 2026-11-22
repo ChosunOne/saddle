@@ -78,6 +78,11 @@ struct Cli {
     /// Drop a scope's grants for this run only, as in `--revoke net` (D63).
     #[arg(long, global = true)]
     revoke: Vec<String>,
+    /// Use one of config.toml's `[profiles.<name>]` sets of grants for this run, instead of
+    /// `[agent]`; `none` is `[agent]` as written (D175). Nothing is written, so a new session starts
+    /// on the file's own default again.
+    #[arg(long, global = true, value_name = "NAME")]
+    profile: Option<String>,
     /// Use this theme for one run without changing what is saved, as pi's `--use-theme` (D72).
     #[arg(long, global = true, value_name = "NAME")]
     use_theme: Option<String>,
@@ -286,6 +291,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let overrides = config::Overrides {
         grant: cli.grant,
         revoke: cli.revoke,
+        profile: cli.profile,
     };
     // One id for the whole invocation: it names the session in the audit log, and it is what an
     // allowance is written against (D60).
@@ -716,6 +722,33 @@ fn line_turn(
                 Err(error) => out.info(&format!("{error:#}")),
             }
             End::Answered
+        } else if text == "/profile" || text.starts_with("/profile ") {
+            let arg = text.trim_start_matches("/profile").trim();
+            if arg.is_empty() {
+                out.info(&session::profile_report(&session.setup));
+                End::Answered
+            } else {
+                // A switch is a policy change, so it is applied the way `/reload` applies one (D47):
+                // the session reloads, the model's next request carries the new grants (D175).
+                let chosen = (arg != config::NONE_PROFILE).then_some(arg);
+                match session.switch_profile(chosen) {
+                    Ok(()) => {
+                        agent.refresh_extensions(session, out);
+                        out.info(&format!(
+                            "profile: {}; the model is told on its next request",
+                            session.setup.profile.as_deref().unwrap_or("none")
+                        ));
+                        End::Answered
+                    }
+                    Err(error) if error.is::<HostFailure>() => return Err(error),
+                    Err(error) => {
+                        out.info(&format!(
+                            "the profile was not switched, so this session keeps its grants: {error:#}"
+                        ));
+                        End::Failed
+                    }
+                }
+            }
         } else if text == "/reload" {
             match session.reload_policy() {
                 Err(error) if !error.is::<HostFailure>() => {
@@ -1101,6 +1134,19 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
         "grants     {} (sha256 {})",
         setup.policy_path.display(),
         &setup.global_sha256[..16]
+    );
+    // Which base those grants are layered on (D175), with the alternatives, so a profile that is in
+    // force is visible and one that could be is discoverable.
+    println!(
+        "profile    {}{}",
+        setup
+            .profile
+            .as_deref()
+            .unwrap_or("none ([agent] as written)"),
+        match setup.profiles.is_empty() {
+            true => String::new(),
+            false => format!("  (defined: {})", setup.profiles.join(", ")),
+        }
     );
     if setup.policy_text.is_empty() {
         println!(
