@@ -1124,6 +1124,85 @@ fn a_declined_wake_ends_the_run_and_wait_arms_one_later() {
 }
 
 #[test]
+fn a_finished_task_answers_a_later_poll_with_its_exit_status_and_output() {
+    // D179: a task's record outlives its command, so polling is how a launch that declined a wake
+    // is read afterwards — while it runs, before it is reaped and long after the turn that started it.
+    let mut id = String::new();
+    let (base, _seen) = serve_dynamic(8, move |index, body| {
+        let calls = match index {
+            0 => vec![(
+                "start",
+                "bash",
+                json!({"command":"printf early; printf done > done.txt; sleep 1", "background":true, "wake":false, "timeout_secs":10}),
+            )],
+            1 => {
+                id = background_id(body);
+                // Still running: no claim about how it ended, and no output yet to show.
+                assert!(result_text(body, "start").contains("running"));
+                assert!(!result_text(body, "start").contains("exited"));
+                thread::sleep(Duration::from_millis(300));
+                vec![("live", "bash", json!({"action":"status","task_id":id}))]
+            }
+            2 => {
+                assert!(
+                    result_text(body, "live").contains("running"),
+                    "{}",
+                    result_text(body, "live")
+                );
+                assert!(
+                    !result_text(body, "live").contains("exited"),
+                    "{}",
+                    result_text(body, "live")
+                );
+                assert!(
+                    result_text(body, "live").contains("early"),
+                    "the capture so far is readable: {}",
+                    result_text(body, "live")
+                );
+                thread::sleep(Duration::from_millis(1500));
+                vec![("done", "bash", json!({"action":"status","task_id":id}))]
+            }
+            3 => {
+                let text = result_text(body, "done");
+                assert!(text.contains("finished"), "{text}");
+                assert!(text.contains("exit code 0"), "{text}");
+                assert!(
+                    text.contains("early"),
+                    "its output is still readable: {text}"
+                );
+                assert!(!text.contains("unknown task"), "{text}");
+                vec![("list", "bash", json!({"action":"list"}))]
+            }
+            4 => {
+                let text = result_text(body, "list");
+                assert!(text.contains(&id), "{text}");
+                assert!(text.contains("finished (exit 0)"), "{text}");
+                return sse_response(&openai_sse("done", &[]));
+            }
+            _ => return sse_response(&openai_sse("done", &[])),
+        };
+        sse_response(&openai_sse("", &calls))
+    });
+    let env = Env::new(Api::Openai, &base);
+    plugin_fixture::configure(
+        &env.xdg.path().join("config/saddle/config.toml"),
+        &standard_component("bash"),
+        "tool={}\nexec={timeout-secs=10}\nfs-read=[{root='workspace'}]\nfs-write=[{root='workspace'}]",
+    );
+    let out = env.saddle(&["run", "poll it"]);
+    assert!(
+        out.status.success(),
+        "{} {}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(env.ws.path().join("done.txt")).unwrap(),
+        "done"
+    );
+}
+
+#[test]
 fn closing_a_session_cancels_background_work_before_the_audit_closes() {
     // The task declines a wake (D174), so the run leaves while it is still running and closing the
     // session is what stops it — which is what this test is about.

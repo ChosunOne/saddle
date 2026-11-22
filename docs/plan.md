@@ -4473,6 +4473,21 @@ the `exec` interface are all deleted.
   contains it (D65), for `bash` exactly as for `write`. Nothing is special-cased inside a root, so
   there is one answer to "may this be written" rather than two.
 
+**D179.** Polling a task answers after it ends, and never claims an ending it has not had. This
+settles what `bash`'s `status`, `list` and `wait` report about a session-owned task (D153, D174).
+
+- **A record outlives its command.** `start` keeps a finished task's reply until `exec-tasks`
+  (16 by default) is full and the oldest finished record makes way. So `status` after the fact is how
+  a launch that said `wake: false` is read: the exit status, the bounded capture and the denials are
+  all still there, and the answer does not depend on catching the moment it finished.
+- **A running task reports no exit line.** Its capture is what has arrived so far; `render` is asked
+  for the streams alone while it runs, instead of printing "exited" and trimming it, so a poll reads
+  `task <id>: running` followed by whatever output exists — never a claim that it exited.
+- **`list` is a polling surface too**: each record says how it stands and how it ended — `running`,
+  `finished (exit 0)`, `cancelled`, `timed out`. A list still carries no captured bodies.
+- **The wake and the poll stay separate.** A completion resumes the agent or does not, as the launch
+  or `wait` said; reading the task later changes neither, and does not re-arm anything.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

@@ -46,16 +46,13 @@ pub enum Action {
 #[cfg(target_arch = "wasm32")]
 fn format_task(task: &Task) -> String {
     let status = if task.running { "running" } else { "finished" };
-    let output = format_reply(&task.output).0;
-    format!(
-        "task {}: {status}\n{}",
-        task.id,
-        if task.running {
-            output.trim_start_matches("exited\n")
-        } else {
-            &output
-        }
-    )
+    // A running task has no exit status to report; its capture is what has arrived so far (D179).
+    let output = render(&task.output, !task.running);
+    if output.is_empty() {
+        format!("task {}: {status}", task.id)
+    } else {
+        format!("task {}: {status}\n{output}", task.id)
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -134,13 +131,7 @@ fn invoke_task(args: Arguments) -> Result<(String, bool), String> {
             } else {
                 tasks
                     .iter()
-                    .map(|task| {
-                        format!(
-                            "{}: {}",
-                            task.id,
-                            if task.running { "running" } else { "finished" }
-                        )
-                    })
+                    .map(|task| format!("{}: {}", task.id, state(task)))
                     .collect::<Vec<_>>()
                     .join("\n")
             };
@@ -150,12 +141,42 @@ fn invoke_task(args: Arguments) -> Result<(String, bool), String> {
 }
 
 pub fn format_reply(reply: &ExecReply) -> (String, bool) {
+    let text = render(reply, true);
+    (
+        text,
+        reply.code == Some(0) && !reply.timed_out && !reply.cancelled,
+    )
+}
+
+/// What `list` says about one task: how it stands, and how it ended (D179). A record outlives its
+/// command, so a poll after the fact still answers what the answer was.
+#[cfg(target_arch = "wasm32")]
+fn state(task: &Task) -> String {
+    if task.running {
+        return "running".into();
+    }
+    match (
+        task.output.code,
+        task.output.timed_out,
+        task.output.cancelled,
+    ) {
+        (_, true, _) => "timed out".into(),
+        (_, _, true) => "cancelled".into(),
+        (Some(code), _, _) => format!("finished (exit {code})"),
+        _ => "finished (no exit status)".into(),
+    }
+}
+
+/// The reply as text: the status line when there is one, then the bounded streams (D179). A task
+/// still running is asked for the streams alone, because "exited" is the one thing it has not done.
+pub fn render(reply: &ExecReply, finished: bool) -> String {
     let mut text = match (reply.code, reply.signal) {
         _ if reply.cancelled => "cancelled by the user\n".into(),
         _ if reply.timed_out => "command timed out\n".into(),
         (Some(code), _) => format!("exit code {code}\n"),
         (_, Some(signal)) => format!("killed by signal {signal}\n"),
-        _ => "exited\n".into(),
+        _ if finished => "exited\n".into(),
+        _ => String::new(),
     };
     for (label, bytes) in [("stdout", &reply.stdout), ("stderr", &reply.stderr)] {
         if !bytes.is_empty() {
@@ -181,10 +202,7 @@ pub fn format_reply(reply: &ExecReply) -> (String, bool) {
         end -= 1;
     }
     text.truncate(end);
-    (
-        text.trim_end().into(),
-        reply.code == Some(0) && !reply.timed_out && !reply.cancelled,
-    )
+    text.trim_end().to_owned()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -236,6 +254,17 @@ mod tests {
         };
         let (text, ok) = format_reply(&reply);
         assert!(ok && text.contains("exit code 0") && text.contains("hello"));
+        // A task still running reports its streams and no status line: it has not exited (D179).
+        let running = ExecReply {
+            code: None,
+            signal: None,
+            truncated: false,
+            ..reply.clone()
+        };
+        let streams = render(&running, false);
+        assert!(!streams.contains("exited"), "{streams}");
+        assert!(streams.contains("hello"), "{streams}");
+        assert!(render(&running, true).starts_with("exited\n"));
         reply.cancelled = true;
         assert!(!format_reply(&reply).1);
         reply.stdout = "é".repeat(256000).into_bytes();
