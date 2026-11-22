@@ -61,7 +61,6 @@ Inside `crates/saddle/src`:
 | `store` | the saved conversations: a SQLite tree of messages per workspace (D53), imported from the older JSON Lines files once, with one row per model request recording what it used and which model answered (D94), and a `declared` node for what an MCP search declared on a branch (D109) |
 | `output` | line-mode output: a terminal, or one JSON object per line for a program (D52) |
 | `cache` | the cache-miss notice: one line to the user when a prompt is re-read at full price (D50) |
-| `reserved` | the D20 snapshot and restore of reserved paths around `exec` |
 | `provider/` | the neutral conversation form, the Anthropic, OpenAI-compatible and Responses renderers (every other server is a `[providers.<name>]` table naming which one it imitates, D84), the cache-affinity key, headers, lifetime and originator, sent to OpenAI's own API and to the subscription backend (D100), and the WebSocket that backend is spoken to over, with the delta a kept connection allows (D101), its endpoint/authentication-bound reuse and completed-socket handoff (D102), and one HTTP recovery of a transient Responses stream failure before text or reasoning is shown (D125), OAuth login and token refresh (D85), the model list, the cached context windows and prices (D34, D36); reasoning is kept for every model and replayed in its original position (D95, D96), while Responses summary parts retain display paragraph boundaries and reasoning renders as Markdown live and on resume (D151), and the pictures one request may carry, older ones replaced by a note past the budget (D162) |
 | `tui/` | the full-screen UI: app state, rendering (a prompt is markdown in the user's colour, D81; tables are fitted to the width, D83), editor, login (a key or an OAuth sign-in, D85; the searchable model picker `/model` opens, D88), selection (a drag copies the transcript's text or the open dialog's, D87, and a formula it covers as the TeX it was drawn from, D166), settings, session list, `permissions` (the grants editor, D45), `tree` (the message tree, full screen, D54, D168; the branch ends have no default key and take one from `[keys]`, D169; a move that would leave replies behind asks before summarizing them, D167), `image` (drawing a picture: kitty and iTerm2, D59; a formula is pinned to its cells and the cursor is saved around every placement, D165; never where a menu or dialog is drawn, D161), `math` (a formula typeset by Typst and placed as a picture in the cells the layout reserved — a block's own rows at one image pixel per screen pixel, or one row of a line of text, on its baseline, D165 — sized to the text's lowercase letters and scaled by `[ui] math-scale`; `$…$` and `$$…$$` are LaTeX, translated to Typst's math syntax, and a fence tagged `typst-math` is Typst's own notation, so no body is ever read as both; the source where it cannot be drawn, and presentation only — the stored text, a copy and the request a model is sent all carry the TeX, the copy in `\(…\)`/`\[…\]`, or in the fence that asked for it, D166), `status` (the `[ui] status` template, D36), `theme` (the colour roles, D71), `catppuccin` (the four built-in flavours, D76), `palette` (pi's role vocabulary, colour forms and the palette derived from the terminal, D72, D73), `terminal` (asking the terminal for its colours and its cell size, D73, D59), `syntax` (code blocks: syntect's grammars, nine roles, the theme's colours, D80), `themes` (the `/theme` picker, D74), `grant` (writing one change into this workspace's policy file, D45), `keys` (the few moves with no default key, read from `[keys]` in `config.toml`, D169), `files` (the `@` file-name completion's own enumeration, which is not an agent tool) and `browser` (opening the link a sign-in shows, D86) |
 
@@ -153,8 +152,8 @@ turn for unconsumed completions from model tool calls when idle; active turns re
 safe request points. This may spend a model request, but idle ticks and consumed notices never do.
 Hook-only tasks do not trigger automatic model spending. Output still requires owning-tool access.
 One shell command per workspace may run at a time, across cooperating Saddle processes: a pinned
-workspace-directory lock spans snapshot, process cleanup and reserved-path restoration. File tools
-can run meanwhile. `timeout_secs` on a start also caps task lifetime; polling cannot renew it.
+workspace-directory lock spans the command's start through process cleanup. File tools can run
+meanwhile. `timeout_secs` on a start also caps task lifetime; polling cannot renew it.
 `/tasks` and `/tasks cancel <id>` give the person status/control in TUI and line mode. Tasks stop
 and are audited before policy replacement on reload and before session close. They do not survive
 restart/resume; `exec-tasks` in `[tool-limits]` bounds retained records (16 by default). Never give a
@@ -422,12 +421,12 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D177 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D178 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
-//! D20: landlock cannot exclude paths beneath a writable root, so a sandboxed command can write
-//! the paths D23 reserves. The host snapshots them before each exec and puts them back after.
+//! D20: landlock grants cannot carve a path out of a granted root, so an `exclude` pattern narrows the
+//! tools and plugin host calls, and a command reaches what the sandbox list names.
 ```
 
 - Read the cited decisions before editing a module; they usually explain why the obvious
@@ -474,8 +473,8 @@ nearly every module header names the ones it implements, for example:
   End-to-end tests go in `crates/saddle/tests/`, build against `env!("CARGO_BIN_EXE_saddle")`, and
   run the real binary in a `tempfile::TempDir` workspace with throwaway `XDG_CONFIG_HOME` and
   `XDG_STATE_HOME` — never against the developer's real config or state.
-- `crates/saddle/tests/cli.rs` covers the gate through the binary (policy layering, denials,
-  reserved paths, the exec sandbox, network grants, the audit chain). `crates/saddle/tests/agent.rs` drives the model loop with
+- `crates/saddle/tests/cli.rs` covers the gate through the binary (policy layering, denials, the exec
+  sandbox, network grants, the audit chain). `crates/saddle/tests/agent.rs` drives the model loop with
   a mock provider that answers catalogue GETs and model POSTs over a loopback `TcpListener`; those
   tests need `socket()`/`bind()` to be permitted. A bind permission error is environmental; other
   failures still need investigation. They use a throwaway home as well as config and state.
@@ -498,22 +497,23 @@ rather than loosening it.
   says so once. A workspace file may narrow or widen a base grant: it is the authority for that
   directory, and only a person can write it. `--grant` and `--revoke` change the grants for one run
   without writing anything. Never move authority back into the workspace: landlock cannot carve
-  a path out of a granted root, so a policy file there is writable by any command, and the
-  snapshot/restore that guarded it (D20) is a race a `setsid` child wins.
-- **Reserved paths.** Writes to `.git/config` and anything under `.git/hooks` (including
-  `.git/modules/**/hooks`) are refused under every grant (D23), because hooks and settings like
-  `core.fsmonitor` run later as the user, outside any sandbox. The list in `RESERVED_VCS` also holds
-  `config.worktree`, a bare `<name>.git` repository's config and hooks, and jj's in-tree config,
-  `git_target` and `.jj/repo/store/git`; a new tool that reads configuration from the tree belongs
-  there too. The policy file was on that list until D42 moved it out of the tree; it is now
-  protected by the kernel instead.
+  a path out of a granted root, so a policy file there would be writable by any command — which is
+  why D42 put it in the config directory, where no root contains it and the kernel protects it. A
+  `saddle.toml` in the tree is not read, and D178 deleted the snapshot/restore that once guarded it.
+- **Nothing inside a root is reserved: a grant is a grant** (D178). `.git/config`, `.git/hooks` and
+  jj's in-tree config are ordinary files in the workspace, and `git` and `jj` write them as ordinary
+  work — `git remote add`, `git submodule add`, `jj`'s own setup — so a rule that undid those writes
+  punished the person, not an attacker. `write` and `bash` now answer the same question the same way:
+  the grant on the root that contains the path. Do not reintroduce a special case inside a root; a
+  path that must be unwritable belongs outside every root or behind the mount view in `docs/plan.md`
+  §8, which no tool or command can write through. (D42's move of the policy out of the tree is
+  unaffected: it is not inside any root, and the kernel refuses it.)
 - **Symlinks.** A path is decided on both the requested path and the resolved one, including dangling
   links; either denial refuses the call. A link to an absolute path is refused. Resolution goes
   through cap-std (`openat2` + `RESOLVE_BENEATH`), so `..` and symlink escapes are closed.
-- **`exec` writes.** Landlock cannot exclude a path beneath a granted root, so `exec` can write
-  reserved paths. `reserved::take`/`restore` snapshots them around every command and logs each
-  restore as a denial (D20). All access there goes through a cap-std `Dir` so a command that swaps a
-  reserved directory for a symlink cannot steer the restore outside the workspace.
+- **`exec` writes what its grants reach.** Landlock cannot exclude a path beneath a granted root, so
+  a command writes everything under the roots and `[sandbox] write` entries its grants name, `.git`
+  included (D178). There is no restore afterwards; a command's effects are its own.
 - **Exclusions do not bind `exec`.** An `exclude` pattern narrows built-in tools and plugin host
   calls only. A secret that must stay unreadable belongs outside every root.
 - **A command can look at a path it cannot open.** Landlock decides what a path may be opened,
@@ -555,7 +555,7 @@ rather than loosening it.
   file tools that may name that directory directly. Tool-visible directories are not roots and no
   policy can name one; `check` lists them separately. An entry that names, contains or sits inside
   the state or config directory is refused, and a misspelt tool name is an error because the file
-  tools run in saddle, with no kernel behind them. A named write still cannot reach a reserved path.
+  tools run in saddle, with no kernel behind them.
   D158 permits these claims in the same protected workspace override file as `[agent]` and
   `[plugin]`: `$XDG_CONFIG_HOME/saddle/policies/--<workspace-path>--.toml`. Its matching canonical
   `workspace` line is required for sandbox lists. There is no separate session override file;

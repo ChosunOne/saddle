@@ -410,7 +410,7 @@ fn tool_loop(api: Api) {
         (
             "t2",
             "write",
-            json!({"path": ".git/hooks/pre-commit", "content": "#!/bin/sh\necho pwned\n"}),
+            json!({"path": "../outside-the-workspace", "content": "#!/bin/sh\necho pwned\n"}),
         ),
         (
             "t3",
@@ -438,7 +438,8 @@ fn tool_loop(api: Api) {
         fs::read_to_string(ws.join("notes/hello.txt")).unwrap(),
         "hi"
     );
-    assert!(!ws.join(".git/hooks/pre-commit").exists());
+    // D178: `.git` is inside the grant, so the refusal comes from the grant not covering `..`.
+    assert!(!ws.parent().unwrap().join("outside-the-workspace").exists());
 
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 2);
@@ -489,10 +490,7 @@ fn tool_loop(api: Api) {
         second.contains("wrote notes/hello.txt (2 bytes"),
         "{second}"
     );
-    assert!(
-        second.contains("denied: workspace:.git/hooks/pre-commit is reserved by the host"),
-        "{second}"
-    );
+    assert!(second.contains("outside every root"), "{second}");
     assert!(second.contains("key=unset\nhi"), "{second}");
     assert!(!second.contains(KEY));
     if api == Api::Anthropic {
@@ -615,7 +613,7 @@ fn background_network_is_attributed_or_fails_closed_during_model_and_input_waits
         assert!(fetched.is_empty());
     }
 
-    // A separate Saddle process must not take an overlapping reserved-path snapshot.
+    // A separate Saddle process must not run an overlapping command.
     let competing = env.saddle(&["tool", "bash", r#"{"command":"printf raced > raced"}"#]);
     assert!(!competing.status.success());
     assert!(text(&competing.stderr).contains("workspace shell execution is busy"));
@@ -708,7 +706,7 @@ fn background_output_and_completed_task_retention_are_bounded_by_runtime_budgets
 }
 
 #[test]
-fn background_shell_returns_live_output_isolates_principals_serializes_and_restores_on_cancel() {
+fn background_shell_returns_live_output_isolates_principals_and_serializes_until_cancel() {
     let mut id = String::new();
     let (base, seen) = serve_dynamic(6, move |index, body| {
         let calls = match index {
@@ -755,7 +753,6 @@ fn background_shell_returns_live_output_isolates_principals_serializes_and_resto
             }
             4 => {
                 assert!(result_text(body, "done").contains("cancelled"));
-                assert!(result_text(body, "done").contains("restored reserved path .git/config"));
                 vec![("unlocked", "bash", json!({"command":"printf unlocked"}))]
             }
             _ => {
@@ -782,9 +779,10 @@ fn background_shell_returns_live_output_isolates_principals_serializes_and_resto
         text(&out.stderr)
     );
     assert_eq!(seen.lock().unwrap().len(), 6);
+    // D178: the task wrote `.git/config` inside the grant before it was cancelled, and that stays.
     assert_eq!(
         fs::read_to_string(env.ws.path().join(".git/config")).unwrap(),
-        "original"
+        "changed"
     );
     assert!(!env.ws.path().join("forbidden").exists());
     let rows = records(&env.audit_log());
@@ -1126,7 +1124,7 @@ fn a_declined_wake_ends_the_run_and_wait_arms_one_later() {
 }
 
 #[test]
-fn closing_a_session_cancels_background_work_and_restores_before_the_audit_closes() {
+fn closing_a_session_cancels_background_work_before_the_audit_closes() {
     // The task declines a wake (D174), so the run leaves while it is still running and closing the
     // session is what stops it — which is what this test is about.
     let (base, _) = serve_dynamic(2, |index, _| {
@@ -1152,9 +1150,10 @@ fn closing_a_session_cancels_background_work_and_restores_before_the_audit_close
     assert!(start.elapsed() < Duration::from_secs(5));
     assert!(env.ws.path().join("ready").exists());
     assert!(!env.ws.path().join("leaked").exists());
+    // D178: the write the command already made stays; only the work still running is stopped.
     assert_eq!(
         fs::read_to_string(env.ws.path().join(".git/config")).unwrap(),
-        "original"
+        "changed"
     );
     let rows = records(&env.audit_log());
     assert!(rows.iter().any(

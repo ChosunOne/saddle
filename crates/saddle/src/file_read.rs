@@ -2,11 +2,10 @@
 
 use crate::session::Session;
 use crate::tools::ToolOutput;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use cap_std::fs::Dir;
 use saddle_cap::{Location, Principal, RelPath, Scope};
-use saddle_policy::{Kind, Request};
-use serde_json::json;
+use saddle_policy::Request;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -101,28 +100,9 @@ pub(crate) fn gate(
         },
     };
     // D66: a `[sandbox]` directory is not covered by a grant, and `locate` has already checked
-    // the tool against the list the config names and recorded the decision. The reserved paths
-    // are still the host's (D23): a write there runs code as the user later, whatever granted it.
+    // the tool against the list the config names and recorded the decision. Nothing inside it is
+    // reserved: a grant is a grant, `.git` included (D178).
     if session.is_tool_root(&loc.root) {
-        if scope == Scope::FsWrite {
-            for target in [&loc, &real] {
-                if session.engine.reserved().contains(target) {
-                    let why = format!("{raw} is reserved by the host and no grant can write it");
-                    session
-                        .audit
-                        .event(
-                            Kind::Decision,
-                            Some(&who),
-                            Some(scope),
-                            Some(false),
-                            json!({ "path": raw }),
-                            &why,
-                        )
-                        .context("writing the audit log")?;
-                    return Ok(Err(ToolOutput::denied(&why)));
-                }
-            }
-        }
         // The resolved location, not the one that came in: a link inside a tool-visible directory
         // would otherwise be walked again by cap-std, which refuses it.
         return Ok(Ok(real));

@@ -154,7 +154,7 @@ fn standard_mutation_components_write_edit_and_patch_through_the_production_host
         ),
         (
             "patch",
-            "tool={}\nfs-read=[{root='workspace'}]\nfs-write=[{root='workspace'}]",
+            "tool={}\nfs-read=[{root='workspace'}]\nfs-write=[{root='workspace',exclude=['private']}]",
             r#"{"patch":"*** Begin Patch\n*** Update File: file\n*** Move to: moved\n@@\n-old\n+new\n*** Add File: added\n+created\n*** Delete File: gone\n*** End Patch"}"#,
         ),
     ] {
@@ -180,7 +180,8 @@ fn standard_mutation_components_write_edit_and_patch_through_the_production_host
                     fs::read_to_string(env.ws().join("added")).unwrap(),
                     "created\n"
                 );
-                let out = env.run(&["plugin", "call", "reader", r#"{"patch":"*** Add File: first\n+ok\n*** Add File: .git/config\n+blocked\n"}"#]);
+                // One target the grant excludes refuses the whole document (D56).
+                let out = env.run(&["plugin", "call", "reader", r#"{"patch":"*** Add File: first\n+ok\n*** Add File: private/blocked\n+blocked\n"}"#]);
                 assert_eq!(out.status.code(), Some(1), "{}", text(&out));
                 assert!(!env.ws().join("first").exists());
                 // Additions are guarded by absence; deletion now requires a readable preimage.
@@ -382,14 +383,8 @@ fn mutation_write_only_parents_and_replacement_permissions_need_no_directory_rea
 }
 
 #[test]
-fn mutation_batches_preflight_all_permissions_including_exclusions_and_reserved_paths() {
-    for denied in [
-        "private",
-        ".env",
-        ".git/config",
-        ".git/hooks/post-checkout",
-        ".git/modules/sub/hooks/pre-commit",
-    ] {
+fn mutation_batches_preflight_all_permissions_including_exclusions() {
+    for denied in [".env", ".env.local", "sub/.env"] {
         let env = mutation_env(
             &[
                 ("newdir/first", Some("first"), "missing"),
@@ -406,6 +401,28 @@ fn mutation_batches_preflight_all_permissions_including_exclusions_and_reserved_
         assert!(!env.ws().join("newdir").exists(), "{denied}");
         assert!(!env.ws().join(denied).exists(), "{denied}");
     }
+    // D178: the VCS metadata those grants cover is written like anything else in the root, so a
+    // batch that names it is published rather than refused.
+    let env = mutation_env(
+        &[
+            (".git/config", Some("committed"), "any"),
+            (".git/hooks/post-checkout", Some("hook"), "any"),
+        ],
+        WRITE_GRANTS,
+    );
+    fs::create_dir_all(env.ws().join(".git/hooks")).unwrap();
+    fs::write(env.ws().join(".git/config"), "original").unwrap();
+    let out = call(&env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        fs::read_to_string(env.ws().join(".git/config")).unwrap(),
+        "committed"
+    );
+    assert_eq!(
+        fs::read_to_string(env.ws().join(".git/hooks/post-checkout")).unwrap(),
+        "hook"
+    );
+
     let env = mutation_env(&[("alias", Some("changed"), "any")], WRITE_GRANTS);
     fs::write(env.ws().join("private"), "original").unwrap();
     symlink("private", env.ws().join("alias")).unwrap();
@@ -642,7 +659,7 @@ fn standard_fetch_checks_redirect_grants_strips_cross_origin_headers_and_bounds_
 }
 
 #[test]
-fn standard_shell_uses_delegated_grants_waits_beyond_guest_deadlines_and_restores_reserved_paths() {
+fn standard_shell_uses_delegated_grants_and_waits_beyond_guest_deadlines() {
     let component = "bash";
     let bytes = standard_component(component);
     let env = Env::new(
@@ -674,14 +691,15 @@ fn standard_shell_uses_delegated_grants_waits_beyond_guest_deadlines_and_restore
     fs::write(env.ws().join(".git/config"), "original config").unwrap();
     let out = env.run(&["plugin", "call", "reader", r#"{"command":"sleep 3; printf success > file; printf changed > .git/config; printf output"}"#]);
     assert!(out.status.success(), "{}", text(&out));
-    assert!(text(&out).contains("output") && text(&out).contains("restored reserved path"));
+    assert!(text(&out).contains("output"));
     assert_eq!(
         fs::read_to_string(env.ws().join("file")).unwrap(),
         "success"
     );
+    // D178: the plugin's `fs-write` grant covers `.git` like any other path in the root.
     assert_eq!(
         fs::read_to_string(env.ws().join(".git/config")).unwrap(),
-        "original config"
+        "changed"
     );
     assert!(env.records().iter().any(|row| row["scope"] == "exec"
         && row["principal"] == "plugin.reader"
@@ -715,7 +733,7 @@ fn standard_shell_uses_delegated_grants_waits_beyond_guest_deadlines_and_restore
 }
 
 #[test]
-fn managed_mutations_check_both_directories_reserved_absolute_paths_and_read_preconditions() {
+fn managed_mutations_check_both_directories_absolute_paths_and_read_preconditions() {
     let outside = tempfile::tempdir().unwrap();
     let source = outside.path().join("source");
     let target = outside.path().join("target");
@@ -778,10 +796,11 @@ fn managed_mutations_check_both_directories_reserved_absolute_paths_and_read_pre
     managed_manifest(&env, "['tool','tool-write']");
     let settings = fs::read_to_string(env.config()).unwrap();
     fs::write(env.config(), format!("{settings}\n[sandbox]\ntools-defaults=false\nwrite=[{{path={git:?},tools=['write']}}]\n")).unwrap();
+    // D178: a `[sandbox] write` entry that names `tools = ['write']` allows the write; nothing
+    // beneath the declared directory is a second class of path.
     let out = call(&env);
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
-    assert!(text(&out).contains("reserved"), "{}", text(&out));
-    assert!(!git.join("config").exists());
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(git.join("config")).unwrap(), "unsafe");
 }
 
 #[test]

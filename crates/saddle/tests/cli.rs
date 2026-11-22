@@ -1,5 +1,5 @@
-//! End to end through the binary: the policy in force, decisions, reserved paths, the exec sandbox,
-//! network grants and the audit log, in a throwaway workspace with its own XDG directories.
+//! End to end through the binary: the policy in force, decisions, the exec sandbox, network
+//! grants and the audit log, in a throwaway workspace with its own XDG directories.
 
 #[path = "support/sandbox_overrides.rs"]
 mod sandbox_override_tests;
@@ -753,16 +753,13 @@ fn file_tools_follow_the_policy() {
         serde_json::json!({"path": ".env", "content": "x"}),
         "excluded by agent.fs-write[0]",
     );
-    denied(
-        "write",
-        serde_json::json!({"path": ".git/hooks/pre-commit", "content": "x"}),
-        "reserved",
-    );
-    denied(
-        "write",
-        serde_json::json!({"path": "saddle.toml", "content": "x"}),
-        "reserved",
-    );
+    // D178: nothing inside the workspace is reserved, `.git` and `saddle.toml` included; the grant
+    // on the root decides, as it does for every other path.
+    for path in [".git/hooks/pre-commit", "saddle.toml"] {
+        let (ok, text) = env.tool("write", serde_json::json!({"path": path, "content": "x"}));
+        assert!(ok, "{path}: {text}");
+        assert_eq!(fs::read_to_string(env.path(path)).unwrap(), "x");
+    }
     let secret = env.outside.path().join("secret");
     denied(
         "read",
@@ -775,18 +772,22 @@ fn file_tools_follow_the_policy() {
         "outside every root",
     );
 
-    // A symlink inside the workspace that points at a reserved path is decided on its target.
+    // A grant is a grant (D178): a link into `.git` is decided on its target, and the target is
+    // inside the workspace write grant, so it is written.
     unix_fs::symlink(".git/hooks/pre-commit", env.path("innocent")).unwrap();
-    denied(
+    let (ok, text) = env.tool(
         "write",
         serde_json::json!({"path": "innocent", "content": "x"}),
-        "reserved",
     );
-    assert!(!env.path(".git/hooks/pre-commit").exists());
+    assert!(ok, "{text}");
+    assert_eq!(
+        fs::read_to_string(env.path(".git/hooks/pre-commit")).unwrap(),
+        "x"
+    );
 }
 
 #[test]
-fn bash_runs_sandboxed_and_reserved_paths_are_restored() {
+fn bash_runs_sandboxed_and_vcs_metadata_is_the_workspace_s_own() {
     if let Err(reason) = saddle_sandbox::availability() {
         eprintln!("skipping: {reason}");
         return;
@@ -807,19 +808,20 @@ fn bash_runs_sandboxed_and_reserved_paths_are_restored() {
     );
     assert!(!ok && text.contains("Permission denied"), "{text}");
 
+    // D178: `.git` is inside the workspace grant, so what a command writes there is its own —
+    // `git remote add` and an installer write exactly these paths as ordinary work.
     let (ok, text) = env.tool(
         "bash",
-        serde_json::json!({"command": "echo evil > .git/hooks/pre-commit && echo '[core] fsmonitor = evil' >> .git/config"}),
+        serde_json::json!({"command": "echo hook > .git/hooks/pre-commit && echo 'fsmonitor = cargo-watch' >> .git/config"}),
     );
     assert!(ok, "{text}");
-    assert!(
-        text.contains("restored reserved path .git/hooks/pre-commit"),
-        "{text}"
+    assert_eq!(
+        fs::read_to_string(env.path(".git/hooks/pre-commit")).unwrap(),
+        "hook\n"
     );
-    assert!(!env.path(".git/hooks/pre-commit").exists());
     assert_eq!(
         fs::read_to_string(env.path(".git/config")).unwrap(),
-        "[core]\n"
+        "[core]\nfsmonitor = cargo-watch\n"
     );
 
     let (ok, text) = env.tool(
@@ -2925,9 +2927,10 @@ fn a_sandbox_entry_naming_tools_lets_those_tools_reach_it() {
 }
 
 #[test]
-fn a_sandbox_entry_naming_tools_can_write_but_never_a_reserved_path() {
-    // The tools run in saddle, so the list is what allows a write there; the skeleton is the
-    // kernel. D23 still holds, because a hook runs as the user later whatever granted the write.
+fn a_sandbox_entry_naming_tools_allows_a_write_and_nothing_inside_it_is_reserved() {
+    // The tools run in saddle, so the list is what allows a write there; the kernel is not
+    // involved. D178: what the entry allows is the whole of it — a `.git/hooks` path under a
+    // tool-visible directory is the person's own directory like any other.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let scratch = home.path().join("scratch");
@@ -2966,11 +2969,26 @@ fn a_sandbox_entry_naming_tools_can_write_but_never_a_reserved_path() {
             ),
         ],
     );
-    assert!(
-        stderr(&out).contains("reserved by the host"),
-        "{}",
-        stderr(&out)
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        fs::read_to_string(scratch.join(".git/hooks/pre-commit")).unwrap(),
+        "#!/bin/sh"
     );
+
+    // What the entry does not name is still refused: the list is the authority, not the skeleton.
+    let out = saddle_in(
+        &env,
+        home.path(),
+        &[
+            "tool",
+            "write",
+            &format!(
+                r#"{{"path":"{}","content":"x"}}"#,
+                home.path().join("elsewhere.txt").display()
+            ),
+        ],
+    );
+    assert!(!out.status.success(), "{}", stderr(&out));
 }
 
 #[test]

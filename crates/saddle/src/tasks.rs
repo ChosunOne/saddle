@@ -218,7 +218,6 @@ fn snapshot(task: &Task) -> Result<TaskReply> {
             timed_out: false,
             cancelled: false,
             truncated: capture.truncated,
-            restored: Vec::new(),
             denials: task.denials.clone(),
         }
     };

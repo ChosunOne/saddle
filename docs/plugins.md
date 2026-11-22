@@ -112,8 +112,7 @@ exiting and killing it; in an interactive session the wake is the follow-up turn
 
 Status returns a bounded snapshot of available stdout/stderr, exit status and timeout/cancellation
 state. Repeated polls return the captured prefix again, not an ever-growing log. Cancellation is
-requested promptly; a task may still report running until process-group cleanup and reserved-path
-restoration finish. The tool that started it is its owner: another plugin cannot read or cancel it,
+requested promptly; a task may still report running until process-group cleanup finishes. The tool that started it is its owner: another plugin cannot read or cancel it,
 nor arm a wake on it. A start's timeout bounds the **task lifetime**; a timeout on a status call only
 bounds that call.
 
@@ -172,8 +171,7 @@ should leave this execution-option name to the host. No guest rebuild or SDK cha
 `saddle tool`, `saddle plugin call` and `saddle mcp call` accept it in their JSON arguments too.
 
 At expiry, guest execution stops, command process groups are killed and a failed result reports the
-timeout. Cleanup, reserved-path restoration and audit finish before returning; completed mutations
-are **not rolled back**. A local MCP server that times out is stopped; restart it with `/mcp restart`.
+timeout. Cleanup and audit finish before returning; completed mutations are **not rolled back**. A local MCP server that times out is stopped; restart it with `/mcp restart`.
 Remote MCP requests stop waiting, but remote work may continue: there is no guarantee of remote
 cancellation. Non-preemptible kernel filesystem operations and children escaping a process group
 remain the existing limitations. Timeout does not turn a fatal host/audit failure into a tool error.

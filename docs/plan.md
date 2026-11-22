@@ -201,9 +201,9 @@ when the kernel supports it. `exec` is unavailable on macOS in v1.
 **D20.** Landlock grants cannot exclude a path beneath a granted root. Two consequences follow for a
 command run under `exec`:
 
-- It can write the paths that D23 reserves. Until mount namespaces are in use, the host snapshots the
-  reserved paths in the workspace before each `exec`, compares them afterwards, restores any change,
-  and logs each restored path as a denial.
+- It can write anything under a granted root, `.git/config` and `.git/hooks` included. D23 answered
+  that with a snapshot and a restore around each `exec`; **D178 deletes it**, and those files are the
+  workspace's own like any other.
 - It can read and write paths that an `exclude` pattern removes from a grant. Exclusions bind the
   built-in tools and plugin host calls only. A secret that must stay unreadable belongs outside every
   root.
@@ -249,7 +249,9 @@ until a hash matched one the user had approved with `saddle trust`, which printe
 effective grants. That covered a cloned repository shipping its own grants, and the agent editing the
 policy through its `fs-write` grant. Both of those are gone: the policy is no longer in the tree
 (D42), and nothing the agent runs can write it, so there was no gate left to keep. D44 records the
-deletion. What survives from this decision is the reserved-path list below.
+deletion. What survived from this decision was the reserved-path list below, which **D178 deletes**;
+it is kept as written because it records what the list was for, and because the deferred mount view
+(§8) is the way to make any of it unwritable if that question ever returns.
 
 The host reserves `.git/config` and anything under `.git/hooks`, including the same paths under
 `.git/modules`, and refuses writes to them under every grant. (The policy file was on this list until
@@ -264,8 +266,8 @@ repository named `<name>.git`, and jj's: `.jj/repo/config.toml` and `.jj/workspa
 which jj 0.45 adopts as trusted configuration when it finds them (`ui.pager` runs on every
 `jj log`), `.jj/repo/store/git_target`, which names the git repository jj drives, and the `config`
 and `hooks` of the repository a non-colocated jj keeps at `.jj/repo/store/git`, whose config git
-reads on `jj git fetch` and `push`. The engine matches each at any depth; the `exec` restore puts
-back the ones at the top of the workspace, as it did before.
+reads on `jj git fetch` and `push`. The engine matched each at any depth, and the `exec` restore put
+back the ones at the top of the workspace.
 
 Rewriting instructions cannot be granted (D7). The original no-network rule for `exec` (D19) is
 superseded by D79: a command's network connections now pass the same policy gate as host requests.
@@ -1429,9 +1431,9 @@ tools without being a root or part of the session.
   one more entry rather than a looser rule. A missing file is resolved through its parent, so a
   write beneath a linked directory works, and the resolved location is what the tool then uses —
   returning the unresolved one made cap-std walk the link again and refuse it.
-- **The reserved paths still hold** (D23). A named write bypasses the engine, so `gate` checks
-  `Reserved` itself: a hook or `.git/config` under a tool-visible directory is refused whatever the
-  entry lists, because it runs code as the user later.
+- **Nothing is reserved** (D178). A named write bypasses the engine, so it is the one place a path
+  could have been refused whatever an entry listed; D23 did that for `.git/config` and hooks, and
+  D178 deletes it. The entry the person wrote is what decides, here as everywhere.
 - **Not a root, and not nameable.** Found by path prefix like a root, but held apart from `Roots`,
   so no policy can name one, `check` prints them under `tool paths` rather than `roots`, and the
   prompt says they are outside the workspace and not part of it. Internally each gets a generated
@@ -3306,8 +3308,8 @@ exec, filesystem and net grants never inherit agent/sibling grants. Network dele
 requested scheme/host/port against the parent, and private-address exemptions require both parent
 and child to name the host/address, so narrowing a wildcard to an exact name cannot gain local access.
 The proxy answers under the executing principal and call id; audit failures stop execution. Existing
-namespace/no-network fallback, bounded pipe draining, group cancellation and reserved-path restore
-remain shared core mechanisms, not guest code. Description-time execution is refused. Traps after
+namespace/no-network fallback, bounded pipe draining and group cancellation remain shared core
+mechanisms, not guest code. Description-time execution is refused. Traps after
 execution warn that host effects may already have occurred.
 
 Guest CPU/fuel deadlines are not relaxed into command timeouts. Explicit long host calls temporarily
@@ -3544,7 +3546,7 @@ works through standalone tool/plugin/MCP calls. MCP CLI discovery and invocation
 One absolute deadline covers component initialization, guest work and every host wait. The loader's
 independent CPU/fuel and aggregate host-wait budgets remain intact; long host calls cannot extend
 past the caller deadline. Commands use the remaining duration without rounding it up to a second,
-kill their process group at expiry, drain bounded output and restore reserved paths before returning.
+kill their process group at expiry and drain bounded output before returning.
 Filesystem, mutation, transcript and HTTP/search services receive deadline-aware calls. MCP discovery,
 HTTP attempts/OAuth refreshes and stdio requests reuse the remaining budget rather than resetting it;
 stdio checks even during message floods and uses nonblocking deadline-bound pipe writes. A timed-out
@@ -3552,8 +3554,8 @@ local MCP server is closed/killed and must be restarted; closing an HTTP request
 remote work stops. Remote cancellation is best-effort, not remote rollback or a new protocol promise.
 
 Timeout is an ordinary failed tool result with existing component provenance, never an excuse to
-swallow fatal host/audit failures. Completed effects are not rolled back. Mandatory process cleanup,
-reservation restore and audit can finish after the deadline; D129's non-preemptible kernel filesystem
+swallow fatal host/audit failures. Completed effects are not rolled back. Mandatory process cleanup
+and audit can finish after the deadline; D129's non-preemptible kernel filesystem
 operations and D19's escaped-process-group limitation still apply. The deadline scope is per call,
 unwind-safe, passed explicitly to the component worker and never leaks to subsequent invocations.
 No SDK ABI, component build variant, digest or operational authority changes.
@@ -3569,17 +3571,17 @@ The additive `saddle:host/exec-tasks` interface offers typed start/inspect/list/
 Task creation uses the exact foreground authorization, lowering, environment stripping, timeout and
 sandbox path. Task observation/control uses a typed `ExecTask` request over that same exec grant,
 and the core additionally isolates tasks by host-assigned principal: knowing another principal's
-id cannot expose its output or cancel it. Starts, observations, cancellation, completions and reserved
-restores remain attributable to that owner and call id in the single audit chain. A monitor owns the
-child, deadline, bounded capture, pinned workspace and reserved snapshot, never a policy engine.
+id cannot expose its output or cancel it. Starts, observations, cancellation and completions remain
+attributable to that owner and call id in the single audit chain. A monitor owns the child, deadline,
+bounded capture and pinned workspace, never a policy engine.
 The session thread services proxy decisions during model requests, between host calls and while
 idle (TUI and line mode). Blocking native host operations can delay fresh proxy decisions; this does
 not grant bypass access. Namespace/relay failure still means no network, never unrestricted access.
 
 There is **one active shell execution per workspace**, including foreground calls and cooperating
 Saddle processes. A separately opened, pinned workspace directory holds a nonblocking exclusive
-`flock` from before snapshot through process-group cleanup and reserved-path restore. A competing
-start fails with a busy result rather than taking an overlapping snapshot or silently queueing.
+`flock` from before the command starts through process-group cleanup. A competing start fails with a
+busy result rather than silently queueing.
 This serializes Saddle commands, not independent user programs; D20's external-writer race and
 D19's escaped-process-group limitation remain. File tools can continue to work while a task runs.
 
@@ -3588,8 +3590,7 @@ grant/configured execution budget. A timeout on a later status/list/cancel call 
 invocation and never renews the task. Capture is bounded per stream using `exec-capture-bytes`;
 `exec-tasks` (default 16) bounds retained task records, evicting the oldest finished task when full.
 Lists omit captured bodies. Polling is a snapshot, not an unbounded log or incremental storage API.
-A task's monitor restores reserved paths on completion even while the session waits for the model.
-Completion auditing is drained on the session thread; fatal monitor/restore/audit errors stay fatal.
+Completion auditing is drained on the session thread; fatal monitor/audit errors stay fatal.
 
 Every successful permission/settings reload cancels, joins and audits tasks under the old grants,
 then clears the task registry before replacing grants/principals. Session close does the same before
@@ -3721,7 +3722,7 @@ Saddle never deletes a person's config file on close.
   grants are unchanged. Paths remain command-only unless a D66 tool role is explicitly declared and
   operationally delegated. No toolchain/cache path becomes a root nameable by a policy.
 - This extends D66's protected configuration sources with a session-specific file, not with sandbox
-  tables in workspace policies. D16's config/state protection and D23 reservations are unchanged.
+  tables in workspace policies. D16's config/state protection is unchanged.
   Additions and replacements are checked against protected paths, including their resolved aliases.
   Configured directories must already exist for the kernel to grant access; the host never grants
   a parent merely to create a missing cache directory.
@@ -3740,7 +3741,7 @@ and sandbox fields are errors, not silently ignored configuration. Sandbox overr
 matching canonical `workspace` line. No roots, providers or include rules may be declared here.
 
 The existing protected workspace file is read with pinned no-follow traversal, refusing symlinked
-files/directories. Config/state paths and aliases, reserved paths, delegation, principal isolation
+files/directories. Config/state paths and aliases, delegation, principal isolation
 and root boundaries remain protected. These are directory claims, not policy-addressable roots;
 list subtraction is not a deny rule and cannot narrow an independent parent claim or workspace/tmp
 grant. The source hash and effective sandbox paths are audited alongside the effective grants.
@@ -4436,6 +4437,42 @@ subtracts a path (D158).
 - **Every layer has it**, because `saddle_cap::policy::merge` is what all of them use: a profile
   subtracts from `[agent]`, and this workspace's file subtracts from what the profile left.
 
+**D178.** Nothing in a workspace is reserved: a grant is a grant. This supersedes D20's snapshot and
+restore and D23's list of paths no grant could write — the `Reserved` matcher, the `RESERVED_VCS`
+patterns, the `Restore` audit record's writer, `reserved.rs` itself, and the `reply.restored` field of
+the `exec` interface are all deleted.
+
+- **Why the mechanism was wrong, not just expensive.** It patrolled paths a shell command writes as
+  ordinary work: `git remote add` and `git config` write `.git/config`, `git submodule add` the
+  submodule's config, `jj config set --repo` `.jj/repo/config.toml`. The restore silently undid those
+  — the writes the person's own command asked for — and logged each as a denial, so fixing a remote in
+  a sandboxed shell reverted with an audit line calling it an attack. That is worse than the risk it
+  was bought to cover.
+- **It was a second source of authority for one decision.** The engine refused `.git/config` under
+  every grant while the kernel allowed it, and the host repaired the difference afterwards. D22 says a
+  decision is a lookup over grants; this was a lookup, a kernel exception and an undo, with the audit
+  log recording a denial that was never a decision. §5 names exactly that shape as the failure this
+  project exists to prevent.
+- **It could not be complete.** The list never held `.git/objects/info/alternates` or
+  `.git/refs/replace`, which change what a later `git` reads, and it covered one repository: a
+  `[sandbox] write` entry, a `~/.cargo/config.toml` a person grants for a wrapper, or any other
+  writable root has the same "runs later as the user" property with no snapshot at all. A guardrail
+  that must be extended for every new way of configuring a tool, and is wrong about the ordinary
+  writes above, is not a boundary.
+- **What replaces it: nothing, and the grant is the answer.** The workspace is granted for write
+  because the agent edits the code in it, and `.git` is part of the workspace. What a command writes
+  there persists exactly as its other writes do. Stated plainly, because it is the cost: neither
+  `git status` nor `jj diff` shows `.git/config` or a hook — they are not in the working tree — so
+  what a person has to go on is the transcript and the audit log, which record the command and its
+  argv (D10), and looking for themselves (`git config --list`, `ls .git/hooks`). A diff was never
+  going to show these paths, so the snapshot did not make them reviewable; it made them vanish.
+  Where a person wants a path the agent cannot write, the answer is the mount view in §8, which the
+  kernel enforces for every path at once instead of the host undoing one afterwards — D178 does not
+  pretend a snapshot is that.
+- **The rule that survives is the honest one:** a path is decided by the grant on the root that
+  contains it (D65), for `bash` exactly as for `write`. Nothing is special-cased inside a root, so
+  there is one answer to "may this be written" rather than two.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
@@ -4443,8 +4480,8 @@ subtracts a path (D158).
 | `exec` | running commands and session-owned tasks | `saddle:host/exec`, `saddle:host/exec-tasks` imports | sandbox helper (D18, D19); the network it reaches is `net` (D79) |
 | `fs-read` | reading files under granted roots | `saddle:host/fs-read` import | policy per call |
 | `tool-read` | bounded reads of existing D66 tool paths under explicitly delegated read-only roles | ordinary filesystem-read imports (D139); legacy `saddle:host/tool-paths` | policy per requested/resolved location and current configuration entry (D138) |
-| `tool-write` | mutations of existing D66 tool paths under explicitly delegated write roles | ordinary `saddle:host/fs-write` import (D141) | policy per requested/resolved location, absolute reserved paths and current configuration entry |
-| `fs-write` | writing files under granted roots | `saddle:host/fs-write` import | policy per call, reserved paths (D23) |
+| `tool-write` | mutations of existing D66 tool paths under explicitly delegated write roles | ordinary `saddle:host/fs-write` import (D141) | policy per requested/resolved location and current configuration entry |
+| `fs-write` | writing files under granted roots | `saddle:host/fs-write` import | policy per call |
 | `net` | HTTP requests to granted hosts | `saddle:host/http` and `saddle:host/web-search`, a command's proxy; raw WASI HTTP remains unlinked | host HTTP client, policy per hop under the calling principal (D28, D79, D143) |
 | `transcript-read` | reading session messages and their request usage, and observing them as they arrive | `saddle:host/transcript-read` import, `saddle:plugin/observer` export | policy per call |
 | `event-publish` | publishing custom events as the calling plugin | `saddle:host/plugin-events` import | per publication, principal attribution and queue/size budgets |
@@ -4541,10 +4578,10 @@ read bindings under a write capability must never let that principal read a file
 - Isolating component compilation under independent time/memory limits before automatic loading
   of untrusted artifacts; D127 caps input bytes but fuel/epochs bound execution, not the compiler.
 - `exec` on macOS through Seatbelt.
-- A mount namespace with read-only bind mounts for reserved paths and empty mounts over excluded
-  paths, replacing the D20 snapshot and making `exclude` bind `exec`. The same view is the only way
-  to hide a path no sandbox list names, and with it the `stat` a command can do outside its grants
-  (§9).
+- A mount namespace with empty mounts over excluded paths, making `exclude` bind `exec`, and with
+  read-only bind mounts for any path a workspace grant should not carry — the form D178 refused to
+  fake with a snapshot. The same view is the only way to hide a path no sandbox list names, and with
+  it the `stat` a command can do outside its grants (§9).
 - Tracking child processes by cgroup. A child that calls `setsid` leaves its process group and
   survives the group kill in D19.
 - An external append-only sink for the audit log.

@@ -22,7 +22,8 @@ pub enum Kind {
     SessionStart,
     /// A policy decision.
     Decision,
-    /// The host restored a reserved path that a sandboxed command changed (D20).
+    /// The host restored a reserved path that a sandboxed command changed. Nothing writes this any
+    /// more (D178), and it stays so a chain written before that still verifies.
     Restore,
     /// Instruction files added to the system prompt (D32), with their hashes.
     Context,

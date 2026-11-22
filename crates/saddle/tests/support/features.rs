@@ -193,7 +193,7 @@ fn vetoes_deny_and_fail_closed_before_tool_effects_without_rewriting_allowed_cal
                 (
                     "policy",
                     "write",
-                    json!({"path":".git/hooks/not-permitted","content":"no"}),
+                    json!({"path":"../not-permitted","content":"no"}),
                 ),
             ],
         )),
@@ -212,7 +212,14 @@ fn vetoes_deny_and_fail_closed_before_tool_effects_without_rewriting_allowed_cal
     assert!(result_text(&seen[1].body, "blocked").contains("fixture veto"));
     assert!(result_text(&seen[1].body, "spin").contains("veto failed closed"));
     assert!(result_text(&seen[1].body, "policy").contains("denied:"));
-    assert!(!env.ws.path().join(".git/hooks/not-permitted").exists());
+    assert!(
+        !env.ws
+            .path()
+            .parent()
+            .unwrap()
+            .join("not-permitted")
+            .exists()
+    );
     let origin = seen[1].body["messages"]
         .as_array()
         .unwrap()

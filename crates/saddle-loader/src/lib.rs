@@ -517,7 +517,7 @@ impl<H: HostServices> ExecHost for State<H> {
             request.timeout_secs = allowance.as_secs().max(1);
             host.execute(call, request)
         })?;
-        if matches!(&result, Ok(reply) if reply.stdout.len() > budgets::exec_capture_bytes() || reply.stderr.len() > budgets::exec_capture_bytes() || reply.denials.iter().chain(&reply.restored).map(String::len).sum::<usize>() > budgets::metadata_bytes())
+        if matches!(&result, Ok(reply) if reply.stdout.len() > budgets::exec_capture_bytes() || reply.stderr.len() > budgets::exec_capture_bytes() || reply.denials.iter().map(String::len).sum::<usize>() > budgets::metadata_bytes())
         {
             return Ok(Err("execution reply exceeds bounds".into()));
         }
@@ -560,13 +560,7 @@ impl<H: HostServices> State<H> {
                     task.id.len() > budgets::metadata_bytes()
                         || task.output.stdout.len() > budgets::exec_capture_bytes()
                         || task.output.stderr.len() > budgets::exec_capture_bytes()
-                        || task
-                            .output
-                            .restored
-                            .iter()
-                            .chain(&task.output.denials)
-                            .map(String::len)
-                            .sum::<usize>()
+                        || task.output.denials.iter().map(String::len).sum::<usize>()
                             > budgets::metadata_bytes()
                 })
             {

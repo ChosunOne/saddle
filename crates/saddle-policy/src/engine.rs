@@ -1,13 +1,14 @@
-//! Per-call decisions (D10, D22, D23). Every decision is a lookup over grants: no ordering, no
-//! fallthrough, and a one-sentence explanation either way.
+//! Per-call decisions (D10, D22, D178). Every decision is a lookup over grants: no ordering, no
+//! fallthrough, and a one-sentence explanation either way. A grant is a grant: the workspace's own
+//! `.git` holds no path the policy refuses, because refusing one beneath a granted root would be a
+//! second source of authority (D178).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::audit::sha256_hex;
-use globset::GlobSet;
-use saddle_cap::policy::{FsGrant, NetGrant, POLICY_FILE, Sessions, exclude_set, net_allows};
-use saddle_cap::{Location, Policy, Principal, RelPath, RootName, RuleId, Scope};
+use saddle_cap::policy::{FsGrant, NetGrant, Sessions, net_allows};
+use saddle_cap::{Location, Policy, Principal, RuleId, Scope};
 use serde_json::{Value, json};
 
 /// A request with its arguments already resolved.
@@ -206,68 +207,8 @@ impl Decision {
     }
 }
 
-/// Paths no grant can write (D23).
-#[derive(Debug)]
-pub struct Reserved {
-    any_root: GlobSet,
-    policy_file: Location,
-}
-
-/// Version-control paths that run code as the user later, outside any sandbox: hooks and config,
-/// matched at any depth (D23).
-pub const RESERVED_VCS: &[&str] = &[
-    // git: the repository, a linked worktree's own config, submodules, and a bare repository
-    // (`name.git`), which has no `.git` directory to match.
-    ".git/hooks",
-    ".git/config",
-    ".git/config.worktree",
-    ".git/worktrees/*/config.worktree",
-    ".git/modules/**/hooks",
-    ".git/modules/**/config",
-    ".git/modules/**/config.worktree",
-    "*.git/hooks",
-    "*.git/config",
-    // jj: a repo or workspace config found in the tree is adopted as the user's own, `git_target`
-    // names the git repository jj drives, and a jj repository that is not colocated keeps that
-    // repository under `.jj`, where git reads its config on fetch and push.
-    ".jj/repo/config.toml",
-    ".jj/workspace-config.toml",
-    ".jj/repo/store/git_target",
-    ".jj/repo/store/git/hooks",
-    ".jj/repo/store/git/config",
-];
-
-impl Reserved {
-    pub fn new() -> Self {
-        let patterns: Vec<String> = RESERVED_VCS.iter().map(|p| format!("**/{p}")).collect();
-        Self {
-            any_root: exclude_set(&patterns).expect("reserved patterns compile"),
-            policy_file: Location::new(
-                RootName::workspace(),
-                RelPath::new(POLICY_FILE).expect("policy file name is a relative path"),
-            ),
-        }
-    }
-
-    pub fn contains(&self, loc: &Location) -> bool {
-        *loc == self.policy_file
-            || (!loc.rel.is_root() && self.any_root.is_match(loc.rel.as_slash()))
-    }
-
-    pub fn policy_file(&self) -> &Location {
-        &self.policy_file
-    }
-}
-
-impl Default for Reserved {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 pub struct Engine {
     policy: Policy,
-    reserved: Reserved,
     spent: Mutex<BTreeMap<Principal, u64>>,
     money: Mutex<BTreeMap<Principal, f64>>,
 }
@@ -295,7 +236,6 @@ impl Engine {
     pub fn new(policy: Policy) -> Self {
         Self {
             policy,
-            reserved: Reserved::new(),
             spent: Mutex::new(BTreeMap::new()),
             money: Mutex::new(BTreeMap::new()),
         }
@@ -395,10 +335,6 @@ impl Engine {
         self.policy = policy;
     }
 
-    pub fn reserved(&self) -> &Reserved {
-        &self.reserved
-    }
-
     /// Which conversations the principal's transcript grant covers (D163). `None` when it holds
     /// none, which is what the host uses to decide whether another session may even be resolved;
     /// the decision itself is still [`Engine::decide`].
@@ -423,29 +359,16 @@ impl Engine {
         };
         match req {
             Request::ToolWrite {
-                path,
-                available_tools,
-            } => {
-                let relative = RelPath::new(path.trim_start_matches('/'));
-                if relative.as_ref().is_ok_and(|rel| {
-                    self.reserved
-                        .contains(&Location::new(RootName::workspace(), rel.clone()))
-                }) {
-                    return Decision::deny(
-                        scope,
-                        "path is reserved by the host and no grant can write it".into(),
-                    );
+                available_tools, ..
+            } => match &grants.tool_write {
+                Some(g) if g.tools.iter().any(|tool| available_tools.contains(tool)) => {
+                    Decision::allow(scope, &g.rule, &g.why)
                 }
-                match &grants.tool_write {
-                    Some(g) if g.tools.iter().any(|tool| available_tools.contains(tool)) => {
-                        Decision::allow(scope, &g.rule, &g.why)
-                    }
-                    _ => Decision::deny(
-                        scope,
-                        format!("{who} has no tool-write role covering this configured directory"),
-                    ),
-                }
-            }
+                _ => Decision::deny(
+                    scope,
+                    format!("{who} has no tool-write role covering this configured directory"),
+                ),
+            },
             Request::ToolRead {
                 available_tools, ..
             } => match &grants.tool_read {
@@ -458,15 +381,7 @@ impl Engine {
                 ),
             },
             Request::FsRead { loc } => fs_decision(who, scope, &grants.fs_read, loc),
-            Request::FsWrite { loc } => {
-                if self.reserved.contains(loc) {
-                    return Decision::deny(
-                        scope,
-                        format!("{loc} is reserved by the host and no grant can write it"),
-                    );
-                }
-                fs_decision(who, scope, &grants.fs_write, loc)
-            }
+            Request::FsWrite { loc } => fs_decision(who, scope, &grants.fs_write, loc),
             Request::Exec { .. } | Request::ExecTask { .. } => match &grants.exec {
                 Some(g) => Decision::allow(scope, &g.rule, &g.why),
                 None => Decision::deny(scope, format!("{who} has no exec grant")),
@@ -544,7 +459,7 @@ fn fs_decision(who: &Principal, scope: Scope, grants: &[FsGrant], loc: &Location
 #[cfg(test)]
 mod tests {
     use super::*;
-    use saddle_cap::{PluginId, Roots};
+    use saddle_cap::{PluginId, RelPath, RootName, Roots};
 
     #[test]
     fn tool_paths_intersect_host_supplied_entry_roles_and_the_calling_principal() {
@@ -789,7 +704,7 @@ model-invoke = { tokens-per-session = 100, why = "summaries" }
     }
 
     #[test]
-    fn fs_allow_exclude_and_reserved() {
+    fn fs_allow_and_exclude() {
         let (_d, e) = engine();
         let a = Principal::Agent;
         let d = e.decide(
@@ -813,59 +728,35 @@ model-invoke = { tokens-per-session = 100, why = "summaries" }
             "workspace:conf/.env.local is excluded by agent.fs-write[0]"
         );
 
+        // A grant is a grant (D178): the workspace's own VCS metadata is inside the grant, and
+        // `git` and `jj` write it as ordinary work — `git remote add` writes `.git/config`, an
+        // installer writes `.git/hooks`, `jj` adopts the config it finds in the tree.
         for path in [
-            "saddle.toml",
-            ".git/hooks/pre-commit",
             ".git/config",
-            "sub/.git/hooks",
+            ".git/hooks/pre-commit",
+            "sub/.git/hooks/pre-commit",
             ".git/modules/x/config",
             ".git/config.worktree",
-            ".git/worktrees/side/config.worktree",
-            ".git/modules/x/config.worktree",
-            "vendor/lib.git/config",
-            "vendor/lib.git/hooks/pre-receive",
             ".jj/repo/config.toml",
-            ".jj/workspace-config.toml",
             ".jj/repo/store/git_target",
             ".jj/repo/store/git/config",
             ".jj/repo/store/git/hooks/pre-push",
-        ] {
-            let d = e.decide(&a, &Request::FsWrite { loc: &ws(path) });
-            assert!(!d.allow, "{path}");
-            assert!(
-                d.explanation.contains("reserved"),
-                "{path}: {}",
-                d.explanation
-            );
-        }
-        // The rest of a repository stays writable: jj and git rewrite it on every command.
-        for path in [
             ".git/config.lock",
-            ".jj/repo/op_heads/heads/x",
-            ".jj/repo/store/git/objects/ab/cd",
-            ".jj/working_copy/tree_state",
+            ".git/objects/ab/cd",
         ] {
             let d = e.decide(&a, &Request::FsWrite { loc: &ws(path) });
             assert!(d.allow, "{path}: {}", d.explanation);
         }
-        // Reading reserved paths is fine; only writes are refused.
-        assert!(
-            e.decide(
-                &a,
-                &Request::FsRead {
-                    loc: &ws(".git/config")
-                }
-            )
-            .allow
+        // It is the ordinary grant that allows it, not a special case in the engine.
+        let d = e.decide(
+            &a,
+            &Request::FsWrite {
+                loc: &ws(".git/config"),
+            },
         );
-        assert!(
-            e.decide(
-                &a,
-                &Request::FsWrite {
-                    loc: &ws(".git/objects/ab/cd")
-                }
-            )
-            .allow
+        assert_eq!(
+            d.rule.as_ref().map(|r| r.as_str()),
+            Some("agent.fs-write[0]")
         );
     }
 

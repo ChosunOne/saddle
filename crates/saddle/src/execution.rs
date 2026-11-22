@@ -5,13 +5,12 @@ use std::env;
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
+use cap_std::fs::{OpenOptions, OpenOptionsExt};
 use saddle_cap::sandbox::{ExecRequest, SandboxSpec, lower_exec};
 use saddle_cap::{Location, Principal, RelPath, RootName, Scope};
 use saddle_policy::{Kind, Request};
@@ -20,26 +19,22 @@ use saddle_wit::saddle::host::exec::Reply;
 use serde_json::json;
 
 use crate::net::bridge::Bridge;
-use crate::reserved::{Change, Snapshot};
 use crate::session::Session;
 use crate::tools::timeout;
-use crate::{cancel, reserved, tasks};
+use crate::{cancel, tasks};
 
 pub const HELPER_ARG: &str = "__sandbox";
 
-/// pins the reservation lock through process termination and reserved-path restoration.
+/// pins the workspace lock through process termination (D142).
 pub struct Prepared {
     pub spec: SandboxSpec,
     deadline: Instant,
-    ws: Dir,
-    before: Snapshot,
     _lock: File,
     capture_bytes: usize,
 }
 
 pub struct Completed {
     output: io::Result<Output>,
-    changes: Vec<(PathBuf, Change)>,
 }
 
 /// one lowering for foreground and background execution; no second policy or sandbox source.
@@ -122,12 +117,9 @@ pub fn prepare(
         }
         return Err(error).context("locking workspace execution");
     }
-    let before = reserved::take(&ws).context("snapshotting reserved paths")?;
     Ok(Ok(Prepared {
         spec: lowered.spec,
         deadline,
-        ws,
-        before,
         _lock: lock,
         capture_bytes: budgets::exec_capture_bytes(),
     }))
@@ -165,10 +157,8 @@ impl Prepared {
                 capture,
             )
         };
-        let changes =
-            reserved::restore(&self.ws, &self.before).context("restoring reserved paths")?;
-        // self, including the workspace lock, drops only after restore.
-        Ok(Completed { output, changes })
+        // Self, including the workspace lock, drops only once the helper is reaped (D142).
+        Ok(Completed { output })
     }
 }
 
@@ -179,9 +169,6 @@ pub fn finish(
     completed: Completed,
     denials: Vec<String>,
 ) -> Result<Reply> {
-    for (path, change) in &completed.changes {
-        session.audit.event(Kind::Restore, Some(who), Some(Scope::FsWrite), Some(false), json!({"call_id":call,"path":format!("workspace:{}",path.display()),"change":format!("{change:?}").to_lowercase()}), format!("exec changed reserved path workspace:{}; restored",path.display()))?;
-    }
     let output = completed.output.context("running the sandbox helper")?;
     session.audit.event(Kind::Decision, Some(who), Some(Scope::Exec), Some(true), json!({"call_id":call,"operation":"exec-completed","code":output.code,"signal":output.signal,"timed_out":output.timed_out,"cancelled":output.cancelled,"stdout_bytes":output.stdout.len(),"stderr_bytes":output.stderr.len()}), "execution completed")?;
     Ok(Reply {
@@ -192,11 +179,6 @@ pub fn finish(
         timed_out: output.timed_out,
         cancelled: output.cancelled,
         truncated: output.truncated,
-        restored: completed
-            .changes
-            .iter()
-            .map(|(path, _)| path.display().to_string())
-            .collect(),
         denials,
     })
 }

@@ -26,7 +26,6 @@ mod output;
 mod paths;
 mod plugins;
 mod provider;
-mod reserved;
 mod search_transport;
 mod session;
 mod skills;

@@ -173,9 +173,6 @@ pub fn format_reply(reply: &ExecReply) -> (String, bool) {
     if reply.truncated {
         text.push_str("(capture truncated at configured per-stream limit)\n");
     }
-    for path in reply.restored.iter().take(budgets::exec_report_paths()) {
-        let _ = writeln!(text, "restored reserved path {path}");
-    }
     for why in reply.denials.iter().take(budgets::exec_report_denials()) {
         let _ = writeln!(text, "--- net ---\n{why}");
     }
@@ -195,7 +192,7 @@ impl Tool for Bash {
     fn describe() -> Definition {
         Definition {
             name:"bash".into(),
-            description:"run sh -c in the workspace through the delegated exec sandbox. Filesystem/environment/net reach comes from this plugin's runtime grants and protected sandbox configuration, not the agent's broader grants; network uses the policy proxy or falls back to none. background=true starts a session-owned task and returns its id promptly, and the session resumes you when it finishes unless wake=false, so you can do other work meanwhile; action=wait arms a task started with wake=false, answers at once and never blocks the call. action=status/list/cancel with task_id inspect bounded live output or stop it. Only one shell command per workspace may run at a time. Tasks stop on session exit/reload. Timeout bounds the task lifetime, never raises grants or configured limits. Capture is bounded per stream; presentation is host-configurable. Cancellation kills the process group; reserved Git paths are restored.".into(),
+            description:"run sh -c in the workspace through the delegated exec sandbox. Filesystem/environment/net reach comes from this plugin's runtime grants and protected sandbox configuration, not the agent's broader grants; network uses the policy proxy or falls back to none. background=true starts a session-owned task and returns its id promptly, and the session resumes you when it finishes unless wake=false, so you can do other work meanwhile; action=wait arms a task started with wake=false, answers at once and never blocks the call. action=status/list/cancel with task_id inspect bounded live output or stop it. Only one shell command per workspace may run at a time. Tasks stop on session exit/reload. Timeout bounds the task lifetime, never raises grants or configured limits. Capture is bounded per stream; presentation is host-configurable. Cancellation kills the process group.".into(),
             input_schema:json!({"type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":"integer","minimum":1},"background":{"type":"boolean"},"wake":{"type":"boolean","description":"with background: whether the session resumes you when the task finishes (default true)"},"action":{"type":"string","enum":["run","status","list","cancel","wait"]},"task_id":{"type":"string"}},"additionalProperties":false}).to_string(),
         }
     }
@@ -235,15 +232,10 @@ mod tests {
             timed_out: false,
             cancelled: false,
             truncated: false,
-            restored: vec![".git/config".into()],
             denials: vec![],
         };
         let (text, ok) = format_reply(&reply);
-        assert!(
-            ok && text.contains("exit code 0")
-                && text.contains("hello")
-                && text.contains("restored reserved path")
-        );
+        assert!(ok && text.contains("exit code 0") && text.contains("hello"));
         reply.cancelled = true;
         assert!(!format_reply(&reply).1);
         reply.stdout = "é".repeat(256000).into_bytes();

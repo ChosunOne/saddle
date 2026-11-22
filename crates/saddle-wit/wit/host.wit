@@ -21,7 +21,7 @@ interface exec {
     record reply {
         code: option<s32>, signal: option<s32>, stdout: list<u8>, stderr: list<u8>,
         timed-out: bool, cancelled: bool, truncated: bool,
-        restored: list<string>, denials: list<string>,
+        denials: list<string>,
     }
     run: func(request: command) -> result<reply, string>;
 }
