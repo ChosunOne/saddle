@@ -485,7 +485,7 @@ mod tests {
         for text in [String::new(), config_text(None)] {
             let cfg: UserConfig = toml::from_str(&text).unwrap();
             assert!(
-                cfg.global_policy(None)["agent"]
+                cfg.global_policy(None).unwrap()["agent"]
                     .get("transcript-read")
                     .is_some()
             );
@@ -493,7 +493,7 @@ mod tests {
         for text in ["[agent]\n", "[agent]\nexec = {}\n"] {
             let cfg: UserConfig = toml::from_str(text).unwrap();
             assert!(
-                cfg.global_policy(None)["agent"]
+                cfg.global_policy(None).unwrap()["agent"]
                     .get("transcript-read")
                     .is_none()
             );
@@ -506,7 +506,7 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let roots = Roots::resolve([(RootName::workspace(), ws.path().into())], &[]).unwrap();
         let cfg: UserConfig = toml::from_str(&config_text(None)).unwrap();
-        let text = toml::to_string(&cfg.global_policy(None)).unwrap();
+        let text = toml::to_string(&cfg.global_policy(None).unwrap()).unwrap();
         Policy::parse(&text, &roots).unwrap();
 
         let dir = tempfile::tempdir().unwrap();

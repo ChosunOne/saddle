@@ -501,6 +501,8 @@ fn a_profile_is_layered_between_the_base_grants_and_the_project() {
                 "[build]\n",
                 "exec = { timeout-secs = 60 }\n\n",
                 "[offline]\nnet = []\n\n",
+                "[narrow]\nnet = [\"-api.example.com\"]\n\n",
+                "[typo]\nnet = [\"-nope.example\"]\n\n",
                 "[review]\n",
             )
             .parse::<toml::Table>()
@@ -517,7 +519,10 @@ fn a_profile_is_layered_between_the_base_grants_and_the_project() {
         text.contains("profile    none ([agent] as written)"),
         "{text}"
     );
-    assert!(text.contains("defined: build, offline, review"), "{text}");
+    assert!(
+        text.contains("defined: build, narrow, offline, review, typo"),
+        "{text}"
+    );
     assert!(text.contains("agent.exec = timeout 20s"), "{text}");
 
     // The profile's own scope replaces the base's, and everything else is inherited.
@@ -543,6 +548,28 @@ fn a_profile_is_layered_between_the_base_grants_and_the_project() {
         "the profile emptied it: {text}"
     );
     assert!(text.contains("agent.exec = timeout 20s"), "{text}");
+
+    // A `-name` entry takes one grant away without restating the ones it keeps (D177), and what
+    // the base gave is still there.
+    let out = env.saddle(&["--profile", "narrow", "check"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        !text.contains("agent.net["),
+        "the one host is subtracted: {text}"
+    );
+    assert!(
+        text.contains("agent.exec = timeout 20s"),
+        "and the scopes it does not name are inherited: {text}"
+    );
+
+    // A name that nothing inherits is a mistake in that profile, not a no-op, and it says so.
+    let out = env.saddle(&["--profile", "typo", "check"]);
+    assert!(!out.status.success());
+    let e = stderr(&out);
+    assert!(e.contains("profiles.typo"), "{e}");
+    assert!(e.contains("nothing inherited matches -nope.example"), "{e}");
+    assert!(e.contains("api.example.com"), "it names what is there: {e}");
 
     // This workspace's own file is layered on top of both (D63).
     env.write_override("version = 1\n[agent]\nexec = { timeout-secs = 7 }\n");
@@ -580,6 +607,19 @@ fn a_profile_is_layered_between_the_base_grants_and_the_project() {
         String::from_utf8_lossy(&out.stdout).contains("profile    none ([agent] as written)"),
         "{}",
         String::from_utf8_lossy(&out.stdout)
+    );
+
+    // The project's file subtracts in the same form, from what the profile left (D177).
+    env.write_override("version = 1\n[agent]\nfs-read = [\"-workspace\"]\n");
+    let out = env.saddle(&["--profile", "build", "check"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        !text.contains("agent.fs-read["),
+        "the project took the root away: {text}"
+    );
+    assert!(
+        text.contains("agent.net[0] = https://api.example.com:443"),
+        "and left the rest of the base alone: {text}"
     );
 }
 

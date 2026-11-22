@@ -119,6 +119,9 @@ net  = [{ host = "*.crates.io" }]
 
 [profiles.offline]           # the same, and no network even if the base had one
 net = []
+
+[profiles.review]            # the same, without one host the base grants
+net = ["-api.example.com"]
 ```
 
 | how | what it does |
@@ -128,10 +131,27 @@ net = []
 | `/profile` | report the set in force and the ones defined |
 | `/profile <name>` | switch this session at once — the model is told on its next request, and background tasks stop first because they were started under the replaced grants (D153) |
 
-A layer can add a scope or replace one, but not remove one: a list can be emptied (`net = []`,
-`mcp = []`, `fs-write = []`), while a scope written as a table — `exec`, `transcript-read` — can only
-be replaced, never dropped. To have a profile that runs nothing, leave `exec` out of `[agent]` and
-grant it in the profiles that need it.
+A list scope can also **subtract** single entries, the way a `[sandbox]` list subtracts a path
+(D177): written wholly as `-name` entries, it is the inherited list without those entries, so a layer
+takes one grant away without restating the ones it keeps. The name is the entry's identity — the
+**host** of a `net` grant, the **root** of an `fs-read`/`fs-write` grant, the **server** of an `mcp`
+grant — and every layer has the form, so a project file subtracts from what a profile left.
+
+```toml
+[profiles.review]
+net     = ["-api.example.com"]   # that host goes, the other hosts stay
+fs-read = ["-scratch"]           # every grant for that root goes
+mcp     = ["-exa"]               # that server goes
+```
+
+A list is written wholly as names or wholly as entries; `net = []` still empties a scope rather than
+subtracting, and `+name` is refused (an added grant carries a scheme, a port and a `why` a bare name
+cannot). A name nothing inherits is an error naming what the inherited list does hold, so a typo is
+not a silent no-op. A `-` in `[agent]` itself is refused: the base grants are what everything
+inherits, and there is nothing below them to subtract from.
+
+A scope written as a table — `exec`, `transcript-read` — can only be replaced, never dropped. To have
+a profile that runs nothing, leave `exec` out of `[agent]` and grant it in the profiles that need it.
 
 Names are 1-64 letters, digits, `-` or `_`, and `none` is reserved for `[agent]` as written. A name
 that is not defined is refused, at load and at a switch, with the defined ones listed: a mistyped

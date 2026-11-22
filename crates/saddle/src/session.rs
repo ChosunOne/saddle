@@ -262,7 +262,7 @@ impl Setup {
         };
         // All path claims use the same resolver after the one workspace override is applied.
         let (extras, tool_paths) = user.sandbox_extras(&roots, &paths.protected())?;
-        let global = user.global_policy(profile.as_deref());
+        let global = user.global_policy(profile.as_deref())?;
         if !overrides.is_empty() {
             // Applied to the *merged* grants, not to the workspace's own: `--revoke exec` has to
             // remove a grant that came from the base, and a workspace-level edit could only
@@ -270,7 +270,8 @@ impl Setup {
             let merged_doc = policy::merge(
                 global.clone(),
                 own.unwrap_or_else(|| config::policy_document_pub(None)),
-            );
+            )
+            .with_context(|| format!("reading the grants in {}", own_path.display()))?;
             let mut agent = match merged_doc.get("agent") {
                 Some(toml::Value::Table(t)) => t.clone(),
                 _ => toml::Table::new(),

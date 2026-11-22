@@ -422,7 +422,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D173 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D177 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
@@ -490,7 +490,9 @@ rather than loosening it.
 - **The policy is not in the tree.** The base grants are `[agent]` in
   `$XDG_CONFIG_HOME/saddle/config.toml` — with one of its `[profiles.<name>]` sets layered on it by a
   top-level `profile = "…"`, swapped for one run or one session with `--profile`/`/profile`
-  (D175, D176) — and a workspace's own are `policies/--<path>--.toml` beside it
+  (D175, D176); a layer may subtract one list entry with `-name`, resolved by `saddle_cap`'s merge
+  before anything is parsed, so it is a layering form and never a deny rule (D177) — and a
+  workspace's own are `policies/--<path>--.toml` beside it
   (D63), layered on the base (D42, D43); each grants file carries a `workspace = "…"` line and a
   session refuses one that names a different directory, since the filename encoding is lossy. A `saddle.toml` in the repository is not read and a session
   says so once. A workspace file may narrow or widen a base grant: it is the authority for that

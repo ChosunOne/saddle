@@ -460,22 +460,189 @@ pub fn document(value: &toml::Value) -> Result<String, PolicyError> {
 /// `project` on top of `global`, as one TOML document (D43).
 ///
 /// Tables merge, so a grant the project leaves alone keeps the global value. Grants are lists, and
-/// a project's list replaces the global one for that scope — the whole point of overriding.
-pub fn merge(global: toml::Value, project: toml::Value) -> toml::Value {
-    match (global, project) {
-        (toml::Value::Table(mut g), toml::Value::Table(p)) => {
-            for (key, value) in p {
-                let merged = match g.remove(&key) {
-                    Some(existing) => merge(existing, value),
-                    None => value,
-                };
-                g.insert(key, merged);
-            }
-            toml::Value::Table(g)
-        }
-        // A project value replaces the global one unless the global is a table, above.
-        (_, project) => project,
+/// a project's list replaces the global one for that scope — the whole point of overriding. A list
+/// written as `-name` entries is the exception (D177): it means the inherited list without those
+/// entries, so a layer can take one grant away without restating the rest.
+pub fn merge(global: toml::Value, project: toml::Value) -> Result<toml::Value, PolicyError> {
+    // Subtraction is a layer's form, so it means nothing in what everything else inherits.
+    reject_subtractions(&global, "")?;
+    merge_at("", Some(global), project)
+}
+
+/// The field that names one entry of a list scope, which is what a `-name` entry subtracts (D177).
+/// The identity is per scope because the entries are not strings: a host, a root, a server.
+fn entry_name(scope: &str) -> Option<&'static str> {
+    match scope {
+        "fs-read" | "fs-write" => Some("root"),
+        "net" => Some("host"),
+        "mcp" => Some("server"),
+        _ => None,
     }
+}
+
+/// Whether one inherited entry is the one `-name` removes. A host is a name like a DNS name is,
+/// so it compares the way `HostPattern` matches; a root and a server are spelled as they are.
+fn names_entry(entry: &toml::Value, field: &str, name: &str) -> bool {
+    match entry.get(field).and_then(toml::Value::as_str) {
+        Some(written) if field == "host" => written.eq_ignore_ascii_case(name),
+        Some(written) => written == name,
+        None => false,
+    }
+}
+
+fn merge_at(
+    at: &str,
+    inherited: Option<toml::Value>,
+    layer: toml::Value,
+) -> Result<toml::Value, PolicyError> {
+    let path = |key: &str| {
+        if at.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{at}.{key}")
+        }
+    };
+    match layer {
+        toml::Value::Table(table) => {
+            let mut out = match inherited {
+                Some(toml::Value::Table(inherited)) => inherited,
+                _ => toml::Table::new(),
+            };
+            for (key, value) in table {
+                let previous = out.remove(&key);
+                let merged = merge_at(&path(&key), previous, value)?;
+                out.insert(key, merged);
+            }
+            Ok(toml::Value::Table(out))
+        }
+        toml::Value::Array(entries) => {
+            // A list of names subtracts, a list of entries (or an empty one) replaces; only the
+            // scopes whose entries carry a name can do the first.
+            let scope = at.rsplit('.').next().unwrap_or(at);
+            let subtracts = entries.iter().any(|e| e.is_str());
+            match entry_name(scope).filter(|_| subtracts && !entries.is_empty()) {
+                Some(field) => subtract(at, field, inherited, entries),
+                None => Ok(toml::Value::Array(entries)),
+            }
+        }
+        other => Ok(other),
+    }
+}
+
+fn subtract(
+    at: &str,
+    field: &str,
+    inherited: Option<toml::Value>,
+    entries: Vec<toml::Value>,
+) -> Result<toml::Value, PolicyError> {
+    let mut kept = match inherited {
+        Some(toml::Value::Array(inherited)) => inherited,
+        _ => Vec::new(),
+    };
+    for entry in &entries {
+        let Some(written) = entry.as_str() else {
+            return Err(invalid(
+                at,
+                "cannot mix names with entries in one list: write the whole list as -name \
+                 entries to subtract from the inherited one, or the whole list as entries to \
+                 replace it",
+            ));
+        };
+        if written.starts_with('+') {
+            return Err(invalid(
+                at,
+                format!(
+                    "`{written}` is not read: a + entry adds nothing, because an added grant is \
+                     written as its ordinary entry here and a list of entries replaces the \
+                     inherited one"
+                ),
+            ));
+        }
+        let Some(name) = written.strip_prefix('-') else {
+            return Err(invalid(
+                at,
+                format!(
+                    "`{written}` does not say what to subtract: a name in this list is written \
+                     -name, and a list written any other way replaces the inherited one"
+                ),
+            ));
+        };
+        if name.is_empty() {
+            return Err(invalid(at, "a -name entry needs a name to subtract"));
+        }
+        let before = kept.len();
+        kept.retain(|previous| !names_entry(previous, field, name));
+        if kept.len() == before {
+            let names: Vec<&str> = kept
+                .iter()
+                .filter_map(|previous| previous.get(field).and_then(toml::Value::as_str))
+                .collect();
+            return Err(invalid(
+                at,
+                if names.is_empty() {
+                    format!(
+                        "nothing inherits {written}: there is no inherited list to subtract from"
+                    )
+                } else {
+                    format!(
+                        "nothing inherited matches {written}: the inherited {at} names [{}]",
+                        names.join(", ")
+                    )
+                },
+            ));
+        }
+    }
+    Ok(toml::Value::Array(kept))
+}
+
+/// The base grants are what every layer inherits, so a `-name` entry there has nothing to
+/// subtract from and is refused where the base is built, before a profile or a project is layered
+/// on it (D177).
+pub fn check_base(value: &toml::Value) -> Result<(), PolicyError> {
+    reject_subtractions(value, "")
+}
+
+/// A `-name` entry subtracts from a list a layer below granted, so it is refused where there is
+/// nothing below: the base grants, and a server's own reach, which is written out in full (D177).
+fn reject_subtractions(value: &toml::Value, at: &str) -> Result<(), PolicyError> {
+    let path = |key: &str| {
+        if at.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{at}.{key}")
+        }
+    };
+    let toml::Value::Table(table) = value else {
+        return Ok(());
+    };
+    for (key, value) in table {
+        let toml::Value::Array(entries) = value else {
+            reject_subtractions(value, &path(key))?;
+            continue;
+        };
+        for (i, entry) in entries.iter().enumerate() {
+            if entry.is_table() {
+                reject_subtractions(entry, &format!("{}[{i}]", path(key)))?;
+            }
+        }
+        if entry_name(key).is_none() {
+            continue;
+        }
+        if let Some(written) = entries
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .find(|name| name.starts_with('-'))
+        {
+            return Err(invalid(
+                path(key),
+                format!(
+                    "`{written}` subtracts from a list a layer below granted, and there is no \
+                     inherited list here: write the entry itself"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn invalid(at: impl fmt::Display, msg: impl Into<String>) -> PolicyError {
@@ -616,7 +783,7 @@ impl Policy {
         // Both sides must parse first, so a project cannot slip past the check by being invalid.
         // `toml::to_string` on a `Value` writes an inline `{...}`, which is not a document, so the
         // merged table is rendered as one first.
-        let merged = merge(global, project);
+        let merged = merge(global, project)?;
         Policy::parse(&document(&merged)?, roots)
     }
 
@@ -1165,6 +1332,106 @@ exec     = { why = "runs tests" }
             Vec::<String>::new(),
             "also untouched"
         );
+    }
+
+    #[test]
+    fn a_layer_subtracts_one_entry_from_an_inherited_list() {
+        // D177: `-name` takes one grant away instead of the layer restating the whole list, so a
+        // profile can give up a host without copying the ones it keeps.
+        let (_d, roots) = roots();
+        let global = r#"
+version = 1
+
+[agent]
+fs-read = [{ root = "workspace" }, { root = "workspace", exclude = [".env*"], why = "not the secrets" }]
+net     = [{ host = "api.example.com" }, { host = "*.example.net" }]
+mcp     = [{ server = "exa", tools = ["search"] }]
+"#;
+        let narrower = "version = 1\n[agent]\nnet = [\"-API.example.com\"]\n";
+        let layered = Policy::layer(global, narrower, &roots).unwrap();
+        let agent = layered.grants(&Principal::Agent).unwrap();
+        let hosts: Vec<String> = agent.net.iter().map(|n| n.host.to_string()).collect();
+        assert_eq!(
+            hosts,
+            ["*.example.net"],
+            "only the named host goes, and a host compares as a name"
+        );
+        assert_eq!(
+            agent.fs_read.len(),
+            2,
+            "a scope the layer leaves alone is inherited"
+        );
+        assert_eq!(agent.mcp[0].server, "exa");
+
+        // A root names every entry for it, whether or not they narrow it differently, and a
+        // subtraction can empty a scope altogether.
+        let empties = r#"
+version = 1
+[agent]
+fs-read = ["-workspace"]
+mcp = ["-exa"]
+"#;
+        let layered = Policy::layer(global, empties, &roots).unwrap();
+        let agent = layered.grants(&Principal::Agent).unwrap();
+        assert!(agent.fs_read.is_empty());
+        assert!(agent.mcp.is_empty());
+        assert_eq!(agent.net.len(), 2, "still inherited");
+
+        // Layers stack, so each one subtracts from what the layer below it left (D176, D177).
+        let base: toml::Value = toml::from_str(global).unwrap();
+        let one: toml::Value =
+            toml::from_str("version = 1\n[agent]\nnet = [\"-api.example.com\"]\n").unwrap();
+        let two: toml::Value =
+            toml::from_str("version = 1\n[agent]\nnet = [\"-*.example.net\"]\n").unwrap();
+        let twice = super::merge(super::merge(base, one).unwrap(), two).unwrap();
+        let twice = Policy::parse(&super::document(&twice).unwrap(), &roots).unwrap();
+        assert!(
+            twice.grants(&Principal::Agent).unwrap().net.is_empty(),
+            "what the base granted, a profile removed, and a project removed again"
+        );
+    }
+
+    #[test]
+    fn a_subtraction_that_could_not_have_meant_anything_is_refused() {
+        // D177: a name nothing inherits, a list that mixes names with entries, a `+` entry and a
+        // name written without its `-` are all mistakes, and each says which.
+        let (_d, roots) = roots();
+        let global = "version = 1\n[agent]\nnet = [{ host = \"api.example.com\" }]\n";
+        let refused = |layer: &str| {
+            Policy::layer(global, layer, &roots)
+                .unwrap_err()
+                .to_string()
+        };
+        let e = refused("version = 1\n[agent]\nnet = [\"-api.other.example\"]\n");
+        assert!(
+            e.contains("nothing inherited matches -api.other.example"),
+            "{e}"
+        );
+        assert!(e.contains("api.example.com"), "it says what is there: {e}");
+        let e =
+            refused("version = 1\n[agent]\nnet = [\"-api.example.com\", { host = \"b.test\" }]\n");
+        assert!(e.contains("cannot mix names with entries"), "{e}");
+        let e = refused("version = 1\n[agent]\nnet = [\"+api.example.com\"]\n");
+        assert!(e.contains("a + entry adds nothing"), "{e}");
+        let e = refused("version = 1\n[agent]\nnet = [\"api.example.com\"]\n");
+        assert!(e.contains("does not say what to subtract"), "{e}");
+        let e = refused("version = 1\n[agent]\nnet = [\"-\"]\n");
+        assert!(e.contains("needs a name to subtract"), "{e}");
+
+        // There is nothing below the base grants, so a `-` there is not a narrowing but a typo:
+        // it is refused where the base is built, and by the merge as well (D177).
+        let base = "version = 1\n[agent]\nnet = [\"-api.example.com\"]\n";
+        let value: toml::Value = toml::from_str(base).unwrap();
+        let e = super::check_base(&value).unwrap_err().to_string();
+        assert!(e.contains("there is no inherited list here"), "{e}");
+        assert!(e.contains("agent.net"), "it names where: {e}");
+        let e = Policy::layer(base, "", &roots).unwrap_err().to_string();
+        assert!(e.contains("there is no inherited list here"), "{e}");
+        // A server's own reach is written in full, not layered, so the same form is refused there.
+        let base = "version = 1\n[agent]\nmcp = [{ server = \"exa\", net = [\"-a.test\"] }]\n";
+        let e = Policy::layer(base, "", &roots).unwrap_err().to_string();
+        assert!(e.contains("there is no inherited list here"), "{e}");
+        assert!(e.contains("mcp[0].net"), "it names where: {e}");
     }
 
     #[test]

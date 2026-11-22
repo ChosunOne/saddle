@@ -616,8 +616,8 @@ impl UserConfig {
     }
 
     /// The grant document every workspace inherits, as the policy parser reads it (D63): `[agent]`
-    /// with the profile in force layered on it (D175, D176).
-    pub fn global_policy(&self, profile: Option<&str>) -> toml::Value {
+    /// with the profile in force layered on it (D175, D176, D177).
+    pub fn global_policy(&self, profile: Option<&str>) -> Result<toml::Value> {
         // The order is the file's: `[agent]`, then the profile, then this workspace's own grants,
         // which `Setup::load` layers on what this returns (D63, D176). So a profile names what it
         // changes and inherits the rest — it is a layer, not a second copy of the table.
@@ -631,13 +631,19 @@ impl UserConfig {
                 .map(|v| toml::Value::Table(v.as_table().cloned().unwrap_or_default()))
         });
         let mut document = policy_document(agent);
+        // A `-name` entry narrows what a layer below granted, and the base grants are what
+        // everything inherits (D177): refused here so it is not blamed on a profile.
+        policy::check_base(&document).context("config.toml")?;
         if let Some(name) = profile {
             let Some(grants) = self.profiles.get(name).cloned() else {
                 // Unreachable: `profile_in_force` refuses a name that is not defined, before this
                 // is called. Granting nothing is the fail-closed answer if it ever is reached.
-                return policy_document(None);
+                return Ok(policy_document(None));
             };
-            document = policy::merge(document, policy_document(Some(grants)));
+            // A profile subtracts from the base with `-name` entries (D177), so a name the base
+            // does not grant is reported as the profile's mistake rather than the file's.
+            document = policy::merge(document, policy_document(Some(grants)))
+                .with_context(|| format!("profiles.{name}"))?;
         }
         if let toml::Value::Table(table) = &mut document {
             table.insert(
@@ -650,7 +656,7 @@ impl UserConfig {
                 ),
             );
         }
-        document
+        Ok(document)
     }
 
     /// The extras every child gets: named roots, plus the directories the include rules work out
@@ -902,7 +908,7 @@ mod tests {
         .unwrap();
         let config = UserConfig::load(&path).unwrap();
         let agent = |profile: Option<&str>| {
-            config.global_policy(profile)["agent"]
+            config.global_policy(profile).unwrap()["agent"]
                 .as_table()
                 .cloned()
                 .unwrap()
@@ -1001,7 +1007,7 @@ mod tests {
             Budgets::default().mutation_bytes
         );
         assert!(
-            config.global_policy(None)["agent"]
+            config.global_policy(None).unwrap()["agent"]
                 .as_table()
                 .unwrap()
                 .is_empty()

@@ -4400,13 +4400,41 @@ is.
   as if it had taken the file tools away.
 - **A layer adds or replaces; it does not remove.** A list scope can be emptied — `net = []` is a
   profile with no network — but a scope written as a table (`exec`, `transcript-read`) can only be
-  replaced, because the merge has no form for "absent". Removing one would need either a deny rule,
+  replaced, because the merge has no form for "absent". D177 adds the one form that is worth having,
+  for lists only: a `-name` entry subtracts from the inherited list.
+- **A table scope is still all or nothing.** Removing `exec` outright would need either a deny rule,
   which the policy deliberately has none of (D22, a decision being a lookup over grants), or a
   sentinel the parser reads as removal. Neither is worth it for a case a minimal `[agent]` already
   answers: keep the base to what every profile shares, and let the profiles that need `exec` grant it.
 - **Still one representation.** The profile is merged into the document *before* it is parsed, so the
   interface check, the per-call decisions and the sandbox spec are all built from one grant document
   exactly as before (D63, D126). What is layered is the text of the grants, never a second decision.
+
+**D177.** A layer subtracts one entry from an inherited list with `-name`, the way a `[sandbox]` list
+subtracts a path (D158).
+
+- **The form is the list's own.** `[profiles.review]` with `net = ["-api.example.com"]` is the
+  inherited `net` without that host, and `fs-read = ["-workspace"]` or `mcp = ["-exa"]` the same for a
+  root and for a server. The list is written entirely as names or entirely as entries: a plain list
+  of tables still replaces the inherited one, so no list is both, and `+name` is refused rather than
+  read as an addition, because an added grant carries a scheme, a port and a `why` that a bare name
+  cannot. Emptying a scope stays `net = []`.
+- **A name is the entry's identity, and the identity is the scope's**: the host of a `net` grant,
+  the root of an `fs-read`/`fs-write` grant, the server of an `mcp` grant. A host compares as a name
+  does, case-insensitively; a root and a server as written. A root names every entry for it, since
+  two entries for one root differ only in the exclusions that narrow it.
+- **Subtraction is resolved by the merge, before the document is parsed**, so what the engine, the
+  interface check and the sandbox spec see is an ordinary list of grants (D63, D176). It is not a
+  deny rule: nothing in the resolved policy says "not this", the entry is simply not there. That is
+  why it belongs to layering and not to `saddle-policy`.
+- **Every mistake in the form is refused, not ignored.** A name nothing inherits is an error naming
+  what the inherited list does hold — a profile that means to take a host away should hear that it
+  took nothing, rather than run on with the grant still in force. A list mixing names with entries, a
+  `+` entry, and a name written without its `-` are errors too. So is a `-` in the base grants,
+  refused where the base is built, and one inside a server's own reach, which is written in full and
+  inherits nothing.
+- **Every layer has it**, because `saddle_cap::policy::merge` is what all of them use: a profile
+  subtracts from `[agent]`, and this workspace's file subtracts from what the profile left.
 
 ## 4. Scope enumeration
 
