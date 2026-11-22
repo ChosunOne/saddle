@@ -94,35 +94,48 @@ net = [{ host = "api.example.com", why = "the project's API" }]
 
 ### profiles
 
-A profile is a set of grants kept under its own name, so switching what the agent may do does not
-mean editing `[agent]` and editing it back (D175). Each `[profiles.<name>]` is written exactly as
-`[agent]` is, and the one in force **replaces** `[agent]` rather than adding to it: it is the base a
-workspace's own file is layered on, so a scope the workspace names still replaces that scope.
+A profile is a named layer of grants, so switching what the agent may do does not mean editing
+`[agent]` and editing it back (D175, D176). The layers apply in this order:
+
+```
+[agent]  →  [profiles.<name>]  →  this workspace's own file  →  --grant / --revoke
+```
+
+A layer names what it changes and **inherits every scope it does not name**: a scope the later layer
+names replaces that scope (a list replaces the list, a table is merged key by key), and the rest come
+from the layer below. So the base holds what every profile shares, and each profile says only what it
+adds.
 
 ```toml
 profile = "build"            # the default; `none` is [agent] as written
 
-[profiles.build]
+[agent]                      # what every profile shares
 fs-read  = [{ root = "workspace" }]
 fs-write = [{ root = "workspace", exclude = [".env*"] }]
-exec     = { timeout-secs = 300 }
-net      = [{ host = "*.crates.io" }]
 
-[profiles.review]            # read-only: no exec, no net
-fs-read  = [{ root = "workspace" }]
-fs-write = []
+[profiles.build]             # the same, plus running commands and one host
+exec = { timeout-secs = 300 }
+net  = [{ host = "*.crates.io" }]
+
+[profiles.offline]           # the same, and no network even if the base had one
+net = []
 ```
 
 | how | what it does |
 | --- | --- |
 | `profile = "name"` | what a new session starts on; unset means `[agent]` |
 | `--profile <name>` | one run only, nothing written |
-| `/profile` | report the sets in force and the ones defined |
+| `/profile` | report the set in force and the ones defined |
 | `/profile <name>` | switch this session at once — the model is told on its next request, and background tasks stop first because they were started under the replaced grants (D153) |
+
+A layer can add a scope or replace one, but not remove one: a list can be emptied (`net = []`,
+`mcp = []`, `fs-write = []`), while a scope written as a table — `exec`, `transcript-read` — can only
+be replaced, never dropped. To have a profile that runs nothing, leave `exec` out of `[agent]` and
+grant it in the profiles that need it.
 
 Names are 1-64 letters, digits, `-` or `_`, and `none` is reserved for `[agent]` as written. A name
 that is not defined is refused, at load and at a switch, with the defined ones listed: a mistyped
-switch never falls back to the wider base. `saddle check` prints the profile in force and the
+switch never falls back to a wider layer. `saddle check` prints the profile in force and the
 alternatives. `[plugin.<id>]` grants and `[sandbox]` lists stay global — a profile is the agent's
 grants, not a second copy of the command sandbox's authority.
 

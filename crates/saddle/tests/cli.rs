@@ -479,19 +479,32 @@ fn shipped_tool_inventory_and_delegation_template_do_not_modify_existing_config(
 }
 
 #[test]
-fn a_profile_names_the_grants_a_run_starts_with() {
-    // D175: `[profiles.<name>]` is a set of grants chosen by name, and the choice is the base this
-    // workspace's own file is layered on — so switching does not mean editing `[agent]` each time.
+fn a_profile_is_layered_between_the_base_grants_and_the_project() {
+    // D176: the order is `[agent]`, then the profile, then this workspace's own file. A profile
+    // names what it changes and inherits the rest, so switching sets do not mean copying the base.
     let env = Env::new();
     env.write_policy(POLICY);
+    env.edit_agent(|agent| {
+        let mut grant = toml::Table::new();
+        grant.insert("host".into(), toml::Value::String("api.example.com".into()));
+        agent.insert(
+            "net".into(),
+            toml::Value::Array(vec![toml::Value::Table(grant)]),
+        );
+    });
     let path = env.policy_path();
     let mut doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
     doc.insert(
         "profiles".into(),
         toml::Value::Table(
-            "[locked]\nfs-read = [{ root = \"workspace\" }]\n"
-                .parse::<toml::Table>()
-                .unwrap(),
+            concat!(
+                "[build]\n",
+                "exec = { timeout-secs = 60 }\n\n",
+                "[offline]\nnet = []\n\n",
+                "[review]\n",
+            )
+            .parse::<toml::Table>()
+            .unwrap(),
         ),
     );
     let write = |doc: &toml::Table| fs::write(&path, toml::to_string(doc).unwrap()).unwrap();
@@ -504,34 +517,45 @@ fn a_profile_names_the_grants_a_run_starts_with() {
         text.contains("profile    none ([agent] as written)"),
         "{text}"
     );
-    assert!(text.contains("(defined: locked)"), "{text}");
+    assert!(text.contains("defined: build, offline, review"), "{text}");
     assert!(text.contains("agent.exec = timeout 20s"), "{text}");
 
-    // A profile replaces the base rather than adding to it: nothing runs under `locked`.
-    let out = env.saddle(&["--profile", "locked", "check"]);
+    // The profile's own scope replaces the base's, and everything else is inherited.
+    let out = env.saddle(&["--profile", "build", "check"]);
     assert!(out.status.success(), "{}", stderr(&out));
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert!(text.contains("profile    locked"), "{text}");
-    assert!(text.contains("agent.fs-read"), "{text}");
+    assert!(text.contains("profile    build"), "{text}");
+    assert!(text.contains("agent.exec = timeout 60s"), "{text}");
     assert!(
-        !text.contains("agent.exec"),
-        "a profile is not the base plus a profile: {text}"
+        text.contains("agent.fs-read[0] = workspace"),
+        "the base is inherited: {text}"
     );
-    let out = env.saddle(&[
-        "--profile",
-        "locked",
-        "tool",
-        "bash",
-        r#"{"command":"echo hi"}"#,
-    ]);
-    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out));
-    assert!(said.contains("denied"), "{said}");
+    assert!(
+        text.contains("agent.net[0] = https://api.example.com:443"),
+        "inherited from the base too: {text}"
+    );
 
-    // It is still the base, so this workspace's own file replaces a scope of it (D63).
-    env.write_override("version = 1\n[agent]\nexec = { timeout-secs = 7 }\n");
-    let out = env.saddle(&["--profile", "locked", "check"]);
+    // A list scope can be emptied by the profile, which is how one narrows; a table scope cannot.
+    let out = env.saddle(&["--profile", "offline", "check"]);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert!(text.contains("agent.exec = timeout 7s"), "{text}");
+    assert!(
+        !text.contains("agent.net["),
+        "the profile emptied it: {text}"
+    );
+    assert!(text.contains("agent.exec = timeout 20s"), "{text}");
+
+    // This workspace's own file is layered on top of both (D63).
+    env.write_override("version = 1\n[agent]\nexec = { timeout-secs = 7 }\n");
+    let out = env.saddle(&["--profile", "build", "check"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        text.contains("agent.exec = timeout 7s"),
+        "the project's file is last: {text}"
+    );
+    assert!(
+        text.contains("agent.net[0] = https://api.example.com:443"),
+        "and it leaves what it does not name alone: {text}"
+    );
 
     // A name that is not defined is refused, never quietly replaced by `[agent]`.
     let out = env.saddle(&["--profile", "nope", "check"]);
@@ -543,11 +567,11 @@ fn a_profile_names_the_grants_a_run_starts_with() {
     );
 
     // The file's own default is what a session starts on, and `none` goes back to `[agent]`.
-    doc.insert("profile".into(), toml::Value::String("locked".into()));
+    doc.insert("profile".into(), toml::Value::String("build".into()));
     write(&doc);
     let out = env.saddle(&["check"]);
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("profile    locked"),
+        String::from_utf8_lossy(&out.stdout).contains("profile    build"),
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );

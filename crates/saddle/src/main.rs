@@ -1145,7 +1145,10 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
             .unwrap_or("none ([agent] as written)"),
         match setup.profiles.is_empty() {
             true => String::new(),
-            false => format!("  (defined: {})", setup.profiles.join(", ")),
+            false => format!(
+                "  (layered on [agent], then this workspace's file; defined: {})",
+                setup.profiles.join(", ")
+            ),
         }
     );
     if setup.policy_text.is_empty() {

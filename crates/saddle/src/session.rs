@@ -100,7 +100,10 @@ pub fn profile_report(setup: &Setup) -> String {
         };
         text.push_str(&format!("\n  {name}{mark}"));
     }
-    text.push_str("\n`/profile <name>` switches this session; `none` is [agent] as written");
+    text.push_str(
+        "\n`/profile <name>` switches this session; `none` is [agent] as written, and a profile is\
+         \nlayered on it, with this workspace's own grants on top (D176)",
+    );
     text
 }
 

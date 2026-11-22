@@ -488,9 +488,9 @@ Treat these as load-bearing, not stylistic. If a task appears to require changin
 rather than loosening it.
 
 - **The policy is not in the tree.** The base grants are `[agent]` in
-  `$XDG_CONFIG_HOME/saddle/config.toml` — or one of its `[profiles.<name>]` sets, chosen by a
-  top-level `profile = "…"` and swapped for one run or one session with `--profile`/`/profile`
-  (D175) — and a workspace's own are `policies/--<path>--.toml` beside it
+  `$XDG_CONFIG_HOME/saddle/config.toml` — with one of its `[profiles.<name>]` sets layered on it by a
+  top-level `profile = "…"`, swapped for one run or one session with `--profile`/`/profile`
+  (D175, D176) — and a workspace's own are `policies/--<path>--.toml` beside it
   (D63), layered on the base (D42, D43); each grants file carries a `workspace = "…"` line and a
   session refuses one that names a different directory, since the filename encoding is lossy. A `saddle.toml` in the repository is not read and a session
   says so once. A workspace file may narrow or widen a base grant: it is the authority for that

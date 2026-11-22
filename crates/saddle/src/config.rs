@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Error as AnyError, Result, bail};
 use saddle_cap::sandbox::SandboxExtras;
-use saddle_cap::{PluginId, RootName, Roots};
+use saddle_cap::{PluginId, RootName, Roots, policy};
 use serde::Deserialize;
 
 use crate::mcp::McpTable;
@@ -615,23 +615,30 @@ impl UserConfig {
             .collect()
     }
 
-    /// The grant document every workspace inherits, as the policy parser reads it (D63), from the
-    /// profile in force when one is named (D175).
+    /// The grant document every workspace inherits, as the policy parser reads it (D63): `[agent]`
+    /// with the profile in force layered on it (D175, D176).
     pub fn global_policy(&self, profile: Option<&str>) -> toml::Value {
-        // A profile *replaces* `[agent]` rather than being added to it: it is the base this
-        // workspace's own grants are layered on. No `[agent]` at all is "not configured yet", so
-        // the built-in grants apply; an `[agent]` table that is present and empty is a decision and
-        // is taken as written (D63). An empty profile is that same decision, and an unknown one
-        // grants nothing rather than falling back to the base.
-        let agent = match profile {
-            Some(name) => self.profiles.get(name).cloned(),
-            None => self.agent.clone().or_else(|| {
-                toml::from_str::<toml::Value>(defaults::DEFAULT_AGENT)
-                    .ok()
-                    .map(|v| toml::Value::Table(v.as_table().cloned().unwrap_or_default()))
-            }),
-        };
+        // The order is the file's: `[agent]`, then the profile, then this workspace's own grants,
+        // which `Setup::load` layers on what this returns (D63, D176). So a profile names what it
+        // changes and inherits the rest — it is a layer, not a second copy of the table.
+        //
+        // No `[agent]` at all is "not configured yet", so the built-in grants apply; an `[agent]`
+        // table that is present and empty is a decision and is taken as written (D63). A profile
+        // inherits that the same way, so an empty one changes nothing.
+        let agent = self.agent.clone().or_else(|| {
+            toml::from_str::<toml::Value>(defaults::DEFAULT_AGENT)
+                .ok()
+                .map(|v| toml::Value::Table(v.as_table().cloned().unwrap_or_default()))
+        });
         let mut document = policy_document(agent);
+        if let Some(name) = profile {
+            let Some(grants) = self.profiles.get(name).cloned() else {
+                // Unreachable: `profile_in_force` refuses a name that is not defined, before this
+                // is called. Granting nothing is the fail-closed answer if it ever is reached.
+                return policy_document(None);
+            };
+            document = policy::merge(document, policy_document(Some(grants)));
+        }
         if let toml::Value::Table(table) = &mut document {
             table.insert(
                 "plugin".into(),
@@ -875,15 +882,22 @@ mod tests {
     use crate::tui::keys::Keys;
     use std::fs;
 
-    /// A profile is a base, not an addition: what it names is the whole `[agent]` for a session
-    /// that chose it (D175).
+    /// A profile is a layer between the base and the project's own grants: it names what it
+    /// changes and inherits the rest (D176).
     #[test]
-    fn a_profile_replaces_the_base_grants_and_an_unknown_one_grants_nothing() {
+    fn a_profile_is_layered_on_the_base_and_an_unknown_one_grants_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(
             &path,
-            "[agent]\nexec = { timeout-secs = 20 }\n\n[profiles.locked]\nfs-read = [{ root = \"workspace\" }]\n\n[profiles.empty]\n",
+            concat!(
+                "[agent]\n",
+                "exec = { timeout-secs = 20 }\n",
+                "net = [{ host = \"api.example.com\" }]\n\n",
+                "[profiles.build]\nexec = { timeout-secs = 300 }\n\n",
+                "[profiles.offline]\nnet = []\n\n",
+                "[profiles.empty]\n",
+            ),
         )
         .unwrap();
         let config = UserConfig::load(&path).unwrap();
@@ -893,17 +907,29 @@ mod tests {
                 .cloned()
                 .unwrap()
         };
-        assert!(agent(None).contains_key("exec"));
-        let locked = agent(Some("locked"));
-        assert!(locked.contains_key("fs-read"));
-        assert!(
-            !locked.contains_key("exec"),
-            "a profile is not the base plus a profile: {locked:?}"
+        assert_eq!(
+            agent(None)["exec"]["timeout-secs"].as_integer(),
+            Some(20),
+            "the base as written"
         );
-        // An empty profile is the decision to grant nothing, never the built-in defaults.
-        assert!(agent(Some("empty")).is_empty());
-        // Unknown names never reach `global_policy`, and if one did it grants nothing rather than
-        // falling back to `[agent]`.
+        // A scope the profile names replaces that scope; every other scope is inherited.
+        let build = agent(Some("build"));
+        assert_eq!(build["exec"]["timeout-secs"].as_integer(), Some(300));
+        assert_eq!(
+            build["net"][0]["host"].as_str(),
+            Some("api.example.com"),
+            "a profile inherits what it does not name: {build:?}"
+        );
+        // A list scope can be emptied by a layer, which is how a profile narrows one.
+        let offline = agent(Some("offline"));
+        assert!(offline["net"].as_array().unwrap().is_empty());
+        assert!(
+            offline.contains_key("exec"),
+            "a scope written as a table cannot be removed by a layer: {offline:?}"
+        );
+        // An empty profile changes nothing, and an unknown one never reaches here — if it did, it
+        // grants nothing rather than falling back to the base.
+        assert_eq!(agent(Some("empty")), agent(None));
         assert!(agent(Some("missing")).is_empty());
     }
 

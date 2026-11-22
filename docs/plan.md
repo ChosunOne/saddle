@@ -4365,8 +4365,8 @@ is.
 
 - **A profile is a base, not an addition.** `[profiles.<name>]` in the protected config holds what
   `[agent]` holds, and the profile in force *is* the base a workspace's own file is layered on
-  (D63). So it replaces `[agent]` entirely — an empty profile grants nothing, and a scope the
-  workspace names still replaces that scope, narrower or wider. None of the lowering changes: a
+  (D63). It is layered *on* `[agent]` rather than replacing it, as D176 settles: this bullet
+  originally had it replace the base entirely. None of the lowering changes: a
   profile is a choice of document, so it is still checked before instantiation, decided per call and
   turned into a sandbox spec exactly as the base is. Nothing selects authority; it selects which
   grants the one representation is built from.
@@ -4386,6 +4386,27 @@ is.
 - **What a profile does not hold.** `[plugin.<id>]` grants and the `[sandbox]` read/write lists stay
   global. Those are separate authority surfaces with their own rules (D66, D128), and letting a
   session-scoped switch redefine the command sandbox would put the protected lists behind it.
+
+**D176.** A profile is layered on the global grants, and a project's own file on both.
+
+- **The order is the file's.** `[agent]` first, then `[profiles.<name>]`, then this workspace's own
+  grants — the same shape `saddle_cap::policy::merge` already gives a workspace file (D63): a scope
+  the later layer names replaces that scope, and every other scope is inherited. So a profile says
+  what it changes, a project file can still replace any scope of either, and switching sets does not
+  mean keeping a second copy of the base.
+- **This supersedes D175's first bullet.** There a profile replaced `[agent]` entirely, which made
+  the useful direction the awkward one: adding `exec` or a host to a base that every profile shares
+  meant restating everything the base already had, and a profile that only added a `net` host read
+  as if it had taken the file tools away.
+- **A layer adds or replaces; it does not remove.** A list scope can be emptied — `net = []` is a
+  profile with no network — but a scope written as a table (`exec`, `transcript-read`) can only be
+  replaced, because the merge has no form for "absent". Removing one would need either a deny rule,
+  which the policy deliberately has none of (D22, a decision being a lookup over grants), or a
+  sentinel the parser reads as removal. Neither is worth it for a case a minimal `[agent]` already
+  answers: keep the base to what every profile shares, and let the profiles that need `exec` grant it.
+- **Still one representation.** The profile is merged into the document *before* it is parsed, so the
+  interface check, the per-call decisions and the sandbox spec are all built from one grant document
+  exactly as before (D63, D126). What is layered is the text of the grants, never a second decision.
 
 ## 4. Scope enumeration
 
