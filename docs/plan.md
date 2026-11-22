@@ -4488,6 +4488,23 @@ settles what `bash`'s `status`, `list` and `wait` report about a session-owned t
 - **The wake and the poll stay separate.** A completion resumes the agent or does not, as the launch
   or `wait` said; reading the task later changes neither, and does not re-arm anything.
 
+**D180.** A cancellation answers with the ending it asked for. `access` asks every matching task to
+stop, then waits — at most `CANCEL_REAP`, one second — for the monitors to kill and reap the process
+group before it snapshots, so the reply says `cancelled by the user` instead of the `running` that
+was true a millisecond earlier (D153, D179).
+
+- **Why it is worth a wait.** A cancellation is the one call whose whole point is the ending: a reply
+  that says the task is still running tells the caller to poll for something it just asked for, and a
+  model reading it will call `status` again to learn what happened. The wait is short because the
+  monitor is already killing the group; the loop calls `service`, which is what joins a finished
+  worker.
+- **The bound is the contract.** A child that cannot be reaped within the second still gets an honest
+  snapshot, so this never becomes an unbounded wait on the session thread — the same thread that
+  services the network proxy. Another call's `status` can still see `running` in that window, which
+  is a fact about the process, not a contradiction.
+- **Nothing else changed.** `cancel` still returns success whether or not the task finished, the wake
+  it would have had is unaffected, and the record stays readable afterwards as D179 says.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

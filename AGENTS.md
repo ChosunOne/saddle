@@ -139,7 +139,9 @@ returns a failed result; cleanup/restore/audit still finish, committed effects a
 and remote MCP work cannot be guaranteed cancelled. Omission retains existing defaults.
 
 `bash` accepts `background: true` to return a session-owned task id, then `action: "status"`,
-`"list"` or `"cancel"` with `task_id` as appropriate (D153). A finished task keeps answering: `status`
+`"list"` or `"cancel"` with `task_id` as appropriate (D153); `cancel` waits a bounded moment for the
+process group to be reaped so its own reply says `cancelled` rather than `running` (D180). A finished
+task keeps answering: `status`
 reports its exit status and bounded capture until `exec-tasks` evicts the record, `list` says
 `finished (exit 0)`/`cancelled`/`timed out` per task, and a running one never prints an exit line
 (D179). The guest owns these workflows; the
@@ -424,7 +426,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D179 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D180 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

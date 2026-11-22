@@ -748,6 +748,11 @@ fn background_shell_returns_live_output_isolates_principals_and_serializes_until
                 vec![("cancel", "bash", json!({"action":"cancel","task_id":id}))]
             }
             3 => {
+                // D180: the call that asked for the cancellation answers with the ending, rather
+                // than a snapshot taken before the process group was reaped.
+                let text = result_text(body, "cancel");
+                assert!(text.contains("finished"), "{text}");
+                assert!(text.contains("cancelled by the user"), "{text}");
                 thread::sleep(Duration::from_millis(150));
                 vec![("done", "bash", json!({"action":"status","task_id":id}))]
             }

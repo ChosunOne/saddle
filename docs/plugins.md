@@ -114,7 +114,9 @@ Status returns a bounded snapshot of available stdout/stderr, exit status and ti
 state. Repeated polls return the captured prefix again, not an ever-growing log, and a finished task
 keeps answering with its exit status until the `exec-tasks` retention budget evicts it; `list` shows
 each record as running, finished (with its exit code), cancelled or timed out (D179). Cancellation is
-requested promptly; a task may still report running until process-group cleanup finishes. The tool that started it is its owner: another plugin cannot read or cancel it,
+requested promptly, and the cancel call waits — up to a second — for the process group to be killed
+and reaped, so its own reply says how the task ended; another call's status can still see it running
+until then (D180). The tool that started it is its owner: another plugin cannot read or cancel it,
 nor arm a wake on it. A start's timeout bounds the **task lifetime**; a timeout on a status call only
 bounds that call.
 

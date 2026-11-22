@@ -20,6 +20,10 @@ use crate::net::bridge::Bridge;
 use crate::plugins::HostFailure;
 use crate::session::{Session, session_id};
 
+/// How long a cancellation waits for the monitors to reap what they killed, so its own reply can
+/// say how the task ended rather than "running" (D180).
+const CANCEL_REAP: Duration = Duration::from_secs(1);
+
 struct Task {
     id: String,
     ui_call: Option<String>,
@@ -394,16 +398,41 @@ pub fn access(
         return Ok(Err(format!("denied: {}", decision.explanation)));
     }
     service(session)?;
-    let selected = session
+    if cancel {
+        // Ask first, then wait for the monitors to reap what they killed, so the call that asked
+        // for the cancellation answers with the ending rather than "running" (D180). The wait is
+        // bounded: a child that cannot be reaped at once still gets an honest snapshot.
+        let cancelled: Vec<String> = session
+            .tasks
+            .entries
+            .iter()
+            .filter(|task| &task.owner == who && id.is_none_or(|id| task.id == id))
+            .map(|task| task.id.clone())
+            .collect();
+        for task in &session.tasks.entries {
+            if cancelled.contains(&task.id) {
+                task.stop.store(true, Ordering::Relaxed);
+            }
+        }
+        let deadline = Instant::now() + CANCEL_REAP;
+        while Instant::now() < deadline
+            && session
+                .tasks
+                .entries
+                .iter()
+                .any(|task| cancelled.contains(&task.id) && task.worker.is_some())
+        {
+            service(session)?;
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let mut replies = Vec::new();
+    for task in session
         .tasks
         .entries
         .iter()
-        .filter(|task| &task.owner == who && id.is_none_or(|id| task.id == id));
-    let mut replies = Vec::new();
-    for task in selected {
-        if cancel {
-            task.stop.store(true, Ordering::Relaxed);
-        }
+        .filter(|task| &task.owner == who && id.is_none_or(|id| task.id == id))
+    {
         let mut reply = snapshot(task)?;
         if id.is_none() {
             reply.output.stdout.clear();
