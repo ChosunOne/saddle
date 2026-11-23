@@ -139,7 +139,7 @@ impl Tool for ConfigHelp {
             input_schema: json!({
                 "type":"object",
                 "properties":{
-                    "section":{"type":"string","description":"one section by name: files, top-level, agent, roots, sandbox, standard-tools, plugins, ui, keys, compaction, context, skills, themes, providers, mcp, tool-limits, commands or problems; omitted returns all of them"}
+                    "section":{"type":"string","description":"one section by name: files, top-level, agent, roots, sandbox, launch-profiles, standard-tools, plugins, ui, keys, compaction, context, skills, themes, providers, mcp, tool-limits, commands or problems; omitted returns all of them"}
                 },
                 "additionalProperties":false
             })

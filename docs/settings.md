@@ -19,7 +19,7 @@ Saddle keeps two directories, both outside every root:
 | --- | --- |
 | `$XDG_CONFIG_HOME/saddle/config.toml` | every setting below, in one file; `~/.config/saddle` when the variable is unset |
 | `$XDG_CONFIG_HOME/saddle/AGENTS.md` | the global instruction file, until `[context] global` names another (D32) |
-| `$XDG_CONFIG_HOME/saddle/policies/--<path>--.toml` | one grants and sandbox file per workspace (D63, D158) |
+| `$XDG_CONFIG_HOME/saddle/policies/--<path>--.toml` | one protected overrides file per workspace (D63, D158, D184) |
 | `$XDG_STATE_HOME/saddle/sessions.db` | the saved conversations, as a tree per workspace (D53) |
 | `$XDG_STATE_HOME/saddle/auth.json` | the keys and OAuth tokens `/login` stores (D85) |
 | `$XDG_STATE_HOME/saddle/models.json` | each endpoint's model list, context windows and prices (D34) |
@@ -29,7 +29,8 @@ The workspace file's name is a readable encoding of the directory and is allowed
 the `workspace = "..."` line inside it is what counts, and a session refuses a file naming a
 different directory. It holds `[agent]` grants, `[plugin.<id>]` grants and `[sandbox]` lists; what it
 does not mention is taken from the base, and what it does mention replaces that scope for this
-directory, wider or narrower. `/permissions` creates it on first use, and `saddle check` names it.
+directory, wider or narrower. It can also override individual [launch-profile fields](#launch-profiles).
+`/permissions` creates it on first use, and `saddle check` names it.
 
 Neither directory is a root, and a path in one cannot become one. That is deliberate: a policy file
 inside the workspace would be writable by anything the agent runs (D42). `saddle check` prints the
@@ -205,6 +206,32 @@ a path in `[sandbox]` that names or contains the config or state directory is re
 A workspace file may override these lists: `+path` appends to the inherited list, `-path` removes,
 an unprefixed list replaces it, and a mixed list is an error (D157, D158). List subtraction is not a
 deny rule and cannot carve a hole in a parent claim.
+
+## launch-profiles
+
+Launch profile definitions (D184) are currently inspection-only. They do not enable a tool or
+give existing tools access to the listed files. Define a default in `config.toml`:
+
+```toml
+[launch-profiles.gh]
+executable = "/usr/bin/gh"
+read = ["~/.config/gh/hosts.yml"]
+timeout-secs = 30
+```
+
+In the protected workspace override file, keep the canonical `workspace` line and set only the
+fields you want to change:
+
+```toml
+[launch-profiles.gh]
+read = []
+```
+
+The omitted timeout inherits; the empty list clears the inherited read paths. A nonempty list
+replaces the whole inherited list; `+`/`-` list operators are not supported here. Paths must be
+absolute or start with `~/`, without `..`. `timeout-secs`, if set, is a positive integer. To choose
+a different executable, define a new profile by name. `saddle check` prints the effective definition
+and names the fields from the workspace file. No settings in the checkout define a profile.
 
 ## standard-tools
 

@@ -31,7 +31,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use cap_std::fs::Dir;
 use saddle_cap::policy::{NetGrant, POLICY_FILE, TOOL_READ_ROLES, TOOL_WRITE_ROLES, ToolReadGrant};
 use saddle_cap::sandbox::SandboxExtras;
@@ -41,6 +41,7 @@ use saddle_policy::{AuditLog, Decision, Engine, Kind, Request, net_decision};
 use serde_json::{Value, json};
 
 use crate::config::UserConfig;
+use crate::config::launch_profiles::{self, Resolved as LaunchProfile};
 use crate::config::sandbox_overrides::{self, Source as SandboxSource};
 use crate::fs_access;
 use crate::mcp::Transport;
@@ -127,6 +128,7 @@ pub fn roots_for_validation() -> Result<Roots> {
 /// log.
 pub struct Setup {
     pub sandbox_override: Option<SandboxSource>,
+    pub launch_profiles: BTreeMap<String, LaunchProfile>,
     pub standard_tools: Profiles,
     pub tool_limits: Budgets,
     pub plugins: BTreeMap<PluginId, PluginEntry>,
@@ -228,6 +230,7 @@ impl Setup {
         };
         // A header with no grants is the same as no file: nothing is overridden.
         let sandbox_override;
+        let launch_profiles;
         let mut own: Option<toml::Value> = {
             let doc: toml::Table = toml::from_str(&own_text)
                 .with_context(|| format!("reading {}", own_path.display()))?;
@@ -249,6 +252,29 @@ impl Setup {
             sandbox_override = Some(sandbox_overrides::apply(
                 &mut user, &paths, &roots, &workspace, &own_path, &own_text, &doc,
             )?);
+            let launch_overlay = match doc.get("launch-profiles") {
+                Some(value) => {
+                    if !doc
+                        .get("workspace")
+                        .and_then(toml::Value::as_str)
+                        .is_some_and(|claimed| Some(claimed) == workspace.to_str())
+                    {
+                        bail!(
+                            "launch profile overrides require a matching canonical workspace line"
+                        );
+                    }
+                    value.clone().try_into().with_context(|| {
+                        format!("invalid launch profiles in {}", own_path.display())
+                    })?
+                }
+                None => BTreeMap::new(),
+            };
+            launch_profiles = launch_profiles::resolve(
+                mem::take(&mut user.launch_profiles),
+                launch_overlay,
+                &paths.protected(),
+            )
+            .with_context(|| format!("resolving launch profiles for {}", workspace.display()))?;
             (doc.contains_key("agent") || doc.contains_key("plugin")).then(|| {
                 let mut out = toml::Table::new();
                 out.insert("version".into(), toml::Value::Integer(1));
@@ -372,6 +398,7 @@ impl Setup {
         );
         Ok(Self {
             sandbox_override,
+            launch_profiles,
             standard_tools: user.standard_tools,
             tool_limits: user.tool_limits,
             plugins: user.plugins,

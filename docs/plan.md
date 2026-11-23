@@ -4587,6 +4587,31 @@ own deadline instead.
   command. A component load is host administration, not the person's work, and it is already bounded
   by its own deadline.
 
+**D184.** Named launch profiles are protected definitions, separate from permission to invoke them.
+`[launch-profiles.<name>]` in `config.toml` defines an executable and its bounds. The protected D158
+workspace file allows the same table with field-level overrides and requires the matching canonical
+`workspace` line. Omitted fields inherit; a supplied list replaces rather than appends; `[]` clears.
+A workspace can define its own profile, but selecting another executable for an inherited profile
+requires a new name. Invalid workspace definitions fail setup rather than falling back to global ones.
+`check` shows effective definitions and which fields came from the workspace. These paths never
+become roots, ordinary sandbox extras, or file-tool paths.
+
+The first increment is configuration and inspection only, covering `executable`, `read` and
+`timeout-secs`. It confers no authority. The intended runtime is one shipped foreground tool with
+literal arguments and a named launch grant independent of `exec`. The host, not the guest, resolves
+the approved definition and confines the child. The ordinary sandbox must not be extended: the same
+binary launched through `bash` has exactly its ordinary reach. Before enabling invocation, the
+launcher must pin and validate the executable and its trusted runtime against agent-writable inputs,
+separate read from execute rights, and reject profiles it cannot enforce. Any borrowed workspace or
+network reach must be bounded by both the profile and the caller. Arguments are not a subcommand
+policy: a program can disclose any credential it can read, and a program that interprets untrusted
+code is effectively a code runner inside its profile.
+
+Runtime acceptance uses the same fixture binary and compiled tool before grant, after grant and
+after revocation. The named launch opens its specified file but not its sibling or an agent-written
+helper; ordinary `bash` and `read` never acquire the named read, and the named launch does not need
+`exec`. Another principal without the named grant cannot invoke it.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

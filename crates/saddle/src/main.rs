@@ -1228,6 +1228,23 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
             println!("  {}", path.display());
         }
     }
+    if !setup.launch_profiles.is_empty() {
+        println!("launch profiles (definitions only; invocation is not implemented)");
+        for (name, profile) in &setup.launch_profiles {
+            println!("  {name}: {:?}", profile.executable);
+            println!("    read = {:?}", profile.read);
+            if let Some(seconds) = profile.timeout_secs {
+                println!("    timeout-secs = {seconds}");
+            }
+            if !profile.workspace_fields.is_empty() {
+                println!(
+                    "    workspace fields: {} ({})",
+                    profile.workspace_fields.join(", "),
+                    setup.workspace_policy_path.display()
+                );
+            }
+        }
+    }
     for note in &setup.notes {
         println!("note       {note}");
     }

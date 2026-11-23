@@ -580,6 +580,10 @@ rather than loosening it.
   directories is followed, which no root allows, but only to another declared entry: otherwise a
   link would reach the policy (D16).
   `saddle check` shows `tool paths`; `saddle tool read '{"path":"~/.agents/…"}'` is the by-hand test.
+- **Launch profiles are separate definitions, not ordinary sandbox paths** (D184). They are
+  inspected by `saddle check`, not runnable yet. The protected workspace file can override fields:
+  omitted fields inherit, supplied lists replace, and `[]` clears. An inherited executable cannot
+  be overridden. Do not add these paths to roots, file-tool access, or the ordinary exec sandbox.
 - **`exec` is Linux-only** and needs landlock ABI 3 as a hard requirement. A command now has a network
   of its own (D79): a user and network namespace with no route out, a relay on its loopback, and a proxy
   in this process that decides every connection with the same engine, audit log and `net` grants as

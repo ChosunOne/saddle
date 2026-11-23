@@ -18,6 +18,7 @@
 //! # api-key-env = "LOCAL_KEY"          # omit when the server takes no key
 //! ```
 
+pub mod launch_profiles;
 pub mod sandbox_overrides;
 
 use crate::defaults;
@@ -82,6 +83,8 @@ pub struct UserConfig {
     pub roots: BTreeMap<String, String>,
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    #[serde(default, rename = "launch-profiles")]
+    pub launch_profiles: launch_profiles::Definitions,
     /// The provider used when `--provider` is not given.
     #[serde(default)]
     pub provider: Option<String>,
@@ -462,6 +465,7 @@ pub fn edit(
     let config = toml::from_str::<UserConfig>(&out)
         .with_context(|| format!("the change would leave {} invalid", path.display()))?;
     sandbox_overrides::validate_global(&config.sandbox)?;
+    launch_profiles::validate_global(&config.launch_profiles)?;
     let dir = path.parent().context("config path has no parent")?;
     fs::create_dir_all(dir)?;
     let tmp = dir.join(".config.toml.tmp");
@@ -573,6 +577,8 @@ impl UserConfig {
             Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
         };
         sandbox_overrides::validate_global(&config.sandbox)
+            .with_context(|| format!("{}", path.display()))?;
+        launch_profiles::validate_global(&config.launch_profiles)
             .with_context(|| format!("{}", path.display()))?;
         config
             .validate_profiles()

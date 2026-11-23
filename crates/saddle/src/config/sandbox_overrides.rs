@@ -68,7 +68,16 @@ pub fn apply(
     doc: &toml::Table,
 ) -> Result<Source> {
     for key in doc.keys() {
-        if !["version", "workspace", "agent", "plugin", "sandbox"].contains(&key.as_str()) {
+        if ![
+            "version",
+            "workspace",
+            "agent",
+            "plugin",
+            "sandbox",
+            "launch-profiles",
+        ]
+        .contains(&key.as_str())
+        {
             bail!(
                 "unsupported workspace override section `{key}` in {}",
                 path.display()
@@ -137,7 +146,7 @@ fn key(entry: &SandboxEntry, roots: &Roots, protected: &[PathBuf]) -> Result<Pat
 }
 
 /// resolve an existing ancestor too, so a missing leaf cannot hide a protected symlink target.
-fn resolve_missing(path: &Path) -> Result<PathBuf> {
+pub(super) fn resolve_missing(path: &Path) -> Result<PathBuf> {
     let mut base = path;
     let mut suffix = Vec::new();
     loop {
