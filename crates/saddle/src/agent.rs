@@ -2058,7 +2058,15 @@ pub fn call_detail(call: &ToolCall) -> String {
         (Some(pattern), None, _) => pattern.to_owned(),
         (None, Some(path), _) => path.to_owned(),
         (None, None, Some(command)) => command.to_owned(),
-        (None, None, None) => String::new(),
+        // A call that runs nothing still asks for something: `status <task>`, `list`, `cancel
+        // <task>`, `wait <task>` (D181). Without this the header is a `$` and a space, which is
+        // what a person dragging a polled task out of the transcript got: `$ ·`.
+        (None, None, None) => match (field("action"), field("task_id")) {
+            (Some(action), Some(task)) => format!("{action} {task}"),
+            (Some(action), None) => action.to_owned(),
+            (None, Some(task)) => task.to_owned(),
+            (None, None) => String::new(),
+        },
     }
 }
 
@@ -2864,6 +2872,29 @@ mod tests {
         fn compaction(&mut self, event: compact::Event) {
             self.events.push(event);
         }
+    }
+
+    #[test]
+    fn a_call_that_runs_nothing_says_what_it_asks_for() {
+        // D181: the transcript's header is the call's detail, so a `status` poll has to name what it
+        // polls rather than leaving the `$` glyph with nothing after it.
+        let detail = |input: serde_json::Value| call_detail(&call("bash", input));
+        assert_eq!(
+            detail(json!({"action": "status", "task_id": "task-7f3a"})),
+            "status task-7f3a"
+        );
+        assert_eq!(detail(json!({"action": "list"})), "list");
+        assert_eq!(
+            detail(json!({"action": "wait", "task_id": "task-7f3a"})),
+            "wait task-7f3a"
+        );
+        // A command is still the header, whatever the action says, and a call naming neither keeps
+        // the empty detail the renderer falls back for.
+        assert_eq!(
+            detail(json!({"command": "cargo test", "background": true})),
+            "cargo test"
+        );
+        assert_eq!(detail(json!({})), "");
     }
 
     fn call(name: &str, input: serde_json::Value) -> ToolCall {

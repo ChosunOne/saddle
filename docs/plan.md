@@ -4505,6 +4505,23 @@ was true a millisecond earlier (D153, D179).
 - **Nothing else changed.** `cancel` still returns success whether or not the task finished, the wake
   it would have had is unaffected, and the record stays readable afterwards as D179 says.
 
+**D181.** A tool call's header says what the call asks for, and never a `$` with nothing after it.
+
+- **How it happened.** The transcript draws a `bash` call as `$ ` plus the call's detail — the first
+  of `pattern`, `path` or `command` the arguments name (D172's stopwatch sits after it). A poll names
+  none of those: `{"action": "status", "task_id": "…"}` is the whole argument list. So the header was
+  a `$`, a space and the stopwatch — `$ · 1.2s` — and a person who dragged it out of the transcript
+  got `$ ·`, which reads as a model emitting decoration and is really the interface with nothing to
+  say.
+- **The detail falls back to the action**: `status task-7f3a`, `list`, `cancel task-7f3a`,
+  `wait task-7f3a`. A command still wins whenever there is one, so a background launch reads
+  `$ cargo test` exactly as before.
+- **The renderer refuses the degenerate form.** A `bash` block whose first line is empty shows the
+  tool's own name instead of a bare `$`, and no tool's header carries a trailing space when it has no
+  detail — which is also the `● bash ` line-mode printed for the same call.
+- **Presentation only.** The conversation still holds the arguments the model sent; nothing here
+  rewrites a call, and a replay draws the same header from the same arguments.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

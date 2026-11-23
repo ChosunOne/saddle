@@ -1487,13 +1487,15 @@ fn tool_block(
             Style::new().fg(theme.warning),
         ));
     }
-    if name == "bash" {
+    if name == "bash" && !first.is_empty() {
         header.push(Span::styled("$ ", accent));
         header.push(Span::styled(first, bold));
     } else {
         header.push(Span::styled(name.to_owned(), accent));
-        header.push(Span::raw(" "));
-        header.push(Span::styled(first, bold));
+        if !first.is_empty() {
+            header.push(Span::raw(" "));
+            header.push(Span::styled(first, bold));
+        }
     }
     // A stopwatch beside the call: running while it works, and the total once it has answered, so a
     // command that took a minute says so afterwards (D172).
@@ -4141,6 +4143,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let passing = format!("exit code 0\n--- stdout ---\n{output}");
+        // A call with nothing to name falls back to the tool's own name: a lone `$` with a
+        // stopwatch beside it is what a polled task looked like (D181).
+        let (lines, _) = block("bash", "", true, "exit code 0", false);
+        assert_eq!(lines.first().map(String::as_str), Some("bash"), "{lines:?}");
         let (lines, bg) = block("bash", "cargo test", true, &passing, false);
         assert_eq!(bg, Theme::default().tool_success_bg);
         assert_eq!(

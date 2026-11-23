@@ -149,7 +149,9 @@ additive `exec-tasks` SDK service is bounded by the existing `exec` grant and is
 A task's completion resumes the agent unless the launch said `wake: false`, and `action: "wait"`
 arms one later — `exec-tasks.set-wake`, additive, authorized and audited like inspect and cancel
 (D174). `wait` answers at once and never blocks the call, and a one-shot `saddle run` waits for a
-task it will be woken by instead of exiting and killing it (D174).
+task it will be woken by instead of exiting and killing it (D174). A call that runs no command names
+its action and task in the transcript's header — `$ status task-7f3a` — because the header is the
+call's detail and a poll has no command to show (D181).
 D159 keeps running task launch blocks on the theme's pending background with a spinner and updates
 them from host state at completion; a running `bash` call and each background task say how long they
 have been going, the first from the frame's clock and the second from its own start (D172). Interactive TUI/line-mode sessions start one normal follow-up
@@ -426,7 +428,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D180 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D181 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust
