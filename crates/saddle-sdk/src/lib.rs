@@ -30,6 +30,7 @@ pub use saddle::host::fs_write::{Change, Expectation, apply as apply_changes};
 pub use saddle::host::http::{
     Header, Request as HttpRequest, Response as HttpResponse, get as http_get,
 };
+pub use saddle::host::run_binary::{Launch, run as run_binary};
 pub use saddle::host::tool_result::emit_diff;
 pub use saddle::host::tool_result::{ImageInfo, emit_image};
 pub use saddle::host::transcript_read::query as query_transcript;

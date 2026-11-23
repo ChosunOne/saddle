@@ -146,7 +146,7 @@ fn key(entry: &SandboxEntry, roots: &Roots, protected: &[PathBuf]) -> Result<Pat
 }
 
 /// resolve an existing ancestor too, so a missing leaf cannot hide a protected symlink target.
-pub(super) fn resolve_missing(path: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_missing(path: &Path) -> Result<PathBuf> {
     let mut base = path;
     let mut suffix = Vec::new();
     loop {

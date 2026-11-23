@@ -11,6 +11,7 @@ use anyhow::anyhow;
 use saddle_cap::component::{Direction, HostInterface, Interface, PluginExport, check_component};
 use saddle_cap::delegate::{self, DelegationError};
 use saddle_cap::manifest::{Manifest, above_ceiling};
+use saddle_cap::policy::valid_launch_profile_name;
 use saddle_cap::{Grants, Principal, Scope};
 use saddle_limits::{self as budgets, Budgets};
 use saddle_wit::ReadToolPre;
@@ -40,6 +41,9 @@ use saddle_wit::saddle::host::model_invoke::{
 };
 use saddle_wit::saddle::host::persist::{self, Change as PersistChange, Host as PersistHost};
 use saddle_wit::saddle::host::plugin_events::{self, Host as EventsHost};
+use saddle_wit::saddle::host::run_binary::{
+    self, Host as LaunchHost, Launch, Reply as LaunchReply,
+};
 use saddle_wit::saddle::host::tool_paths::{
     self, Chunk as ToolChunk, Entry as ToolEntry, EntryKind as ToolEntryKind,
     Failure as ToolFailure, Host as ToolPathsHost, Page as ToolPage, Path as ToolPath,
@@ -250,6 +254,15 @@ pub trait HostServices: Send + 'static {
         _request: Command,
     ) -> anyhow::Result<Result<ExecReply, String>> {
         Ok(Err("host does not implement execution".into()))
+    }
+    /// run the exact named profile through the session policy gate (D184).
+    fn run_binary(
+        &mut self,
+        _call: &Invocation,
+        _request: Launch,
+        _allowance: Duration,
+    ) -> anyhow::Result<Result<LaunchReply, String>> {
+        Ok(Err("host does not implement named launches".into()))
     }
     fn task(
         &mut self,
@@ -517,7 +530,26 @@ impl<H: HostServices> ExecHost for State<H> {
             request.timeout_secs = allowance.as_secs().max(1);
             host.execute(call, request)
         })?;
-        if matches!(&result, Ok(reply) if reply.stdout.len() > budgets::exec_capture_bytes() || reply.stderr.len() > budgets::exec_capture_bytes() || reply.denials.iter().map(String::len).sum::<usize>() > budgets::metadata_bytes())
+        Ok(bounded_exec_reply(result))
+    }
+}
+
+impl<H: HostServices> LaunchHost for State<H> {
+    fn run(&mut self, request: Launch) -> anyhow::Result<Result<LaunchReply, String>> {
+        if !valid_launch_profile_name(&request.profile)
+            || request.timeout_secs == 0
+            || request.argv.len() >= budgets::exec_arguments()
+            || request.argv.iter().map(String::len).sum::<usize>() > budgets::exec_argument_bytes()
+            || request.argv.iter().any(|s| s.contains('\0'))
+        {
+            return Ok(Err("invalid named launch or exceeds argument bounds".into()));
+        }
+        let allowance =
+            Duration::from_secs(request.timeout_secs.min(budgets::exec_seconds() as u64));
+        let result = self.host_wait(allowance, |host, call, left| {
+            host.run_binary(call, request, left)
+        })?;
+        if matches!(&result, Ok(reply) if !valid_exec_output(&reply.stdout, &reply.stderr, &reply.denials))
         {
             return Ok(Err("execution reply exceeds bounds".into()));
         }
@@ -526,6 +558,23 @@ impl<H: HostServices> ExecHost for State<H> {
         }
         Ok(result)
     }
+}
+
+fn valid_exec_output(stdout: &[u8], stderr: &[u8], denials: &[String]) -> bool {
+    stdout.len() <= budgets::exec_capture_bytes()
+        && stderr.len() <= budgets::exec_capture_bytes()
+        && denials.iter().map(String::len).sum::<usize>() <= budgets::metadata_bytes()
+}
+
+fn bounded_exec_reply(result: Result<ExecReply, String>) -> Result<ExecReply, String> {
+    if matches!(&result, Ok(reply) if !valid_exec_output(&reply.stdout, &reply.stderr, &reply.denials))
+    {
+        return Err("execution reply exceeds bounds".into());
+    }
+    if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
+        return Err("host error exceeds configured byte limit".into());
+    }
+    result
 }
 
 impl<H: HostServices> State<H> {
@@ -1246,6 +1295,9 @@ fn bind_host<H: HostServices>(
         }
         HostInterface::PluginEvents => {
             plugin_events::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
+        }
+        HostInterface::RunBinary => {
+            run_binary::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
         }
         HostInterface::Exec => exec::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
         HostInterface::ExecTasks => {

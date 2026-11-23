@@ -180,6 +180,7 @@ mod tests {
         "agent",
         "roots",
         "sandbox",
+        "launch-profiles",
         "standard-tools",
         "plugins",
         "ui",

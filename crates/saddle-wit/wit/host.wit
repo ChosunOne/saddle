@@ -26,6 +26,17 @@ interface exec {
     run: func(request: command) -> result<reply, string>;
 }
 
+// A protected launch profile is separate from ordinary shell execution (D184).
+interface run-binary {
+    record reply {
+        code: option<s32>, signal: option<s32>, stdout: list<u8>, stderr: list<u8>,
+        timed-out: bool, cancelled: bool, truncated: bool,
+        denials: list<string>,
+    }
+    record launch { profile: string, argv: list<string>, timeout-secs: u64 }
+    run: func(request: launch) -> result<reply, string>;
+}
+
 // Session-owned subprocesses; importing this service grants no resources beyond exec (D153).
 interface exec-tasks {
     use exec.{command, reply};

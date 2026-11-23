@@ -50,6 +50,10 @@ name = "patch"
 crate-type = ["cdylib"]
 
 [[example]]
+name = "run_binary"
+crate-type = ["cdylib"]
+
+[[example]]
 name = "bash"
 crate-type = ["cdylib"]
 

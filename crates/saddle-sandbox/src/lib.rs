@@ -27,6 +27,8 @@ pub use saddle_cap::sandbox::SandboxSpec;
 
 mod dns;
 #[cfg(target_os = "linux")]
+mod launch;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 mod namespaces;
@@ -96,6 +98,13 @@ pub fn availability() -> Result<i32, String> {
 
 /// What a command's network will be, for `check` to print. A user namespace cannot be created in
 /// this process to find out, so this reports what the kernel's own switches say (D79).
+pub fn launch_availability() -> Result<(), String> {
+    match landlock_abi() {
+        Some(abi) if abi >= 6 => Ok(()),
+        _ => Err("named launches require Linux with Landlock ABI 6 for signal and abstract socket isolation".into()),
+    }
+}
+
 pub fn network_availability() -> Result<String, String> {
     if !cfg!(target_os = "linux") {
         return Err("a command's network is Linux-only in v1".into());

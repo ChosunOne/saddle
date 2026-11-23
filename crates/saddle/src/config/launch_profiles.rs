@@ -6,7 +6,7 @@ use std::num::NonZeroU32;
 use std::path::{Component, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use saddle_cap::policy::valid_launch_profile_name;
+use saddle_cap::policy::{HostPattern, valid_launch_profile_name};
 use serde::Deserialize;
 
 use super::sandbox_overrides::resolve_missing;
@@ -20,6 +20,7 @@ pub type Definitions = BTreeMap<String, Definition>;
 pub struct Definition {
     executable: Option<String>,
     read: Option<Vec<String>>,
+    net: Option<Vec<String>>,
     timeout_secs: Option<NonZeroU32>,
 }
 
@@ -28,6 +29,7 @@ pub struct Definition {
 pub struct Resolved {
     pub executable: PathBuf,
     pub read: Vec<PathBuf>,
+    pub net: Vec<String>,
     pub timeout_secs: Option<NonZeroU32>,
     pub workspace_fields: Vec<&'static str>,
 }
@@ -63,6 +65,10 @@ pub fn resolve(
                 inherited.read = Some(read);
                 source.push("read");
             }
+            if let Some(net) = fields.net {
+                inherited.net = Some(net);
+                source.push("net");
+            }
             if let Some(timeout) = fields.timeout_secs {
                 inherited.timeout_secs = Some(timeout);
                 source.push("timeout-secs");
@@ -71,6 +77,9 @@ pub fn resolve(
             source.push("executable");
             if fields.read.is_some() {
                 source.push("read");
+            }
+            if fields.net.is_some() {
+                source.push("net");
             }
             if fields.timeout_secs.is_some() {
                 source.push("timeout-secs");
@@ -99,6 +108,12 @@ pub fn resolve(
                 Resolved {
                     executable,
                     read,
+                    net: definition
+                        .net
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|host| host.to_ascii_lowercase())
+                        .collect(),
                     timeout_secs: definition.timeout_secs,
                     workspace_fields,
                 },
@@ -110,6 +125,13 @@ pub fn resolve(
 fn validate(name: &str, fields: &Definition) -> Result<()> {
     if !valid_launch_profile_name(name) {
         bail!("invalid launch profile name {name:?}: use 1-64 letters, digits, `-` or `_`");
+    }
+    for host in fields.net.iter().flatten() {
+        if !matches!(HostPattern::parse(host), Ok(HostPattern::Exact(_))) {
+            bail!(
+                "launch-profiles.{name}.net needs an exact hostname or IP for HTTPS on port 443, got {host:?}"
+            );
+        }
     }
     for path in fields.executable.iter().chain(fields.read.iter().flatten()) {
         expand(path).with_context(|| format!("launch-profiles.{name}"))?;
@@ -147,6 +169,7 @@ fn check_path(written: &str, protected: &[PathBuf]) -> Result<PathBuf> {
             }
         }
     }
-    // This is a configuration-time check only. The launcher must validate and pin what it opens.
-    Ok(resolved)
+    // Do not turn an untrusted alias into a trusted runtime path. The launcher opens the
+    // original expanded claim with no symlink traversal, after this configuration-time check.
+    Ok(path)
 }

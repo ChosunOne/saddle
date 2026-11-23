@@ -1,0 +1,534 @@
+//! strict, single-exec child confinement for named launch profiles (D184).
+
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::env::{self, consts};
+use std::ffi::{CStr, CString};
+use std::fs::{self, File};
+use std::io::{self, ErrorKind, Read};
+use std::mem;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Component, Path, PathBuf};
+use std::ptr;
+use std::sync::mpsc;
+use std::thread;
+
+use landlock::{
+    ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr,
+    RulesetCreatedAttr, RulesetStatus, Scope,
+};
+use seccompiler::{
+    BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+    SeccompRule, TargetArch,
+};
+
+use saddle_cap::sandbox::NamedLaunch;
+
+use crate::linux::start_network;
+use crate::{SandboxError, SandboxSpec, launch_availability};
+
+/// system runtime paths; no ordinary command includes, checkout or general home access.
+const LIB_DIRS: &[&str] = &[
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/usr/lib",
+    "/usr/lib32",
+    "/usr/lib64",
+];
+const RUNTIME_READ: &[&str] = &[
+    "/etc/ld.so.cache",
+    "/etc/ssl/certs",
+    "/etc/pki/tls/certs",
+    "/etc/pki/ca-trust",
+    "/usr/share/ca-certificates",
+    "/usr/share/crypto-policies",
+    "/dev/null",
+    "/dev/urandom",
+];
+
+pub(crate) fn enter(spec: &SandboxSpec, guard: &NamedLaunch) -> Result<Infallible, SandboxError> {
+    launch_availability().map_err(SandboxError::Unavailable)?;
+    if !spec.write.is_empty() {
+        return Err(SandboxError::Spec(
+            "named launches do not support writable paths".into(),
+        ));
+    }
+    let path = Path::new(&spec.argv[0]);
+    reject_overlap(path, &guard.protected)?;
+    reject_overlap(path, &guard.agent_write)?;
+    let mut executable = open_pinned(path, true)?;
+    let mut magic = [0; 4];
+    executable.read_exact(&mut magic)?;
+    if &magic != b"\x7fELF" {
+        return Err(SandboxError::Spec(
+            "launch executable must be a native ELF binary, not a script".into(),
+        ));
+    }
+    let argv = strings(spec.argv.iter().map(String::as_str))?;
+    let environment: Vec<_> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let envp = strings(environment.iter().map(String::as_str))?;
+    let argv = pointers(&argv);
+    let envp = pointers(&envp);
+
+    // The fresh helper has consumed its spec and replaced stdin. Do not pass any other inherited
+    // handle to the relay or executable. Do this before making sockets or starting threads.
+    // SAFETY: close_range takes descriptor numbers and flags; preserve the pinned executable.
+    let fd = executable.as_raw_fd();
+    for (first, last) in [(3, fd as u32 - 1), (fd as u32 + 1, u32::MAX)] {
+        if first <= last && unsafe { libc::syscall(libc::SYS_close_range, first, last, 0u32) } < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    env::set_current_dir(&spec.cwd)?;
+    let networked = start_network(spec);
+    confine_files(spec, guard, &executable)?;
+    confine_syscalls(networked)?;
+    let (send, receive) = mpsc::sync_channel::<File>(0);
+    // Only trusted helper code is running. The monitor is started after Landlock, before the
+    // exec-notification filter. It authorizes one syscall and drops the CLOEXEC listener. The
+    // successful exec destroys this thread; all later exec attempts inherit the filter but have
+    // no listener, and the kernel denies them. There is no monitor serving untrusted requests.
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+    thread::Builder::new()
+        .name("launch-once".into())
+        .spawn(move || {
+            if let Ok(listener) = receive.recv()
+                && let Err(error) = allow_initial_exec(&listener, tid)
+            {
+                eprintln!("saddle-sandbox: cannot release initial exec: {error}");
+            }
+        })?;
+    let listener = exec_listener()?;
+    // A later filter with its own listener could supersede USER_NOTIF. Seal both Linux filter
+    // installation paths before any untrusted code runs.
+    seal_filters()?;
+    send.send(listener)
+        .map_err(|_| SandboxError::Spec("launch monitor stopped".into()))?;
+    // SAFETY: the pinned ELF fd stays owned and argv/envp consist of live NUL-terminated strings
+    // and a terminating null pointer. AT_EMPTY_PATH executes the opened inode, not a reopened path.
+    unsafe {
+        libc::syscall(
+            libc::SYS_execveat,
+            fd,
+            c"".as_ptr(),
+            argv.as_ptr(),
+            envp.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    Err(SandboxError::Exec {
+        program: path.to_path_buf(),
+        source: io::Error::last_os_error(),
+    })
+}
+
+fn strings<'a>(items: impl Iterator<Item = &'a str>) -> Result<Vec<CString>, SandboxError> {
+    items
+        .map(|s| {
+            CString::new(s)
+                .map_err(|_| SandboxError::Spec("NUL in launch arguments or environment".into()))
+        })
+        .collect()
+}
+
+fn pointers(items: &[CString]) -> Vec<*const libc::c_char> {
+    items
+        .iter()
+        .map(|s| s.as_ptr())
+        .chain([ptr::null()])
+        .collect()
+}
+
+/// Open a canonical absolute path without following any links, using pinned parents. Restrict the
+/// executable to a root-owned, non-group/world-writable file under likewise trusted directories.
+fn open_pinned(path: &Path, trusted: bool) -> Result<File, SandboxError> {
+    let mut parts = path.components().peekable();
+    if parts.next() != Some(Component::RootDir) || parts.peek().is_none() {
+        return Err(SandboxError::Spec(format!(
+            "invalid launch path: {}",
+            path.display()
+        )));
+    }
+    let mut file = open_at(libc::AT_FDCWD, c"/", libc::O_PATH | libc::O_DIRECTORY)?;
+    // A parent user namespace may report host root as its overflow UID. Require the same system
+    // owner as the root directory throughout the chain, rather than accepting caller-owned files.
+    let owner = file.metadata()?.uid();
+    while let Some(Component::Normal(part)) = parts.next() {
+        if trusted && !system_owned(&file, owner)? {
+            return Err(SandboxError::Spec(format!(
+                "launch path is not system-owned and immutable to ordinary users: {}",
+                path.display()
+            )));
+        }
+        let part = CString::new(part.as_bytes())
+            .map_err(|_| SandboxError::Spec("NUL in launch path".into()))?;
+        let flags = if parts.peek().is_some() {
+            libc::O_PATH | libc::O_DIRECTORY
+        } else if trusted {
+            libc::O_RDONLY | libc::O_NONBLOCK
+        } else {
+            libc::O_PATH
+        };
+        file = open_at(file.as_raw_fd(), &part, flags)?;
+        let typ = file.metadata()?.file_type();
+        if typ.is_symlink()
+            || (parts.peek().is_none()
+                && trusted
+                && (!typ.is_file() || !system_owned(&file, owner)?))
+        {
+            return Err(SandboxError::Spec(format!(
+                "untrusted launch path: {}",
+                path.display()
+            )));
+        }
+        if parts.peek().is_none() {
+            return Ok(file);
+        }
+    }
+    Err(SandboxError::Spec(format!(
+        "invalid launch path: {}",
+        path.display()
+    )))
+}
+
+fn open_at(dir: libc::c_int, name: &CStr, flags: libc::c_int) -> io::Result<File> {
+    // SAFETY: name is live and NUL-terminated, no creation mode is needed, and the fd is owned.
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+fn system_owned(file: &File, owner: u32) -> io::Result<bool> {
+    let metadata = file.metadata()?;
+    Ok(metadata.uid() == owner && metadata.mode() & 0o022 == 0)
+}
+
+fn confine_files(
+    spec: &SandboxSpec,
+    guard: &NamedLaunch,
+    executable: &File,
+) -> Result<(), SandboxError> {
+    let ll = |error: landlock::RulesetError| SandboxError::Landlock(error.to_string());
+    let abi = ABI::V6;
+    let mut rules = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::from_all(abi))
+        .map_err(ll)?
+        .scope(Scope::Signal | Scope::AbstractUnixSocket)
+        .map_err(ll)?
+        .create()
+        .map_err(ll)?
+        .add_rule(PathBeneath::new(
+            executable.try_clone()?,
+            AccessFs::ReadFile | AccessFs::Execute,
+        ))
+        .map_err(ll)?;
+    let owner = fs::metadata("/")?.uid();
+    for (written, access) in LIB_DIRS
+        .iter()
+        .map(|p| (p, AccessFs::from_read(abi)))
+        .chain(
+            RUNTIME_READ
+                .iter()
+                .map(|p| (p, AccessFs::ReadFile | AccessFs::ReadDir)),
+        )
+    {
+        let path = match fs::canonicalize(written) {
+            Ok(path) => path,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        reject_overlap(&path, &guard.protected)?;
+        reject_overlap(&path, &guard.agent_write)?;
+        let file = open_pinned(&path, false)?;
+        let device = matches!(*written, "/dev/null" | "/dev/urandom");
+        let metadata = file.metadata()?;
+        if if device {
+            !metadata.file_type().is_char_device()
+        } else {
+            !system_owned(&file, owner)?
+        } {
+            return Err(SandboxError::Spec(format!(
+                "untrusted system runtime path: {}",
+                path.display()
+            )));
+        }
+        let access = if file.metadata()?.is_dir() {
+            access
+        } else {
+            access & !AccessFs::ReadDir
+        };
+        rules = rules.add_rule(PathBeneath::new(file, access)).map_err(ll)?;
+    }
+    for path in &spec.read {
+        reject_overlap(path, &guard.protected)?;
+        let file = open_pinned(path, false).map_err(|error| {
+            SandboxError::Spec(format!(
+                "opening launch read path {}: {error}",
+                path.display()
+            ))
+        })?;
+        let metadata = file.metadata()?;
+        let access = if metadata.is_dir() {
+            AccessFs::ReadFile | AccessFs::ReadDir
+        } else if metadata.is_file() {
+            AccessFs::ReadFile.into()
+        } else {
+            return Err(SandboxError::Spec(format!(
+                "launch read path must be a regular file or directory: {}",
+                path.display()
+            )));
+        };
+        rules = rules.add_rule(PathBeneath::new(file, access)).map_err(ll)?;
+    }
+    let status = rules.restrict_self().map_err(ll)?;
+    if status.ruleset != RulesetStatus::FullyEnforced || !status.no_new_privs {
+        return Err(SandboxError::Landlock(
+            "named launch rules were not fully enforced".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_overlap(path: &Path, forbidden: &[PathBuf]) -> Result<(), SandboxError> {
+    if forbidden
+        .iter()
+        .any(|claim| path.starts_with(claim) || claim.starts_with(path))
+    {
+        return Err(SandboxError::Spec(format!(
+            "launch path overlaps protected or agent-writable paths: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn confine_syscalls(networked: bool) -> Result<(), SandboxError> {
+    let sc = |error: seccompiler::BackendError| SandboxError::Seccomp(error.to_string());
+    let mut rules = BTreeMap::new();
+    let socket = if networked {
+        vec![
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Ne,
+                    libc::AF_INET as u64,
+                )
+                .map_err(sc)?,
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Ne,
+                    libc::AF_INET6 as u64,
+                )
+                .map_err(sc)?,
+            ])
+            .map_err(sc)?,
+        ]
+    } else {
+        Vec::new()
+    };
+    rules.insert(libc::SYS_socket, socket);
+    rules.insert(
+        libc::SYS_socketpair,
+        vec![
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Ne,
+                    libc::AF_UNIX as u64,
+                )
+                .map_err(sc)?,
+            ])
+            .map_err(sc)?,
+        ],
+    );
+    for syscall in [
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
+        libc::SYS_setns,
+        libc::SYS_unshare,
+        libc::SYS_setsid,
+        libc::SYS_setpgid,
+        libc::SYS_keyctl,
+        libc::SYS_add_key,
+        libc::SYS_request_key,
+        libc::SYS_ptrace,
+        libc::SYS_pidfd_getfd,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+    ] {
+        rules.insert(syscall, Vec::new());
+    }
+    let arch = TargetArch::try_from(consts::ARCH).map_err(sc)?;
+    let program: BpfProgram = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        arch,
+    )
+    .map_err(sc)?
+    .try_into()
+    .map_err(sc)?;
+    seccompiler::apply_filter(&program).map_err(|error| SandboxError::Seccomp(error.to_string()))
+}
+
+fn seal_filters() -> Result<(), SandboxError> {
+    let sc = |error: seccompiler::BackendError| SandboxError::Seccomp(error.to_string());
+    let set_filter = SeccompRule::new(vec![
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::PR_SET_SECCOMP as u64,
+        )
+        .map_err(sc)?,
+    ])
+    .map_err(sc)?;
+    let rules = BTreeMap::from([
+        (libc::SYS_seccomp, Vec::new()),
+        (libc::SYS_prctl, vec![set_filter]),
+    ]);
+    let arch = TargetArch::try_from(consts::ARCH).map_err(sc)?;
+    let program: BpfProgram = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        arch,
+    )
+    .map_err(sc)?
+    .try_into()
+    .map_err(sc)?;
+    seccompiler::apply_filter(&program).map_err(|error| SandboxError::Seccomp(error.to_string()))
+}
+
+fn exec_listener() -> Result<File, SandboxError> {
+    let sc = |error: seccompiler::BackendError| SandboxError::Seccomp(error.to_string());
+    let arch = TargetArch::try_from(consts::ARCH).map_err(sc)?;
+    let rules = BTreeMap::from([
+        (libc::SYS_execve, Vec::new()),
+        (libc::SYS_execveat, Vec::new()),
+    ]);
+    // Prevent native-arch syscall-number aliases from evading the filter on x86-64. Its legacy
+    // x32 ABI uses the same audit architecture; reject x32 wholesale below.
+    let mut program: BpfProgram =
+        SeccompFilter::new(rules, SeccompAction::Allow, SeccompAction::Trace(0), arch)
+            .map_err(sc)?
+            .try_into()
+            .map_err(sc)?;
+    // seccompiler does not yet expose USER_NOTIF. Rewrite only the constant TRACE return it
+    // emitted above; reject a compiler change that does not produce that return instruction.
+    let mut rewritten = false;
+    for op in &mut program {
+        if op.code == 0x06 && op.k == libc::SECCOMP_RET_TRACE {
+            op.k = libc::SECCOMP_RET_USER_NOTIF;
+            rewritten = true;
+        }
+    }
+    if !rewritten {
+        return Err(SandboxError::Seccomp(
+            "missing launch notification action".into(),
+        ));
+    }
+    #[cfg(target_arch = "x86_64")]
+    program.splice(
+        0..0,
+        [
+            seccompiler::sock_filter {
+                code: 0x20,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            }, // load seccomp_data.nr
+            seccompiler::sock_filter {
+                code: 0x35,
+                jt: 0,
+                jf: 1,
+                k: 0x4000_0000,
+            }, // nr >= x32 bit
+            seccompiler::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_KILL_PROCESS,
+            },
+        ],
+    );
+    let prog = libc::sock_fprog {
+        len: program.len() as u16,
+        filter: program.as_mut_ptr().cast(),
+    };
+    // SAFETY: the kernel copies this live BPF program. This attaches to the calling thread only;
+    // its future executable and descendants inherit it. The returned descriptor is CLOEXEC.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+            &prog,
+        )
+    };
+    if fd < 0 {
+        return Err(SandboxError::Seccomp(
+            io::Error::last_os_error().to_string(),
+        ));
+    }
+    Ok(unsafe { File::from_raw_fd(fd as libc::c_int) })
+}
+
+fn allow_initial_exec(listener: &File, tid: u32) -> io::Result<()> {
+    // SAFETY: ioctl writes into a zero-initialized kernel ABI record owned by this thread.
+    let mut request: libc::seccomp_notif = unsafe { mem::zeroed() };
+    loop {
+        if unsafe {
+            libc::ioctl(
+                listener.as_raw_fd(),
+                libc::SECCOMP_IOCTL_NOTIF_RECV,
+                &mut request,
+            )
+        } == 0
+        {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    if request.pid != tid || i64::from(request.data.nr) != libc::SYS_execveat {
+        return Err(io::Error::other("unexpected launch notification"));
+    }
+    let response = libc::seccomp_notif_resp {
+        id: request.id,
+        val: 0,
+        error: 0,
+        flags: libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32,
+    };
+    // SAFETY: the kernel reads the live response for the single trusted helper syscall.
+    if unsafe {
+        libc::ioctl(
+            listener.as_raw_fd(),
+            libc::SECCOMP_IOCTL_NOTIF_SEND,
+            &response,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}

@@ -1,3 +1,4 @@
+use crate::launch;
 use crate::namespaces;
 use crate::relay;
 use std::collections::BTreeMap;
@@ -39,6 +40,9 @@ pub(crate) fn landlock_abi() -> Option<i32> {
 pub(crate) fn enter(spec: &SandboxSpec) -> Result<Infallible, SandboxError> {
     // The network comes first: it needs `/proc/self/uid_map` and the loopback interface, and
     // landlock refuses both once it is applied (D79).
+    if let Some(guard) = &spec.named_launch {
+        return launch::enter(spec, guard);
+    }
     let networked = start_network(spec);
     env::set_current_dir(&spec.cwd)?;
     let program = resolve_program(&spec.argv[0], &spec.env)?;
@@ -60,7 +64,7 @@ pub(crate) fn enter(spec: &SandboxSpec) -> Result<Infallible, SandboxError> {
 /// user namespaces runs the command exactly as it ran before D79, with `socket(2)` refused. That is
 /// why the answer is a `bool` rather than a result — the caller must not be able to treat a failure
 /// as permission.
-fn start_network(spec: &SandboxSpec) -> bool {
+pub(crate) fn start_network(spec: &SandboxSpec) -> bool {
     let Some(net) = &spec.net else {
         return false;
     };

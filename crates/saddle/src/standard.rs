@@ -46,6 +46,9 @@ pub fn delegate(parent: &Grants, name: &str, scopes: &BTreeSet<Scope>) -> Grants
     if scopes.contains(&Scope::Exec) {
         child.exec = parent.exec.clone();
     }
+    if scopes.contains(&Scope::RunBinary) {
+        child.run_binary = parent.run_binary.clone();
+    }
     if scopes.contains(&Scope::Net) {
         child.net = parent.net.clone();
     }

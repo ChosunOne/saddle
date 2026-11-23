@@ -105,6 +105,7 @@ impl Fixture {
             read,
             write,
             net: None,
+            named_launch: None,
         }
     }
 

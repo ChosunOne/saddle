@@ -21,6 +21,7 @@ const NAMES: &[&str] = &[
     "find",
     "grep",
     "bash",
+    "run_binary",
     "tasks",
     "fetch",
     "websearch",

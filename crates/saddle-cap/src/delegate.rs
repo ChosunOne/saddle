@@ -91,6 +91,15 @@ pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationEr
         grant.timeout = want.timeout.min(parent.timeout);
         out.exec = Some(grant);
     }
+    for want in &plugin.run_binary {
+        if agent.launch_profile(&want.profile).is_none() {
+            return Err(DelegationError::Reach(format!(
+                "run-binary profile {:?} exceeds parent reach",
+                want.profile
+            )));
+        }
+        out.run_binary.push(want.clone());
+    }
     for want in &plugin.net {
         if !agent.net.iter().any(|parent| covers(parent, want)) {
             return Err(DelegationError::Reach(format!(

@@ -37,6 +37,7 @@ write = ["fs-read", "fs-write", "tool-read", "tool-write"]
 edit = ["fs-read", "fs-write", "tool-read", "tool-write"]
 patch = ["fs-read", "fs-write", "tool-read", "tool-write"]
 bash = ["exec", "fs-read", "fs-write", "net"]
+run_binary = ["run-binary", "net"]
 tasks = ["exec"]
 fetch = ["net"]
 websearch = ["net"]
@@ -81,6 +82,14 @@ defaults enabled, an explicit home rule keeps the old merged credential exclusio
 implicit child rules are omitted so they cannot undo an exclusion. Existing configs with no flag
 receive the narrower defaults on startup/reload; no protected file is automatically rewritten.
 `saddle check` and the model prompt report the effective command read paths.
+
+## Named launches (D184)
+
+`run_binary` invokes a protected profile with literal `argv`; it neither imports `exec` nor
+inherits its sandbox, environment, or task controls. The exact profile name must be granted to the
+agent and delegated to the component. A third-party component uses the `saddle:host/run-binary`
+interface with that scope in its manifest and exact named grants in `[plugin.<id>]`. Network, if
+used, is independently delegated and narrowed by the profile. See [configuration](settings.md#launch-profiles).
 
 ## Background shell work
 

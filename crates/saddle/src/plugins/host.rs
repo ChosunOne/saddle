@@ -30,6 +30,7 @@ use saddle_wit::saddle::host::fs_list::Page as DirectoryPage;
 use saddle_wit::saddle::host::fs_read::{Failure, Path};
 use saddle_wit::saddle::host::fs_read_range::Chunk;
 use saddle_wit::saddle::host::fs_write::Change;
+use saddle_wit::saddle::host::run_binary::{Launch, Reply as LaunchReply};
 use saddle_wit::saddle::host::tool_result::ImageInfo;
 use saddle_wit::saddle::widgets::types::Panel;
 use saddle_wit::veto::exports::saddle::plugin::veto::{Decision as VetoDecision, PendingToolCall};
@@ -135,6 +136,12 @@ enum Event {
         who: Principal,
         request: Command,
         answer: SyncSender<HostReply<ExecReply, String>>,
+    },
+    Launch {
+        who: Principal,
+        request: Launch,
+        deadline: Instant,
+        answer: SyncSender<HostReply<LaunchReply, String>>,
     },
     Diff {
         who: Principal,
@@ -354,6 +361,27 @@ impl HostServices for Host {
         result
             .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
             .map_err(|_| anyhow!("plugin execution request timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
+    fn run_binary(
+        &mut self,
+        call: &Invocation,
+        request: Launch,
+        allowance: Duration,
+    ) -> Result<Result<LaunchReply, String>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        let deadline = call.deadline().min(Instant::now() + allowance);
+        self.events
+            .send(Event::Launch {
+                who: call.principal().clone(),
+                request,
+                deadline,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        result
+            .recv_timeout(call.deadline().saturating_duration_since(Instant::now()))
+            .map_err(|_| anyhow!("named launch request timed out"))?
             .map_err(|why| anyhow!(why))
     }
     fn task(
@@ -871,6 +899,28 @@ fn execute_inner(
                             "execution is refused during describe",
                         )
                         .map(|_| Err("execution is refused during describe".into()))
+                        .map_err(Into::into)
+                };
+                respond(result, answer, &mut fatal, &cancelled);
+            }
+            Ok(Event::Launch {
+                who,
+                request,
+                deadline,
+                answer,
+            }) => {
+                let result = if invoking {
+                    execution::launch(
+                        session,
+                        &who,
+                        call,
+                        request,
+                        deadline,
+                        &mut execution_effects,
+                    )
+                } else {
+                    session.audit.event(Kind::Decision, Some(&who), Some(Scope::RunBinary), Some(false), json!({"call_id":call,"operation":"run-binary","profile":request.profile}), "named launch is refused outside invocation")
+                        .map(|_| Err("named launch is refused outside invocation".into()))
                         .map_err(Into::into)
                 };
                 respond(result, answer, &mut fatal, &cancelled);

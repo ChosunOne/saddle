@@ -1,0 +1,4 @@
+id = "run-binary"
+version = "0.1.0"
+component = "run_binary.component.wasm"
+scopes = ["tool", "run-binary", "net"]

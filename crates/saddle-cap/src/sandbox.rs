@@ -59,6 +59,16 @@ pub struct SandboxSpec {
     /// The network the child reaches, if any (D79).
     #[serde(default)]
     pub net: Option<NetBridge>,
+    /// select the stricter named-profile helper path (D184).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub named_launch: Option<NamedLaunch>,
+}
+
+/// paths no named launch may grant, even through system-runtime claims (D184).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedLaunch {
+    pub protected: Vec<PathBuf>,
+    pub agent_write: Vec<PathBuf>,
 }
 
 /// User-level additions from `config.toml` (`[sandbox] read = [...]`, `write = [...]`), for
@@ -325,6 +335,7 @@ pub fn lower_exec(
             // The caller fills this in once it has a socket to offer: the bridge is plumbing, not
             // a grant, and the authority it reaches is decided per request (D79).
             net: None,
+            named_launch: None,
         },
         timeout: exec.timeout,
     })

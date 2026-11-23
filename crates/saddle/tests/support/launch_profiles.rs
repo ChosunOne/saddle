@@ -44,6 +44,76 @@ fn launch_profile_grants_are_independent_and_layer_per_workspace() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn launch_profile_runtime_is_independent_of_bash_and_revocable() {
+    if saddle_sandbox::launch_availability().is_err() {
+        return;
+    }
+    let env = Env::new();
+    let secret = env.home.path().join("private");
+    let sibling = env.home.path().join("sibling");
+    fs::write(&secret, "named-launch-fixture").unwrap();
+    fs::write(&sibling, "not-for-the-child").unwrap();
+    fs::copy("/bin/cat", env.ws.path().join("untrusted-cat")).unwrap();
+    env.write_config(&format!(
+        "[launch-profiles.cat]\nexecutable = '/usr/bin/cat'\nread = ['~/private']\n\
+         [launch-profiles.env]\nexecutable = '/usr/bin/env'\n\
+         [launch-profiles.untrusted]\nexecutable = {:?}\n",
+        env.ws.path().join("untrusted-cat").to_str().unwrap(),
+    ));
+    let named = |extra: &[&str], profile: &str, argv: serde_json::Value| {
+        let input = json!({"profile":profile,"argv":argv}).to_string();
+        let mut args = extra.to_vec();
+        args.extend(["tool", "run_binary", &input]);
+        let output = env.saddle(&args);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            stderr(&output)
+        );
+        (output.status.success(), text)
+    };
+    let (ok, text) = named(&[], "cat", json!([secret]));
+    assert!(!ok && !text.contains("named-launch-fixture"), "{text}");
+    env.write_override(
+        "[agent]\nrun-binary = [{profile='cat'}, {profile='env'}, {profile='untrusted'}]\n",
+    );
+    let no_exec = ["--revoke", "exec"];
+    let (ok, text) = named(&no_exec, "cat", json!([secret]));
+    assert!(ok && text.contains("named-launch-fixture"), "{text}");
+    let (ok, text) = named(&no_exec, "cat", json!([sibling]));
+    assert!(
+        !ok && text.contains("Permission denied") && !text.contains("not-for-the-child"),
+        "{text}"
+    );
+    let (ok, text) = named(&no_exec, "env", json!(["/bin/true"]));
+    assert!(!ok && text.contains("Function not implemented"), "{text}");
+    let (ok, text) = named(&no_exec, "untrusted", json!([secret]));
+    assert!(!ok && text.contains("agent-writable paths"), "{text}");
+    let (ok, text) = env.tool(
+        "bash",
+        json!({"command":format!("/bin/cat '{}'",secret.display())}),
+    );
+    assert!(!ok && text.contains("Permission denied"), "{text}");
+    let (ok, text) = env.tool("read", json!({"path":secret}));
+    assert!(!ok && !text.contains("named-launch-fixture"), "{text}");
+
+    env.write_override("[agent]\nrun-binary = [{profile='cat'}, {profile='env'}]\n[launch-profiles.cat]\nread = []\n");
+    let (ok, text) = named(&no_exec, "cat", json!([secret]));
+    assert!(
+        !ok && text.contains("Permission denied") && !text.contains("named-launch-fixture"),
+        "{text}"
+    );
+
+    env.write_override("[agent]\nrun-binary = [{profile='env'}]\n");
+    let (ok, text) = named(&no_exec, "cat", json!([secret]));
+    assert!(
+        !ok && text.contains("no run-binary grant for profile"),
+        "{text}"
+    );
+}
+
 #[test]
 fn launch_profile_fields_inherit_replace_and_clear() {
     let env = Env::new();

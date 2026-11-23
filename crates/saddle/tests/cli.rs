@@ -452,8 +452,8 @@ fn first_run_includes_and_enables_shipped_tools_without_manual_configuration() {
     let listing = String::from_utf8_lossy(&listing.stdout);
     for artifact in saddle_standard::ARTIFACTS {
         assert!(config["standard-tools"].get(artifact.name).is_some());
-        let status = if matches!(artifact.name, "fetch" | "websearch") {
-            // Enabled profiles never invent the network reach absent from first-run grants.
+        let status = if matches!(artifact.name, "fetch" | "websearch" | "run_binary") {
+            // Enabled tools never invent network or named launch grants missing from defaults.
             "standard tool unavailable:"
         } else {
             "ready: shipped standard tool"

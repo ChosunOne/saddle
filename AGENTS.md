@@ -69,7 +69,7 @@ Inside `crates/saddle/src`:
 intercepts `__sandbox` before clap parses anything — that is the helper process path, and it must stay
 first in `main`.
 
-The ordinary tool names are `read`, `write`, `edit`, `patch`, `ls`, `find`, `grep`, `bash`, `tasks`,
+The ordinary tool names are `read`, `write`, `edit`, `patch`, `ls`, `find`, `grep`, `bash`, `run_binary`, `tasks`,
 `fetch`, `websearch`, `session_query` and `config_help` (`tools::NAMES`); each runs a shipped WASI component
 chosen by the protected `[standard-tools]` table, and the binary holds no native implementation of any
 of them (D146, D147). `config_help` is `docs/settings.md` compiled into a guest that imports only the
@@ -409,7 +409,7 @@ exists to prevent. Two concrete consequences worth restating, because they are t
   because a root is nameable by any workspace policy. Content the harness chooses — the global
   `AGENTS.md`, an attachment — is host-read with no root at all; a skill is not, since `read` loads
   it (D67).
-- No tool is privileged. The twelve ordinary ones run as bounded component principals, so each passes
+- No tool is privileged. Shipped tools run as bounded component principals, so each passes
   through the same engine, the same audit log, the same budgets and the same sandbox as a third-party
   plugin call (D17, D126, D139): a `[standard-tools]` entry selects a fixed shipped component and the
   operation scopes in it delegate the agent's current reach, never reach of their own. `ls`, `find` and
@@ -581,7 +581,7 @@ rather than loosening it.
   link would reach the policy (D16).
   `saddle check` shows `tool paths`; `saddle tool read '{"path":"~/.agents/…"}'` is the by-hand test.
 - **Launch profiles are separate definitions, not ordinary sandbox paths** (D184). They are
-  inspected by `saddle check`, not runnable yet. The protected workspace file can override fields:
+  inspected by `saddle check` and invoked by `run_binary`. The protected workspace file can override fields:
   omitted fields inherit, supplied lists replace, and `[]` clears. An inherited executable cannot
   be overridden. The separate `run-binary` grant names an exact profile and can be layered or
   revoked independently of `exec`. Do not add these paths to roots, file-tool access, or the

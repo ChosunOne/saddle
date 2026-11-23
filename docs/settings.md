@@ -209,14 +209,14 @@ deny rule and cannot carve a hole in a parent claim.
 
 ## launch-profiles
 
-Launch profiles (D184) are currently inspection-only: Saddle validates definitions and grants but
-does not launch them or give existing tools access to the listed files. Define a default in
-`config.toml`:
+Launch profiles (D184) run through the single `run_binary` tool. They do not give existing tools
+access to the listed files. Define a default in `config.toml`:
 
 ```toml
 [launch-profiles.gh]
 executable = "/usr/bin/gh"
 read = ["~/.config/gh/hosts.yml"]
+net = ["api.github.com"]
 timeout-secs = 30
 ```
 
@@ -245,6 +245,25 @@ An effective agent grant must name a defined profile. A workspace can replace th
 list, clear it with `run-binary = []`, or subtract one with `run-binary = ["-gh"]`. Use
 `--grant run-binary:gh` or `--revoke run-binary` to change the grants for one run. `saddle check`
 shows the result independently of `exec`. This grant does not give `bash` any new access.
+
+In an existing configuration, select the shipped tool with
+`run_binary = ["run-binary", "net"]` in `[standard-tools]`. Network is optional: list exact
+HTTPS hosts on port 443 in the profile's `net` field, and grant those hosts in the usual `[agent]`
+`net` list. Both are required. If the command proxy cannot start in an isolated namespace, the
+binary runs without network. Omit `net` at both levels for a purely local profile.
+
+```sh
+saddle tool run_binary '{"profile":"gh","argv":["api","user","--jq",".login"]}'
+```
+
+`argv` excludes the executable. Arguments are literal and unrestricted by Saddle; a CLI can
+return a credential it can read. Use a dedicated, appropriately scoped credential if needed,
+and don't grant a profile whose full command surface you don't trust. The tool runs foreground
+only, with a private cwd and no inherited checkout, writable paths, or helper executables.
+Use a trusted system-owned native ELF binary; binaries in agent-writable roots and scripts are
+refused. Write the real paths for the executable and profile reads (for example `/usr/bin/cat`
+instead of `/bin/cat` where `/bin` is a symlink). This mode requires Linux with Landlock ABI 6 and
+seccomp user notification.
 
 ## standard-tools
 

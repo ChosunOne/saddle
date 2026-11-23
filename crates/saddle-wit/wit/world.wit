@@ -13,6 +13,7 @@ world read-tool {
     import web-search;
     import exec;
     import exec-tasks;
+    import run-binary;
     import fs-read;
     import fs-write;
     import fs-preimage;

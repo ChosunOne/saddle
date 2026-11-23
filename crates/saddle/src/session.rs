@@ -257,7 +257,15 @@ impl Setup {
                 || doc
                     .get("agent")
                     .and_then(|agent| agent.get("run-binary"))
-                    .is_some())
+                    .is_some()
+                || doc
+                    .get("plugin")
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|plugins| {
+                        plugins
+                            .values()
+                            .any(|plugin| plugin.get("run-binary").is_some())
+                    }))
                 && !doc
                     .get("workspace")
                     .and_then(toml::Value::as_str)

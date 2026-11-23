@@ -46,9 +46,9 @@ libc.workspace = true
 rusqlite.workspace = true
 syntect.workspace = true
 two-face.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 wat.workspace = true
-tempfile.workspace = true
 # The end-to-end tests read the session store directly to check what was saved (D53).
 rusqlite.workspace = true

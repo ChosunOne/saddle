@@ -8,6 +8,8 @@ pub mod listing;
 pub mod mutation;
 mod pagination;
 mod patch;
+#[cfg(target_arch = "wasm32")]
+pub mod run_binary;
 pub mod search;
 pub mod tasks;
 pub mod transcript;

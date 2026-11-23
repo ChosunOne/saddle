@@ -112,6 +112,7 @@ macro_rules! catalogue {
     };
 }
 catalogue!(HostInterface {
+    RunBinary => ("saddle:host/run-binary", Requirement::Scope(Scope::RunBinary), true),
     Exec => ("saddle:host/exec", Requirement::Scope(Scope::Exec), true),
     PluginEvents => ("saddle:host/plugin-events", Requirement::Scope(Scope::EventPublish), true),
     ExecTasks => ("saddle:host/exec-tasks", Requirement::Scope(Scope::Exec), true),

@@ -239,10 +239,34 @@ impl Bridge {
         who: &Principal,
         call: Option<&str>,
     ) -> HostResult<Vec<String>> {
+        self.service_bounded(session, who, call, None)
+    }
+
+    /// a named launch gets the same net decisions, narrowed by a fixed HTTPS host list (D184).
+    pub fn service_bounded(
+        &mut self,
+        session: &mut Session,
+        who: &Principal,
+        call: Option<&str>,
+        https_hosts: Option<&[String]>,
+    ) -> HostResult<Vec<String>> {
+        let allows = |host: &str, port: u16| {
+            https_hosts.is_none_or(|hosts| {
+                port == 443 && hosts.iter().any(|item| item.eq_ignore_ascii_case(host))
+            })
+        };
         loop {
             match self.asks.try_recv() {
                 Ok(Ask::Decide { net, reply }) => {
-                    let result = decide_as(session, who, call, &net);
+                    let result = if allows(&net.host, net.port)
+                        && (https_hosts.is_none() || net.scheme == "https")
+                    {
+                        decide_as(session, who, call, &net)
+                    } else {
+                        let why = "network target is outside the named launch HTTPS host list";
+                        session.audit.event(Kind::Decision, Some(who), Some(Scope::Net), Some(false), json!({"call_id":call, "via":"run-binary", "host":net.host,"port":net.port}), why)?;
+                        Ok(Err(why.into()))
+                    };
                     match result {
                         Ok(result) => {
                             let _ = reply.send(result);
@@ -254,7 +278,12 @@ impl Bridge {
                     }
                 }
                 Ok(Ask::Resolve { host, port, reply }) => {
-                    let _ = reply.send(resolve_as(session, who, &host, port));
+                    let result = if allows(&host, port) {
+                        resolve_as(session, who, &host, port)
+                    } else {
+                        Err("network target is outside the named launch HTTPS host list".into())
+                    };
+                    let _ = reply.send(result);
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }

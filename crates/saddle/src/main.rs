@@ -1229,7 +1229,10 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
         }
     }
     if !setup.launch_profiles.is_empty() {
-        println!("launch profiles (invocation is not implemented)");
+        match saddle_sandbox::launch_availability() {
+            Ok(()) => println!("launch profiles (named launch sandbox)"),
+            Err(why) => println!("launch profiles (unavailable: {why})"),
+        }
         for (name, profile) in &setup.launch_profiles {
             let access = if setup.granted_launch_profiles.contains(name) {
                 "granted"
@@ -1238,6 +1241,7 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
             };
             println!("  {name}: {:?} ({access})", profile.executable);
             println!("    read = {:?}", profile.read);
+            println!("    net (HTTPS/443 ceiling) = {:?}", profile.net);
             if let Some(seconds) = profile.timeout_secs {
                 println!("    timeout-secs = {seconds}");
             }
