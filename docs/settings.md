@@ -327,11 +327,15 @@ two of them for one session.
 | `theme` | `default` | a built-in or `[themes.<name>]` theme; `"light/dark"` picks by the terminal (D71, D74) |
 | `show-reasoning` | `true` | whether reasoning is shown as it streams (D151) |
 | `expand-tools` | `false` | whether tool results start expanded (D124) |
-| `status` | the built-in template | the status line, from `{provider}`, `{model}`, `{input}`, `{output}`, `{cache}`, `{ctx}`, `{window}`, `{percent}`, `{cost}`, `{quota}`, `{workspace}` (D36) |
+| `status` | the built-in template | the status line, from `{provider}`, `{model}`, `{input}`, `{output}`, `{cache}`, `{ctx}`, `{window}`, `{percent}`, `{cost}`, `{quota}`, `{tasks}`, `{workspace}` (D36, D187) |
 | `mouse` | `true` | `false` hands the mouse back to the terminal, losing the wheel and drag-to-copy (D35) |
 | `notify` | `bell` | how a turn that ends while the window is not focused is announced: `bell`, `osc9`, `osc777`, `off` (D164) |
 | `images` | worked out | how a picture is drawn: `kitty`, `iterm2`, `none`, or unset to detect (D59) |
 | `math-scale` | `1.0` | how large a formula is drawn, held to half to four times its natural size (D165) |
+
+`{tasks}` shows this session's running background tasks (for example, `2 tasks`). It is part of
+the default template and disappears when no tasks are running. Add `{tasks}` to a custom template
+to show it there too.
 
 ## keys
 

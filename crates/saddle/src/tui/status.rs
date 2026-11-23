@@ -1,4 +1,4 @@
-//! The status line: a template the user can change, filled from the session (D36).
+//! The status line: a template the user can change, filled from the session (D36, D187).
 //!
 //! A template is text with `{field}` placeholders. A field the session has no answer for renders
 //! as nothing, and takes the separator in front of it along, so leaving out a `[ui] status` field
@@ -12,10 +12,9 @@ use std::time::SystemTime;
 
 use crate::provider::Usage;
 
-/// What the line shows when `[ui] status` is not set. It keeps the shape the UI has always had and
-/// adds the two figures the template exists for: cost, and the allowance left.
+/// What the line shows when `[ui] status` is not set.
 pub const DEFAULT_STATUS: &str = "↑{input} ↓{output} {cache} {cachehit} · ctx {ctx}/{window} · \
-                                  {cost} · {quota} · {provider} {model}";
+                                  {cost} · {quota} · {tasks} · {provider} {model}";
 
 /// The separator an empty field takes with it.
 const SEPARATOR: &str = " · ";
@@ -35,6 +34,7 @@ pub enum Field {
     Percent,
     Cost,
     Quota,
+    Tasks,
     Workspace,
 }
 
@@ -52,6 +52,7 @@ impl Field {
             "percent" => Field::Percent,
             "cost" => Field::Cost,
             "quota" => Field::Quota,
+            "tasks" => Field::Tasks,
             "workspace" => Field::Workspace,
             _ => return None,
         })
@@ -70,6 +71,7 @@ impl Field {
             "percent",
             "cost",
             "quota",
+            "tasks",
             "workspace",
         ]
     }
@@ -223,6 +225,7 @@ pub struct StatusData<'a> {
     /// price (D36).
     pub priced: bool,
     pub quota: Option<&'a Quota>,
+    pub running_tasks: usize,
     pub context: u64,
     pub window: u64,
     pub workspace: &'a str,
@@ -253,6 +256,11 @@ impl StatusData<'_> {
             Field::Cost if self.cost <= 0.0 => "$0.00".into(),
             Field::Cost => money(self.cost),
             Field::Quota => self.quota_text(),
+            Field::Tasks => match self.running_tasks {
+                0 => String::new(),
+                1 => "1 task".into(),
+                n => format!("{n} tasks"),
+            },
             Field::Workspace => self.workspace.into(),
         }
     }
@@ -366,6 +374,7 @@ mod tests {
             cost,
             priced: cost > 0.0,
             quota,
+            running_tasks: 0,
             context: 1_300,
             window: 128_000,
             // A fixed clock, so the line renders the same way twice (D49).

@@ -641,6 +641,8 @@ pub struct App {
     /// Messages handed to the running turn and not yet delivered, oldest first (D149).
     pub steering: VecDeque<String>,
     pub busy: Option<Activity>,
+    /// Latest host count, including tasks without a transcript row (D187).
+    pub running_tasks: usize,
     pub cancelling: bool,
     /// The session ended after a host error; no more prompts.
     pub stopped: Option<String>,
@@ -781,6 +783,7 @@ impl App {
             queue: VecDeque::new(),
             steering: VecDeque::new(),
             busy: None,
+            running_tasks: 0,
             cancelling: false,
             stopped: None,
             expand_tools,
@@ -974,7 +977,7 @@ impl App {
     }
 
     pub fn background_running(&self) -> bool {
-        self.entries.iter().any(|entry| matches!(entry, Entry::Tool { tasks, .. } if tasks.iter().any(|task| task.state == TaskState::Running)))
+        self.running_tasks != 0
     }
 
     pub fn tick(&mut self) {
@@ -2087,6 +2090,10 @@ impl App {
                 // A queued human prompt will carry the completion at its safe request point.
             }
             AgentEvent::Tasks(views) => {
+                self.running_tasks = views
+                    .iter()
+                    .filter(|view| view.state == TaskState::Running)
+                    .count();
                 for (index, entry) in self.entries.iter_mut().enumerate() {
                     if let Entry::Tool { id, tasks, .. } = entry {
                         let mut next: Vec<_> = views

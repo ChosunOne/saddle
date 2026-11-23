@@ -137,7 +137,7 @@ impl Setting {
                 "the model's window in tokens; compaction starts 16k below it (empty: 128k)"
             }
             Setting::StatusLine => {
-                "placeholders such as {cost}, {quota}, {cachehit}; empty uses the default"
+                "placeholders such as {cost}, {quota}, {tasks}; empty uses the default"
             }
             Setting::AutoCompact => "summarize older messages when the context is nearly full",
             Setting::IdleCompact => {

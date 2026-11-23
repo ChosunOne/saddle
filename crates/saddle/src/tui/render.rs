@@ -2162,6 +2162,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         cost: app.cost,
         priced: app.header.priced,
         quota: app.quota.as_ref(),
+        running_tasks: app.running_tasks,
         context: app.context,
         window: app.header.context_window,
         workspace: &home_relative(&app.header.workspace),
@@ -4263,6 +4264,40 @@ mod tests {
         let (lines, _) = transcript_with_images(&mut app, 120);
         let shown = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
         assert!(shown.contains("[task-1: completed · 10s]"), "{shown}");
+    }
+
+    #[test]
+    fn the_status_line_counts_only_running_background_tasks() {
+        let mut app = bare_app();
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        let now = Instant::now();
+        let task = |id: &str, state| TaskView {
+            id: id.into(),
+            call: None,
+            state,
+            started: now,
+            stopped: (state != TaskState::Running).then_some(now),
+        };
+        app.agent(AgentEvent::Tasks(vec![
+            task("a", TaskState::Running),
+            task("b", TaskState::Running),
+            task("c", TaskState::Succeeded),
+        ]));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(screen(&terminal).contains(" · 2 tasks · "));
+
+        app.agent(AgentEvent::Tasks(vec![
+            task("a", TaskState::Running),
+            task("b", TaskState::Cancelled),
+        ]));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(screen(&terminal).contains(" · 1 task · "));
+
+        app.agent(AgentEvent::Tasks(vec![task("a", TaskState::Failed)]));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(!shown.contains("task"), "{shown}");
+        assert!(!shown.contains(" ·  · "), "{shown}");
     }
 
     #[test]

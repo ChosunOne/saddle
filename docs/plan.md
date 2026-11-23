@@ -4647,6 +4647,12 @@ is an executable policy, not a prohibition on fork or threading, and not an argv
 guarantee that an interpreter will not interpret code within the sandbox. There is no ordinary
 `exec` delegation, extra filesystem reach, writable claim, or network grant for helpers.
 
+**D187.** The TUI's default status line includes `{tasks}`, the count of currently running
+background tasks in this session. It is rendered as `1 task` or `N tasks` and omitted at zero,
+including its separator (D36). Custom templates can use or omit it. The count comes from the
+existing host task updates (D159), including tasks without linked transcript blocks. Finished
+retained records do not count. It needs no polling or new persisted state.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

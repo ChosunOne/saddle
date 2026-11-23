@@ -159,6 +159,8 @@ have been going, the first from the frame's clock and the second from its own st
 turn for unconsumed completions from model tool calls when idle; active turns receive notices at
 safe request points. This may spend a model request, but idle ticks and consumed notices never do.
 Hook-only tasks do not trigger automatic model spending. Output still requires owning-tool access.
+The TUI's `{tasks}` status field counts this session's running tasks, including unlinked ones;
+the default template shows it only when the count is nonzero (D187).
 Independent shell commands can overlap (D185). Sequence commands that edit the same files or
 depend on the same build outputs; Saddle no longer locks the workspace. `timeout_secs` on a start
 also caps task lifetime; polling cannot renew it.
