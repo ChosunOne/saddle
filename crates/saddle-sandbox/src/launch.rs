@@ -1,4 +1,4 @@
-//! named launch confinement and optional pinned helper executables (D184, D186).
+//! named launch confinement and optional pinned helper executables (D184, D186, D188).
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -169,9 +169,9 @@ fn open_executable(path: &Path, guard: &NamedLaunch) -> Result<File, SandboxErro
     Ok(executable)
 }
 
-/// Open a canonical absolute path without following any links, using pinned parents. Restrict the
-/// executable to a root-owned, non-group/world-writable file under likewise trusted directories.
-fn open_pinned(path: &Path, trusted: bool) -> Result<File, SandboxError> {
+/// Open an absolute path without following any links, using pinned parents. An explicit
+/// executable must be a regular file; its trust comes from the protected launch profile.
+fn open_pinned(path: &Path, executable: bool) -> Result<File, SandboxError> {
     let mut parts = path.components().peekable();
     if parts.next() != Some(Component::RootDir) || parts.peek().is_none() {
         return Err(SandboxError::Spec(format!(
@@ -180,34 +180,21 @@ fn open_pinned(path: &Path, trusted: bool) -> Result<File, SandboxError> {
         )));
     }
     let mut file = open_at(libc::AT_FDCWD, c"/", libc::O_PATH | libc::O_DIRECTORY)?;
-    // A parent user namespace may report host root as its overflow UID. Require the same system
-    // owner as the root directory throughout the chain, rather than accepting caller-owned files.
-    let owner = file.metadata()?.uid();
     while let Some(Component::Normal(part)) = parts.next() {
-        if trusted && !system_owned(&file, owner)? {
-            return Err(SandboxError::Spec(format!(
-                "launch path is not system-owned and immutable to ordinary users: {}",
-                path.display()
-            )));
-        }
         let part = CString::new(part.as_bytes())
             .map_err(|_| SandboxError::Spec("NUL in launch path".into()))?;
         let flags = if parts.peek().is_some() {
             libc::O_PATH | libc::O_DIRECTORY
-        } else if trusted {
+        } else if executable {
             libc::O_RDONLY | libc::O_NONBLOCK
         } else {
             libc::O_PATH
         };
         file = open_at(file.as_raw_fd(), &part, flags)?;
         let typ = file.metadata()?.file_type();
-        if typ.is_symlink()
-            || (parts.peek().is_none()
-                && trusted
-                && (!typ.is_file() || !system_owned(&file, owner)?))
-        {
+        if typ.is_symlink() || (parts.peek().is_none() && executable && !typ.is_file()) {
             return Err(SandboxError::Spec(format!(
-                "untrusted launch path: {}",
+                "invalid launch path (expected no symlinks and a regular executable file): {}",
                 path.display()
             )));
         }

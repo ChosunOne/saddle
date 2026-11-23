@@ -269,9 +269,12 @@ fn launch_profile_helpers_are_default_on_bounded_and_narrowable() {
     fs::write(&denied, "must-not-be-disclosed").unwrap();
     let local_helper = env.ws.path().join("local-cat");
     fs::copy("/usr/bin/cat", &local_helper).unwrap();
+    // Protected config can whitelist binaries installed by the user, outside writable roots.
+    fs::copy("/usr/bin/bash", env.home.path().join("fixture-bash")).unwrap();
+    fs::copy("/usr/bin/cat", env.home.path().join("fixture-cat")).unwrap();
     env.write_config(
-        "[launch-profiles.fixture]\nexecutable = '/usr/bin/bash'\n\
-         helpers = ['/usr/bin/cat']\nread = ['~/helper-input', '/usr/bin/true']\n",
+        "[launch-profiles.fixture]\nexecutable = '~/fixture-bash'\n\
+         helpers = ['~/fixture-cat']\nread = ['~/helper-input', '/usr/bin/true']\n",
     );
     env.write_override("[agent]\nrun-binary = [{profile='fixture'}]\n");
     let run = |command: &str, arg: &str, allow_children: Option<bool>| {
@@ -288,7 +291,7 @@ fn launch_profile_helpers_are_default_on_bounded_and_narrowable() {
     // Force a child process, not bash's optimization of a final external command into exec.
     let read = |path: &Path, allow_children| {
         run(
-            "cat -- \"$1\" & wait $!",
+            "fixture-cat -- \"$1\" & wait $!",
             path.to_str().unwrap(),
             allow_children,
         )
@@ -303,7 +306,7 @@ fn launch_profile_helpers_are_default_on_bounded_and_narrowable() {
     let (ok, text) = run("exec /usr/bin/true", "", Some(true));
     assert!(!ok && text.contains("Permission denied"), "{text}");
     let (ok, text) = run(
-        "exec /usr/bin/cat -- \"$1\"",
+        "exec \"$HOME/fixture-cat\" -- \"$1\"",
         allowed.to_str().unwrap(),
         Some(false),
     );

@@ -4609,8 +4609,9 @@ independent of `exec`. Scope binding and exact profile delegation use the normal
 The host resolves the definition into a separate child spec: private cwd, no writable claims or
 borrowed workspace roots, a minimal environment, and dedicated read-only claims. Network uses D79
 but only when both the profile's exact HTTPS/443 host list and the caller's grants allow it. The
-ordinary sandbox is unchanged. The helper validates and pins a system-owned ELF executable, refuses
-runtime claims overlapping protected locations or agent write reach, and executes by descriptor.
+ordinary sandbox is unchanged. The helper validates and pins the whitelisted ELF executable (see
+D188), refuses executable paths overlapping protected locations or agent write reach, and executes
+by descriptor.
 Landlock ABI 6 isolates filesystem and signals. In the initial-executable-only mode (see D186), the
 seccomp listener releases only the initial exec (including its trusted system runtime); subsequent
 execs are denied, even for a loader or the same program. If the strict setup fails, it does not fall
@@ -4652,6 +4653,14 @@ background tasks in this session. It is rendered as `1 task` or `N tasks` and om
 including its separator (D36). Custom templates can use or omit it. The count comes from the
 existing host task updates (D159), including tasks without linked transcript blocks. Finished
 retained records do not count. It needs no polling or new persisted state.
+
+**D188.** Explicit launch entry points and helpers are trusted by exact path in protected
+configuration, not by Unix ownership. A user-installed native ELF binary is eligible without
+being copied into a system-owned directory. The launcher still opens without following symlinks,
+checks for a regular native executable, and refuses paths overlapping protected locations or
+ordinary agent write reach. This is a path allowlist, not a content pin across calls: the person
+configuring it must trust who can update the file and replace its parent directories. Implicit
+system runtime paths retain their system-ownership checks.
 
 ## 4. Scope enumeration
 

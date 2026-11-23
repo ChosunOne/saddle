@@ -273,8 +273,9 @@ saddle --profile github tool run_binary '{"profile":"gh","argv":["api","user","-
 helpers can return a credential they can read. Use a dedicated, appropriately scoped credential if
 needed, and don't grant a profile whose full command surface you don't trust. The tool runs
 foreground only, with a private cwd and no inherited checkout or writable paths. Workflows that
-need to update local refs or files are not supported. Use trusted system-owned native ELF files
-for the entry point and helpers; binaries in agent-writable roots and scripts are refused. Write
+need to update local refs or files are not supported. The entry point and helpers can be
+user-installed native ELF binaries (D188). Whitelist only files and directories whose contents
+and updates you trust; paths overlapping agent write access and scripts are refused. Write
 real paths for all profile paths (for example `/usr/bin/cat` instead of `/bin/cat` where `/bin` is a
 symlink). Named launches require Linux with Landlock ABI 6; the initial-executable-only mode
 also requires seccomp user notification.
