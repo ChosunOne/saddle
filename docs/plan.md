@@ -3578,7 +3578,7 @@ The session thread services proxy decisions during model requests, between host 
 idle (TUI and line mode). Blocking native host operations can delay fresh proxy decisions; this does
 not grant bypass access. Namespace/relay failure still means no network, never unrestricted access.
 
-There is **one active shell execution per workspace**, including foreground calls and cooperating
+Before D185 there was **one active shell execution per workspace**, including foreground calls and cooperating
 Saddle processes. A separately opened, pinned workspace directory holds a nonblocking exclusive
 `flock` from before the command starts through process-group cleanup. A competing start fails with a
 busy result rather than silently queueing.
@@ -4598,7 +4598,9 @@ become roots, ordinary sandbox extras, or file-tool paths.
 
 Configuration and inspection cover `executable`, `read`, `net` and `timeout-secs`. The separate
 `run-binary` scope names exact profiles with `run-binary = [{ profile = "name" }]`. It layers like
-other named grants: omission inherits, `[]` replaces with no grants, and `["-name"]` subtracts.
+other named grants (D176, D177): `[profiles.<name>]` can grant launches independently of the base,
+and protected workspace grants layer on top. Omission inherits, `[]` clears, and `["-name"]`
+subtracts. A permission profile contains grants, not launch definitions.
 The effective agent grant must name an effective definition, and `check` reports both. A policy
 decision for that name carries no ordinary `exec` or filesystem authority.
 
@@ -4621,6 +4623,13 @@ Runtime acceptance uses the same fixture binary and compiled tool before grant, 
 after revocation. The named launch opens its specified file but not its sibling or an agent-written
 helper; ordinary `bash` and `read` never acquire the named read, and the named launch does not need
 `exec`. Another principal without the named grant cannot invoke it.
+
+**D185.** Independent shell commands can overlap. This removes D153's workspace-wide lock;
+it was a scheduling rule, not sandbox enforcement or coordination with other writers. Background
+and foreground commands can overlap in the same or different sessions. The caller sequences work
+that shares files or outputs. Each launch still has its own sandbox, deadline, cancellation and
+audit attribution; the background task budget still applies. Foreground shell waits keep servicing
+the session's background task bridges through the same policy engine.
 
 ## 4. Scope enumeration
 

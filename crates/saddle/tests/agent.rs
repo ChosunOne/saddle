@@ -614,10 +614,10 @@ fn background_network_is_attributed_or_fails_closed_during_model_and_input_waits
         assert!(fetched.is_empty());
     }
 
-    // A separate Saddle process must not run an overlapping command.
-    let competing = env.saddle(&["tool", "bash", r#"{"command":"printf raced > raced"}"#]);
-    assert!(!competing.status.success());
-    assert!(text(&competing.stderr).contains("workspace shell execution is busy"));
+    // An independent command from a separate Saddle process can overlap the task.
+    let concurrent = env.saddle(&["tool", "bash", r#"{"command":"printf concurrent"}"#]);
+    assert!(concurrent.status.success(), "{}", text(&concurrent.stderr));
+    assert!(text(&concurrent.stdout).contains("concurrent"));
     child
         .stdin
         .take()
@@ -626,7 +626,6 @@ fn background_network_is_attributed_or_fails_closed_during_model_and_input_waits
         .unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert!(!env.ws.path().join("raced").exists());
     let directory = env.xdg.path().join("state/saddle/audit");
     let rows: Vec<_> = fs::read_dir(directory)
         .unwrap()
@@ -707,9 +706,9 @@ fn background_output_and_completed_task_retention_are_bounded_by_runtime_budgets
 }
 
 #[test]
-fn background_shell_returns_live_output_isolates_principals_and_serializes_until_cancel() {
+fn background_shell_overlaps_commands_and_preserves_task_isolation() {
     let mut id = String::new();
-    let (base, seen) = serve_dynamic(6, move |index, body| {
+    let (base, seen) = serve_dynamic(5, move |index, body| {
         let calls = match index {
             0 => vec![(
                 "start",
@@ -733,9 +732,14 @@ fn background_shell_returns_live_output_isolates_principals_and_serializes_until
                         json!({"action":"cancel","task_id":id}),
                     ),
                     (
-                        "busy",
+                        "second",
                         "bash",
-                        json!({"command":"printf must-not-run > forbidden"}),
+                        json!({"command":"sleep 30", "background":true, "wake":false}),
+                    ),
+                    (
+                        "foreground",
+                        "bash",
+                        json!({"command":"printf foreground-ok"}),
                     ),
                 ]
             }
@@ -745,7 +749,8 @@ fn background_shell_returns_live_output_isolates_principals_and_serializes_until
                 assert!(result_text(body, "foreign").contains("unknown task for this principal"));
                 assert!(!result_text(body, "foreign").contains("SECRET-EARLY"));
                 assert!(result_text(body, "foreign-cancel").contains("unknown task"));
-                assert!(result_text(body, "busy").contains("workspace shell execution is busy"));
+                assert!(result_text(body, "second").contains("running"));
+                assert!(result_text(body, "foreground").contains("foreground-ok"));
                 vec![("cancel", "tasks", json!({"action":"cancel","task_id":id}))]
             }
             3 => {
@@ -759,11 +764,10 @@ fn background_shell_returns_live_output_isolates_principals_and_serializes_until
             }
             4 => {
                 assert!(result_text(body, "done").contains("cancelled"));
-                vec![("unlocked", "bash", json!({"command":"printf unlocked"}))]
+                return sse_response(&openai_sse("done", &[]));
             }
             _ => {
-                assert!(result_text(body, "unlocked").contains("unlocked"));
-                return sse_response(&openai_sse("done", &[]));
+                unreachable!();
             }
         };
         sse_response(&openai_sse("", &calls))
@@ -786,13 +790,12 @@ fn background_shell_returns_live_output_isolates_principals_and_serializes_until
         text(&out.stdout),
         text(&out.stderr)
     );
-    assert_eq!(seen.lock().unwrap().len(), 6);
+    assert_eq!(seen.lock().unwrap().len(), 5);
     // D178: the task wrote `.git/config` inside the grant before it was cancelled, and that stays.
     assert_eq!(
         fs::read_to_string(env.ws.path().join(".git/config")).unwrap(),
         "changed"
     );
-    assert!(!env.ws.path().join("forbidden").exists());
     let rows = records(&env.audit_log());
     assert!(
         rows.iter()

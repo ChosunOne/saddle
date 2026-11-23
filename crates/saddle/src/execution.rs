@@ -1,17 +1,14 @@
-//! attributed subprocess effects and shared reservation lifetimes (D142, D152, D153).
+//! attributed subprocess effects and shared execution limits (D142, D152, D153, D185).
 
 use saddle_limits as budgets;
 use std::env;
-use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use cap_std::fs::{OpenOptions, OpenOptionsExt};
 use saddle_cap::sandbox::{ExecRequest, NamedLaunch, PROXY_PORT, SandboxSpec, lower_exec};
 use saddle_cap::{Location, Principal, RelPath, RootName, Scope};
 use saddle_policy::{Kind, Request};
@@ -29,11 +26,10 @@ use crate::{cancel, tasks};
 
 pub const HELPER_ARG: &str = "__sandbox";
 
-/// pins the workspace lock through process termination (D142).
+/// holds the lowered sandbox and resource bounds for one launch.
 pub struct Prepared {
     pub spec: SandboxSpec,
     deadline: Instant,
-    _lock: File,
     capture_bytes: usize,
 }
 
@@ -99,38 +95,15 @@ pub fn prepare(
         Err(why) => return Ok(Err(why.to_string())),
     };
     let deadline = Instant::now() + timeout;
-    let ws = session
-        .file_roots
-        .get(&RootName::workspace())
-        .context("no pinned workspace")?
-        .try_clone()?;
-    // A separately opened description (not dup): flock serializes cooperating Saddle sessions too.
-    let lock = ws
-        .open_with(
-            ".",
-            OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY),
-        )?
-        .into_std();
-    // SAFETY: lock is an owned, live directory fd. No path or filesystem authority is added.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::WouldBlock {
-            return Ok(Err("workspace shell execution is busy; inspect or cancel the active task before starting another command".into()));
-        }
-        return Err(error).context("locking workspace execution");
-    }
     Ok(Ok(Prepared {
         spec: lowered.spec,
         deadline,
-        _lock: lock,
         capture_bytes: budgets::exec_capture_bytes(),
     }))
 }
 
 impl Prepared {
-    /// process cleanup and restoration run on the monitor, even while the model is busy.
+    /// process cleanup runs on the monitor, even while the model is busy.
     pub fn run(
         self,
         cancel: &AtomicBool,
@@ -161,7 +134,6 @@ impl Prepared {
                 capture,
             )
         };
-        // Self, including the workspace lock, drops only once the helper is reaped (D142).
         Ok(Completed { output })
     }
 }
@@ -222,6 +194,14 @@ pub fn execute(
         &mut || {
             if cancel::FLAG.load(Ordering::Relaxed) {
                 stop.store(true, Ordering::Relaxed);
+            }
+            if failure.is_some() {
+                return;
+            }
+            if let Err(error) = tasks::service(session) {
+                failure = Some(error);
+                stop.store(true, Ordering::Relaxed);
+                return;
             }
             if let Some(bridge) = bridge.as_mut() {
                 match bridge.service_as(session, who, Some(call)) {

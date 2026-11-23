@@ -44,7 +44,7 @@ Inside `crates/saddle/src`:
 | `session` | opening the workspace, resolving roots, the policy engine and audit log for a session |
 | `plugins` | protected/digest-pinned loading, tool registration, provenance and CLI installation (D128); worker-to-session host calls through the one engine/audit log, reload revocation and bounded reads (D129) |
 | `network`, `search_transport` | per-hop attributed HTTP and protected provider/Exa communication, bounded per-principal raw search snapshots; parsing/presentation is guest-owned (D143) |
-| `execution` | shared foreground/background subprocess lowering, workspace execution lock, bounded capture and reservation restore (D142, D152, D153) |
+| `execution` | shared foreground/background subprocess lowering, bounded capture and deadlines (D142, D152, D153, D185) |
 | `tasks` | session-owned background subprocess monitors, principal-isolated status/cancel, bounded retention and completion notices; proxy decisions and audit stay on the session thread (D153) |
 | `plugins/mutations` | bounded write/remove batches with all-target permission/precondition preflight, pinned staging and per-entry atomic publication under the plugin principal; not a filesystem-wide transaction (D140) |
 | `fs_access` | pinned no-follow directory/file opens for session roots and plugin artifacts/reads (D129) |
@@ -159,9 +159,9 @@ have been going, the first from the frame's clock and the second from its own st
 turn for unconsumed completions from model tool calls when idle; active turns receive notices at
 safe request points. This may spend a model request, but idle ticks and consumed notices never do.
 Hook-only tasks do not trigger automatic model spending. Output still requires owning-tool access.
-One shell command per workspace may run at a time, across cooperating Saddle processes: a pinned
-workspace-directory lock spans the command's start through process cleanup. File tools can run
-meanwhile. `timeout_secs` on a start also caps task lifetime; polling cannot renew it.
+Independent shell commands can overlap (D185). Sequence commands that edit the same files or
+depend on the same build outputs; Saddle no longer locks the workspace. `timeout_secs` on a start
+also caps task lifetime; polling cannot renew it.
 `/tasks` and `/tasks cancel <id>` give the person status/control in TUI and line mode. Tasks stop
 and are audited before policy replacement on reload and before session close. They do not survive
 restart/resume; `exec-tasks` in `[tool-limits]` bounds retained records (16 by default). Never give a

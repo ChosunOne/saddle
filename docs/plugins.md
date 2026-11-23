@@ -93,6 +93,10 @@ used, is independently delegated and narrowed by the profile. See [configuration
 
 ## Background shell work
 
+Independent shell commands can overlap in a workspace (D185). Wait for a task before running
+another command that changes the same files or consumes its outputs. Each command still has its
+own sandbox and deadline, and the session's background-task budget still applies.
+
 `bash` runs the command; the separate `tasks` tool reads, stops and waits on it (D153, D182). A
 launch is `bash` with `background: true`:
 
