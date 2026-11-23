@@ -7,7 +7,8 @@ shipped standard tools and MCP; the loader, canonical WIT and SDK are separate l
 `docs/plan.md` is the specification; read it before changing behaviour in the policy, sandbox or tool
 layer.
 
-There is no README. `docs/plan.md` is the design document, the rationale and the milestone list,
+`README.md` is the short orientation: install, first run, configuration and plugins.
+`docs/plan.md` is the design document, the rationale and the milestone list,
 `docs/plugins.md` is the tool surface a person uses: the delegation table, the budgets, the mutation
 contracts and how to build and install a third-party component, and `docs/settings.md` is the
 configuration reference a person edits by hand and `config_help` returns to any session (D171).
