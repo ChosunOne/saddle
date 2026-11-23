@@ -361,7 +361,14 @@ pub fn launch(
         argv: [program.to_owned()].into_iter().chain(argv).collect(),
         cwd: dir.path().into(),
         env: environment,
-        read: profile.read.clone(),
+        // D190: the workspace is a read claim of the named launch only. The helper still
+        // opens it without symlink traversal and checks for protected-path overlap.
+        read: profile
+            .read
+            .iter()
+            .chain(profile.read_workspace.then_some(&session.setup.workspace))
+            .cloned()
+            .collect(),
         write: Vec::new(),
         net: bridge.as_ref().map(Bridge::spec),
         named_launch: Some(NamedLaunch {

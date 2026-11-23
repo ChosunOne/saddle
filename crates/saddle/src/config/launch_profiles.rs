@@ -1,4 +1,4 @@
-//! protected launch-profile definitions and workspace overlays (D184, D186, D189); no invocation authority.
+//! protected launch-profile definitions and workspace overlays (D184, D186, D189, D190); no invocation authority.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -21,6 +21,7 @@ pub type Definitions = BTreeMap<String, Definition>;
 pub struct Definition {
     executable: Option<String>,
     read: Option<Vec<String>>,
+    read_workspace: Option<bool>,
     helpers: Option<Vec<String>>,
     verify_sha256: Option<bool>,
     net: Option<Vec<String>>,
@@ -32,6 +33,7 @@ pub struct Definition {
 pub struct Resolved {
     pub executable: PathBuf,
     pub read: Vec<PathBuf>,
+    pub read_workspace: bool,
     pub helpers: Vec<PathBuf>,
     pub verify_sha256: bool,
     pub net: Vec<String>,
@@ -70,6 +72,10 @@ pub fn resolve(
                 inherited.read = Some(read);
                 source.push("read");
             }
+            if let Some(read_workspace) = fields.read_workspace {
+                inherited.read_workspace = Some(read_workspace);
+                source.push("read-workspace");
+            }
             if let Some(helpers) = fields.helpers {
                 inherited.helpers = Some(helpers);
                 source.push("helpers");
@@ -90,6 +96,9 @@ pub fn resolve(
             source.push("executable");
             if fields.read.is_some() {
                 source.push("read");
+            }
+            if fields.read_workspace.is_some() {
+                source.push("read-workspace");
             }
             if fields.helpers.is_some() {
                 source.push("helpers");
@@ -134,6 +143,7 @@ pub fn resolve(
                 Resolved {
                     executable,
                     read,
+                    read_workspace: definition.read_workspace.unwrap_or(true),
                     helpers,
                     verify_sha256: definition.verify_sha256.unwrap_or(false),
                     net: definition

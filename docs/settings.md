@@ -228,11 +228,18 @@ fields you want to change:
 read = []
 ```
 
-The omitted timeout inherits; the empty list clears the inherited read paths. A nonempty list
+The omitted timeout inherits; the empty list clears the inherited extra read paths. A nonempty list
 replaces the whole inherited list; `+`/`-` list operators are not supported here. Paths must be
 absolute or start with `~/`, without `..`. `timeout-secs`, if set, is a positive integer. To choose
 a different executable, define a new profile by name. `saddle check` prints the effective definition
 and names the fields from the workspace file. No settings in the checkout define a profile.
+
+Named launches can read the current workspace by default (D190), including repository metadata.
+This is separate from the `read` list: `read = []` clears only extra paths. To opt out, set
+`read-workspace = false` in the profile or its protected workspace override. This grants
+read-only access to the workspace tree without applying file-tool exclusions; it does not extend
+outside the tree through symlinks or change permissions for other tools. If the workspace overlaps
+Saddle's protected config or state, the launch refuses the claim.
 
 If the program launches other programs, list the exact binaries in `helpers` (D186). For example,
 Git's `git-remote-https` may be a symlink to `/usr/lib/git-core/git-remote-http`; list the real
@@ -280,9 +287,10 @@ saddle --profile github tool run_binary '{"profile":"gh","argv":["api","user","-
 `argv` excludes the executable. Arguments are literal and unrestricted by Saddle; a CLI or its
 helpers can return a credential they can read. Use a dedicated, appropriately scoped credential if
 needed, and don't grant a profile whose full command surface you don't trust. The tool runs
-foreground only, with a private cwd and no inherited checkout or writable paths. Workflows that
-need to update local refs or files are not supported. The entry point and helpers can be
-user-installed native ELF binaries (D188). Whitelist only files and directories whose contents
+foreground only, with a private cwd and no writable paths. Use an absolute workspace path if the
+program needs to locate the checkout. Workflows that update local refs or files are not supported.
+The entry point and helpers can be user-installed native ELF binaries (D188). Whitelist only files
+and directories whose contents
 and updates you trust; paths overlapping agent write access and scripts are refused. Write
 real paths for all profile paths (for example `/usr/bin/cat` instead of `/bin/cat` where `/bin` is a
 symlink). Named launches require Linux with Landlock ABI 6; the initial-executable-only mode

@@ -1241,6 +1241,11 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
             };
             println!("  {name}: {:?} ({access})", profile.executable);
             println!("    read = {:?}", profile.read);
+            if profile.read_workspace {
+                println!("    read-workspace = true ({:?})", setup.workspace);
+            } else {
+                println!("    read-workspace = false");
+            }
             println!("    helpers = {:?}", profile.helpers);
             println!("    verify-sha256 = {}", profile.verify_sha256);
             println!("    net (HTTPS/443 ceiling) = {:?}", profile.net);

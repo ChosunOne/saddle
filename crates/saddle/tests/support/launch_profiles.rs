@@ -332,3 +332,68 @@ fn launch_profile_helpers_are_default_on_bounded_and_narrowable() {
         "{text}"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn launch_profile_workspace_read_is_default_and_can_be_disabled() {
+    if saddle_sandbox::launch_availability().is_err() {
+        return;
+    }
+    let env = Env::new();
+    let metadata = env.ws.path().join(".jj/repo");
+    fs::create_dir_all(&metadata).unwrap();
+    let input = metadata.join("config-id");
+    fs::write(&input, "workspace-read-fixture").unwrap();
+    let outside = env.outside.path().join("secret");
+    fs::write(&outside, "not-for-the-launch").unwrap();
+    let link = env.ws.path().join("link");
+    symlink(&outside, &link).unwrap();
+    env.write_config("[launch-profiles.fixture]\nexecutable = '/usr/bin/bash'\nread = []\n");
+    let grant = "[agent]\nrun-binary = [{profile='fixture'}]\n";
+    env.write_override(grant);
+    let run = |command: &str, path: &Path| {
+        let input = json!({"profile":"fixture","argv":["-c",command,"fixture",path]});
+        let out = env.saddle(&[
+            "--revoke",
+            "exec",
+            "--revoke",
+            "fs-read",
+            "tool",
+            "run_binary",
+            &input.to_string(),
+        ]);
+        (
+            out.status.success(),
+            format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out)),
+        )
+    };
+    let read =
+        "IFS= read -r value < \"$1\" || [[ -n $value ]]; [[ -n $value ]] && printf '%s' \"$value\"";
+    let (ok, text) = run(read, &input);
+    assert!(ok && text.contains("workspace-read-fixture"), "{text}");
+    let (ok, text) = run(read, &link);
+    assert!(!ok && !text.contains("not-for-the-launch"), "{text}");
+    let (ok, text) = run("printf changed > \"$1\"", &input);
+    assert!(!ok && text.contains("Permission denied"), "{text}");
+    assert_eq!(
+        fs::read_to_string(&input).unwrap(),
+        "workspace-read-fixture"
+    );
+
+    env.write_override(&format!(
+        "{grant}[launch-profiles.fixture]\nread-workspace = false\n"
+    ));
+    let (ok, text) = run(read, &input);
+    assert!(
+        !ok && text.contains("Permission denied") && !text.contains("workspace-read-fixture"),
+        "{text}"
+    );
+    let check = env.saddle(&["check"]);
+    assert!(check.status.success(), "{}", stderr(&check));
+    let text = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        text.contains("read-workspace = false")
+            && text.contains("workspace fields: read-workspace"),
+        "{text}"
+    );
+}

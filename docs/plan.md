@@ -4606,8 +4606,8 @@ decision for that name carries no ordinary `exec` or filesystem authority.
 
 The runtime is one shipped foreground tool with literal arguments and a named launch grant
 independent of `exec`. Scope binding and exact profile delegation use the normal component gate.
-The host resolves the definition into a separate child spec: private cwd, no writable claims or
-borrowed workspace roots, a minimal environment, and dedicated read-only claims. Network uses D79
+The host resolves the definition into a separate child spec: private cwd, no writable claims, a
+minimal environment, and dedicated read-only claims (including the workspace by default, D190). Network uses D79
 but only when both the profile's exact HTTPS/443 host list and the caller's grants allow it. The
 ordinary sandbox is unchanged. The helper validates and pins the whitelisted ELF executable (see
 D188), refuses executable paths overlapping protected locations or agent write reach, and executes
@@ -4670,6 +4670,14 @@ helper verifies the entry point and enabled helpers on the same descriptors used
 Landlock execute rules. A missing, unreadable or changed binary fails closed for the launch, not
 for other tools. This checks bytes before execution, not signatures or libraries. It does not
 freeze an inode against in-place writes by unrelated processes after verification (D20).
+
+**D190.** The canonical current workspace is a default read-only claim of a named launch, including
+repository metadata. This is part of the named launch, not borrowed from `fs-read` or `exec`; their
+grants and exclusions are unchanged. Protected profiles can opt out with `read-workspace = false`,
+which inherits or overrides as a scalar. `read = []` clears only the extra paths. `check` shows
+both the switch and the workspace path if enabled. The workspace claim goes through the existing
+no-follow and protected-path overlap checks, has no execute or write rights, and does not change
+cwd, helper approval, or network reach.
 
 ## 4. Scope enumeration
 
