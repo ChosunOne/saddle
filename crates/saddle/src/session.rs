@@ -41,7 +41,9 @@ use saddle_policy::{AuditLog, Decision, Engine, Kind, Request, net_decision};
 use serde_json::{Value, json};
 
 use crate::config::UserConfig;
-use crate::config::launch_profiles::{self, Resolved as LaunchProfile};
+use crate::config::launch_profiles::{
+    self, Baselines as LaunchBaselines, Resolved as LaunchProfile,
+};
 use crate::config::sandbox_overrides::{self, Source as SandboxSource};
 use crate::fs_access;
 use crate::mcp::Transport;
@@ -628,6 +630,7 @@ pub struct Session {
     pub file_roots: BTreeMap<RootName, Dir>,
     pub plugins: PluginRegistry,
     pub setup: Setup,
+    pub launch_baselines: LaunchBaselines,
     pub engine: Engine,
     pub audit: AuditLog,
     /// `Ok(landlock ABI)` or the reason exec is unavailable.
@@ -725,6 +728,8 @@ impl Session {
             let tmp = setup.roots.get(&RootName::tmp()).map(Path::to_path_buf);
             Registry::new(grants, user.mcp, host_env.clone(), tmp)
         };
+        let mut launch_baselines = LaunchBaselines::default();
+        launch_baselines.enroll(&setup.launch_profiles);
         let mut session = Self {
             extensions: Default::default(),
             plugin_events: Default::default(),
@@ -732,6 +737,7 @@ impl Session {
             file_roots,
             plugins,
             setup,
+            launch_baselines,
             engine: Engine::new(policy),
             audit,
             sandbox,
@@ -831,6 +837,7 @@ impl Session {
         self.plugin_events = Default::default();
         self.extensions = Default::default();
         let before = self.setup.policy_sha256.clone();
+        self.launch_baselines.enroll(&fresh.launch_profiles);
         self.setup = fresh;
         search_transport::trim_cache(self);
         self.tool_roots = configured_tool_roots(&self.setup);

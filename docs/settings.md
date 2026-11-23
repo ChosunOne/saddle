@@ -243,6 +243,14 @@ further executable launches for that call. An empty `helpers` list also denies f
 creation. Every helper runs inside the same sandbox and cannot add access. A path in `read` does
 not make it executable.
 
+Set `verify-sha256 = true` to check for binary changes during a Saddle session (default: `false`).
+Saddle records SHA-256 digests of the executable and configured helpers when the session opens.
+Each launch checks the executable and enabled helpers before running; a mismatch or unavailable
+baseline refuses the launch. `/reload` can enroll new paths but does not refresh an existing
+baseline. After an intentional update, verify the new binary and restart Saddle. The protected
+workspace override can inherit or replace this setting. This is a session baseline, not a
+publisher signature or a check of libraries; keep the files protected from concurrent writers.
+
 To grant a launch profile, add `run-binary` to the global `[agent]`, a named permission profile,
 or the protected workspace `[agent]`. For example, to grant `gh` only in the `github` permission
 profile (unless a workspace overrides it):

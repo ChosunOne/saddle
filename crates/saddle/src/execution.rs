@@ -3,7 +3,7 @@
 use saddle_limits as budgets;
 use std::env::{self, join_paths};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -305,8 +305,21 @@ pub fn launch(
         .prefix("launch-")
         .tempdir_in(&session.setup.paths.state)
         .context("creating private named-launch directory")?;
+    let expected = |path: &Path| session.launch_baselines.expected(profile, path);
+    let executable_sha256 = match expected(&profile.executable) {
+        Ok(digest) => digest,
+        Err(why) => return Ok(Err(why)),
+    };
     let helpers = if allow_children {
-        profile.helpers.clone()
+        match profile
+            .helpers
+            .iter()
+            .map(|path| Ok((path.clone(), expected(path)?)))
+            .collect::<Result<Vec<_>, String>>()
+        {
+            Ok(helpers) => helpers,
+            Err(why) => return Ok(Err(why)),
+        }
     } else {
         Vec::new()
     };
@@ -317,7 +330,7 @@ pub fn launch(
         join_paths(
             [&profile.executable]
                 .into_iter()
-                .chain(&helpers)
+                .chain(helpers.iter().map(|(path, _)| path))
                 .filter_map(|p| p.parent()),
         )
         .context("building helper lookup path")?
@@ -354,6 +367,7 @@ pub fn launch(
         named_launch: Some(NamedLaunch {
             protected,
             agent_write,
+            executable_sha256,
             helpers,
         }),
     };

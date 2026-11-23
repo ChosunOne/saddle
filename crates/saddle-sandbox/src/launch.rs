@@ -1,4 +1,4 @@
-//! named launch confinement and optional pinned helper executables (D184, D186, D188).
+//! named launch confinement and optional pinned helper executables (D184, D186, D188, D189).
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -28,6 +28,7 @@ use seccompiler::{
 };
 
 use saddle_cap::sandbox::NamedLaunch;
+use sha2::{Digest, Sha256};
 
 use crate::linux::start_network;
 use crate::{SandboxError, SandboxSpec, launch_availability};
@@ -60,7 +61,7 @@ pub(crate) fn enter(spec: &SandboxSpec, guard: &NamedLaunch) -> Result<Infallibl
         ));
     }
     let path = Path::new(&spec.argv[0]);
-    let executable = open_executable(path, guard)?;
+    let executable = verified_executable(path, guard.executable_sha256.as_ref(), guard)?;
     let argv = strings(spec.argv.iter().map(String::as_str))?;
     let environment: Vec<_> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let envp = strings(environment.iter().map(String::as_str))?;
@@ -81,7 +82,7 @@ pub(crate) fn enter(spec: &SandboxSpec, guard: &NamedLaunch) -> Result<Infallibl
     let helpers = guard
         .helpers
         .iter()
-        .map(|path| open_executable(path, guard))
+        .map(|(path, expected)| verified_executable(path, expected.as_ref(), guard))
         .collect::<Result<Vec<_>, _>>()?;
     confine_files(spec, guard, &executable, &helpers)?;
     confine_syscalls(networked)?;
@@ -154,10 +155,32 @@ fn pointers(items: &[CString]) -> Vec<*const libc::c_char> {
         .collect()
 }
 
-fn open_executable(path: &Path, guard: &NamedLaunch) -> Result<File, SandboxError> {
+fn verified_executable(
+    path: &Path,
+    expected: Option<&[u8; 32]>,
+    guard: &NamedLaunch,
+) -> Result<File, SandboxError> {
     reject_overlap(path, &guard.protected)?;
     reject_overlap(path, &guard.agent_write)?;
     let mut executable = open_pinned(path, true)?;
+    if let Some(expected) = expected {
+        if hash_elf(path, &mut executable)? != *expected {
+            return Err(SandboxError::Spec(format!(
+                "launch binary SHA-256 does not match the session baseline: {} (restart Saddle after verifying the update)",
+                path.display()
+            )));
+        }
+    } else {
+        check_elf(path, &mut executable)?;
+    }
+    Ok(executable)
+}
+
+pub(crate) fn digest(path: &Path) -> Result<[u8; 32], SandboxError> {
+    hash_elf(path, &mut open_pinned(path, true)?)
+}
+
+fn check_elf(path: &Path, executable: &mut File) -> Result<[u8; 4], SandboxError> {
     let mut magic = [0; 4];
     executable.read_exact(&mut magic)?;
     if &magic != b"\x7fELF" {
@@ -166,7 +189,28 @@ fn open_executable(path: &Path, guard: &NamedLaunch) -> Result<File, SandboxErro
             path.display()
         )));
     }
-    Ok(executable)
+    Ok(magic)
+}
+
+fn hash_elf(path: &Path, executable: &mut File) -> Result<[u8; 32], SandboxError> {
+    let before = executable.metadata()?;
+    let magic = check_elf(path, executable)?;
+    let mut digest = Sha256::new();
+    digest.update(magic);
+    let remaining = before.len().saturating_sub(magic.len() as u64);
+    let copied = io::copy(&mut executable.take(remaining), &mut digest)?;
+    let after = executable.metadata()?;
+    if before.len() < magic.len() as u64
+        || copied != remaining
+        || (before.len(), before.ctime(), before.ctime_nsec())
+            != (after.len(), after.ctime(), after.ctime_nsec())
+    {
+        return Err(SandboxError::Spec(format!(
+            "launch binary changed while hashing: {}",
+            path.display()
+        )));
+    }
+    Ok(digest.finalize().into())
 }
 
 /// Open an absolute path without following any links, using pinned parents. An explicit
@@ -558,4 +602,33 @@ fn allow_initial_exec(listener: &File, tid: u32) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NamedLaunch, digest, fs, verified_executable};
+    use tempfile::tempdir;
+
+    #[test]
+    fn launch_digest_verification_rejects_changed_bytes_only_when_enabled() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("binary");
+        fs::write(&path, b"\x7fELF-original").unwrap();
+        let expected = digest(&path).unwrap();
+        let guard = NamedLaunch {
+            protected: vec![],
+            agent_write: vec![],
+            executable_sha256: Some(expected),
+            helpers: vec![],
+        };
+        verified_executable(&path, Some(&expected), &guard).unwrap();
+        // Same inode and length: a pathname or file size check alone would miss this.
+        fs::write(&path, b"\x7fELF-modified").unwrap();
+        let err = verified_executable(&path, Some(&expected), &guard).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match the session baseline")
+        );
+        verified_executable(&path, None, &guard).unwrap();
+    }
 }

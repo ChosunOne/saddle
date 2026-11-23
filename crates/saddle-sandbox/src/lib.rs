@@ -105,6 +105,21 @@ pub fn launch_availability() -> Result<(), String> {
     }
 }
 
+/// hash a protected launch path using the same no-follow open as the launcher (D189).
+pub fn launch_digest(path: &Path) -> Result<[u8; 32], SandboxError> {
+    #[cfg(target_os = "linux")]
+    {
+        launch::digest(path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err(SandboxError::Unavailable(
+            "named launches require Linux".into(),
+        ))
+    }
+}
+
 pub fn network_availability() -> Result<String, String> {
     if !cfg!(target_os = "linux") {
         return Err("a command's network is Linux-only in v1".into());

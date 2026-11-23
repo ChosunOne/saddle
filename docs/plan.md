@@ -4658,9 +4658,18 @@ retained records do not count. It needs no polling or new persisted state.
 configuration, not by Unix ownership. A user-installed native ELF binary is eligible without
 being copied into a system-owned directory. The launcher still opens without following symlinks,
 checks for a regular native executable, and refuses paths overlapping protected locations or
-ordinary agent write reach. This is a path allowlist, not a content pin across calls: the person
+ordinary agent write reach. By default this is a path allowlist, not a content check (see D189): the person
 configuring it must trust who can update the file and replace its parent directories. Implicit
 system runtime paths retain their system-ownership checks.
+
+**D189.** Protected launch definitions and workspace overrides accept `verify-sha256` (default
+false). For enabled definitions, session open records a SHA-256 baseline for each explicit binary
+and helper using a no-follow open. Reload enrolls new paths only and preserves existing results,
+including errors, even if temporarily disabled or removed. No baseline is persisted. The sandbox
+helper verifies the entry point and enabled helpers on the same descriptors used for exec or
+Landlock execute rules. A missing, unreadable or changed binary fails closed for the launch, not
+for other tools. This checks bytes before execution, not signatures or libraries. It does not
+freeze an inode against in-place writes by unrelated processes after verification (D20).
 
 ## 4. Scope enumeration
 

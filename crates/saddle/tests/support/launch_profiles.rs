@@ -273,7 +273,7 @@ fn launch_profile_helpers_are_default_on_bounded_and_narrowable() {
     fs::copy("/usr/bin/bash", env.home.path().join("fixture-bash")).unwrap();
     fs::copy("/usr/bin/cat", env.home.path().join("fixture-cat")).unwrap();
     env.write_config(
-        "[launch-profiles.fixture]\nexecutable = '~/fixture-bash'\n\
+        "[launch-profiles.fixture]\nexecutable = '~/fixture-bash'\nverify-sha256 = true\n\
          helpers = ['~/fixture-cat']\nread = ['~/helper-input', '/usr/bin/true']\n",
     );
     env.write_override("[agent]\nrun-binary = [{profile='fixture'}]\n");
