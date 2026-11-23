@@ -597,6 +597,17 @@ pub fn execute(
     budgets::using(&limits, || execute_inner(prepared, session, job, call))
 }
 
+/// Whether a job is part of a turn the person can cancel, and so should stop when they do: a tool
+/// call, a hook, a veto or a panel drawn while the turn runs. Registration — `describe` and the two
+/// subscription reads — happens between turns, at load or reload, and is bounded by the plugin
+/// deadline instead (D183).
+fn turn_scoped(job: &Job) -> bool {
+    matches!(
+        job,
+        Job::Invoke(_) | Job::Observe(_) | Job::Receive(_) | Job::Veto(_) | Job::Render
+    )
+}
+
 fn execute_inner(
     prepared: Arc<Prepared<Host>>,
     session: &mut Session,
@@ -624,7 +635,13 @@ fn execute_inner(
             .map(|byte| format!("{byte:02x}"))
             .collect(),
     };
-    let cancelled = Arc::new(AtomicBool::new(cancel::FLAG.load(Ordering::Relaxed)));
+    // D183: only a job that belongs to a turn is cancelled with one. Loading a component answers
+    // `describe` and reads its subscriptions with no turn in flight, so a flag left set by an Esc
+    // must not decide whether the session can register its tools.
+    let turn_scoped = turn_scoped(&job);
+    let cancelled = Arc::new(AtomicBool::new(
+        turn_scoped && cancel::FLAG.load(Ordering::Relaxed),
+    ));
     let flag = cancelled.clone();
     let deadline = timeout::deadline();
     // Reserve host frames beyond Wasmtime's configured guest stack; never silently exceed the thread.
@@ -670,7 +687,7 @@ fn execute_inner(
             fatal = Some(error);
             cancelled.store(true, Ordering::Relaxed);
         }
-        if cancel::FLAG.load(Ordering::Relaxed) || timeout::expired() {
+        if (turn_scoped && cancel::FLAG.load(Ordering::Relaxed)) || timeout::expired() {
             cancelled.store(true, Ordering::Relaxed);
         }
         match pending.recv_timeout(Duration::from_millis(10)) {

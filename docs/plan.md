@@ -4561,6 +4561,32 @@ waits for the background task it started.
   config`, read out of the defaults' own text so it matches `saddle tools --config`. A tool that does
   have an entry and failed to load keeps its own reason, and a third-party plugin is unaffected.
 
+**D183.** A cancelled turn stops its own work and nothing after it. The guest's cancellation flag is
+seeded from the process's one flag only for a job that belongs to a turn — a tool invocation, an
+observer or custom-event handler, a veto, a rendered panel (D153, D155, D156). Registration is not
+one of them: `describe` and the two subscription reads happen when components are loaded, which is
+before or between turns, and a load is bounded by `[tool-limits] plugin-timeout-ms` and the loader's
+own deadline instead.
+
+- **The failure it fixes.** Esc leaves the flag set until the next turn-starting action clears it. In
+  the TUI, `/reload` was such an action without the clearing: it reloads the policy and the plugins,
+  so every standard tool was registered under a turn that had already been cancelled and came back
+  `standard tool unavailable: plugin call cancelled`. The status is recorded once, at load, so the
+  session had no tools at all until it was restarted — and a second `/reload`, with the flag still
+  set, failed the same way. `/profile` and applying a permission change take the same reload path and
+  failed identically.
+- **Why the rule lives where the flag is read.** Resetting the flag at each command that reloads
+  would have to be repeated at every such caller, including ones added later; the question "does this
+  job belong to a turn" is answered once, in `plugins/host.rs`, and `turn_scoped` states it. Line mode
+  was never affected because it resets per command line, which is why the defect showed up only in
+  the interface.
+- **The guard.** `a_cancelled_turn_does_not_stop_a_reload_from_registering_its_tools` sets the flag,
+  reloads a session with `bash` and `tasks` selected, and requires them registered; with the old
+  seeding it reproduces the exact status text above.
+- **What a cancel still stops.** A running tool call, hook, veto or panel; the model stream; a
+  command. A component load is host administration, not the person's work, and it is already bounded
+  by its own deadline.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

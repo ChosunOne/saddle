@@ -714,6 +714,48 @@ pub fn install(manifest_path: &Path, paths: &Paths) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancel;
+    use crate::config::Overrides;
+    use crate::session::Session;
+    use std::env;
+
+    /// D183: Esc leaves the turn's flag set, and a `/reload` right after it must still register the
+    /// session's tools. The reported failure was every standard tool answering
+    /// `standard tool unavailable: plugin call cancelled` until the session was restarted.
+    ///
+    /// nextest runs one test per process, so setting the directories this session reads is not a
+    /// race with another test; `cargo test` would share them between threads and must not be used.
+    #[test]
+    fn a_cancelled_turn_does_not_stop_a_reload_from_registering_its_tools() {
+        let ws = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let config = xdg.path().join("config");
+        fs::create_dir_all(config.join("saddle")).unwrap();
+        fs::write(
+            config.join("saddle/config.toml"),
+            "[agent]\nexec = { why = \"runs commands\", timeout-secs = 20 }\n\n\
+             [standard-tools]\nbash = [\"exec\"]\ntasks = [\"exec\"]\n",
+        )
+        .unwrap();
+        // SAFETY: one process per test (nextest), and nothing else reads these.
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", &config);
+            env::set_var("XDG_STATE_HOME", xdg.path().join("state"));
+            env::set_var("HOME", xdg.path().join("home"));
+        }
+        let mut session = Session::open_with(ws.path(), None, &Overrides::default()).unwrap();
+        assert!(
+            session.plugins.tool("standard-bash").is_some(),
+            "loaded when the session opened"
+        );
+        cancel::request();
+        session.reload_policy().unwrap();
+        assert!(
+            session.plugins.tool("standard-bash").is_some(),
+            "a reload after a cancelled turn still registers: {:?}",
+            session.plugins.report()
+        );
+    }
 
     #[test]
     fn a_plugin_cannot_close_its_wrapper_or_write_terminal_controls() {
