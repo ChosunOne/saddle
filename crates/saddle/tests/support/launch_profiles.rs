@@ -44,6 +44,39 @@ fn launch_profile_grants_are_independent_and_layer_per_workspace() {
     );
 }
 
+#[test]
+fn launch_grants_layer_through_permission_profiles() {
+    let env = Env::new();
+    env.write_config(
+        "[launch-profiles.fixture]\nexecutable = '/usr/bin/cat'\n\
+         [profiles.with-launch]\nrun-binary = [{profile='fixture'}]\n\
+         [profiles.empty]\nrun-binary = []\n",
+    );
+    let check = |profile, access| {
+        let out = env.saddle(&["--profile", profile, "check"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("  fixture:") && line.ends_with(access)),
+            "{text}"
+        );
+    };
+    check("none", "(not granted)");
+    check("with-launch", "(granted)");
+    env.write_override("[agent]\nrun-binary = ['-fixture']\n");
+    check("with-launch", "(not granted)");
+    env.write_override("");
+    env.edit_agent(|agent| {
+        agent.insert(
+            "run-binary".into(),
+            toml::Value::try_from(json!([{"profile":"fixture"}])).unwrap(),
+        );
+    });
+    check("none", "(granted)");
+    check("empty", "(not granted)");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn launch_profile_runtime_is_independent_of_bash_and_revocable() {

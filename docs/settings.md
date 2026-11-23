@@ -234,15 +234,19 @@ absolute or start with `~/`, without `..`. `timeout-secs`, if set, is a positive
 a different executable, define a new profile by name. `saddle check` prints the effective definition
 and names the fields from the workspace file. No settings in the checkout define a profile.
 
-To grant a profile, separately add this to the global or protected workspace `[agent]` table:
+To grant a launch profile, add `run-binary` to the global `[agent]`, a named permission profile,
+or the protected workspace `[agent]`. For example, to grant `gh` only in the `github` permission
+profile (unless a workspace overrides it):
 
 ```toml
-[agent]
+[profiles.github]
 run-binary = [{ profile = "gh" }]
 ```
 
-An effective agent grant must name a defined profile. A workspace can replace the global grant
-list, clear it with `run-binary = []`, or subtract one with `run-binary = ["-gh"]`. Use
+Select it with `--profile github` or switch to it in a session with `/profile github`. This selects
+the grant, not a different executable or sandbox. An effective grant must name a defined launch
+profile. Permission profiles and workspace grants can replace the inherited list, clear it with
+`run-binary = []`, or subtract one entry with `run-binary = ["-gh"]`. Use
 `--grant run-binary:gh` or `--revoke run-binary` to change the grants for one run. `saddle check`
 shows the result independently of `exec`. This grant does not give `bash` any new access.
 
@@ -253,7 +257,7 @@ HTTPS hosts on port 443 in the profile's `net` field, and grant those hosts in t
 binary runs without network. Omit `net` at both levels for a purely local profile.
 
 ```sh
-saddle tool run_binary '{"profile":"gh","argv":["api","user","--jq",".login"]}'
+saddle --profile github tool run_binary '{"profile":"gh","argv":["api","user","--jq",".login"]}'
 ```
 
 `argv` excludes the executable. Arguments are literal and unrestricted by Saddle; a CLI can
