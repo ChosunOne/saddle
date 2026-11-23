@@ -37,6 +37,7 @@ write = ["fs-read", "fs-write", "tool-read", "tool-write"]
 edit = ["fs-read", "fs-write", "tool-read", "tool-write"]
 patch = ["fs-read", "fs-write", "tool-read", "tool-write"]
 bash = ["exec", "fs-read", "fs-write", "net"]
+tasks = ["exec"]
 fetch = ["net"]
 websearch = ["net"]
 session_query = ["transcript-read"]
@@ -83,13 +84,15 @@ receive the narrower defaults on startup/reload; no protected file is automatica
 
 ## Background shell work
 
-Use the same bash tool with `background: true` (D153):
+`bash` runs the command; the separate `tasks` tool reads, stops and waits on it (D153, D182). A
+launch is `bash` with `background: true`:
 
 ```json
 {"command":"cargo nextest run", "background":true, "timeout_secs":300}
 ```
 
-It returns a task id promptly. Continue working with file tools, then inspect or cancel the task:
+It returns a task id promptly. Continue working with file tools, then inspect or cancel the task with
+`tasks` — every call in the next block is a `tasks` call:
 
 ```json
 {"action":"status", "task_id":"task-<id>"}
@@ -98,8 +101,8 @@ It returns a task id promptly. Continue working with file tools, then inspect or
 ```
 
 The completion of a task started here **resumes the agent**, so the work it began does not have to be
-polled: `background: true, "wake": false` declines that, and `action: "wait"` arms a task later
-(D174):
+polled: `background: true, "wake": false` declines that, and `tasks`' `action: "wait"` arms a task
+later (D174):
 
 ```json
 {"action":"wait", "task_id":"task-<id>"}
@@ -116,9 +119,10 @@ keeps answering with its exit status until the `exec-tasks` retention budget evi
 each record as running, finished (with its exit code), cancelled or timed out (D179). Cancellation is
 requested promptly, and the cancel call waits — up to a second — for the process group to be killed
 and reaped, so its own reply says how the task ended; another call's status can still see it running
-until then (D180). The tool that started it is its owner: another plugin cannot read or cancel it,
-nor arm a wake on it. A start's timeout bounds the **task lifetime**; a timeout on a status call only
-bounds that call.
+until then (D180). A task belongs to the principal that started it: a third-party plugin cannot read
+or cancel another's task, nor arm a wake on it, while the shipped `standard-*` tools act for the agent,
+so `tasks` sees what `bash` started (D182). A start's timeout bounds the **task lifetime**; a timeout
+on a status call only bounds that call.
 
 **One shell command may be active per workspace.** Foreground and background commands, including
 other Saddle processes in that workspace, share an exclusive reservation lock. A second start

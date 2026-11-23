@@ -1,0 +1,4 @@
+id = "tasks"
+version = "0.1.0"
+component = "tasks.component.wasm"
+scopes = ["tool", "exec"]

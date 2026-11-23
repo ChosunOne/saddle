@@ -24,6 +24,19 @@ use crate::session::{Session, session_id};
 /// say how the task ended rather than "running" (D180).
 const CANCEL_REAP: Duration = Duration::from_secs(1);
 
+/// Whose task this is. A shipped standard tool acts for the agent — it holds only what the agent
+/// delegated to that profile, and `standard-*` identities are reserved for the components built with
+/// the binary — so a task `bash` started is the agent's, and the `tasks` profile of the same agent
+/// reads it (D182). A third-party plugin's task belongs to that plugin, which is what keeps one
+/// principal from reading another's output (D153). The recorded owner stays the principal that ran
+/// the command, so the proxy decides a task's network under that profile and the audit names it.
+fn holder(who: &Principal) -> Principal {
+    match who {
+        Principal::Plugin(id) if id.as_str().starts_with("standard-") => Principal::Agent,
+        other => other.clone(),
+    }
+}
+
 struct Task {
     id: String,
     ui_call: Option<String>,
@@ -193,10 +206,11 @@ impl Tasks {
 
     /// Says whether finishing one of this principal's tasks should resume the agent (D174).
     fn set_wake(&mut self, id: &str, who: &Principal, wake: bool) -> Option<&Task> {
+        let caller = holder(who);
         let task = self
             .entries
             .iter_mut()
-            .find(|task| task.id == id && &task.owner == who)?;
+            .find(|task| task.id == id && holder(&task.owner) == caller)?;
         task.wake = if wake { Wake::Armed } else { Wake::Quiet };
         Some(task)
     }
@@ -398,6 +412,7 @@ pub fn access(
         return Ok(Err(format!("denied: {}", decision.explanation)));
     }
     service(session)?;
+    let caller = holder(who);
     if cancel {
         // Ask first, then wait for the monitors to reap what they killed, so the call that asked
         // for the cancellation answers with the ending rather than "running" (D180). The wait is
@@ -406,7 +421,7 @@ pub fn access(
             .tasks
             .entries
             .iter()
-            .filter(|task| &task.owner == who && id.is_none_or(|id| task.id == id))
+            .filter(|task| holder(&task.owner) == caller && id.is_none_or(|id| task.id == id))
             .map(|task| task.id.clone())
             .collect();
         for task in &session.tasks.entries {
@@ -431,7 +446,7 @@ pub fn access(
         .tasks
         .entries
         .iter()
-        .filter(|task| &task.owner == who && id.is_none_or(|id| task.id == id))
+        .filter(|task| holder(&task.owner) == caller && id.is_none_or(|id| task.id == id))
     {
         let mut reply = snapshot(task)?;
         if id.is_none() {
@@ -508,6 +523,17 @@ pub fn pending(session: &mut Session) -> Result<bool> {
     Ok(session.tasks.pending())
 }
 
+/// what one completion notice says: the id, whose task it is and how it ended, then where the output
+/// is (D153). Reading a task is `tasks`, not `bash`, since D182 — and a task another principal
+/// started is no more readable by naming that tool, so the notice says where the reach ends instead.
+fn notice_line(id: &str, owner: &Principal, state: &str) -> String {
+    if holder(owner) == Principal::Agent {
+        format!("background {id} ({owner}) {state}; read it with the tasks tool (action: status)")
+    } else {
+        format!("background {id} ({owner}) {state}; only the principal that started it can read it")
+    }
+}
+
 /// notices contain only host-owned ids and state, never command output from an untrusted process.
 pub fn notices(session: &mut Session, model: bool) -> Result<Vec<String>> {
     service(session)?;
@@ -530,10 +556,7 @@ pub fn notices(session: &mut Session, model: bool) -> Result<Vec<String>> {
             } else {
                 "failed"
             };
-            notices.push(format!(
-                "background {} ({}) {state}; inspect its output with the owning bash tool",
-                task.id, task.owner
-            ));
+            notices.push(notice_line(&task.id, &task.owner, state));
         }
     }
     Ok(notices)
@@ -602,6 +625,23 @@ pub fn human(session: &mut Session, argument: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use saddle_cap::PluginId;
+
+    #[test]
+    fn a_completion_notice_says_where_to_read_it_and_whose_it_is() {
+        let agent = notice_line("task-1", &Principal::Agent, "completed");
+        assert!(agent.contains("read it with the tasks tool"), "{agent}");
+        let plugin = notice_line(
+            "task-2",
+            &Principal::Plugin(PluginId::new("reader").unwrap()),
+            "completed",
+        );
+        assert!(
+            plugin.contains("only the principal that started it can read it"),
+            "{plugin}"
+        );
+        assert!(!plugin.contains("tasks tool"), "{plugin}");
+    }
 
     #[test]
     fn a_duration_reads_as_a_stopwatch() {

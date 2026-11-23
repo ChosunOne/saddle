@@ -218,6 +218,7 @@ force.
 [standard-tools]
 read  = ["fs-read", "tool-read"]
 bash  = ["exec", "fs-read", "fs-write", "net"]
+tasks = ["exec"]          # a background task bash started: report, stop, wait (D182)
 config_help = []          # the configuration reference: nothing to delegate
 ```
 

@@ -9,6 +9,7 @@ pub mod mutation;
 mod pagination;
 mod patch;
 pub mod search;
+pub mod tasks;
 pub mod transcript;
 pub mod websearch;
 pub use pagination::read_with;

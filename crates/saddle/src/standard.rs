@@ -79,3 +79,29 @@ pub fn delegate(parent: &Grants, name: &str, scopes: &BTreeSet<Scope>) -> Grants
     }
     child
 }
+
+/// the `[standard-tools]` line the shipped defaults carry for one tool (D182), read out of the
+/// defaults' own text so it matches what `saddle tools --config` prints. A refusal uses it to show
+/// what to add rather than only which mechanism refused.
+pub fn default_entry(name: &str) -> Option<&'static str> {
+    DEFAULT_PROFILES.lines().find_map(|line| {
+        let (key, _) = line.split_once('=')?;
+        (key.trim() == name).then(|| line.trim())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_entry;
+
+    #[test]
+    fn a_default_entry_is_named_exactly_as_the_config_prints_it() {
+        assert_eq!(default_entry("tasks"), Some(r#"tasks = ["exec"]"#));
+        assert_eq!(default_entry("config_help"), Some("config_help = []"));
+        assert_eq!(
+            default_entry("bash"),
+            Some(r#"bash = ["exec", "fs-read", "fs-write", "net"]"#)
+        );
+        assert_eq!(default_entry("nope"), None);
+    }
+}

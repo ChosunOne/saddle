@@ -54,6 +54,10 @@ name = "bash"
 crate-type = ["cdylib"]
 
 [[example]]
+name = "tasks"
+crate-type = ["cdylib"]
+
+[[example]]
 name = "fetch"
 crate-type = ["cdylib"]
 

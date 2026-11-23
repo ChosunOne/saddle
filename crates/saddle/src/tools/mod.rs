@@ -73,6 +73,7 @@ pub const NAMES: &[&str] = &[
     "find",
     "grep",
     "bash",
+    "tasks",
     "fetch",
     "websearch",
     "session_query",

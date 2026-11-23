@@ -7,10 +7,7 @@ use std::fmt::Write as _;
 
 use saddle_sdk::ExecReply;
 #[cfg(target_arch = "wasm32")]
-use saddle_sdk::{
-    Command, Definition, Output, Task, Tool, cancel_task, execute, inspect_task, list_tasks,
-    start_task, wake_task,
-};
+use saddle_sdk::{Command, Definition, Output, Task, Tool, execute, start_task, wake_task};
 use serde::Deserialize;
 #[cfg(target_arch = "wasm32")]
 use serde_json::json;
@@ -20,33 +17,20 @@ pub struct Bash;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Arguments {
-    pub command: Option<String>,
+    pub command: String,
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub background: bool,
     /// Whether finishing should resume the session, which is the default (D174). Only meaningful
-    /// with `background`, and a task that declined can be armed later with `action: "wait"`.
+    /// with `background`, and a task that declined can be armed later with `tasks` (D182).
     pub wake: Option<bool>,
-    #[serde(default)]
-    pub action: Action,
-    pub task_id: Option<String>,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Action {
-    #[default]
-    Run,
-    Status,
-    List,
-    Cancel,
-    Wait,
-}
-
+/// One task as the transcript and a poll show it: how it stands, then what it has said (D179). A
+/// running task has no exit status to report, so `render` is asked for the streams alone.
 #[cfg(target_arch = "wasm32")]
-fn format_task(task: &Task) -> String {
+pub(crate) fn format_task(task: &Task) -> String {
     let status = if task.running { "running" } else { "finished" };
-    // A running task has no exit status to report; its capture is what has arrived so far (D179).
     let output = render(&task.output, !task.running);
     if output.is_empty() {
         format!("task {}: {status}", task.id)
@@ -57,87 +41,31 @@ fn format_task(task: &Task) -> String {
 
 #[cfg(target_arch = "wasm32")]
 fn invoke_task(args: Arguments) -> Result<(String, bool), String> {
-    if !matches!(args.action, Action::Run)
-        && (args.command.is_some() || args.background || args.wake.is_some())
-    {
-        return Err("command, background and wake are only valid for action run".into());
+    if args.command.trim().is_empty() {
+        return Err("run requires a nonempty command".into());
     }
-    match args.action {
-        Action::Run => {
-            if args.task_id.is_some() {
-                return Err("task_id is not valid for action run".into());
-            }
-            let command = args
-                .command
-                .filter(|command| !command.trim().is_empty())
-                .ok_or("run requires a nonempty command")?;
-            let request = Command {
-                argv: vec!["sh".into(), "-c".into(), command],
-                timeout_secs: args.timeout_secs.unwrap_or(budgets::exec_seconds() as u64),
-            };
-            if !args.background {
-                if args.wake.is_some() {
-                    return Err("wake is only valid with background: true".into());
-                }
-                return execute(&request).map(|reply| format_reply(&reply));
-            }
-            // The launch says what its completion should do about the session (D174), rather than
-            // leaving the session to infer it from the call's own association.
-            let wake = args.wake.unwrap_or(true);
-            let started = start_task(&request)?;
-            let task = wake_task(&started.id, wake)?;
-            let mut text = format_task(&task);
-            text.push_str(if wake {
-                "\nthe session will be resumed when this finishes; read its output with action=status"
-            } else {
-                "\nthe session will not be resumed when this finishes; arm it with action=wait, or read it with action=status"
-            });
-            Ok((text, true))
+    let request = Command {
+        argv: vec!["sh".into(), "-c".into(), args.command.clone()],
+        timeout_secs: args.timeout_secs.unwrap_or(budgets::exec_seconds() as u64),
+    };
+    if !args.background {
+        if args.wake.is_some() {
+            return Err("wake is only valid with background: true".into());
         }
-        // D174: arm a wake for a task that was started without one. It answers at once, because the
-        // wait belongs to the session rather than to this call.
-        Action::Wait => {
-            let id = args.task_id.ok_or("wait requires task_id")?;
-            let task = wake_task(&id, true)?;
-            let mut text = format_task(&task);
-            text.push_str(if task.running {
-                "\narmed: the session will be resumed when this finishes; the notification carries no output, so read it with action=status"
-            } else {
-                "\nit has already finished, so there is nothing to wait for; its output is above"
-            });
-            Ok((text, true))
-        }
-        Action::Status | Action::Cancel => {
-            let id = args.task_id.ok_or("status/cancel requires task_id")?;
-            let task = if matches!(args.action, Action::Cancel) {
-                cancel_task(&id)?
-            } else {
-                inspect_task(&id)?
-            };
-            let ok = task.running
-                || (task.output.code == Some(0)
-                    && !task.output.timed_out
-                    && !task.output.cancelled)
-                || matches!(args.action, Action::Cancel);
-            Ok((format_task(&task), ok))
-        }
-        Action::List => {
-            if args.task_id.is_some() {
-                return Err("task_id is not valid for action list".into());
-            }
-            let tasks = list_tasks()?;
-            let text = if tasks.is_empty() {
-                "no background tasks".into()
-            } else {
-                tasks
-                    .iter()
-                    .map(|task| format!("{}: {}", task.id, state(task)))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            Ok((text, true))
-        }
+        return execute(&request).map(|reply| format_reply(&reply));
     }
+    // The launch says what its completion should do about the session (D174), rather than leaving
+    // the session to infer it from the call's own association. Reading the task is `tasks` (D182).
+    let wake = args.wake.unwrap_or(true);
+    let started = start_task(&request)?;
+    let task = wake_task(&started.id, wake)?;
+    let mut text = format_task(&task);
+    text.push_str(if wake {
+        "\nthe session will be resumed when this finishes; read it with the tasks tool (action: status)"
+    } else {
+        "\nthe session will not be resumed when this finishes; arm it with the tasks tool (action: wait) or read it with action: status"
+    });
+    Ok((text, true))
 }
 
 pub fn format_reply(reply: &ExecReply) -> (String, bool) {
@@ -151,7 +79,7 @@ pub fn format_reply(reply: &ExecReply) -> (String, bool) {
 /// What `list` says about one task: how it stands, and how it ended (D179). A record outlives its
 /// command, so a poll after the fact still answers what the answer was.
 #[cfg(target_arch = "wasm32")]
-fn state(task: &Task) -> String {
+pub(crate) fn state(task: &Task) -> String {
     if task.running {
         return "running".into();
     }
@@ -210,8 +138,8 @@ impl Tool for Bash {
     fn describe() -> Definition {
         Definition {
             name:"bash".into(),
-            description:"run sh -c in the workspace through the delegated exec sandbox. Filesystem/environment/net reach comes from this plugin's runtime grants and protected sandbox configuration, not the agent's broader grants; network uses the policy proxy or falls back to none. background=true starts a session-owned task and returns its id promptly, and the session resumes you when it finishes unless wake=false, so you can do other work meanwhile; action=wait arms a task started with wake=false, answers at once and never blocks the call. action=status/list/cancel with task_id inspect bounded live output or stop it. Only one shell command per workspace may run at a time. Tasks stop on session exit/reload. Timeout bounds the task lifetime, never raises grants or configured limits. Capture is bounded per stream; presentation is host-configurable. Cancellation kills the process group.".into(),
-            input_schema:json!({"type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":"integer","minimum":1},"background":{"type":"boolean"},"wake":{"type":"boolean","description":"with background: whether the session resumes you when the task finishes (default true)"},"action":{"type":"string","enum":["run","status","list","cancel","wait"]},"task_id":{"type":"string"}},"additionalProperties":false}).to_string(),
+            description:"run sh -c in the workspace through the delegated exec sandbox. Filesystem/environment/net reach comes from this plugin's runtime grants and protected sandbox configuration, not the agent's broader grants; network uses the policy proxy or falls back to none. background=true starts a session-owned task and returns its id promptly; the tasks tool then reports, stops or waits on it, and the session resumes you when it finishes unless wake=false, so you can do other work meanwhile. Only one shell command per workspace may run at a time. Tasks stop on session exit/reload. Timeout bounds the task lifetime, never raises grants or configured limits. Capture is bounded per stream; presentation is host-configurable. Cancellation kills the process group.".into(),
+            input_schema:json!({"type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":"integer","minimum":1},"background":{"type":"boolean"},"wake":{"type":"boolean","description":"with background: whether the session resumes you when the task finishes (default true)"}},"required":["command"],"additionalProperties":false}).to_string(),
         }
     }
     fn invoke(arguments: String) -> Output {

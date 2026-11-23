@@ -2277,7 +2277,8 @@ pub fn base_prompt(session: &Session, context: &[ContextFile]) -> String {
     );
     s.push_str(
         "\nread, write and edit work on files; ls, find and grep explore the workspace. bash runs \
-         `sh -c` with the workspace as the working directory.\n\nEvery tool call is checked against a policy file that the user \
+         `sh -c` with the workspace as the working directory, and `background: true` returns a task id \
+         that tasks reports on, stops or waits for.\n\nEvery tool call is checked against a policy file that the user \
          owns and the agent cannot write. The policy can change during a session: when the user \
          changes a grant, the grants below are updated in this prompt before your next request. A \
          refused call returns a result starting with \"denied:\" and the reason; if the grant it \

@@ -391,6 +391,11 @@ fn existing_configs_need_explicit_standard_profiles_and_omitted_scopes_never_inh
     fs::write(env.policy_path(), toml::to_string(&doc).unwrap()).unwrap();
     let (ok, text) = env.tool("read", serde_json::json!({"path":"README"}));
     assert!(!ok && text.contains("no native fallback"), "{text}");
+    // the refusal names the row to add, not only the mechanism that refused (D182)
+    assert!(
+        text.contains(r#"read = ["fs-read", "tool-read"]"#),
+        "{text}"
+    );
     let mut profiles = toml::Table::new();
     profiles.insert(
         "write".into(),

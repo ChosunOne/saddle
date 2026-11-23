@@ -548,14 +548,23 @@ impl Registry {
             })
             .map(|(id, _)| id.clone());
         let Some(id) = owner else {
-            let status = artifact(name)
-                .and_then(|artifact| PluginId::new(artifact.id))
+            let shipped = artifact(name).and_then(|artifact| PluginId::new(artifact.id));
+            let status = shipped
+                .clone()
                 .and_then(|id| self.status.get(&id))
-                .map(String::as_str)
-                .unwrap_or("no explicit [standard-tools] entry or plugin enablement");
-            let why = format!(
-                "tool {name:?} is not enabled, granted and loaded: {status}; use saddle plugin list (no native fallback)"
-            );
+                .map(String::as_str);
+            // A shipped tool that nothing selected is the one migration an existing config has to
+            // make, so the refusal names the row to add rather than only the mechanism that refused
+            // (D182). A tool that has an entry and did not load keeps its own reason.
+            let why = match (shipped, status, standard::default_entry(name)) {
+                (Some(_), None, Some(entry)) => format!(
+                    "tool {name:?} is not selected: add {entry} under [standard-tools] in the protected config (saddle tools --config prints the table; no native fallback)"
+                ),
+                (_, status, _) => format!(
+                    "tool {name:?} is not enabled, granted and loaded: {}; use saddle plugin list (no native fallback)",
+                    status.unwrap_or("no explicit [standard-tools] entry or plugin enablement")
+                ),
+            };
             session.audit.event(
                 Kind::Decision,
                 Some(&Principal::Agent),

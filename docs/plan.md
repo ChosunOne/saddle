@@ -3561,9 +3561,9 @@ unwind-safe, passed explicitly to the component worker and never leaks to subseq
 No SDK ABI, component build variant, digest or operational authority changes.
 
 **D153.** Background shell work is explicit and session-owned, not a detached `&` command or a
-persistent Wasm instance. The bash guest accepts `background: true` on its default `run` action,
-returns a host-generated task id promptly, and owns `status`, `list` and `cancel` workflows and
-formatting. `task_id` selects a task; status returns a bounded snapshot of stdout/stderr available
+persistent Wasm instance. The bash guest accepts `background: true`, returns a host-generated task id
+promptly, and the `tasks` guest owns the `status`, `list`, `cancel` and `wait` workflows and their
+formatting (D182). `task_id` selects a task; status returns a bounded snapshot of stdout/stderr available
 so far, and cancellation requests process-group termination. Foreground behavior remains the default.
 The additive `saddle:host/exec-tasks` interface offers typed start/inspect/list/cancel effects under
 `exec`, without changing the existing exec interface, scope set or explicit delegation profiles.
@@ -4474,7 +4474,7 @@ the `exec` interface are all deleted.
   there is one answer to "may this be written" rather than two.
 
 **D179.** Polling a task answers after it ends, and never claims an ending it has not had. This
-settles what `bash`'s `status`, `list` and `wait` report about a session-owned task (D153, D174).
+settles what `tasks`' `status`, `list` and `wait` report about a session-owned task (D153, D174).
 
 - **A record outlives its command.** `start` keeps a finished task's reply until `exec-tasks`
   (16 by default) is full and the oldest finished record makes way. So `status` after the fact is how
@@ -4515,12 +4515,51 @@ was true a millisecond earlier (D153, D179).
   say.
 - **The detail falls back to the action**: `status task-7f3a`, `list`, `cancel task-7f3a`,
   `wait task-7f3a`. A command still wins whenever there is one, so a background launch reads
-  `$ cargo test` exactly as before.
+  `$ cargo test` exactly as before. Since D182 the poll is its own tool, so the header reads
+  `tasks status task-7f3a` — the fallback is what lets it, and any other call whose arguments name no
+  path or command, say something rather than nothing.
 - **The renderer refuses the degenerate form.** A `bash` block whose first line is empty shows the
   tool's own name instead of a bare `$`, and no tool's header carries a trailing space when it has no
   detail — which is also the `● bash ` line-mode printed for the same call.
 - **Presentation only.** The conversation still holds the arguments the model sent; nothing here
   rewrites a call, and a replay draws the same header from the same arguments.
+
+**D182.** The task surface is a tool of its own: `bash` runs a command, `tasks` reports on, stops or
+waits for the background task it started.
+
+- **Why it is not a `bash` call.** A poll is not a shell command. The schema had to accept a `run`
+  shape and then refuse it per action ("command, background and wake are only valid for action run"),
+  every one of those rules a turn a model can spend; and the transcript's `bash` header is `$ ` plus
+  the command, so a poll drew a `$` with nothing after it (D181 fixed the symptom). The split gives
+  `tasks` a schema with two fields and no mode: `action`, and the `task_id` the action names.
+- **The holder is the agent, when a shipped tool asks.** Principal isolation (D153) is by principal,
+  and `bash` and `tasks` are two `standard-*` identities — so a task `bash` started would be invisible
+  to `tasks` if ownership were the component id. A shipped standard tool holds only what the agent
+  delegated to that profile and cannot do anything the agent could not, so `tasks` keys the *holder*
+  of a task as `Principal::Agent` for any `standard-*` caller. A third-party plugin's task stays its
+  own: another plugin still cannot read or cancel it. The recorded owner is the principal that ran
+  the command, so a task's proxy decisions are made under that profile and the audit names it.
+- **What did not change.** The `exec` scope, the `saddle:host/exec-tasks` service, principal
+  isolation for third-party plugins, the budgets, the task record's retention (D179), the cancel wait
+  (D180) and the wake rules (D174) are all as they were. `bash` still launches: `background: true`
+  and `wake` remain its arguments, because starting the task is running the command.
+- **The cost is one more name.** `tasks` is a thirteenth shipped tool with its own
+  `[standard-tools]` entry (`tasks = ["exec"]`), so it appears in the prompt and in `saddle tools`.
+  Entries are explicit by design: an existing config that grants `bash` and not `tasks` keeps running
+  commands and cannot poll until the row is added, which the first-run defaults and
+  `saddle tools --config` state.
+- **The completion notice names `tasks`.** The notice a finished task leaves in the conversation said
+  "inspect its output with the owning bash tool", which after the split names a tool that refuses and
+  an owner that no longer exists. It now says "read it with the tasks tool (action: status)" for a
+  task the agent holds, and for one another principal started it says only that principal can read
+  it — the notice must not send the model to a call that will be refused, nor promise output the
+  agent's reach does not cover (D153).
+- **The refusal names the row.** A shipped tool that nothing selected used to answer that it was "not
+  enabled, granted and loaded: no explicit [standard-tools] entry", with `saddle plugin list` as the
+  next step — which points at the mechanism that refused rather than the line to write. It now says
+  `denied: tool "tasks" is not selected: add tasks = ["exec"] under [standard-tools] in the protected
+  config`, read out of the defaults' own text so it matches `saddle tools --config`. A tool that does
+  have an entry and failed to load keeps its own reason, and a third-party plugin is unaffected.
 
 ## 4. Scope enumeration
 

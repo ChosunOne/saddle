@@ -27,7 +27,7 @@ because it is followed.
 | `crates/saddle-wit` | canonical read-tool WIT and generated host bindings (D127) |
 | `crates/saddle-loader` | actual component inspection, bounded delegation, typed checked-import binding with exhaustive adapters (D150), fresh bounded instances and a narrow host-services trait, without a dependency on the binary's session (D126, D127) |
 | `crates/saddle-sdk` | guest bindings generated from the same WIT, so a guest can call only the host services it imports; no `std::fs` authority, no ambient filesystem or socket (D12, D127, D140) |
-| `crates/saddle-tools` | standard guest tools: text/image reads, pagination, listing, traversal/search, transcript queries, write/edit/patch, shell and HTTP/search workflows, and the configuration reference compiled from `docs/settings.md` (D171); uses runtime-gated SDK services, not native filesystem/database access. Mutations and reads cover policy roots and delegated D66 directories; guests emit minimal human-only hunks and guarded preimages (D131–D147) |
+| `crates/saddle-tools` | standard guest tools: text/image reads, pagination, listing, traversal/search, transcript queries, write/edit/patch, shell and background-task workflows, HTTP/search, and the configuration reference compiled from `docs/settings.md` (D171); uses runtime-gated SDK services, not native filesystem/database access. Mutations and reads cover policy roots and delegated D66 directories; guests emit minimal human-only hunks and guarded preimages (D131–D147) |
 | `crates/saddle-ignore` | authority-free ignore-file parsing, shared by skill discovery, the editor's file-name completion and the guest search components (D68, D133) |
 | `crates/saddle-sandbox` | applies a sandbox spec to the current process and execs the target, including the command's own network namespace and the relay in it (D79); starts a long-lived child whose stdin and stdout belong to the caller, with the spec on fd 3 (D106); also builds the `saddle-sandbox` helper binary used by its own tests |
 | `crates/saddle` | the binary: tool dispatch, model providers, the model loop, the TUI |
@@ -69,8 +69,8 @@ Inside `crates/saddle/src`:
 intercepts `__sandbox` before clap parses anything — that is the helper process path, and it must stay
 first in `main`.
 
-The ordinary tool names are `read`, `write`, `edit`, `patch`, `ls`, `find`, `grep`, `bash`, `fetch`,
-`websearch`, `session_query` and `config_help` (`tools::NAMES`); each runs a shipped WASI component
+The ordinary tool names are `read`, `write`, `edit`, `patch`, `ls`, `find`, `grep`, `bash`, `tasks`,
+`fetch`, `websearch`, `session_query` and `config_help` (`tools::NAMES`); each runs a shipped WASI component
 chosen by the protected `[standard-tools]` table, and the binary holds no native implementation of any
 of them (D146, D147). `config_help` is `docs/settings.md` compiled into a guest that imports only the
 budgets snapshot, so its entry delegates no scope: `config_help = []` (D171). The one name that is
@@ -138,17 +138,18 @@ execution option unless the underlying schema already declares it. Expiry stops 
 returns a failed result; cleanup/restore/audit still finish, committed effects are not rolled back,
 and remote MCP work cannot be guaranteed cancelled. Omission retains existing defaults.
 
-`bash` accepts `background: true` to return a session-owned task id, then `action: "status"`,
-`"list"` or `"cancel"` with `task_id` as appropriate (D153); `cancel` waits a bounded moment for the
+`bash` accepts `background: true` to return a session-owned task id, and the separate `tasks` tool
+then reports, stops or waits on it — `status`, `list`, `cancel` or `wait` with `task_id` as
+appropriate (D153, D182); `cancel` waits a bounded moment for the
 process group to be reaped so its own reply says `cancelled` rather than `running` (D180). A finished
 task keeps answering: `status`
 reports its exit status and bounded capture until `exec-tasks` evicts the record, `list` says
 `finished (exit 0)`/`cancelled`/`timed out` per task, and a running one never prints an exit line
-(D179). The guest owns these workflows; the
-additive `exec-tasks` SDK service is bounded by the existing `exec` grant and isolates principals.
-A task's completion resumes the agent unless the launch said `wake: false`, and `action: "wait"`
-arms one later — `exec-tasks.set-wake`, additive, authorized and audited like inspect and cancel
-(D174). `wait` answers at once and never blocks the call, and a one-shot `saddle run` waits for a
+(D179). The guests own these workflows; the additive `exec-tasks` SDK service is bounded by the
+existing `exec` grant, and a task is held by the principal that asked — the agent, when a shipped
+`standard-*` tool started it, so `bash` and `tasks` are one holder (D182). A task's completion
+resumes the agent unless the launch said `wake: false`, and `tasks` `action: "wait"` arms one
+later — `exec-tasks.set-wake`, additive, authorized and audited like inspect and cancel (D174). `wait` answers at once and never blocks the call, and a one-shot `saddle run` waits for a
 task it will be woken by instead of exiting and killing it (D174). A call that runs no command names
 its action and task in the transcript's header — `$ status task-7f3a` — because the header is the
 call's detail and a poll has no command to show (D181).

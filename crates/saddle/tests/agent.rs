@@ -476,6 +476,7 @@ fn tool_loop(api: Api) {
             "ls",
             "patch",
             "read",
+            "tasks",
             "write"
         ]
     );
@@ -655,7 +656,7 @@ fn background_output_and_completed_task_retention_are_bounded_by_runtime_budgets
                 thread::sleep(Duration::from_millis(150));
                 vec![(
                     "status",
-                    "bash",
+                    "tasks",
                     json!({"action":"status","task_id":background_id(body)}),
                 )]
             }
@@ -674,7 +675,7 @@ fn background_output_and_completed_task_retention_are_bounded_by_runtime_budgets
             }
             3 => vec![(
                 "old",
-                "bash",
+                "tasks",
                 json!({"action":"status","task_id":background_id(body)}),
             )],
             _ => {
@@ -720,15 +721,15 @@ fn background_shell_returns_live_output_isolates_principals_and_serializes_until
                 assert!(result_text(body, "start").contains("running"));
                 thread::sleep(Duration::from_millis(200));
                 vec![
-                    ("live", "bash", json!({"action":"status","task_id":id})),
+                    ("live", "tasks", json!({"action":"status","task_id":id})),
                     (
                         "foreign",
-                        "plugin__reader__bash",
+                        "plugin__reader__tasks",
                         json!({"action":"status","task_id":id}),
                     ),
                     (
                         "foreign-cancel",
-                        "plugin__reader__bash",
+                        "plugin__reader__tasks",
                         json!({"action":"cancel","task_id":id}),
                     ),
                     (
@@ -745,7 +746,7 @@ fn background_shell_returns_live_output_isolates_principals_and_serializes_until
                 assert!(!result_text(body, "foreign").contains("SECRET-EARLY"));
                 assert!(result_text(body, "foreign-cancel").contains("unknown task"));
                 assert!(result_text(body, "busy").contains("workspace shell execution is busy"));
-                vec![("cancel", "bash", json!({"action":"cancel","task_id":id}))]
+                vec![("cancel", "tasks", json!({"action":"cancel","task_id":id}))]
             }
             3 => {
                 // D180: the call that asked for the cancellation answers with the ending, rather
@@ -754,7 +755,7 @@ fn background_shell_returns_live_output_isolates_principals_and_serializes_until
                 assert!(text.contains("finished"), "{text}");
                 assert!(text.contains("cancelled by the user"), "{text}");
                 thread::sleep(Duration::from_millis(150));
-                vec![("done", "bash", json!({"action":"status","task_id":id}))]
+                vec![("done", "tasks", json!({"action":"status","task_id":id}))]
             }
             4 => {
                 assert!(result_text(body, "done").contains("cancelled"));
@@ -770,9 +771,11 @@ fn background_shell_returns_live_output_isolates_principals_and_serializes_until
     let env = Env::new(Api::Openai, &base);
     fs::write(env.ws.path().join(".git/config"), "original").unwrap();
     let config = env.xdg.path().join("config/saddle/config.toml");
+    // The foreign principal is the tasks surface installed as a third-party plugin, so it asks the
+    // same host service under its own id and must still be refused (D182).
     plugin_fixture::configure(
         &config,
-        &standard_component("bash"),
+        &standard_component("tasks"),
         "tool={}\nexec={timeout-secs=10}\nfs-read=[{root='workspace'}]\nfs-write=[{root='workspace'}]",
     );
     fs::write(config.parent().unwrap().join("plugins/reader/plugin.toml"), "id='reader'\nversion='0.1.0'\ncomponent='component.wasm'\nscopes=['tool','exec','fs-read','fs-write','net']\n").unwrap();
@@ -819,14 +822,14 @@ fn background_timeout_runs_during_model_wait_and_notices_do_not_expose_process_o
                 thread::sleep(Duration::from_millis(1300));
                 vec![(
                     "status",
-                    "bash",
+                    "tasks",
                     json!({"action":"status","task_id":background_id(body)}),
                 )]
             }
             2 => {
                 assert!(result_text(body, "status").contains("command timed out"));
                 assert!(result_text(body, "status").contains("OUTPUT-NOT-A-NOTICE"));
-                vec![("list", "bash", json!({"action":"list"}))]
+                vec![("list", "tasks", json!({"action":"list"}))]
             }
             _ => {
                 let messages = body["messages"].as_array().unwrap();
@@ -892,7 +895,7 @@ fn background_completion_wakes_idle_sessions_once_without_new_input() {
                     "",
                     &[(
                         "status",
-                        "bash",
+                        "tasks",
                         json!({"action":"status","task_id":background_id(body)}),
                     )],
                 ))
@@ -988,7 +991,7 @@ fn a_one_shot_run_waits_for_a_task_it_will_be_woken_by() {
                 "",
                 &[(
                     "status",
-                    "bash",
+                    "tasks",
                     json!({"action":"status","task_id":background_id(body)}),
                 )],
             ))
@@ -1075,7 +1078,7 @@ fn a_declined_wake_ends_the_run_and_wait_arms_one_later() {
             "",
             &[(
                 "armed",
-                "bash",
+                "tasks",
                 json!({"action":"wait","task_id":background_id(body)}),
             )],
         )),
@@ -1098,7 +1101,7 @@ fn a_declined_wake_ends_the_run_and_wait_arms_one_later() {
                 "",
                 &[(
                     "status",
-                    "bash",
+                    "tasks",
                     json!({"action":"status","task_id":background_id(body)}),
                 )],
             ))
@@ -1146,7 +1149,7 @@ fn a_finished_task_answers_a_later_poll_with_its_exit_status_and_output() {
                 assert!(result_text(body, "start").contains("running"));
                 assert!(!result_text(body, "start").contains("exited"));
                 thread::sleep(Duration::from_millis(300));
-                vec![("live", "bash", json!({"action":"status","task_id":id}))]
+                vec![("live", "tasks", json!({"action":"status","task_id":id}))]
             }
             2 => {
                 assert!(
@@ -1165,7 +1168,7 @@ fn a_finished_task_answers_a_later_poll_with_its_exit_status_and_output() {
                     result_text(body, "live")
                 );
                 thread::sleep(Duration::from_millis(1500));
-                vec![("done", "bash", json!({"action":"status","task_id":id}))]
+                vec![("done", "tasks", json!({"action":"status","task_id":id}))]
             }
             3 => {
                 let text = result_text(body, "done");
@@ -1176,7 +1179,7 @@ fn a_finished_task_answers_a_later_poll_with_its_exit_status_and_output() {
                     "its output is still readable: {text}"
                 );
                 assert!(!text.contains("unknown task"), "{text}");
-                vec![("list", "bash", json!({"action":"list"}))]
+                vec![("list", "tasks", json!({"action":"list"}))]
             }
             4 => {
                 let text = result_text(body, "list");
@@ -1264,12 +1267,12 @@ fn background_tasks_are_cancelled_before_permission_reload_and_the_artifact_stay
         sse_response(&openai_sse("started", &[])),
         sse_response(&openai_sse(
             "",
-            &[("revoked", "bash", json!({"action":"list"}))],
+            &[("revoked", "tasks", json!({"action":"list"}))],
         )),
         sse_response(&openai_sse("done", &[])),
         sse_response(&openai_sse(
             "",
-            &[("enabled", "bash", json!({"action":"list"}))],
+            &[("enabled", "tasks", json!({"action":"list"}))],
         )),
         sse_response(&openai_sse("done", &[])),
     ]);
