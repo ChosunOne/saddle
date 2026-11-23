@@ -39,6 +39,8 @@ pub enum Mode {
     Http,
     /// The proxy protocol: `CONNECT`, an absolute URL, or origin form.
     Proxy,
+    /// named-launch proxy: CONNECT requests to port 22 use the SSH grant (D192).
+    NamedProxy,
 }
 
 /// The other end of a connection the proxy opened on the guest's behalf.
@@ -132,7 +134,7 @@ fn negotiate(
         let step = if mode == Mode::Tls {
             decide_tls(&buf, peer)?
         } else {
-            decide_http(&buf, peer)?
+            decide_http(&buf, mode, peer)?
         };
         match step {
             Step::More => {}
@@ -192,7 +194,7 @@ fn decide_tls(buf: &[u8], peer: &mut dyn Peer) -> io::Result<Step> {
 }
 
 /// A plaintext request: a `CONNECT` line, an absolute URL, or an origin-form `Host` header.
-fn decide_http(buf: &[u8], peer: &mut dyn Peer) -> io::Result<Step> {
+fn decide_http(buf: &[u8], mode: Mode, peer: &mut dyn Peer) -> io::Result<Step> {
     match head::route(buf) {
         Route::Incomplete => Ok(Step::More),
         Route::Unknown => Ok(Step::Refuse(
@@ -201,7 +203,10 @@ fn decide_http(buf: &[u8], peer: &mut dyn Peer) -> io::Result<Step> {
         Route::TooLong => Ok(Step::Refuse(
             "the request head never ended within the size a head may be".to_owned(),
         )),
-        Route::Tunnel(target) => {
+        Route::Tunnel(mut target) => {
+            if mode == Mode::NamedProxy && target.port == 22 {
+                target.scheme = "ssh".into();
+            }
             let mut step = permit("connect", &target, &[], Vec::new(), peer)?;
             if let Step::Go(plan) = &mut step {
                 plan.reply = Some(b"HTTP/1.1 200 Connection Established\r\n\r\n".to_vec());
@@ -545,6 +550,39 @@ mod tests {
         assert_eq!(peer.decided, ["https://crates.io:443"]);
         assert!(written.starts_with("HTTP/1.1 200 Connection Established\r\n\r\n"));
         assert!(outcome.denials.is_empty());
+    }
+
+    #[test]
+    fn only_named_proxy_connect_to_port_22_is_classified_as_ssh() {
+        for (mode, request, expected) in [
+            (
+                Mode::NamedProxy,
+                "CONNECT github.com:22 HTTP/1.1",
+                "ssh://github.com:22",
+            ),
+            (
+                Mode::Proxy,
+                "CONNECT github.com:22 HTTP/1.1",
+                "https://github.com:22",
+            ),
+            (
+                Mode::NamedProxy,
+                "CONNECT github.com:443 HTTP/1.1",
+                "https://github.com:443",
+            ),
+            (
+                Mode::NamedProxy,
+                "GET https://github.com:22/ HTTP/1.1",
+                "https://github.com:22",
+            ),
+        ] {
+            let mut peer = Fake::refusing("test denial");
+            let (outcome, reply) = run(mode, format!("{request}\r\n\r\n").as_bytes(), &mut peer);
+            assert_eq!(peer.decided, [expected]);
+            assert!(peer.opened.is_empty());
+            assert_eq!(outcome.denials, ["test denial"]);
+            assert!(reply.starts_with("HTTP/1.1 403"));
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! named launch confinement and pinned executables (D184, D186, D188, D189, D191).
+//! named launch confinement and pinned executables (D184, D186, D188, D189, D191, D193).
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -55,11 +55,6 @@ const RUNTIME_READ: &[&str] = &[
 
 pub(crate) fn enter(spec: &SandboxSpec, guard: &NamedLaunch) -> Result<Infallible, SandboxError> {
     launch_availability().map_err(SandboxError::Unavailable)?;
-    if !spec.write.is_empty() {
-        return Err(SandboxError::Spec(
-            "named launches do not support writable paths".into(),
-        ));
-    }
     let path = Path::new(&spec.argv[0]);
     let executable = verified_executable(path, guard.executable_sha256.as_ref(), guard)?;
     let argv = strings(spec.argv.iter().map(String::as_str))?;
@@ -367,6 +362,25 @@ fn confine_files(
             )));
         };
         rules = rules.add_rule(PathBeneath::new(file, access)).map_err(ll)?;
+    }
+    for path in &spec.write {
+        reject_overlap(path, &guard.protected)?;
+        let dir = open_pinned(path, false).map_err(|error| {
+            SandboxError::Spec(format!(
+                "opening launch write path {}: {error}",
+                path.display()
+            ))
+        })?;
+        if !dir.metadata()?.is_dir() {
+            return Err(SandboxError::Spec(format!(
+                "launch write path must be a directory: {}",
+                path.display()
+            )));
+        }
+        // Everything but Execute: a writable tree must never become a place to run a new
+        // program, which is why approved executables are checked against this reach (D188).
+        let write = AccessFs::from_all(abi) & !AccessFs::Execute;
+        rules = rules.add_rule(PathBeneath::new(dir, write)).map_err(ll)?;
     }
     let status = rules.restrict_self().map_err(ll)?;
     if status.ruleset != RulesetStatus::FullyEnforced || !status.no_new_privs {

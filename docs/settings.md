@@ -234,12 +234,19 @@ absolute or start with `~/`, without `..`. `timeout-secs`, if set, is a positive
 a different executable, define a new profile by name. `saddle check` prints the effective definition
 and names the fields from the workspace file. No settings in the checkout define a profile.
 
-Named launches can read the current workspace by default (D190), including repository metadata.
-This is separate from the `read` list: `read = []` clears only extra paths. To opt out, set
-`read-workspace = false` in the profile or its protected workspace override. This grants
-read-only access to the workspace tree without applying file-tool exclusions; it does not extend
-outside the tree through symlinks or change permissions for other tools. If the workspace overlaps
-Saddle's protected config or state, the launch refuses the claim.
+Named launches can read and write the current workspace by default (D190, D193), including
+repository metadata such as `.jj` and `.git`. These are separate from the `read` list:
+`read = []` clears only extra paths. Set `read-workspace = false` or `write-workspace = false` in
+the profile or its protected workspace override to opt out of either; a write claim implies
+reading the workspace, so removing both needs both set to false. The claims cover the
+workspace tree without applying file-tool exclusions, because landlock cannot carve a path out of
+a granted directory; a `write` claim therefore reaches paths such as `.env` that the file tools
+may not. A write claim never grants execution, so a file written there is still refused as an executable.
+Neither claim extends outside the tree through symlinks, and neither changes permissions
+for other tools or for `bash`. A program that can read a credential can copy it into the
+workspace, where the agent can read it, so grant a writable profile only as much read reach as its
+trusted programs need. If the workspace overlaps Saddle's protected config or state, the launch
+refuses the claim.
 
 If the program launches other programs, list the exact binaries in `helpers` (D186). For example,
 Git's `git-remote-https` may be a symlink to `/usr/lib/git-core/git-remote-http`; list the real
@@ -283,6 +290,34 @@ binary runs without network. Omit `net` at both levels for a purely local profil
 ```sh
 saddle --profile github tool run_binary '{"profile":"gh","argv":["api","user","--jq",".login"]}'
 ```
+
+### SSH for named launches
+
+`ssh-hosts = ["github.com"]` in a launch profile permits that destination on port 22 only when
+its caller also has a matching `{ host = "github.com", scheme = "ssh" }` entry in `net`. The
+standard tool must delegate `net` as above. This is a separate grant from HTTPS; there is no SSH
+access by default. OpenSSH needs an HTTP CONNECT-capable `ProxyCommand`, for example the following
+in a dedicated SSH client config on a machine with Ncat installed:
+
+```sshconfig
+Host github.com
+    User git
+    Port 22
+    ProxyCommand /usr/bin/ncat --proxy 127.0.0.1:3128 --proxy-type http %h %p
+    BatchMode yes
+    IdentitiesOnly yes
+    IdentityAgent none
+    IdentityFile ~/.ssh/saddle-deploy-key
+    UserKnownHostsFile ~/.ssh/saddle-known-hosts
+    StrictHostKeyChecking yes
+    UpdateHostKeys no
+```
+
+The profile must authorize the actual helper executables (for `jj`, Git, OpenSSH, the shell used
+by `ProxyCommand`, and Ncat), and the client config, dedicated key, and verified known-hosts file
+must be readable inside the profile. Use a repository-scoped deploy key and verify the server's
+host key independently. Anyone who can invoke the profile may be able to read a key it can read.
+The proxy does not expose a local SSH agent and does not force a remote to use SSH.
 
 `argv` excludes the executable. Arguments are literal and unrestricted by Saddle; a CLI or its
 helpers can return a credential they can read. Use a dedicated, appropriately scoped credential if

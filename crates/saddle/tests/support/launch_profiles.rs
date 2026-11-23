@@ -375,15 +375,10 @@ fn launch_profile_workspace_read_is_default_and_can_be_disabled() {
     assert!(!ok && !text.contains("not-for-the-launch"), "{text}");
     let (ok, text) = run("exec 3<>/dev/null && printf discarded >&3", &input);
     assert!(ok && !text.contains("discarded"), "{text}");
-    let (ok, text) = run("printf changed > \"$1\"", &input);
-    assert!(!ok && text.contains("Permission denied"), "{text}");
-    assert_eq!(
-        fs::read_to_string(&input).unwrap(),
-        "workspace-read-fixture"
-    );
 
+    // Writing implies reading, so both switches are needed to remove the workspace entirely.
     env.write_override(&format!(
-        "{grant}[launch-profiles.fixture]\nread-workspace = false\n"
+        "{grant}[launch-profiles.fixture]\nread-workspace = false\nwrite-workspace = false\n"
     ));
     let (ok, text) = run(read, &input);
     assert!(
@@ -395,7 +390,64 @@ fn launch_profile_workspace_read_is_default_and_can_be_disabled() {
     let text = String::from_utf8_lossy(&check.stdout);
     assert!(
         text.contains("read-workspace = false")
+            && text.contains("write-workspace = false")
             && text.contains("workspace fields: read-workspace"),
+        "{text}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn launch_profile_workspace_write_is_default_and_can_be_disabled() {
+    if saddle_sandbox::launch_availability().is_err() {
+        return;
+    }
+    let env = Env::new();
+    let target = env.ws.path().join("written");
+    let outside = env.outside.path().join("outside");
+    env.write_config("[launch-profiles.fixture]\nexecutable = '/usr/bin/bash'\nread = []\n");
+    let grant = "[agent]\nrun-binary = [{profile='fixture'}]\n";
+    env.write_override(grant);
+    let run = |command: &str, path: &Path| {
+        let input = json!({"profile":"fixture","argv":["-c",command,"fixture",path]});
+        let out = env.saddle(&[
+            "--revoke",
+            "exec",
+            "--revoke",
+            "fs-read",
+            "--revoke",
+            "fs-write",
+            "tool",
+            "run_binary",
+            &input.to_string(),
+        ]);
+        (
+            out.status.success(),
+            format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out)),
+        )
+    };
+    let (ok, text) = run("printf changed > \"$1\"", &target);
+    assert!(ok, "{text}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "changed");
+    let (ok, text) = run("printf leaked > \"$1\"", &outside);
+    assert!(
+        !ok && text.contains("Permission denied") && !outside.exists(),
+        "{text}"
+    );
+
+    env.write_override(&format!(
+        "{grant}[launch-profiles.fixture]\nwrite-workspace = false\n"
+    ));
+    fs::remove_file(&target).unwrap();
+    let (ok, text) = run("printf changed > \"$1\"", &target);
+    assert!(!ok && text.contains("Permission denied"), "{text}");
+    assert!(!target.exists());
+    let check = env.saddle(&["check"]);
+    assert!(check.status.success(), "{}", stderr(&check));
+    let text = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        text.contains("write-workspace = false")
+            && text.contains("workspace fields: write-workspace"),
         "{text}"
     );
 }

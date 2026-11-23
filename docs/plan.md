@@ -4684,6 +4684,27 @@ can use it to fill missing standard descriptors. Landlock grants `WriteFile` on 
 null character device (major 1, minor 3) only. This adds no writable directory, regular file,
 or profile-defined write permission and does not change the ordinary exec sandbox.
 
+**D192.** Named launches can opt into SSH on port 22 with a protected `ssh-hosts` list of exact
+hosts. A `CONNECT host:22` request on the named launch's loopback proxy is checked as `scheme =
+"ssh"` against both this ceiling and the caller's delegated `net` grants, then relayed unchanged.
+The bridge dials only the addresses returned by that decision, with no second DNS lookup. This
+adds no route to the namespace, no SSH agent socket, and no change to ordinary shell proxy request
+classification. Direct SSH handshakes name no host and still cannot use the relay. Client-side
+host-key verification and credential selection remain with OpenSSH. The proxy confines the tunnel
+destination, not the contents of the encrypted stream.
+
+**D193.** The canonical current workspace is also a default write claim of a named launch, so
+version-control workflows such as `jj git push` can record local metadata. `write-workspace`
+inherits and overrides as a scalar and defaults to true. A write claim includes the read rights,
+so removing all workspace access needs both switches off; `read-workspace` alone narrows a
+read-only profile. Landlock cannot exclude a path inside a granted root, so file-tool exclusions do
+not narrow this claim and it reaches the whole tree. It grants no write outside the workspace, never `Execute`
+inside it, and no additional network reach, so a file the caller writes there cannot become a
+program the profile runs (D188). Because the claim is paired with the profile's
+read reach, a profile that can read a credential can write it into the workspace where the caller
+can read it; that consequence belongs to the person choosing the profile. `check` reports both
+switches.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

@@ -342,13 +342,18 @@ pub fn launch(
         environment.push((key.clone(), value.clone()));
     }
     let hosts = profile.net.clone();
+    let ssh_hosts = profile.ssh_hosts.clone();
     let net_granted = session.engine.policy().grants(who).is_some_and(|g| {
         hosts
             .iter()
             .any(|host| g.net.iter().any(|grant| grant.allows("https", host, 443)))
+            || ssh_hosts
+                .iter()
+                .any(|host| g.net.iter().any(|grant| grant.allows("ssh", host, 22)))
     });
     let mut bridge = if net_granted {
-        let bridge = Bridge::start(dir.path()).context("starting named-launch network proxy")?;
+        let bridge =
+            Bridge::start_named(dir.path()).context("starting named-launch network proxy")?;
         let proxy = format!("http://127.0.0.1:{PROXY_PORT}");
         for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
             environment.push((key.into(), proxy.clone()));
@@ -369,7 +374,13 @@ pub fn launch(
             .chain(profile.read_workspace.then_some(&session.setup.workspace))
             .cloned()
             .collect(),
-        write: Vec::new(),
+        // D193: the workspace is writable by default. Landlock cannot carve a path out of a
+        // granted root, so file-tool exclusions do not narrow this claim.
+        write: profile
+            .write_workspace
+            .then(|| session.setup.workspace.clone())
+            .into_iter()
+            .collect(),
         net: bridge.as_ref().map(Bridge::spec),
         named_launch: Some(NamedLaunch {
             protected,
@@ -404,7 +415,7 @@ pub fn launch(
                 stop.store(true, Ordering::Relaxed);
             }
             if let Some(bridge) = bridge.as_mut() {
-                match bridge.service_bounded(session, who, Some(call), Some(&hosts)) {
+                match bridge.service_bounded(session, who, Some(call), Some((&hosts, &ssh_hosts))) {
                     Ok(notes) => denials.extend(
                         notes
                             .into_iter()

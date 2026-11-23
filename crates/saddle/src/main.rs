@@ -1241,14 +1241,20 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
             };
             println!("  {name}: {:?} ({access})", profile.executable);
             println!("    read = {:?}", profile.read);
-            if profile.read_workspace {
-                println!("    read-workspace = true ({:?})", setup.workspace);
-            } else {
-                println!("    read-workspace = false");
+            for (label, enabled) in [
+                ("read-workspace", profile.read_workspace),
+                ("write-workspace", profile.write_workspace),
+            ] {
+                if enabled {
+                    println!("    {label} = true ({:?})", setup.workspace);
+                } else {
+                    println!("    {label} = false");
+                }
             }
             println!("    helpers = {:?}", profile.helpers);
             println!("    verify-sha256 = {}", profile.verify_sha256);
             println!("    net (HTTPS/443 ceiling) = {:?}", profile.net);
+            println!("    ssh-hosts (SSH/22 ceiling) = {:?}", profile.ssh_hosts);
             if let Some(seconds) = profile.timeout_secs {
                 println!("    timeout-secs = {seconds}");
             }

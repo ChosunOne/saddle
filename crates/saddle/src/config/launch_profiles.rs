@@ -22,9 +22,11 @@ pub struct Definition {
     executable: Option<String>,
     read: Option<Vec<String>>,
     read_workspace: Option<bool>,
+    write_workspace: Option<bool>,
     helpers: Option<Vec<String>>,
     verify_sha256: Option<bool>,
     net: Option<Vec<String>>,
+    ssh_hosts: Option<Vec<String>>,
     timeout_secs: Option<NonZeroU32>,
 }
 
@@ -34,9 +36,11 @@ pub struct Resolved {
     pub executable: PathBuf,
     pub read: Vec<PathBuf>,
     pub read_workspace: bool,
+    pub write_workspace: bool,
     pub helpers: Vec<PathBuf>,
     pub verify_sha256: bool,
     pub net: Vec<String>,
+    pub ssh_hosts: Vec<String>,
     pub timeout_secs: Option<NonZeroU32>,
     pub workspace_fields: Vec<&'static str>,
 }
@@ -72,9 +76,19 @@ pub fn resolve(
                 inherited.read = Some(read);
                 source.push("read");
             }
-            if let Some(read_workspace) = fields.read_workspace {
-                inherited.read_workspace = Some(read_workspace);
-                source.push("read-workspace");
+            for (value, name) in [
+                (fields.read_workspace, "read-workspace"),
+                (fields.write_workspace, "write-workspace"),
+            ] {
+                if let Some(value) = value {
+                    let target = if name == "read-workspace" {
+                        &mut inherited.read_workspace
+                    } else {
+                        &mut inherited.write_workspace
+                    };
+                    *target = Some(value);
+                    source.push(name);
+                }
             }
             if let Some(helpers) = fields.helpers {
                 inherited.helpers = Some(helpers);
@@ -88,6 +102,10 @@ pub fn resolve(
                 inherited.net = Some(net);
                 source.push("net");
             }
+            if let Some(hosts) = fields.ssh_hosts {
+                inherited.ssh_hosts = Some(hosts);
+                source.push("ssh-hosts");
+            }
             if let Some(timeout) = fields.timeout_secs {
                 inherited.timeout_secs = Some(timeout);
                 source.push("timeout-secs");
@@ -100,6 +118,9 @@ pub fn resolve(
             if fields.read_workspace.is_some() {
                 source.push("read-workspace");
             }
+            if fields.write_workspace.is_some() {
+                source.push("write-workspace");
+            }
             if fields.helpers.is_some() {
                 source.push("helpers");
             }
@@ -108,6 +129,9 @@ pub fn resolve(
             }
             if fields.net.is_some() {
                 source.push("net");
+            }
+            if fields.ssh_hosts.is_some() {
+                source.push("ssh-hosts");
             }
             if fields.timeout_secs.is_some() {
                 source.push("timeout-secs");
@@ -144,6 +168,7 @@ pub fn resolve(
                     executable,
                     read,
                     read_workspace: definition.read_workspace.unwrap_or(true),
+                    write_workspace: definition.write_workspace.unwrap_or(true),
                     helpers,
                     verify_sha256: definition.verify_sha256.unwrap_or(false),
                     net: definition
@@ -152,6 +177,7 @@ pub fn resolve(
                         .into_iter()
                         .map(|host| host.to_ascii_lowercase())
                         .collect(),
+                    ssh_hosts: definition.ssh_hosts.unwrap_or_default(),
                     timeout_secs: definition.timeout_secs,
                     workspace_fields,
                 },
@@ -168,6 +194,13 @@ fn validate(name: &str, fields: &Definition) -> Result<()> {
         if !matches!(HostPattern::parse(host), Ok(HostPattern::Exact(_))) {
             bail!(
                 "launch-profiles.{name}.net needs an exact hostname or IP for HTTPS on port 443, got {host:?}"
+            );
+        }
+    }
+    for host in fields.ssh_hosts.iter().flatten() {
+        if !matches!(HostPattern::parse(host), Ok(HostPattern::Exact(_))) {
+            bail!(
+                "launch-profiles.{name}.ssh-hosts needs an exact hostname or IP for SSH on port 22, got {host:?}"
             );
         }
     }

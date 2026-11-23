@@ -214,6 +214,7 @@ fn valid_hostname(s: &str) -> bool {
 pub enum UrlScheme {
     Https,
     Http,
+    Ssh,
 }
 
 impl UrlScheme {
@@ -221,6 +222,7 @@ impl UrlScheme {
         match self {
             UrlScheme::Https => "https",
             UrlScheme::Http => "http",
+            UrlScheme::Ssh => "ssh",
         }
     }
 
@@ -228,6 +230,7 @@ impl UrlScheme {
         match self {
             UrlScheme::Https => 443,
             UrlScheme::Http => 80,
+            UrlScheme::Ssh => 22,
         }
     }
 }
