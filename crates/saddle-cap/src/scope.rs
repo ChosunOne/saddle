@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "kebab-case")]
 pub enum Scope {
     Exec,
+    RunBinary,
     FsRead,
     ToolRead,
     ToolWrite,
@@ -27,8 +28,9 @@ pub enum Scope {
 }
 
 impl Scope {
-    pub const ALL: [Scope; 16] = [
+    pub const ALL: [Scope; 17] = [
         Scope::Exec,
+        Scope::RunBinary,
         Scope::FsRead,
         Scope::ToolRead,
         Scope::ToolWrite,
@@ -49,6 +51,7 @@ impl Scope {
     pub fn as_str(self) -> &'static str {
         match self {
             Scope::Exec => "exec",
+            Scope::RunBinary => "run-binary",
             Scope::FsRead => "fs-read",
             Scope::ToolRead => "tool-read",
             Scope::ToolWrite => "tool-write",

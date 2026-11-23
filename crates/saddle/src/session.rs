@@ -18,7 +18,7 @@ use crate::standard::Profiles;
 use saddle_cap::policy;
 use saddle_cap::roots;
 use saddle_limits::Budgets;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::fs::DirBuilder;
@@ -129,6 +129,7 @@ pub fn roots_for_validation() -> Result<Roots> {
 pub struct Setup {
     pub sandbox_override: Option<SandboxSource>,
     pub launch_profiles: BTreeMap<String, LaunchProfile>,
+    pub granted_launch_profiles: BTreeSet<String>,
     pub standard_tools: Profiles,
     pub tool_limits: Budgets,
     pub plugins: BTreeMap<PluginId, PluginEntry>,
@@ -252,21 +253,22 @@ impl Setup {
             sandbox_override = Some(sandbox_overrides::apply(
                 &mut user, &paths, &roots, &workspace, &own_path, &own_text, &doc,
             )?);
+            if (doc.contains_key("launch-profiles")
+                || doc
+                    .get("agent")
+                    .and_then(|agent| agent.get("run-binary"))
+                    .is_some())
+                && !doc
+                    .get("workspace")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|claimed| Some(claimed) == workspace.to_str())
+            {
+                bail!("launch profile overrides require a matching canonical workspace line");
+            }
             let launch_overlay = match doc.get("launch-profiles") {
-                Some(value) => {
-                    if !doc
-                        .get("workspace")
-                        .and_then(toml::Value::as_str)
-                        .is_some_and(|claimed| Some(claimed) == workspace.to_str())
-                    {
-                        bail!(
-                            "launch profile overrides require a matching canonical workspace line"
-                        );
-                    }
-                    value.clone().try_into().with_context(|| {
-                        format!("invalid launch profiles in {}", own_path.display())
-                    })?
-                }
+                Some(value) => value.clone().try_into().with_context(|| {
+                    format!("invalid launch profiles in {}", own_path.display())
+                })?,
                 None => BTreeMap::new(),
             };
             launch_profiles = launch_profiles::resolve(
@@ -350,6 +352,19 @@ impl Setup {
         // table declares is the mistake that would otherwise show up as a server that never
         // starts, so it is named here.
         let agent_grants = merged.grants(&Principal::Agent);
+        let mut granted_launch_profiles = BTreeSet::new();
+        if let Some(grants) = agent_grants {
+            for grant in &grants.run_binary {
+                if !launch_profiles.contains_key(&grant.profile) {
+                    bail!(
+                        "{} names undefined launch profile {:?}",
+                        grant.rule,
+                        grant.profile
+                    );
+                }
+                granted_launch_profiles.insert(grant.profile.clone());
+            }
+        }
         let mut mcp = Vec::new();
         for (name, entry) in &user.mcp {
             let what = match entry.transport() {
@@ -399,6 +414,7 @@ impl Setup {
         Ok(Self {
             sandbox_override,
             launch_profiles,
+            granted_launch_profiles,
             standard_tools: user.standard_tools,
             tool_limits: user.tool_limits,
             plugins: user.plugins,

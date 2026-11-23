@@ -4596,8 +4596,14 @@ requires a new name. Invalid workspace definitions fail setup rather than fallin
 `check` shows effective definitions and which fields came from the workspace. These paths never
 become roots, ordinary sandbox extras, or file-tool paths.
 
-The first increment is configuration and inspection only, covering `executable`, `read` and
-`timeout-secs`. It confers no authority. The intended runtime is one shipped foreground tool with
+Configuration and inspection cover `executable`, `read` and `timeout-secs`. The separate
+`run-binary` scope names exact profiles with `run-binary = [{ profile = "name" }]`. It layers like
+other named grants: omission inherits, `[]` replaces with no grants, and `["-name"]` subtracts.
+The effective agent grant must name an effective definition, and `check` reports both. A policy
+decision for that name carries no ordinary `exec` or filesystem authority. There is no component
+binding yet, and the grant cannot start a process until a launcher enforces the profile.
+
+The intended runtime is one shipped foreground tool with
 literal arguments and a named launch grant independent of `exec`. The host, not the guest, resolves
 the approved definition and confines the child. The ordinary sandbox must not be extended: the same
 binary launched through `bash` has exactly its ordinary reach. Before enabling invocation, the
@@ -4617,6 +4623,7 @@ helper; ordinary `bash` and `read` never acquire the named read, and the named l
 | scope | grants | declared by | enforced at |
 | --- | --- | --- | --- |
 | `exec` | running commands and session-owned tasks | `saddle:host/exec`, `saddle:host/exec-tasks` imports | sandbox helper (D18, D19); the network it reaches is `net` (D79) |
+| `run-binary` | permission for an exact launch profile name | `run-binary` grant (D184); no component import yet | policy decision; process launch is not implemented |
 | `fs-read` | reading files under granted roots | `saddle:host/fs-read` import | policy per call |
 | `tool-read` | bounded reads of existing D66 tool paths under explicitly delegated read-only roles | ordinary filesystem-read imports (D139); legacy `saddle:host/tool-paths` | policy per requested/resolved location and current configuration entry (D138) |
 | `tool-write` | mutations of existing D66 tool paths under explicitly delegated write roles | ordinary `saddle:host/fs-write` import (D141) | policy per requested/resolved location and current configuration entry |

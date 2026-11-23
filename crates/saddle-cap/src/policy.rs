@@ -128,6 +128,23 @@ pub struct ExecGrant {
     pub timeout: Duration,
 }
 
+/// permission to invoke one protected launch profile, not reach to its files (D184).
+#[derive(Debug, Clone)]
+pub struct LaunchGrant {
+    pub rule: RuleId,
+    pub why: String,
+    pub profile: String,
+}
+
+/// syntax shared between the protected definition and the grant that names it (D184).
+pub fn valid_launch_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostPattern {
     /// A hostname or an IP literal.
@@ -372,6 +389,7 @@ pub struct Grants {
     pub fs_read: Vec<FsGrant>,
     pub fs_write: Vec<FsGrant>,
     pub exec: Option<ExecGrant>,
+    pub run_binary: Vec<LaunchGrant>,
     pub net: Vec<NetGrant>,
     pub mcp: Vec<McpGrant>,
     pub model_invoke: Option<BudgetGrant>,
@@ -408,6 +426,9 @@ impl Grants {
         if self.exec.is_some() {
             out.insert(Scope::Exec);
         }
+        if !self.run_binary.is_empty() {
+            out.insert(Scope::RunBinary);
+        }
         if !self.net.is_empty() {
             out.insert(Scope::Net);
         }
@@ -418,6 +439,13 @@ impl Grants {
             out.insert(Scope::ModelInvoke);
         }
         out
+    }
+
+    /// the grant for this exact profile name (D184).
+    pub fn launch_profile(&self, profile: &str) -> Option<&LaunchGrant> {
+        self.run_binary
+            .iter()
+            .find(|grant| grant.profile == profile)
     }
 
     /// The grant for one server, which is what decides every call to it (D103).
@@ -476,6 +504,7 @@ fn entry_name(scope: &str) -> Option<&'static str> {
         "fs-read" | "fs-write" => Some("root"),
         "net" => Some("host"),
         "mcp" => Some("server"),
+        "run-binary" => Some("profile"),
         _ => None,
     }
 }
@@ -674,6 +703,8 @@ struct RawGrants {
     fs_write: Vec<RawFs>,
     exec: Option<RawExec>,
     #[serde(default)]
+    run_binary: Vec<RawLaunch>,
+    #[serde(default)]
     net: Vec<RawNet>,
     #[serde(default)]
     mcp: Vec<RawMcp>,
@@ -706,6 +737,13 @@ struct RawExec {
     #[serde(default)]
     env: Vec<String>,
     timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLaunch {
+    profile: String,
+    why: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -838,6 +876,12 @@ impl Policy {
                 lines.push(with_why(
                     format!("{} = timeout {}s{env}", e.rule, e.timeout.as_secs()),
                     &e.why,
+                ));
+            }
+            for launch in &g.run_binary {
+                lines.push(with_why(
+                    format!("{} = profile {}", launch.rule, launch.profile),
+                    &launch.why,
                 ));
             }
             for n in &g.net {
@@ -1009,6 +1053,21 @@ fn lower(who: &Principal, raw: RawGrants, roots: &Roots) -> Result<Grants, Polic
             rule,
             env: e.env,
             timeout,
+        });
+    }
+
+    for (i, launch) in raw.run_binary.into_iter().enumerate() {
+        let rule = RuleId::new(who, Scope::RunBinary, Some(i));
+        if !valid_launch_profile_name(&launch.profile) {
+            return Err(invalid(
+                &rule,
+                "expected an exact launch profile name (1-64 letters, digits, `-` or `_`)",
+            ));
+        }
+        grants.run_binary.push(LaunchGrant {
+            rule,
+            why: why(launch.why),
+            profile: launch.profile,
         });
     }
 

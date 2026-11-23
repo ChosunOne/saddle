@@ -209,8 +209,9 @@ deny rule and cannot carve a hole in a parent claim.
 
 ## launch-profiles
 
-Launch profile definitions (D184) are currently inspection-only. They do not enable a tool or
-give existing tools access to the listed files. Define a default in `config.toml`:
+Launch profiles (D184) are currently inspection-only: Saddle validates definitions and grants but
+does not launch them or give existing tools access to the listed files. Define a default in
+`config.toml`:
 
 ```toml
 [launch-profiles.gh]
@@ -232,6 +233,18 @@ replaces the whole inherited list; `+`/`-` list operators are not supported here
 absolute or start with `~/`, without `..`. `timeout-secs`, if set, is a positive integer. To choose
 a different executable, define a new profile by name. `saddle check` prints the effective definition
 and names the fields from the workspace file. No settings in the checkout define a profile.
+
+To grant a profile, separately add this to the global or protected workspace `[agent]` table:
+
+```toml
+[agent]
+run-binary = [{ profile = "gh" }]
+```
+
+An effective agent grant must name a defined profile. A workspace can replace the global grant
+list, clear it with `run-binary = []`, or subtract one with `run-binary = ["-gh"]`. Use
+`--grant run-binary:gh` or `--revoke run-binary` to change the grants for one run. `saddle check`
+shows the result independently of `exec`. This grant does not give `bash` any new access.
 
 ## standard-tools
 

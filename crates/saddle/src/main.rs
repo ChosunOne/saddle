@@ -1229,9 +1229,14 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
         }
     }
     if !setup.launch_profiles.is_empty() {
-        println!("launch profiles (definitions only; invocation is not implemented)");
+        println!("launch profiles (invocation is not implemented)");
         for (name, profile) in &setup.launch_profiles {
-            println!("  {name}: {:?}", profile.executable);
+            let access = if setup.granted_launch_profiles.contains(name) {
+                "granted"
+            } else {
+                "not granted"
+            };
+            println!("  {name}: {:?} ({access})", profile.executable);
             println!("    read = {:?}", profile.read);
             if let Some(seconds) = profile.timeout_secs {
                 println!("    timeout-secs = {seconds}");

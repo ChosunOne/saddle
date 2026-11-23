@@ -6,6 +6,7 @@ use std::num::NonZeroU32;
 use std::path::{Component, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use saddle_cap::policy::valid_launch_profile_name;
 use serde::Deserialize;
 
 use super::sandbox_overrides::resolve_missing;
@@ -107,12 +108,7 @@ pub fn resolve(
 }
 
 fn validate(name: &str, fields: &Definition) -> Result<()> {
-    if name.is_empty()
-        || name.len() > 64
-        || !name
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
-    {
+    if !valid_launch_profile_name(name) {
         bail!("invalid launch profile name {name:?}: use 1-64 letters, digits, `-` or `_`");
     }
     for path in fields.executable.iter().chain(fields.read.iter().flatten()) {

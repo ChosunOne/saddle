@@ -1209,7 +1209,10 @@ impl Overrides {
             match rest {
                 "" => {
                     // A scope with no parameters: `exec`, `net` is not one of these.
-                    if matches!(scope, "fs-read" | "fs-write" | "net" | "tool" | "tool-read") {
+                    if matches!(
+                        scope,
+                        "fs-read" | "fs-write" | "net" | "tool" | "tool-read" | "run-binary"
+                    ) {
                         bail!(
                             "--grant {scope} needs what it grants, as in `--grant {scope}:scratch`"
                         );
@@ -1251,6 +1254,10 @@ impl Overrides {
                             if !exclude.is_empty() {
                                 grant.insert("exclude".into(), toml::Value::Array(exclude));
                             }
+                            toml::Value::Table(grant)
+                        }
+                        "run-binary" => {
+                            grant.insert("profile".into(), toml::Value::String(rest.to_owned()));
                             toml::Value::Table(grant)
                         }
                         "net" => {

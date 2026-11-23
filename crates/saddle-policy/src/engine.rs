@@ -33,6 +33,10 @@ pub enum Request<'a> {
         argv: &'a [String],
         cwd: &'a Location,
     },
+    /// invoke a protected definition; no executable or path authority comes from this request.
+    RunBinary {
+        profile: &'a str,
+    },
     /// session-owned process observation/control, still bounded by exec (D153).
     ExecTask {
         operation: &'a str,
@@ -88,6 +92,7 @@ impl Request<'_> {
             Request::FsRead { .. } => Scope::FsRead,
             Request::FsWrite { .. } => Scope::FsWrite,
             Request::Exec { .. } | Request::ExecTask { .. } => Scope::Exec,
+            Request::RunBinary { .. } => Scope::RunBinary,
             Request::Net { .. } => Scope::Net,
             Request::ModelInvoke { .. } | Request::ModelReserve { .. } => Scope::ModelInvoke,
             Request::TranscriptQuery { .. } => Scope::TranscriptRead,
@@ -112,6 +117,7 @@ impl Request<'_> {
                 json!({ "path": loc.to_string() })
             }
             Request::Exec { argv, cwd } => json!({ "argv": argv, "cwd": cwd.to_string() }),
+            Request::RunBinary { profile } => json!({"profile":profile}),
             Request::ExecTask { operation, id } => json!({"operation":operation,"task":id}),
             Request::Net {
                 method,
@@ -386,6 +392,13 @@ impl Engine {
                 Some(g) => Decision::allow(scope, &g.rule, &g.why),
                 None => Decision::deny(scope, format!("{who} has no exec grant")),
             },
+            Request::RunBinary { profile } => match grants.launch_profile(profile) {
+                Some(grant) => Decision::allow(scope, &grant.rule, &grant.why),
+                None => Decision::deny(
+                    scope,
+                    format!("{who} has no run-binary grant for profile {profile:?}"),
+                ),
+            },
             Request::Net {
                 scheme, host, port, ..
             } => match grants.net.iter().find(|g| g.allows(scheme, host, *port)) {
@@ -594,6 +607,51 @@ model-invoke = { tokens-per-session = 100, why = "summaries" }
         )
         .unwrap();
         (ws, Engine::new(policy))
+    }
+
+    #[test]
+    fn launch_permission_is_exact_and_independent_of_exec_and_other_principals() {
+        let (ws, _) = engine();
+        let roots = Roots::resolve([(RootName::workspace(), ws.path().into())], &[]).unwrap();
+        let agent = Principal::Agent;
+        let plugin = Principal::Plugin(PluginId::new("shell").unwrap());
+        let launch = Request::RunBinary { profile: "fixture" };
+        let cwd = Location::new(RootName::workspace(), RelPath::default());
+        let ordinary = Request::Exec {
+            argv: &[],
+            cwd: &cwd,
+        };
+        let base = "version = 1\n[agent]\nrun-binary = [{ profile = 'fixture' }]\n[plugin.shell]\nexec = {}\n";
+        let granted = Engine::new(Policy::parse(base, &roots).unwrap());
+        assert_eq!(launch.args(), json!({"profile":"fixture"}));
+        let decision = granted.decide(&agent, &launch);
+        assert!(decision.allow);
+        assert_eq!(decision.explanation, "agent.run-binary[0]");
+        assert!(
+            !granted
+                .decide(&agent, &Request::RunBinary { profile: "Fixture" })
+                .allow
+        );
+        assert!(!granted.decide(&agent, &ordinary).allow);
+        assert!(granted.decide(&plugin, &ordinary).allow);
+        assert!(!granted.decide(&plugin, &launch).allow);
+
+        let revoked = Engine::new(
+            Policy::layer(
+                base,
+                "version = 1\n[agent]\nrun-binary = ['-fixture']\n",
+                &roots,
+            )
+            .unwrap(),
+        );
+        assert!(!revoked.decide(&agent, &launch).allow);
+        assert!(
+            Policy::parse(
+                "version = 1\n[agent]\nrun-binary = [{profile = '*'}]\n",
+                &roots
+            )
+            .is_err()
+        );
     }
 
     #[test]

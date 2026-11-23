@@ -8,6 +8,43 @@ use serde_json::json;
 use super::{Env, stderr};
 
 #[test]
+fn launch_profile_grants_are_independent_and_layer_per_workspace() {
+    let env = Env::new();
+    env.write_config("[launch-profiles.fixture]\nexecutable = '/bin/cat'\n");
+    let check = |args: &[&str], access: &str| {
+        let output = env.saddle(args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("  fixture:") && line.ends_with(access)),
+            "{text}"
+        );
+        text.contains("agent.exec =")
+    };
+    check(&["check"], "(not granted)");
+    env.edit_agent(|agent| {
+        agent.insert(
+            "run-binary".into(),
+            toml::Value::try_from(json!([{"profile":"fixture"}])).unwrap(),
+        );
+    });
+    assert!(!check(&["--revoke", "exec", "check"], "(granted)"));
+    assert!(check(&["--revoke", "run-binary", "check"], "(not granted)"));
+    env.write_override("[agent]\nrun-binary = ['-fixture']\n");
+    check(&["check"], "(not granted)");
+    check(&["--grant", "run-binary:fixture", "check"], "(granted)");
+    env.write_override("[agent]\nrun-binary = [{ profile = 'undefined' }]\n");
+    let output = env.saddle(&["check"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("names undefined launch profile"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn launch_profile_fields_inherit_replace_and_clear() {
     let env = Env::new();
     let base_read = env.outside.path().join("secret");
