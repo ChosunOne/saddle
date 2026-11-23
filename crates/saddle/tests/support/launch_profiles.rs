@@ -373,6 +373,8 @@ fn launch_profile_workspace_read_is_default_and_can_be_disabled() {
     assert!(ok && text.contains("workspace-read-fixture"), "{text}");
     let (ok, text) = run(read, &link);
     assert!(!ok && !text.contains("not-for-the-launch"), "{text}");
+    let (ok, text) = run("exec 3<>/dev/null && printf discarded >&3", &input);
+    assert!(ok && !text.contains("discarded"), "{text}");
     let (ok, text) = run("printf changed > \"$1\"", &input);
     assert!(!ok && text.contains("Permission denied"), "{text}");
     assert_eq!(

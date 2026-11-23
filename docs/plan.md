@@ -4679,6 +4679,11 @@ both the switch and the workspace path if enabled. The workspace claim goes thro
 no-follow and protected-path overlap checks, has no execute or write rights, and does not change
 cwd, helper approval, or network reach.
 
+**D191.** Named launches can open `/dev/null` for both reading and writing so programs like Git
+can use it to fill missing standard descriptors. Landlock grants `WriteFile` on the pinned Linux
+null character device (major 1, minor 3) only. This adds no writable directory, regular file,
+or profile-defined write permission and does not change the ordinary exec sandbox.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

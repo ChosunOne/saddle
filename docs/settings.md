@@ -287,7 +287,8 @@ saddle --profile github tool run_binary '{"profile":"gh","argv":["api","user","-
 `argv` excludes the executable. Arguments are literal and unrestricted by Saddle; a CLI or its
 helpers can return a credential they can read. Use a dedicated, appropriately scoped credential if
 needed, and don't grant a profile whose full command surface you don't trust. The tool runs
-foreground only, with a private cwd and no writable paths. Use an absolute workspace path if the
+foreground only, with a private cwd and no writable files or directories; the system `/dev/null`
+device can be opened read-write (D191). Use an absolute workspace path if the
 program needs to locate the checkout. Workflows that update local refs or files are not supported.
 The entry point and helpers can be user-installed native ELF binaries (D188). Whitelist only files
 and directories whose contents

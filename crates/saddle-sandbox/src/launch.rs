@@ -1,4 +1,4 @@
-//! named launch confinement and optional pinned helper executables (D184, D186, D188, D189).
+//! named launch confinement and pinned executables (D184, D186, D188, D189, D191).
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -332,11 +332,19 @@ fn confine_files(
                 path.display()
             )));
         }
-        let access = if file.metadata()?.is_dir() {
+        let mut access = if metadata.is_dir() {
             access
         } else {
             access & !AccessFs::ReadDir
         };
+        if *written == "/dev/null" {
+            // Git opens this sink O_RDWR to fill any missing standard descriptors (D191).
+            // Check the pinned device identity before granting write, not just the pathname.
+            if metadata.rdev() != libc::makedev(1, 3) {
+                return Err(SandboxError::Spec("unexpected /dev/null device".into()));
+            }
+            access |= AccessFs::WriteFile;
+        }
         rules = rules.add_rule(PathBeneath::new(file, access)).map_err(ll)?;
     }
     for path in &spec.read {
