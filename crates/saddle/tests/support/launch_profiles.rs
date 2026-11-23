@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::os::unix::fs::symlink;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 
 use serde_json::json;
 
@@ -251,5 +253,79 @@ fn launch_profile_invalid_workspace_fields_do_not_fall_back() {
         stderr(&check).contains("require a matching canonical workspace line"),
         "{}",
         stderr(&check)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn launch_profile_helpers_are_default_on_bounded_and_narrowable() {
+    if saddle_sandbox::launch_availability().is_err() {
+        return;
+    }
+    let env = Env::new();
+    let allowed = env.home.path().join("helper-input");
+    let denied = env.home.path().join("not-helper-input");
+    fs::write(&allowed, "helper-read-fixture").unwrap();
+    fs::write(&denied, "must-not-be-disclosed").unwrap();
+    let local_helper = env.ws.path().join("local-cat");
+    fs::copy("/usr/bin/cat", &local_helper).unwrap();
+    env.write_config(
+        "[launch-profiles.fixture]\nexecutable = '/usr/bin/bash'\n\
+         helpers = ['/usr/bin/cat']\nread = ['~/helper-input', '/usr/bin/true']\n",
+    );
+    env.write_override("[agent]\nrun-binary = [{profile='fixture'}]\n");
+    let run = |command: &str, arg: &str, allow_children: Option<bool>| {
+        let mut input = json!({"profile":"fixture","argv":["-c",command,"fixture",arg]});
+        if let Some(allow) = allow_children {
+            input["allow_children"] = json!(allow);
+        }
+        let out = env.saddle(&["--revoke", "exec", "tool", "run_binary", &input.to_string()]);
+        (
+            out.status.success(),
+            format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out)),
+        )
+    };
+    // Force a child process, not bash's optimization of a final external command into exec.
+    let read = |path: &Path, allow_children| {
+        run(
+            "cat -- \"$1\" & wait $!",
+            path.to_str().unwrap(),
+            allow_children,
+        )
+    };
+    let (ok, text) = read(&allowed, None);
+    assert!(ok && text.contains("helper-read-fixture"), "{text}");
+    let (ok, text) = read(&denied, None);
+    assert!(
+        !ok && text.contains("Permission denied") && !text.contains("must-not-be-disclosed"),
+        "{text}"
+    );
+    let (ok, text) = run("exec /usr/bin/true", "", Some(true));
+    assert!(!ok && text.contains("Permission denied"), "{text}");
+    let (ok, text) = run(
+        "exec /usr/bin/cat -- \"$1\"",
+        allowed.to_str().unwrap(),
+        Some(false),
+    );
+    assert!(!ok && !text.contains("helper-read-fixture"), "{text}");
+
+    env.write_override(
+        "[agent]\nrun-binary = [{profile='fixture'}]\n[launch-profiles.fixture]\nhelpers = []\n",
+    );
+    let check = env.saddle(&["check"]);
+    assert!(check.status.success(), "{}", stderr(&check));
+    let text = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        text.contains("helpers = []") && text.contains("workspace fields: helpers"),
+        "{text}"
+    );
+    let (ok, text) = read(&allowed, Some(true));
+    assert!(!ok && !text.contains("helper-read-fixture"), "{text}");
+
+    env.write_override(&format!("[agent]\nrun-binary = [{{profile='fixture'}}]\n[launch-profiles.fixture]\nhelpers = [{:?}]\n", local_helper.to_str().unwrap()));
+    let (ok, text) = run("printf must-not-start", "", None);
+    assert!(
+        !ok && text.contains("agent-writable paths") && !text.contains("must-not-start"),
+        "{text}"
     );
 }

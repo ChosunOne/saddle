@@ -584,8 +584,9 @@ rather than loosening it.
   inspected by `saddle check` and invoked by `run_binary`. The protected workspace file can override fields:
   omitted fields inherit, supplied lists replace, and `[]` clears. An inherited executable cannot
   be overridden. The separate `run-binary` grant names an exact profile and can be layered or
-  revoked independently of `exec`. Do not add these paths to roots, file-tool access, or the
-  ordinary exec sandbox.
+  revoked independently of `exec`. Protected `helpers` are exact trusted executables (D186),
+  not implied by read paths; `allow_children: false` narrows a call to the initial executable.
+  Do not add these paths to roots, file-tool access, or the ordinary exec sandbox.
 - **`exec` is Linux-only** and needs landlock ABI 3 as a hard requirement. A command now has a network
   of its own (D79): a user and network namespace with no route out, a relay on its loopback, and a proxy
   in this process that decides every connection with the same engine, audit log and `net` grants as

@@ -1,4 +1,4 @@
-//! protected launch-profile definitions and workspace overlays (D184); no invocation authority.
+//! protected launch-profile definitions and workspace overlays (D184, D186); no invocation authority.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -20,6 +20,7 @@ pub type Definitions = BTreeMap<String, Definition>;
 pub struct Definition {
     executable: Option<String>,
     read: Option<Vec<String>>,
+    helpers: Option<Vec<String>>,
     net: Option<Vec<String>>,
     timeout_secs: Option<NonZeroU32>,
 }
@@ -29,6 +30,7 @@ pub struct Definition {
 pub struct Resolved {
     pub executable: PathBuf,
     pub read: Vec<PathBuf>,
+    pub helpers: Vec<PathBuf>,
     pub net: Vec<String>,
     pub timeout_secs: Option<NonZeroU32>,
     pub workspace_fields: Vec<&'static str>,
@@ -65,6 +67,10 @@ pub fn resolve(
                 inherited.read = Some(read);
                 source.push("read");
             }
+            if let Some(helpers) = fields.helpers {
+                inherited.helpers = Some(helpers);
+                source.push("helpers");
+            }
             if let Some(net) = fields.net {
                 inherited.net = Some(net);
                 source.push("net");
@@ -77,6 +83,9 @@ pub fn resolve(
             source.push("executable");
             if fields.read.is_some() {
                 source.push("read");
+            }
+            if fields.helpers.is_some() {
+                source.push("helpers");
             }
             if fields.net.is_some() {
                 source.push("net");
@@ -102,12 +111,20 @@ pub fn resolve(
                 .map(|path| check_path(path, protected))
                 .collect::<Result<_>>()
                 .with_context(|| format!("launch-profiles.{name}.read"))?;
+            let helpers = definition
+                .helpers
+                .unwrap_or_default()
+                .iter()
+                .map(|path| check_path(path, protected))
+                .collect::<Result<_>>()
+                .with_context(|| format!("launch-profiles.{name}.helpers"))?;
             let workspace_fields = workspace_fields.remove(&name).unwrap_or_default();
             Ok((
                 name,
                 Resolved {
                     executable,
                     read,
+                    helpers,
                     net: definition
                         .net
                         .unwrap_or_default()
@@ -133,7 +150,12 @@ fn validate(name: &str, fields: &Definition) -> Result<()> {
             );
         }
     }
-    for path in fields.executable.iter().chain(fields.read.iter().flatten()) {
+    for path in fields
+        .executable
+        .iter()
+        .chain(fields.read.iter().flatten())
+        .chain(fields.helpers.iter().flatten())
+    {
         expand(path).with_context(|| format!("launch-profiles.{name}"))?;
     }
     Ok(())

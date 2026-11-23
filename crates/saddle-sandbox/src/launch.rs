@@ -1,4 +1,4 @@
-//! strict, single-exec child confinement for named launch profiles (D184).
+//! named launch confinement and optional pinned helper executables (D184, D186).
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -14,6 +14,9 @@ use std::path::{Component, Path, PathBuf};
 use std::ptr;
 use std::sync::mpsc;
 use std::thread;
+
+#[cfg(target_arch = "x86_64")]
+use seccompiler::sock_filter as SockFilter;
 
 use landlock::{
     ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr,
@@ -57,16 +60,7 @@ pub(crate) fn enter(spec: &SandboxSpec, guard: &NamedLaunch) -> Result<Infallibl
         ));
     }
     let path = Path::new(&spec.argv[0]);
-    reject_overlap(path, &guard.protected)?;
-    reject_overlap(path, &guard.agent_write)?;
-    let mut executable = open_pinned(path, true)?;
-    let mut magic = [0; 4];
-    executable.read_exact(&mut magic)?;
-    if &magic != b"\x7fELF" {
-        return Err(SandboxError::Spec(
-            "launch executable must be a native ELF binary, not a script".into(),
-        ));
-    }
+    let executable = open_executable(path, guard)?;
     let argv = strings(spec.argv.iter().map(String::as_str))?;
     let environment: Vec<_> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let envp = strings(environment.iter().map(String::as_str))?;
@@ -84,8 +78,17 @@ pub(crate) fn enter(spec: &SandboxSpec, guard: &NamedLaunch) -> Result<Infallibl
     }
     env::set_current_dir(&spec.cwd)?;
     let networked = start_network(spec);
-    confine_files(spec, guard, &executable)?;
+    let helpers = guard
+        .helpers
+        .iter()
+        .map(|path| open_executable(path, guard))
+        .collect::<Result<Vec<_>, _>>()?;
+    confine_files(spec, guard, &executable, &helpers)?;
     confine_syscalls(networked)?;
+    if !helpers.is_empty() {
+        seal_filters()?;
+        return exec(path, &executable, &argv, &envp);
+    }
     let (send, receive) = mpsc::sync_channel::<File>(0);
     // Only trusted helper code is running. The monitor is started after Landlock, before the
     // exec-notification filter. It authorizes one syscall and drops the CLOEXEC listener. The
@@ -107,12 +110,21 @@ pub(crate) fn enter(spec: &SandboxSpec, guard: &NamedLaunch) -> Result<Infallibl
     seal_filters()?;
     send.send(listener)
         .map_err(|_| SandboxError::Spec("launch monitor stopped".into()))?;
+    exec(path, &executable, &argv, &envp)
+}
+
+fn exec(
+    path: &Path,
+    executable: &File,
+    argv: &[*const libc::c_char],
+    envp: &[*const libc::c_char],
+) -> Result<Infallible, SandboxError> {
     // SAFETY: the pinned ELF fd stays owned and argv/envp consist of live NUL-terminated strings
     // and a terminating null pointer. AT_EMPTY_PATH executes the opened inode, not a reopened path.
     unsafe {
         libc::syscall(
             libc::SYS_execveat,
-            fd,
+            executable.as_raw_fd(),
             c"".as_ptr(),
             argv.as_ptr(),
             envp.as_ptr(),
@@ -140,6 +152,21 @@ fn pointers(items: &[CString]) -> Vec<*const libc::c_char> {
         .map(|s| s.as_ptr())
         .chain([ptr::null()])
         .collect()
+}
+
+fn open_executable(path: &Path, guard: &NamedLaunch) -> Result<File, SandboxError> {
+    reject_overlap(path, &guard.protected)?;
+    reject_overlap(path, &guard.agent_write)?;
+    let mut executable = open_pinned(path, true)?;
+    let mut magic = [0; 4];
+    executable.read_exact(&mut magic)?;
+    if &magic != b"\x7fELF" {
+        return Err(SandboxError::Spec(format!(
+            "launch executable must be a native ELF binary, not a script: {}",
+            path.display()
+        )));
+    }
+    Ok(executable)
 }
 
 /// Open a canonical absolute path without following any links, using pinned parents. Restrict the
@@ -219,6 +246,7 @@ fn confine_files(
     spec: &SandboxSpec,
     guard: &NamedLaunch,
     executable: &File,
+    helpers: &[File],
 ) -> Result<(), SandboxError> {
     let ll = |error: landlock::RulesetError| SandboxError::Landlock(error.to_string());
     let abi = ABI::V6;
@@ -235,6 +263,14 @@ fn confine_files(
             AccessFs::ReadFile | AccessFs::Execute,
         ))
         .map_err(ll)?;
+    for helper in helpers {
+        rules = rules
+            .add_rule(PathBeneath::new(
+                helper.try_clone()?,
+                AccessFs::ReadFile | AccessFs::Execute,
+            ))
+            .map_err(ll)?;
+    }
     let owner = fs::metadata("/")?.uid();
     for (written, access) in LIB_DIRS
         .iter()
@@ -385,6 +421,36 @@ fn confine_syscalls(networked: bool) -> Result<(), SandboxError> {
     .map_err(sc)?
     .try_into()
     .map_err(sc)?;
+    // The x32 ABI uses the same audit architecture but aliases native syscall numbers. Reject it
+    // in both launch modes so it cannot evade restrictions such as socket and process-group rules.
+    #[cfg(target_arch = "x86_64")]
+    let program = {
+        let mut program = program;
+        program.splice(
+            0..0,
+            [
+                SockFilter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 0,
+                }, // load seccomp_data.nr
+                SockFilter {
+                    code: 0x35,
+                    jt: 0,
+                    jf: 1,
+                    k: 0x4000_0000,
+                }, // nr >= x32 bit
+                SockFilter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: libc::SECCOMP_RET_KILL_PROCESS,
+                },
+            ],
+        );
+        program
+    };
     seccompiler::apply_filter(&program).map_err(|error| SandboxError::Seccomp(error.to_string()))
 }
 
@@ -424,8 +490,6 @@ fn exec_listener() -> Result<File, SandboxError> {
         (libc::SYS_execve, Vec::new()),
         (libc::SYS_execveat, Vec::new()),
     ]);
-    // Prevent native-arch syscall-number aliases from evading the filter on x86-64. Its legacy
-    // x32 ABI uses the same audit architecture; reject x32 wholesale below.
     let mut program: BpfProgram =
         SeccompFilter::new(rules, SeccompAction::Allow, SeccompAction::Trace(0), arch)
             .map_err(sc)?
@@ -445,30 +509,6 @@ fn exec_listener() -> Result<File, SandboxError> {
             "missing launch notification action".into(),
         ));
     }
-    #[cfg(target_arch = "x86_64")]
-    program.splice(
-        0..0,
-        [
-            seccompiler::sock_filter {
-                code: 0x20,
-                jt: 0,
-                jf: 0,
-                k: 0,
-            }, // load seccomp_data.nr
-            seccompiler::sock_filter {
-                code: 0x35,
-                jt: 0,
-                jf: 1,
-                k: 0x4000_0000,
-            }, // nr >= x32 bit
-            seccompiler::sock_filter {
-                code: 0x06,
-                jt: 0,
-                jf: 0,
-                k: libc::SECCOMP_RET_KILL_PROCESS,
-            },
-        ],
-    );
     let prog = libc::sock_fprog {
         len: program.len() as u16,
         filter: program.as_mut_ptr().cast(),

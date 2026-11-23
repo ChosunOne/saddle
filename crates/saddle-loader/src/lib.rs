@@ -261,6 +261,7 @@ pub trait HostServices: Send + 'static {
         _call: &Invocation,
         _request: Launch,
         _allowance: Duration,
+        _allow_children: bool,
     ) -> anyhow::Result<Result<LaunchReply, String>> {
         Ok(Err("host does not implement named launches".into()))
     }
@@ -536,6 +537,14 @@ impl<H: HostServices> ExecHost for State<H> {
 
 impl<H: HostServices> LaunchHost for State<H> {
     fn run(&mut self, request: Launch) -> anyhow::Result<Result<LaunchReply, String>> {
+        self.run_with_options(request, true)
+    }
+
+    fn run_with_options(
+        &mut self,
+        request: Launch,
+        allow_children: bool,
+    ) -> anyhow::Result<Result<LaunchReply, String>> {
         if !valid_launch_profile_name(&request.profile)
             || request.timeout_secs == 0
             || request.argv.len() >= budgets::exec_arguments()
@@ -547,7 +556,7 @@ impl<H: HostServices> LaunchHost for State<H> {
         let allowance =
             Duration::from_secs(request.timeout_secs.min(budgets::exec_seconds() as u64));
         let result = self.host_wait(allowance, |host, call, left| {
-            host.run_binary(call, request, left)
+            host.run_binary(call, request, left, allow_children)
         })?;
         if matches!(&result, Ok(reply) if !valid_exec_output(&reply.stdout, &reply.stderr, &reply.denials))
         {

@@ -234,6 +234,15 @@ absolute or start with `~/`, without `..`. `timeout-secs`, if set, is a positive
 a different executable, define a new profile by name. `saddle check` prints the effective definition
 and names the fields from the workspace file. No settings in the checkout define a profile.
 
+If the program launches other programs, list the exact binaries in `helpers` (D186). For example,
+Git's `git-remote-https` may be a symlink to `/usr/lib/git-core/git-remote-http`; list the real
+file, not the symlink. A workspace can inherit, replace, or clear `helpers`, just like `read`.
+`run_binary` allows configured helpers by default. Pass `"allow_children": false` to deny all
+further executable launches for that call. An empty `helpers` list also denies further launches;
+`"allow_children": true` cannot override it. This controls program execution, not fork or thread
+creation. Every helper runs inside the same sandbox and cannot add access. A path in `read` does
+not make it executable.
+
 To grant a launch profile, add `run-binary` to the global `[agent]`, a named permission profile,
 or the protected workspace `[agent]`. For example, to grant `gh` only in the `github` permission
 profile (unless a workspace overrides it):
@@ -260,14 +269,15 @@ binary runs without network. Omit `net` at both levels for a purely local profil
 saddle --profile github tool run_binary '{"profile":"gh","argv":["api","user","--jq",".login"]}'
 ```
 
-`argv` excludes the executable. Arguments are literal and unrestricted by Saddle; a CLI can
-return a credential it can read. Use a dedicated, appropriately scoped credential if needed,
-and don't grant a profile whose full command surface you don't trust. The tool runs foreground
-only, with a private cwd and no inherited checkout, writable paths, or helper executables.
-Use a trusted system-owned native ELF binary; binaries in agent-writable roots and scripts are
-refused. Write the real paths for the executable and profile reads (for example `/usr/bin/cat`
-instead of `/bin/cat` where `/bin` is a symlink). This mode requires Linux with Landlock ABI 6 and
-seccomp user notification.
+`argv` excludes the executable. Arguments are literal and unrestricted by Saddle; a CLI or its
+helpers can return a credential they can read. Use a dedicated, appropriately scoped credential if
+needed, and don't grant a profile whose full command surface you don't trust. The tool runs
+foreground only, with a private cwd and no inherited checkout or writable paths. Workflows that
+need to update local refs or files are not supported. Use trusted system-owned native ELF files
+for the entry point and helpers; binaries in agent-writable roots and scripts are refused. Write
+real paths for all profile paths (for example `/usr/bin/cat` instead of `/bin/cat` where `/bin` is a
+symlink). Named launches require Linux with Landlock ABI 6; the initial-executable-only mode
+also requires seccomp user notification.
 
 ## standard-tools
 

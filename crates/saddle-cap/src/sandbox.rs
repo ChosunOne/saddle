@@ -69,6 +69,9 @@ pub struct SandboxSpec {
 pub struct NamedLaunch {
     pub protected: Vec<PathBuf>,
     pub agent_write: Vec<PathBuf>,
+    /// exact native helper executables; an empty list keeps the initial-exec-only mode (D186).
+    #[serde(default)]
+    pub helpers: Vec<PathBuf>,
 }
 
 /// User-level additions from `config.toml` (`[sandbox] read = [...]`, `write = [...]`), for

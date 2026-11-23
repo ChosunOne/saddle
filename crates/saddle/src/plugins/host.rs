@@ -140,6 +140,7 @@ enum Event {
     Launch {
         who: Principal,
         request: Launch,
+        allow_children: bool,
         deadline: Instant,
         answer: SyncSender<HostReply<LaunchReply, String>>,
     },
@@ -368,6 +369,7 @@ impl HostServices for Host {
         call: &Invocation,
         request: Launch,
         allowance: Duration,
+        allow_children: bool,
     ) -> Result<Result<LaunchReply, String>> {
         let (answer, result) = mpsc::sync_channel(1);
         let deadline = call.deadline().min(Instant::now() + allowance);
@@ -375,6 +377,7 @@ impl HostServices for Host {
             .send(Event::Launch {
                 who: call.principal().clone(),
                 request,
+                allow_children,
                 deadline,
                 answer,
             })
@@ -906,6 +909,7 @@ fn execute_inner(
             Ok(Event::Launch {
                 who,
                 request,
+                allow_children,
                 deadline,
                 answer,
             }) => {
@@ -915,6 +919,7 @@ fn execute_inner(
                         &who,
                         call,
                         request,
+                        allow_children,
                         deadline,
                         &mut execution_effects,
                     )

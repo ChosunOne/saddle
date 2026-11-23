@@ -83,13 +83,15 @@ implicit child rules are omitted so they cannot undo an exclusion. Existing conf
 receive the narrower defaults on startup/reload; no protected file is automatically rewritten.
 `saddle check` and the model prompt report the effective command read paths.
 
-## Named launches (D184)
+## Named launches (D184, D186)
 
 `run_binary` invokes a protected profile with literal `argv`; it neither imports `exec` nor
 inherits its sandbox, environment, or task controls. The exact profile name must be granted to the
 agent and delegated to the component. A third-party component uses the `saddle:host/run-binary`
-interface with that scope in its manifest and exact named grants in `[plugin.<id>]`. Network, if
-used, is independently delegated and narrowed by the profile. See [configuration](settings.md#launch-profiles).
+interface with that scope in its manifest and exact named grants in `[plugin.<id>]`. The SDK's
+`run_binary_with_options` can disable profile-approved helpers for one call; `run_binary` uses the
+default of allowing the configured helpers. Network, if used, is independently delegated and
+narrowed by the profile. See [configuration](settings.md#launch-profiles).
 
 ## Background shell work
 

@@ -4611,9 +4611,10 @@ borrowed workspace roots, a minimal environment, and dedicated read-only claims.
 but only when both the profile's exact HTTPS/443 host list and the caller's grants allow it. The
 ordinary sandbox is unchanged. The helper validates and pins a system-owned ELF executable, refuses
 runtime claims overlapping protected locations or agent write reach, and executes by descriptor.
-Landlock ABI 6 isolates filesystem and signals; the seccomp listener releases only the initial
-exec (including its trusted system runtime) and subsequent execs are denied, even for a loader or
-the same program. If the strict setup fails, it does not fall back to ordinary `exec`. The host
+Landlock ABI 6 isolates filesystem and signals. In the initial-executable-only mode (see D186), the
+seccomp listener releases only the initial exec (including its trusted system runtime); subsequent
+execs are denied, even for a loader or the same program. If the strict setup fails, it does not fall
+back to ordinary `exec`. The host
 audits the named decision and process outcome without capturing argv or output in that decision.
 Arguments are not a subcommand
 policy: a program can disclose any credential it can read, and a program that interprets untrusted
@@ -4630,6 +4631,21 @@ and foreground commands can overlap in the same or different sessions. The calle
 that shares files or outputs. Each launch still has its own sandbox, deadline, cancellation and
 audit attribution; the background task budget still applies. Foreground shell waits keep servicing
 the session's background task bridges through the same policy engine.
+
+**D186.** Named launch profiles can specify a `helpers` list of exact native ELF executables.
+The same protected overlay rules apply: omission inherits, a supplied list replaces, and `[]`
+clears. The initial executable still comes only from the protected profile and starts by its
+pinned descriptor. Helper paths have the same trust requirements as that initial executable.
+The launcher pins the approved files and gives Landlock execute rights on those inodes and the
+initial inode, not the directories that contain them or the profile's read paths. With helpers
+enabled, subsequent execs are limited by those rules. The seccomp, filesystem, and network
+restrictions and foreground lifecycle apply to descendants as well. `PATH` contains only the
+parent directories of the approved executables in this mode; it selects names, not authority.
+`run_binary` defaults `allow_children` to true, but a caller may turn it off for a call without
+changing the profile. `false` or an empty helper list retains D184's initial-exec-only mode. This
+is an executable policy, not a prohibition on fork or threading, and not an argv policy or a
+guarantee that an interpreter will not interpret code within the sandbox. There is no ordinary
+`exec` delegation, extra filesystem reach, writable claim, or network grant for helpers.
 
 ## 4. Scope enumeration
 

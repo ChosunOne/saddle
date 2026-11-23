@@ -1241,6 +1241,7 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
             };
             println!("  {name}: {:?} ({access})", profile.executable);
             println!("    read = {:?}", profile.read);
+            println!("    helpers = {:?}", profile.helpers);
             println!("    net (HTTPS/443 ceiling) = {:?}", profile.net);
             if let Some(seconds) = profile.timeout_secs {
                 println!("    timeout-secs = {seconds}");

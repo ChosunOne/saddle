@@ -35,6 +35,7 @@ interface run-binary {
     }
     record launch { profile: string, argv: list<string>, timeout-secs: u64 }
     run: func(request: launch) -> result<reply, string>;
+    run-with-options: func(request: launch, allow-children: bool) -> result<reply, string>;
 }
 
 // Session-owned subprocesses; importing this service grants no resources beyond exec (D153).

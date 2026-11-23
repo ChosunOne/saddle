@@ -1,14 +1,14 @@
 //! attributed subprocess effects and shared execution limits (D142, D152, D153, D185).
 
 use saddle_limits as budgets;
-use std::env;
+use std::env::{self, join_paths};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use saddle_cap::sandbox::{ExecRequest, NamedLaunch, PROXY_PORT, SandboxSpec, lower_exec};
 use saddle_cap::{Location, Principal, RelPath, RootName, Scope};
 use saddle_policy::{Kind, Request};
@@ -235,6 +235,7 @@ pub fn launch(
     who: &Principal,
     call: &str,
     request: Launch,
+    allow_children: bool,
     deadline: Instant,
     effects: &mut bool,
 ) -> Result<Result<LaunchReply, String>> {
@@ -250,7 +251,7 @@ pub fn launch(
         &request,
         &decision,
         call,
-        json!({"operation":"run-binary"}),
+        json!({"operation":"run-binary","allow_children":allow_children}),
     )?;
     if !decision.allow {
         return Ok(Err(format!("denied: {}", decision.explanation)));
@@ -304,7 +305,26 @@ pub fn launch(
         .prefix("launch-")
         .tempdir_in(&session.setup.paths.state)
         .context("creating private named-launch directory")?;
-    let mut environment = vec![("PATH".into(), String::new())];
+    let helpers = if allow_children {
+        profile.helpers.clone()
+    } else {
+        Vec::new()
+    };
+    // The lookup path is only a convenience. Landlock grants execute on exact pinned files.
+    let path = if helpers.is_empty() {
+        String::new()
+    } else {
+        join_paths(
+            [&profile.executable]
+                .into_iter()
+                .chain(&helpers)
+                .filter_map(|p| p.parent()),
+        )
+        .context("building helper lookup path")?
+        .into_string()
+        .map_err(|_| anyhow!("helper lookup path is not UTF-8"))?
+    };
+    let mut environment = vec![("PATH".into(), path)];
     if let Some((key, value)) = session.host_env.iter().find(|(key, _)| key == "HOME") {
         environment.push((key.clone(), value.clone()));
     }
@@ -334,6 +354,7 @@ pub fn launch(
         named_launch: Some(NamedLaunch {
             protected,
             agent_write,
+            helpers,
         }),
     };
     let helper = env::current_exe().context("locating the saddle binary")?;
