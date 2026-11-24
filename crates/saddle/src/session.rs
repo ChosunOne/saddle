@@ -29,6 +29,8 @@ use std::io::{Error, ErrorKind};
 use std::mem;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -664,6 +666,9 @@ pub struct Session {
     pub team: Manager,
     /// Who this session is to its team: "lead", or the worker name (D195).
     pub team_label: String,
+    /// Set by whoever holds this session when a command it is running must stop: a worker's
+    /// interrupt or stop, which reaches the child rather than waiting for it (D195).
+    pub cancel: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -761,6 +766,7 @@ impl Session {
             _tmp: tmp,
             team: Default::default(),
             team_label: "lead".into(),
+            cancel: Arc::new(AtomicBool::new(false)),
         };
         // Managed directories are pinned separately from policy-addressable roots (D138).
         session.tool_roots = configured_tool_roots(&session.setup);
@@ -829,6 +835,7 @@ impl Session {
             _tmp: tmp,
             team: self.team.child(),
             team_label: id.to_owned(),
+            cancel: Arc::new(AtomicBool::new(false)),
         };
         session.tool_roots = configured_tool_roots(&session.setup);
         let mut plugins = mem::take(&mut session.plugins);

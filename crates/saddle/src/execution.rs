@@ -185,14 +185,17 @@ pub fn execute(
     if let Some(bridge) = &bridge {
         prepared.spec.net = Some(bridge.spec());
     }
+    // A command ends for either reason: the person cancelled the turn in this process, or the
+    // session running it was told to stop (a worker's interrupt or stop, D195).
     let stop = AtomicBool::new(cancel::FLAG.load(Ordering::Relaxed));
+    let session_cancel = session.cancel.clone();
     let mut denials = Vec::new();
     let mut failure = None;
     *effects = true;
     let completed = prepared.run(
         &stop,
         &mut || {
-            if cancel::FLAG.load(Ordering::Relaxed) {
+            if cancel::FLAG.load(Ordering::Relaxed) || session_cancel.load(Ordering::Relaxed) {
                 stop.store(true, Ordering::Relaxed);
             }
             if failure.is_some() {
@@ -390,7 +393,10 @@ pub fn launch(
         }),
     };
     let helper = env::current_exe().context("locating the saddle binary")?;
+    // A command ends for either reason: the person cancelled the turn in this process, or the
+    // session running it was told to stop (a worker's interrupt or stop, D195).
     let stop = AtomicBool::new(cancel::FLAG.load(Ordering::Relaxed));
+    let session_cancel = session.cancel.clone();
     let mut denials = Vec::new();
     let mut failure = None;
     let left = end.saturating_duration_since(Instant::now());
@@ -411,7 +417,7 @@ pub fn launch(
         budgets::exec_capture_bytes(),
         &stop,
         &mut || {
-            if cancel::FLAG.load(Ordering::Relaxed) {
+            if cancel::FLAG.load(Ordering::Relaxed) || session_cancel.load(Ordering::Relaxed) {
                 stop.store(true, Ordering::Relaxed);
             }
             if let Some(bridge) = bridge.as_mut() {

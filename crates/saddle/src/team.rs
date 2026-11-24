@@ -45,6 +45,8 @@ pub struct Handle {
     interrupt: Arc<AtomicBool>,
     /// Ends the worker for good after the turn in flight.
     stop: Arc<AtomicBool>,
+    /// Reaches a command the turn is waiting on, so an interrupt does not wait for it (D195).
+    cancel: Arc<AtomicBool>,
 }
 
 /// The handles the interface keeps, so a message or an interrupt reaches a worker while the agent
@@ -66,6 +68,7 @@ impl Steering {
             && let Some(peer) = map.get(name)
         {
             peer.handle.interrupt.store(true, Ordering::SeqCst);
+            peer.handle.cancel.store(true, Ordering::SeqCst);
         }
     }
 }
@@ -181,6 +184,7 @@ impl Manager {
         for peer in map.values() {
             peer.handle.stop.store(true, Ordering::SeqCst);
             peer.handle.interrupt.store(true, Ordering::SeqCst);
+            peer.handle.cancel.store(true, Ordering::SeqCst);
             cancel::request();
         }
         count
@@ -191,6 +195,7 @@ impl Manager {
             .lookup(name)
             .ok_or_else(|| format!("no worker {name:?} in this team"))?;
         peer.handle.interrupt.store(true, Ordering::SeqCst);
+        peer.handle.cancel.store(true, Ordering::SeqCst);
         Ok(format!("interrupting {name}"))
     }
 
@@ -203,6 +208,7 @@ impl Manager {
             .ok_or_else(|| format!("no worker {name:?} in this team"))?;
         peer.handle.stop.store(true, Ordering::SeqCst);
         peer.handle.interrupt.store(true, Ordering::SeqCst);
+        peer.handle.cancel.store(true, Ordering::SeqCst);
         Ok(format!(
             "stopping {name}; its conversation and findings are kept"
         ))
@@ -399,6 +405,7 @@ impl Manager {
             steer: steer.clone(),
             interrupt: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
         };
         let render = Arc::new(Mutex::new(Render {
             name: name.to_owned(),
@@ -409,11 +416,16 @@ impl Manager {
         let (jobs, receive) = mpsc::channel();
         let stop = handle.stop.clone();
         let interrupt = handle.interrupt.clone();
+        let cancel = handle.cancel.clone();
         let steer_in = steer.clone();
         let view = render.clone();
         if let Err(error) = thread::Builder::new()
             .name(format!("saddle-worker-{name}"))
-            .spawn(move || run(agent, child, receive, view, stop, interrupt, steer_in))
+            .spawn(move || {
+                run(
+                    agent, child, receive, view, stop, interrupt, cancel, steer_in,
+                )
+            })
         {
             return Ok(Err(format!("could not start {name}: {error}")));
         }
@@ -443,8 +455,10 @@ fn run(
     view: Arc<Mutex<Render>>,
     stop: Arc<AtomicBool>,
     interrupt: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
     steer: Steer,
 ) {
+    session.cancel = cancel.clone();
     let mut ui = WorkerUi {
         view: view.clone(),
         interrupt: interrupt.clone(),
@@ -523,6 +537,7 @@ fn run(
         }
         // An interrupt ends the turn, not the worker: it takes its next message.
         interrupt.store(false, Ordering::SeqCst);
+        cancel.store(false, Ordering::SeqCst);
     }
     finish(agent, session, &view);
 }

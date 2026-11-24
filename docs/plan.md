@@ -4724,8 +4724,8 @@ and audited as the plugin's `tool` call; `[standard-tools]` delegates `model-inv
 A worker is an ordinary `Agent` and `Session` on its own thread, with its own audit log,
 session id and spending ledger, derived by re-reading the same protected configuration, so it
 inherits only the grants the session has and cannot exceed them. Workers cannot start workers.
-A brief is written under the session's temporary root and read back through the read gate; the
-audit records its path, hash and size, never its words. `tool-limits.team-workers` caps a
+A brief is written under the session's private temporary directory and read by the host from
+there, with no root involved; the audit records its path, hash and size, never its words. `tool-limits.team-workers` caps a
 team and `team-steps` caps each worker turn. A person opens the team with ctrl+b, views a
 worker's live transcript and provider-exposed reasoning, types into it, interrupts one turn
 (keeping the worker), or stops it (keeping its conversation); the interface reaches a worker
