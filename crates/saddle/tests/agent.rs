@@ -1726,6 +1726,31 @@ fn a_live_worker_is_started_and_addressed_by_the_shipped_team_tool() {
         )
         .unwrap();
     assert!(stored > 0, "conversation {id} holds the worker's messages");
+    // The conversation's own audit log names it a worker, which is what lets an older transcript
+    // be recognised as one without the marker column (D195).
+    let body: String = db
+        .query_row(
+            "SELECT body FROM nodes WHERE session = ?1 AND kind = 'turn' ORDER BY id LIMIT 1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let audit = serde_json::from_str::<Value>(&body).unwrap()["audit"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let log = std::fs::read_to_string(
+        env.xdg
+            .path()
+            .join("state/saddle/audit")
+            .join(format!("{audit}.jsonl")),
+    )
+    .unwrap();
+    let first: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+    // The record names the worker by the id it was derived with, and the presence of that field
+    // is the fact adoption relies on (D195).
+    assert!(first["args"].get("worker").is_some(), "{first}");
+    assert!(first["args"].get("parent").is_some(), "{first}");
     // The audit names the brief by hash, never its words.
     // The lead's log and each worker's are separate files, so the whole audit directory is read.
     let dir = env.xdg.path().join("state/saddle/audit");
