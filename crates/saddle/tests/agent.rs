@@ -1645,6 +1645,88 @@ fn reading_the_first_conversation(
 }
 
 #[test]
+fn a_live_worker_is_started_and_addressed_by_the_shipped_team_tool() {
+    // D195: the lead's tool starts a real session on its own thread. The mock answers both
+    // conversations, and a worker request carrying the brief proves the second session exists.
+    let _ = std::fs::remove_file("/tmp/never");
+    let (base, seen) = serve_dynamic(6, |_, body| {
+        let text = body.to_string();
+        let answer = if text.contains("find the reload path") {
+            // The worker's own first turn.
+            sse_response(&openai_sse("worker finished", &[]))
+        } else if text.contains("started runtime") {
+            sse_response(&openai_sse(
+                "",
+                &[(
+                    "s",
+                    "agent",
+                    serde_json::json!({"action":"status","name":"runtime"}),
+                )],
+            ))
+        } else if text.contains("live worker started") || text.contains("runtime ·") {
+            sse_response(&openai_sse("done", &[]))
+        } else {
+            sse_response(&openai_sse(
+                "",
+                &[(
+                    "t",
+                    "agent",
+                    serde_json::json!({
+                        "action":"start","name":"runtime","brief":"find the reload path and report file:line"
+                    }),
+                )],
+            ))
+        };
+        answer
+    });
+    let env = Env::new(Api::Openai, &base);
+    env.write_override(
+        "[agent]\nmodel-invoke = { tokens-per-session = 100000, cost-per-session = 10.0 }\ntranscript-read = {}\n",
+    );
+    let out = env.saddle(&["run", "start a worker and check on it"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|s| s.body.to_string().contains("find the reload path")),
+        "the worker's own conversation reached the model"
+    );
+    let started = seen
+        .iter()
+        .find_map(|s| {
+            s.body["messages"].as_array()?.iter().find_map(|m| {
+                (m["role"] == "tool").then(|| m["content"].as_str().unwrap_or_default().to_owned())
+            })
+        })
+        .expect("the tool result is in the next request");
+    let result = tool_text(&started);
+    assert!(result.contains("started runtime"), "{result}");
+    // The audit names the brief by hash, never its words.
+    // The lead's log and each worker's are separate files, so the whole audit directory is read.
+    let dir = env.xdg.path().join("state/saddle/audit");
+    let all: Vec<Value> = fs::read_dir(&dir)
+        .unwrap()
+        .flat_map(|entry| records(&entry.unwrap().path()))
+        .collect();
+    let start = all
+        .iter()
+        .find(|r| r["args"]["operation"] == "worker-start")
+        .expect("the worker's start is audited");
+    assert_eq!(start["args"]["name"], "runtime");
+    assert!(
+        start["args"]["brief"]
+            .as_str()
+            .unwrap()
+            .contains("brief.md")
+    );
+    assert!(
+        !all.iter()
+            .any(|r| r.to_string().contains("find the reload path")),
+        "the brief's words are not in the audit"
+    );
+}
+
+#[test]
 fn swarm_peers_discover_and_read_attributed_posts_without_relaying_user_prompts() {
     let db = Arc::new(Mutex::new(PathBuf::new()));
     let first = db.clone();

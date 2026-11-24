@@ -16,9 +16,9 @@ use crate::provider::{Contribution, Quota, Reply, Sink, ToolCall};
 use crate::session::{Session, session_id};
 use crate::store::Store;
 use crate::tools::ToolOutput;
-use crate::{file_read, provider, tools};
+use crate::{provider, tools};
 use anyhow::{Context, Result};
-use saddle_cap::{Principal, RootName};
+use saddle_cap::Principal;
 use saddle_limits as budgets;
 use saddle_policy::audit::sha256_hex;
 use saddle_policy::{Kind, Request};
@@ -310,14 +310,10 @@ impl Manager {
                 decision.explanation
             )));
         }
-        let root = scratch_root(session);
-        let Some(base) = session.setup.roots.get(&root).map(ToOwned::to_owned) else {
-            return Ok(Err(
-                "this session has no temporary root for worker briefs".into()
-            ));
-        };
-        let relative = format!("team/{}/{name}", session.audit.session());
-        let dir = base.join(&relative);
+        // The host writes and reads the brief itself, in this session's private 0700 temporary
+        // directory: no root is involved, so no grant is needed to read what the harness chose,
+        // and the exact text is still recorded by hash rather than by argument (D195).
+        let dir = session.tmp_dir().join("team").join(name);
         if let Err(error) = fs::create_dir_all(&dir) {
             return Ok(Err(format!(
                 "could not make the worker's directory: {error}"
@@ -327,13 +323,11 @@ impl Manager {
         if let Err(error) = fs::write(&brief_path, brief) {
             return Ok(Err(format!("could not record the worker's brief: {error}")));
         }
-        let text = match file_read::gate_read(session, &brief_path.display().to_string())? {
-            Ok(loc) => match file_read::read_at(session, &loc) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                Err(why) => return Ok(Err(why.content)),
-            },
-            Err(why) => return Ok(Err(why.content)),
+        let text = match fs::read(&brief_path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) => return Ok(Err(format!("could not read the worker's brief: {error}"))),
         };
+        let brief_label = brief_path.display().to_string();
         session.audit.event(
             Kind::Decision,
             Some(who),
@@ -342,7 +336,7 @@ impl Manager {
             json!({
                 "operation": "worker-start",
                 "name": name,
-                "brief": format!("{}:{relative}/brief.md", root),
+                "brief": brief_label,
                 "brief_sha256": sha256_hex(text.as_bytes()),
                 "brief_bytes": text.len(),
                 "workers": self.views().len() + 1,
@@ -559,21 +553,6 @@ fn first_line(text: &str) -> String {
         out.push('…');
     }
     out
-}
-
-/// The root a worker's brief lives in: the session's own temporary root, which the model can read
-/// back with `read` and which no other session's worker shares.
-fn scratch_root(session: &Session) -> RootName {
-    if session.setup.roots.contains(&RootName::tmp()) {
-        return RootName::tmp();
-    }
-    session
-        .setup
-        .roots
-        .iter()
-        .map(|(name, _)| name.clone())
-        .find(|name| name.as_str() != "workspace")
-        .unwrap_or_else(RootName::tmp)
 }
 
 /// One service call from the shipped team component. Every operation addresses only workers this

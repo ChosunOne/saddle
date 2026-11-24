@@ -780,6 +780,12 @@ impl Session {
 
     /// A worker of this session: the same protected setup and filesystem claims, with its own
     /// audit log, engine and spending ledger (D195).
+    /// This session's private temporary directory, where host-owned files such as a worker's
+    /// brief live (D195).
+    pub(crate) fn tmp_dir(&self) -> &Path {
+        self._tmp.path()
+    }
+
     pub(crate) fn derive(&self, id: &str) -> Result<Self> {
         let run = format!("{id}-{}", session_id());
         let tmp = PrivateTmp::create(&run)?;
