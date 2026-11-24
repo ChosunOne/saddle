@@ -68,6 +68,7 @@ impl Steering {
     pub fn interrupt(&self, name: &str) {
         if let Ok(map) = self.0.lock()
             && let Some(peer) = map.get(name)
+            && peer.running()
         {
             peer.handle.interrupt.store(true, Ordering::SeqCst);
             peer.handle.cancel.store(true, Ordering::SeqCst);
@@ -79,6 +80,7 @@ impl Steering {
     pub fn stop(&self, name: &str) {
         if let Ok(map) = self.0.lock()
             && let Some(peer) = map.get(name)
+            && peer.live()
         {
             peer.handle.stop.store(true, Ordering::SeqCst);
             peer.handle.interrupt.store(true, Ordering::SeqCst);
@@ -182,6 +184,12 @@ impl Render {
     }
 }
 
+/// How many peers still hold a thread. A finished worker is kept for inspection but not counted
+/// against `tool-limits.team-workers` (D195).
+fn live_count(map: &BTreeMap<String, Peer>) -> usize {
+    map.values().filter(|peer| peer.live()).count()
+}
+
 /// What runs on a worker's thread. The brief is the conversation's first prompt; a message arrives
 /// as an ordinary turn with whose words it is stated first.
 enum Job {
@@ -205,6 +213,21 @@ struct Peer {
 impl Peer {
     fn render(&self) -> Render {
         self.render.lock().map(|r| r.clone()).unwrap_or_default()
+    }
+
+    /// Whether this worker still has a thread to reach. A finished one is kept so its conversation
+    /// can still be inspected, but it is not a live worker: it does not use a team slot and its
+    /// name can be used again (D195).
+    fn live(&self) -> bool {
+        self.render.lock().map(|r| !r.finished).unwrap_or(false)
+    }
+
+    /// Whether a turn is in flight, which is the only thing an interrupt can end.
+    fn running(&self) -> bool {
+        self.render
+            .lock()
+            .map(|r| r.state == "running")
+            .unwrap_or(false)
     }
 }
 
@@ -278,18 +301,27 @@ impl Manager {
         let peer = self
             .lookup(name)
             .ok_or_else(|| format!("no worker {name:?} in this team"))?;
+        if !peer.live() {
+            return Ok(format!("{name} has finished"));
+        }
+        // An interrupt at rest would be waiting for the next message and cancel that turn instead:
+        // it ends a turn in flight or it is nothing (D195).
+        if !peer.running() {
+            return Ok(format!("{name} is idle; nothing to interrupt"));
+        }
         peer.handle.interrupt.store(true, Ordering::SeqCst);
         peer.handle.cancel.store(true, Ordering::SeqCst);
         Ok(format!("interrupting {name}"))
     }
 
     pub fn stop(&self, name: &str) -> Result<String, String> {
-        if !self.owns {
-            return Err("only the conversation that started the team stops a worker".into());
-        }
+        self.owner()?;
         let peer = self
             .lookup(name)
             .ok_or_else(|| format!("no worker {name:?} in this team"))?;
+        if !peer.live() {
+            return Ok(format!("{name} has finished"));
+        }
         peer.handle.stop.store(true, Ordering::SeqCst);
         peer.handle.interrupt.store(true, Ordering::SeqCst);
         peer.handle.cancel.store(true, Ordering::SeqCst);
@@ -359,6 +391,19 @@ impl Manager {
         out
     }
 
+    /// Whether this conversation is the one that started the team. A worker sees its peers and can
+    /// message them, but cannot create a team of its own or stop one (D195).
+    fn owner(&self) -> Result<(), String> {
+        if self.owns {
+            Ok(())
+        } else {
+            Err(
+                "a worker cannot start or stop the team; only the conversation that started it can"
+                    .into(),
+            )
+        }
+    }
+
     /// Starts a worker. The brief is written inside the session's temporary root and read back
     /// through the read gate, so the exact text the worker was given is a branch item attributable
     /// to a real file rather than an unrecorded argument (D195).
@@ -377,6 +422,9 @@ impl Manager {
                 "workers are requested by the shipped agent and swarm tools, not {origin_principal}"
             )));
         }
+        if let Err(why) = self.owner() {
+            return Ok(Err(why));
+        }
         match valid_name(name) {
             Ok(()) => {}
             Err(why) => return Ok(Err(why)),
@@ -391,13 +439,13 @@ impl Manager {
             0 => None,
             steps => Some(steps),
         };
-        if self.views().len() >= team_workers {
+        let live = self.shared.lock().map(|map| live_count(&map)).unwrap_or(0);
+        if live >= team_workers {
             return Ok(Err(format!(
-                "this session already has {} workers (tool-limits.team-workers)",
-                self.views().len()
+                "this session already has {live} live workers (tool-limits.team-workers)"
             )));
         }
-        if self.lookup(name).is_some() {
+        if self.lookup(name).is_some_and(|peer| peer.live()) {
             return Ok(Err(format!("a worker named {name:?} is already live")));
         }
         if session.engine.policy().grants(&Principal::Agent).is_none() {
@@ -443,7 +491,7 @@ impl Manager {
                 "brief": brief_label,
                 "brief_sha256": sha256_hex(text.as_bytes()),
                 "brief_bytes": text.len(),
-                "workers": self.views().len() + 1,
+                "workers": live + 1,
             }),
             "live worker started from a delegated brief",
         )?;
@@ -648,6 +696,13 @@ fn set(view: &Arc<Mutex<Render>>, change: impl FnOnce(&mut Render)) {
 }
 
 fn valid_name(name: &str) -> Result<(), String> {
+    // "lead" is what a peer message from the conversation in hand is called, so a worker with that
+    // name would make whose words they are ambiguous (D195).
+    if name == "lead" {
+        return Err(
+            "`lead` names the conversation that started the team; pick another name".into(),
+        );
+    }
     if name.is_empty() || name.len() > budgets::directory_name_bytes() {
         return Err("a worker name needs 1 to a directory-name's bytes".into());
     }
@@ -816,19 +871,105 @@ impl Session {
 mod tests {
     use super::*;
     use saddle_wit::saddle::host::workers::Message;
+    use std::sync::Mutex;
 
     #[test]
     fn names_are_narrow_and_briefs_keep_their_first_line() {
         for name in ["a", "runtime", "tests-2", "a_b"] {
             assert!(valid_name(name).is_ok(), "{name}");
         }
-        for name in ["", "Runtime", "a/b", "../x", "a.b"] {
+        for name in ["", "lead", "Runtime", "a/b", "../x", "a.b"] {
             assert!(valid_name(name).is_err(), "{name}");
         }
         assert_eq!(
             first_line("\n  think from the test\nmore"),
             "think from the test"
         );
+    }
+
+    fn peer(state: &str, finished: bool) -> Peer {
+        let (jobs, receive) = mpsc::channel();
+        // The test keeps no thread to receive: hold the receiver open so a delivery is a delivery.
+        mem::forget(receive);
+        let flag = || Arc::new(AtomicBool::new(false));
+        Peer {
+            conversation: "conversation".into(),
+            handle: Handle {
+                steer: Steer::default(),
+                interrupt: flag(),
+                stop: flag(),
+                cancel: flag(),
+            },
+            render: Arc::new(Mutex::new(Render {
+                state: state.into(),
+                finished,
+                ..Render::default()
+            })),
+            jobs,
+        }
+    }
+
+    fn with_peers(peers: Vec<(&str, &str, bool)>) -> Manager {
+        let mut map = BTreeMap::new();
+        for (name, state, finished) in peers {
+            map.insert(name.to_owned(), peer(state, finished));
+        }
+        Manager {
+            shared: Arc::new(Mutex::new(map)),
+            owns: true,
+        }
+    }
+
+    #[test]
+    fn an_interrupt_only_ends_a_turn_that_is_running() {
+        // At rest there is no turn to end, and marking one would cancel the message that comes
+        // next instead (D195).
+        let idle = with_peers(vec![("idle", "idle", false)]);
+        assert_eq!(
+            idle.interrupt("idle").unwrap(),
+            "idle is idle; nothing to interrupt"
+        );
+        let running = with_peers(vec![("busy", "running", false)]);
+        assert_eq!(running.interrupt("busy").unwrap(), "interrupting busy");
+        let finished = with_peers(vec![("done", "finished", true)]);
+        assert_eq!(finished.interrupt("done").unwrap(), "done has finished");
+    }
+
+    #[test]
+    fn a_finished_worker_keeps_its_conversation_but_not_a_slot_or_its_name() {
+        let team = with_peers(vec![
+            ("done", "finished", true),
+            ("idle", "idle", false),
+            ("busy", "running", false),
+        ]);
+        assert_eq!(live_count(&team.shared.lock().unwrap()), 2);
+        // A message to a finished worker is refused rather than delivered to no thread.
+        let refused = team.say("lead", "done", "hello").unwrap_err();
+        assert_eq!(refused, "done has finished; start a new worker");
+    }
+
+    #[test]
+    fn a_worker_session_cannot_start_or_stop_the_team() {
+        let mut team = with_peers(vec![("peer", "idle", false)]);
+        team.owns = false;
+        let refused = team.owner().unwrap_err();
+        assert!(
+            refused.contains("only the conversation that started it"),
+            "{refused}"
+        );
+        assert!(team.stop("peer").is_err());
+        team.owns = true;
+        assert!(team.owner().is_ok());
+    }
+
+    #[test]
+    fn a_message_at_rest_clears_an_older_interrupt() {
+        let team = with_peers(vec![("idle", "idle", false)]);
+        team.interrupt("idle").unwrap();
+        team.say("lead", "idle", "next task").unwrap();
+        let peer = team.lookup("idle").unwrap();
+        assert!(!peer.handle.interrupt.load(Ordering::SeqCst));
+        assert!(!peer.handle.cancel.load(Ordering::SeqCst));
     }
 
     #[test]
