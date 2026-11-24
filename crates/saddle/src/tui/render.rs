@@ -3331,6 +3331,9 @@ fn draw_worker(frame: &mut Frame<'_>, worker: &Render, area: Rect, theme: &Theme
     let line_count = lines.len();
     let shown: Vec<Line> = lines.split_off(line_count.saturating_sub(room));
     let title = format!(" worker {} · {state} · ctrl+b team ", worker.name);
+    // A dialog is opaque: the lead's transcript is still drawn under it, and without this its
+    // text shows through every cell the worker's own lines do not cover.
+    frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(shown)
             .block(
@@ -3397,6 +3400,9 @@ fn draw_workers(
             "enter view · i interrupt · x stop · esc close",
             dim(theme),
         )));
+    // The list is a surface of its own: clear it first, or the transcript behind it shows in
+    // every inner cell the row text does not reach (D195).
+    frame.render_widget(Clear, rect);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     let shown: Vec<String> = rows
@@ -5477,6 +5483,34 @@ mod tests {
         let listed = screen(&terminal);
         assert!(listed.contains("live workers"), "{listed}");
         assert!(listed.contains("runtime"), "{listed}");
+        // The list is opaque: with a full transcript behind it, its own rows carry no text from
+        // underneath past the end of a row.
+        let mut covered = bare_app();
+        for _ in 0..20 {
+            covered.agent(AgentEvent::Text("z".repeat(200)));
+        }
+        covered.agent(AgentEvent::Workers(vec![Render {
+            name: "runtime".into(),
+            state: "running".into(),
+            turns: 1,
+            ..Render::default()
+        }]));
+        covered.workers = Some(0);
+        terminal.draw(|frame| draw(frame, &mut covered)).unwrap();
+        let row = screen(&terminal)
+            .lines()
+            .find(|line| line.contains("runtime"))
+            .expect("the list shows its worker")
+            .to_owned();
+        let (_, inside) = row.split_once('│').expect("the list has a left border");
+        let inside = inside
+            .rsplit_once('│')
+            .expect("the list has a right border")
+            .0;
+        assert!(
+            !inside.contains('z'),
+            "the transcript showed through: {inside:?}"
+        );
         assert_eq!(
             app.key(KeyEvent::from(KeyCode::Enter)),
             Some(Action::OpenWorker("runtime".into()))
