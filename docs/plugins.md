@@ -779,12 +779,19 @@ isolated model transport and cancellation, and labelled read-only UI panels. MCP
 images in a tool result are refused by decision (D119), not deferred. This migration does not introduce
 automatic plugin updates, an authority picker, ambient native access or a second policy engine.
 
-## Peer findings in saved conversations
+## Live teams
 
-The current `agent` and `swarm` tools operate on saved conversations. They do not start
-workers or attach the interface to a running child. A `TEAM/member` conversation name is a
-discovery label, not a managed team. Native session management is the goal; these tools
-alone do not implement it.
+Ask the agent to start a worker, or call it yourself with
+`saddle tool agent '{"action":"start","name":"runtime","brief":"trace the reload path; return file:line evidence"}'`
+— with `model-invoke` and `[standard-tools] agent = ["transcript-read", "model-invoke", "fs-read", "fs-write"]`
+granted. `agent` also takes `send`, `status`, `interrupt` and `stop`; `swarm` with no arguments
+lists live workers. A worker is a real Saddle session: it owns a conversation, audit log and
+model-spend ledger derived from the same policy, and it cannot start another worker. While
+anything is live, **ctrl+b** opens the team list: enter views a worker's streaming output and
+reasoning, typing steers it (or wakes it when idle), `i` interrupts its turn and `x` stops it.
+`ctrl+b` again goes back to your own conversation; the workers keep running. Stopping a worker
+keeps its saved conversation. Closing Saddle or changing the policy stops every worker first.
+`saddle check` and `saddle tools --config` show the delegation the feature needs.
 
 For example, runtime calls `agent` with `{"action":"post","to":"review/tests","text":"Check the reload path at session.rs:17"}`.
 Tests calls `swarm` with `{"team":"review"}` to find runtime's conversation id, then calls

@@ -52,6 +52,7 @@ use saddle_wit::saddle::host::tool_result::{self, Host as ResultHost, ImageInfo}
 use saddle_wit::saddle::host::transcript_read::{self, Host as TranscriptHost};
 use saddle_wit::saddle::host::ui::{self, Host as UiHost};
 use saddle_wit::saddle::host::web_search::{self, Host as SearchHost, Snapshot as SearchSnapshot};
+use saddle_wit::saddle::host::workers::{self, Host as WorkerHost, Operation as WorkerOperation};
 use saddle_wit::saddle::widgets::types::{self as widget_types, Panel};
 use saddle_wit::veto::exports::saddle::plugin::veto::{Decision as VetoDecision, PendingToolCall};
 use sha2::{Digest, Sha256};
@@ -170,11 +171,13 @@ pub enum Service {
     Contribute(Contribution),
     PersistGet(String),
     PersistApply(Vec<PersistChange>),
+    Worker(WorkerOperation),
     Model(ModelRequest),
     PublishPanel(Panel),
     ClearPanel,
 }
 pub enum ServiceReply {
+    Worker(String),
     Contribution(String),
     Value(Option<Vec<u8>>),
     Applied(bool),
@@ -461,6 +464,15 @@ impl<H: HostServices> PersistHost for State<H> {
             Ok(ServiceReply::Applied(value)) => Ok(Ok(value)),
             Err(why) => Ok(Err(why)),
             _ => Err(anyhow!("wrong typed extension reply")),
+        }
+    }
+}
+impl<H: HostServices> WorkerHost for State<H> {
+    fn manage(&mut self, op: WorkerOperation) -> anyhow::Result<Result<String, String>> {
+        match self.service(Service::Worker(op))? {
+            Ok(ServiceReply::Worker(value)) => Ok(Ok(value)),
+            Err(why) => Ok(Err(why)),
+            _ => Err(anyhow!("wrong worker service reply")),
         }
     }
 }
@@ -1338,6 +1350,7 @@ fn bind_host<H: HostServices>(
             context_contribute::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
         }
         HostInterface::Persist => persist::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
+        HostInterface::Workers => workers::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
         HostInterface::ModelInvoke => {
             model_invoke::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
         }

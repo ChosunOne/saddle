@@ -32,6 +32,7 @@ mod skills;
 mod standard;
 mod store;
 mod tasks;
+mod team;
 mod term;
 mod tools;
 mod transcript;

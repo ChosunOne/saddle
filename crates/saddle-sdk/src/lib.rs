@@ -39,6 +39,7 @@ pub use saddle::host::transcript_read::query as query_transcript;
 pub use saddle::host::web_search::{
     Snapshot as SearchSnapshot, last as last_search, search as search_web,
 };
+pub use saddle::host::workers;
 
 /// register host-originated lifecycle hooks; this API cannot publish harness events (D155).
 pub mod harness {

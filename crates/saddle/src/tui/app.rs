@@ -10,6 +10,7 @@ use crate::provider::{reasoning_text, visible_tool_text};
 use crate::skills;
 use crate::skills::Skill;
 use crate::store::Point;
+use crate::team::Render;
 use crate::tui::image::Fit;
 use crate::tui::image::Protocol;
 use crate::tui::keys::Keys;
@@ -92,6 +93,8 @@ pub enum AgentEvent {
     /// The skills a re-discovery found, for the `/` menu (D70).
     Skills(Vec<Skill>),
     Tasks(Vec<TaskView>),
+    /// The live workers of this session, in the order the team lists them (D195).
+    Workers(Vec<Render>),
     BackgroundReady,
     TurnEnd(End),
     /// The host failed (for example, the audit log could not be written). The session is over.
@@ -189,6 +192,18 @@ pub enum Action {
     /// `/mcp`: what the granted servers are doing, or `restart <name>` for one of them (D118).
     Mcp(String),
     Tasks(String),
+    /// Open the live team: the workers this session started, or none yet (D195).
+    Workers,
+    /// View a live worker in this interface, without stopping it.
+    OpenWorker(String),
+    /// A prompt for the worker being viewed; steering if its turn is running.
+    WorkerInput(String),
+    /// Back to the conversation the person came from.
+    WorkerBack,
+    /// Interrupt the named worker's turn.
+    WorkerInterrupt(String),
+    /// Stop the named worker for good, keeping its conversation.
+    WorkerStop(String),
     /// `/profile`: report the base grants in force, or switch this session to another profile
     /// (D175). Empty is the report.
     Profile(String),
@@ -703,6 +718,12 @@ pub struct App {
     pub settings: Option<SettingsDialog>,
     /// The conversation tree, drawn over everything else while open (D53).
     pub tree: Option<Tree>,
+    /// The live workers of this session (D195).
+    pub team: Vec<Render>,
+    /// Which worker the team list has selected.
+    pub workers: Option<usize>,
+    /// The worker being viewed, by name, or `None` in the person's own conversation.
+    pub worker: Option<String>,
     /// The question a move in `/tree` asks when it would leave work behind (D167).
     pub confirm: Option<Confirm>,
     /// The permissions editor, drawn over everything else while open (D45).
@@ -817,6 +838,9 @@ impl App {
             resume: None,
             settings: None,
             tree: None,
+            team: Vec::new(),
+            workers: None,
+            worker: None,
             confirm: None,
             permissions: None,
             themes: None,
@@ -1183,6 +1207,51 @@ impl App {
         // for the move that is already half made (D167).
         if self.confirm.is_some() {
             return self.answer(key);
+        }
+        // The team view is a keystroke away and owns the keys while it is open (D195).
+        if let Some(selected) = self.workers {
+            let rows = self.team.len();
+            return match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.workers = None;
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') if rows > 0 => {
+                    self.workers = Some((selected + 1).min(rows - 1));
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.workers = Some(selected.saturating_sub(1));
+                    None
+                }
+                KeyCode::Enter if rows > 0 => {
+                    let name = self.team[selected.min(rows - 1)].name.clone();
+                    self.workers = None;
+                    self.worker = Some(name.clone());
+                    Some(Action::OpenWorker(name))
+                }
+                KeyCode::Char('i') if rows > 0 => Some(Action::WorkerInterrupt(
+                    self.team[selected.min(rows - 1)].name.clone(),
+                )),
+                KeyCode::Char('x') if rows > 0 => Some(Action::WorkerStop(
+                    self.team[selected.min(rows - 1)].name.clone(),
+                )),
+                _ => None,
+            };
+        }
+        if self.worker.is_some()
+            && key.code == KeyCode::Char('b')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.worker = None;
+            return Some(Action::WorkerBack);
+        }
+        if key.code == KeyCode::Char('b')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !self.team.is_empty()
+        {
+            self.workers = Some(0);
+            return Some(Action::Workers);
         }
         if let Some(login) = &mut self.login {
             return match login.key(key) {
@@ -1773,6 +1842,9 @@ impl App {
             self.history.push(text.clone());
         }
         self.scroll = 0;
+        if self.worker.is_some() && !text.starts_with('/') {
+            return Some(Action::WorkerInput(text));
+        }
         if text.starts_with('/') && !text.contains('\n') {
             return self.command(&text);
         }
@@ -2088,6 +2160,14 @@ impl App {
                     return Some(Action::BackgroundTurn);
                 }
                 // A queued human prompt will carry the completion at its safe request point.
+            }
+            AgentEvent::Workers(views) => {
+                self.team = views;
+                if let Some(name) = &self.worker
+                    && !self.team.iter().any(|worker| &worker.name == name)
+                {
+                    self.note(NoteKind::Info, &format!("worker {name} has finished"));
+                }
             }
             AgentEvent::Tasks(views) => {
                 self.running_tasks = views

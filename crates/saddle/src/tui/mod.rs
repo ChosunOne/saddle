@@ -16,6 +16,7 @@ use crate::provider::Quota;
 use crate::session;
 use crate::skills;
 use crate::tasks;
+use crate::team::{Render, Steering};
 use crate::tui::app::Effort;
 use crate::tui::theme::Theme;
 use crate::tui::themes::ThemePicker;
@@ -143,6 +144,9 @@ enum Command {
     /// `/mcp`: report the servers, or start one again (D118).
     Mcp(String),
     Tasks(String),
+    Workers,
+    OpenWorker(String),
+    WorkerBack,
     /// `/profile`: report the base grants in force, or switch this session to another one (D175).
     Profile(String),
     /// Remove a saved conversation (D55).
@@ -191,6 +195,9 @@ pub fn run(
     let ev_tx_ui = ev_tx.clone();
     // Before the agent moves to its thread: the turn running there reads this (D149).
     let steering = agent.steering();
+    // The worker handles belong to the session, which moves to the agent thread; the interface
+    // keeps a shared one so a message or an interrupt reaches a worker mid-turn (D195).
+    let team = session.team.steering();
     let worker = thread::Builder::new()
         .name("saddle-agent".into())
         .spawn(move || work(agent, session, cmd_rx, ev_tx))
@@ -222,6 +229,7 @@ pub fn run(
         store,
         signing: Mutex::new(None),
         steering,
+        team,
     };
     if let Some(path) = resume {
         control.send(&mut app, Command::Resume(path));
@@ -339,6 +347,7 @@ fn work(
             ui.tasks(&views);
             shown_tasks = views;
         }
+        ui.workers(&session.team.views());
         if !session.tasks.pending() {
             completion_requested = false;
         }
@@ -654,6 +663,26 @@ fn work(
                     let _ = events.send(AgentEvent::Note(format!("{error:#}")));
                 }
             },
+            Command::Workers => {
+                let _ = events.send(AgentEvent::Workers(session.team.views()));
+            }
+            Command::OpenWorker(name) => match agent.open_worker(&mut session, &name, &mut ui) {
+                Ok(()) => {
+                    let _ = events.send(AgentEvent::Workers(session.team.views()));
+                }
+                Err(e) => {
+                    let _ = events.send(AgentEvent::Note(format!("{e:#}")));
+                    let _ = events.send(AgentEvent::Workers(session.team.views()));
+                }
+            },
+            Command::WorkerBack => match agent.close_worker(&mut session, &mut ui) {
+                Ok(()) => {
+                    let _ = events.send(AgentEvent::Workers(session.team.views()));
+                }
+                Err(e) => {
+                    let _ = events.send(AgentEvent::Note(format!("{e:#}")));
+                }
+            },
             Command::Mcp(arg) => {
                 // The registry lives on the session, and starting a server needs it, so it is
                 // taken out for the call and put back (D108, D118).
@@ -774,6 +803,9 @@ impl Sink for ChannelUi {
 }
 
 impl Ui for ChannelUi {
+    fn workers(&mut self, workers: &[Render]) {
+        let _ = self.0.send(AgentEvent::Workers(workers.to_vec()));
+    }
     fn tasks(&mut self, tasks: &[tasks::View]) {
         let _ = self.0.send(AgentEvent::Tasks(tasks.to_vec()));
     }
@@ -1284,6 +1316,8 @@ struct Controller {
     /// What a prompt typed during a turn is handed to (D149): the agent thread reads it between
     /// requests, so it does not sit in the command channel the turn is blocking on.
     steering: Steer,
+    /// The live workers of this session, reached without the agent thread (D195).
+    team: Steering,
 }
 
 impl Controller {
@@ -1407,6 +1441,34 @@ impl Controller {
             }
             Action::Mcp(arg) => {
                 self.send(app, Command::Mcp(arg));
+                Ok(())
+            }
+            Action::Workers => {
+                self.send(app, Command::Workers);
+                Ok(())
+            }
+            Action::OpenWorker(name) => {
+                self.send(app, Command::OpenWorker(name));
+                Ok(())
+            }
+            Action::WorkerBack => {
+                self.send(app, Command::WorkerBack);
+                Ok(())
+            }
+            Action::WorkerInput(text) => {
+                // Always through the worker's own handle: its thread is the only agent that may
+                // write its conversation, whether it is mid-turn or idle (D149, D195).
+                if let Some(name) = &app.worker {
+                    self.team.say(name, text);
+                }
+                Ok(())
+            }
+            Action::WorkerInterrupt(name) => {
+                self.team.interrupt(&name);
+                Ok(())
+            }
+            Action::WorkerStop(name) => {
+                self.team.interrupt(&name);
                 Ok(())
             }
             Action::DeleteSession(id) => {
@@ -2816,6 +2878,7 @@ mod tests {
             paths,
             signing: Mutex::new(None),
             steering: Steer::default(),
+            team: crate::team::Steering::default(),
         }
     }
 
@@ -2874,6 +2937,7 @@ mod tests {
             paths,
             signing: Mutex::new(None),
             steering: Steer::default(),
+            team: crate::team::Steering::default(),
         };
         let mut app = an_app();
         // An unreachable endpoint is a failure the dialog has to be told about, not a hang: nothing

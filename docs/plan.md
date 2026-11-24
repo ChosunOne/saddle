@@ -4716,14 +4716,25 @@ No process launches, permission transfers, delivery receipts or implicit turns r
 model post. Each interactive worker has its own ordinary session controls and audit. D6 still
 applies to plugin-initiated launches; no privileged spawn API is introduced here.
 
-**D195 (target, not implemented).** Saddle owns managed agent sessions. D194 describes
-saved findings, not the swarm lifecycle. From one running conversation, the lead must be
-able to request two workers through WASI tools. The host assigns session handles and runs
-the workers within delegated authority. In that same interface the person can open either
-live session, inspect its output and provider-visible reasoning, steer it and interrupt it
-without interrupting its sibling. A peer can address the other worker directly without a
-relay through the lead. Returning to the lead leaves both sessions intact. Starting other
-terminals or using a multiplexer is not an implementation of this acceptance case.
+**D195.** Saddle owns live teams of agent sessions. The shipped `agent` and `swarm` tools
+request them through a typed `saddle:host/workers` service (`start`, `send`, `inspect`,
+`interrupt`, `stop`, `roster`); no operation carries a path, command or executable. Only those
+two shipped components may call it. Starting a worker is decided as the agent's `model-invoke`
+and audited as the plugin's `tool` call; `[standard-tools]` delegates `model-invoke` to them.
+A worker is an ordinary `Agent` and `Session` on its own thread, with its own audit log,
+session id and spending ledger, derived by re-reading the same protected configuration, so it
+inherits only the grants the session has and cannot exceed them. Workers cannot start workers.
+A brief is written under the session's temporary root and read back through the read gate; the
+audit records its path, hash and size, never its words. `tool-limits.team-workers` caps a
+team and `team-steps` caps each worker turn. A person opens the team with ctrl+b, views a
+worker's live transcript and provider-exposed reasoning, types into it, interrupts one turn
+(keeping the worker), or stops it (keeping its conversation); the interface reaches a worker
+mid-turn through a shared steering handle, so the lead being busy is not a reason a worker
+cannot be steered. `send` from a worker reaches a peer directly, labelled with its sender; the
+host resolves only live worker names, never arbitrary conversation ids. Closing the session, a
+policy reload or an interrupt from the person stops workers first and audits that. Workers
+have no MCP servers and no nested teams, and budgets are per worker rather than pooled; those
+remain deferred. The saved-branch tools of D194 remain for findings that outlive a live team.
 
 ## 4. Scope enumeration
 

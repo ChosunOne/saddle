@@ -21,6 +21,7 @@ use self::panel::PanelView;
 use crate::cancel;
 use crate::provider::{Contribution, Diagnostic, Item, Provenance, Provider};
 use crate::session::{Session, session_id};
+use crate::team;
 use crate::tools::timeout;
 
 #[derive(Default)]
@@ -54,7 +55,7 @@ pub fn scope(service: &Service) -> Scope {
     match service {
         Service::Contribute(_) => Scope::ContextContribute,
         Service::PersistGet(_) | Service::PersistApply(_) => Scope::Persist,
-        Service::Model(_) => Scope::ModelInvoke,
+        Service::Model(_) | Service::Worker(_) => Scope::ModelInvoke,
         Service::PublishPanel(_) | Service::ClearPanel => Scope::Ui,
     }
 }
@@ -75,6 +76,7 @@ pub fn execute(
             "apply",
             json!({"changes": changes.iter().map(|change| json!({"key_sha256":sha256_hex(change.key.as_bytes()),"bytes":change.value.as_ref().map(Vec::len),"sha256":change.value.as_ref().map(|v|sha256_hex(v)),"expected":match &change.expected { Expectation::Any => "any", Expectation::Missing => "missing", Expectation::Value(_) => "value" }})).collect::<Vec<_>>()}),
         ),
+        Service::Worker(op) => ("worker", team::arguments(op)),
         Service::Model(_) => ("invoke", json!({})),
         Service::PublishPanel(_) => ("publish", json!({})),
         Service::ClearPanel => ("clear", json!({})),
@@ -85,7 +87,7 @@ pub fn execute(
         arguments: &arguments,
     };
     // Model admission additionally reserves parent/child quotas before a provider request.
-    let mut decision = if matches!(service, Service::Model(_)) {
+    let mut decision = if matches!(service, Service::Model(_) | Service::Worker(_)) {
         session
             .engine
             .decide(who, &Request::ModelInvoke { tokens: 0 })
@@ -112,6 +114,9 @@ pub fn execute(
         }
         Service::PersistApply(changes) => persist::apply(session, who, changes, deadline)
             .map(|result| result.map(ServiceReply::Applied)),
+        Service::Worker(op) => {
+            team::manage(session, who, op, &origin).map(|r| r.map(ServiceReply::Worker))
+        }
         Service::Model(request) => model::invoke(session, who, &origin.call_id, request, deadline)
             .map(|result| result.map(ServiceReply::Model)),
         Service::PublishPanel(value) => {

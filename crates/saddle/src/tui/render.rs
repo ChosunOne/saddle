@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 use std::borrow::Cow;
 use std::env;
 use std::iter;
@@ -29,6 +29,7 @@ use super::sessions::{ROWS as SESSION_ROWS, SessionPicker, age};
 use super::settings::{ROWS, SettingsDialog};
 use super::themes::{ROWS as THEME_ROWS, ThemePicker};
 use super::tree::Tree;
+use crate::team::Render;
 use crate::tui::image;
 use crate::tui::math;
 use crate::tui::math::Formula;
@@ -2054,7 +2055,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     ])
     .areas(area);
 
-    draw_transcript(frame, app, transcript_area);
+    if let Some(name) = &app.worker
+        && let Some(worker) = app.team.iter().find(|worker| &worker.name == name)
+    {
+        draw_worker(frame, worker, transcript_area, &app.theme);
+    } else {
+        draw_transcript(frame, app, transcript_area);
+    }
     draw_panels(frame, &app.plugin_panels, panels_area, &app.theme);
 
     let pending = |label: &'static str, text: &String| {
@@ -2193,6 +2200,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let mut surface = None;
     if let Some(picker) = &app.resume {
         surface = Some(draw_resume(frame, picker, area, &app.theme));
+    }
+    if let Some(selected) = app.workers {
+        surface = Some(draw_workers(frame, &app.team, selected, area, &app.theme));
     }
     if let Some(tree) = &mut app.tree {
         surface = Some(draw_tree(frame, tree, area, &app.theme));
@@ -3286,6 +3296,125 @@ fn keep_tail(s: &str, max: usize) -> String {
         out.push(c);
     }
     iter::once('…').chain(out.into_iter().rev()).collect()
+}
+
+/// A live worker's transcript, streamed by its own thread and read through the session (D195).
+fn draw_worker(frame: &mut Frame<'_>, worker: &Render, area: Rect, theme: &Theme) {
+    let state = if worker.state.is_empty() {
+        "starting"
+    } else {
+        worker.state.as_str()
+    };
+    let room = area.height.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    if !worker.reasoning.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "thinking:",
+            Style::new().fg(theme.muted),
+        )));
+        for line in worker.reasoning.lines().take(room.saturating_sub(2)) {
+            lines.push(Line::from(Span::styled(
+                line.to_owned(),
+                Style::new().fg(theme.muted).add_modifier(Modifier::ITALIC),
+            )));
+        }
+    }
+    for line in &worker.lines {
+        lines.push(Line::from(line.clone()));
+    }
+    if let Some(error) = &worker.error {
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::new().fg(theme.error),
+        )));
+    }
+    let line_count = lines.len();
+    let shown: Vec<Line> = lines.split_off(line_count.saturating_sub(room));
+    let title = format!(" worker {} · {state} · ctrl+b team ", worker.name);
+    frame.render_widget(
+        Paragraph::new(shown)
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::new().fg(theme.border_accent))
+                    .title(title),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// The live team: one row per worker, with what it is doing (D195).
+fn draw_workers(
+    frame: &mut Frame<'_>,
+    team: &[Render],
+    selected: usize,
+    area: Rect,
+    theme: &Theme,
+) -> Seen {
+    let width = area.width.saturating_sub(4).min(76);
+    let height = (team.len() as u16 + 4).min(area.height.saturating_sub(2));
+    let rect = Rect::new(
+        area.x + (area.width.saturating_sub(width)) / 2,
+        area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    );
+    let rows: Vec<Line> = if team.is_empty() {
+        vec![Line::from(Span::styled(
+            "no live workers; ask the agent to start one",
+            dim(theme),
+        ))]
+    } else {
+        team.iter()
+            .enumerate()
+            .map(|(index, worker)| {
+                let mark = if index == selected { "› " } else { "  " };
+                let turns = format!("{} turns", worker.turns);
+                let text = format!(
+                    "{mark}{:<14} {:<18} {turns}",
+                    worker.name,
+                    if worker.state.is_empty() {
+                        "starting"
+                    } else {
+                        &worker.state
+                    }
+                );
+                let style = if index == selected {
+                    Style::new().fg(theme.accent)
+                } else {
+                    Style::new()
+                };
+                Line::from(Span::styled(text, style))
+            })
+            .collect()
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme.border_accent))
+        .title(" live workers ")
+        .title_bottom(Line::from(Span::styled(
+            "enter view · i interrupt · x stop · esc close",
+            dim(theme),
+        )));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let shown: Vec<String> = rows
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rows), inner);
+    Seen {
+        area: rect,
+        top: 0,
+        lines: shown,
+        pictures: Vec::new(),
+    }
 }
 
 fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {

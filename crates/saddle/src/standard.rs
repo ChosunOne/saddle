@@ -43,6 +43,9 @@ pub fn delegate(parent: &Grants, name: &str, scopes: &BTreeSet<Scope>) -> Grants
     if scopes.contains(&Scope::FsWrite) {
         child.fs_write = parent.fs_write.clone();
     }
+    if scopes.contains(&Scope::ModelInvoke) {
+        child.model_invoke = parent.model_invoke.clone();
+    }
     if scopes.contains(&Scope::Exec) {
         child.exec = parent.exec.clone();
     }
@@ -91,6 +94,38 @@ pub fn default_entry(name: &str) -> Option<&'static str> {
         let (key, _) = line.split_once('=')?;
         (key.trim() == name).then(|| line.trim())
     })
+}
+
+#[cfg(test)]
+mod worker_delegation_tests {
+    use super::*;
+    use saddle_cap::Principal;
+    use saddle_cap::Roots;
+    use saddle_cap::policy::Policy;
+
+    #[test]
+    fn the_team_tools_can_invoke_models_only_when_the_agent_can() {
+        let policy = Policy::parse(
+            "version = 1\n[agent]\nmodel-invoke = { tokens-per-session = 100 }\n[plugin.standard-agent]\n[plugin.standard-swarm]\n",
+            &Roots::default(),
+        )
+        .unwrap();
+        let agent = policy.grants(&Principal::Agent).cloned().unwrap();
+        let scopes: BTreeSet<Scope> = [Scope::ModelInvoke, Scope::TranscriptRead].into();
+        for name in ["agent", "swarm"] {
+            let child = delegate(&agent, name, &scopes);
+            assert!(
+                child
+                    .model_invoke
+                    .as_ref()
+                    .is_some_and(|g| g.tokens_per_session == 100),
+                "{name} inherits the budget"
+            );
+        }
+        let none = Policy::parse("version = 1\n[agent]\n", &Roots::default()).unwrap();
+        let plain = none.grants(&Principal::Agent).cloned().unwrap();
+        assert!(delegate(&plain, "agent", &scopes).model_invoke.is_none());
+    }
 }
 
 #[cfg(test)]

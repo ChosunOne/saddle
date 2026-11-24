@@ -1,4 +1,4 @@
 id = "agent"
 version = "0.1.0"
 component = "agent.component.wasm"
-scopes = ["tool", "transcript-read"]
+scopes = ["tool", "transcript-read", "model-invoke", "fs-read", "fs-write"]

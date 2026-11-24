@@ -40,6 +40,8 @@ budgets! {
     persist_keys: usize = 1024,
     persist_total_bytes: usize = 4 * 1024 * 1024,
     persist_changes: usize = 32,
+    team_workers: usize = 8,
+    team_steps: usize = 16,
     model_input_bytes: usize = 64 * 1024,
     model_output_tokens: usize = 4096,
     model_reply_bytes: usize = 64 * 1024,

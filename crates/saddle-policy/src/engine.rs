@@ -4,7 +4,7 @@
 //! second source of authority (D178).
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::audit::sha256_hex;
 use saddle_cap::policy::{FsGrant, NetGrant, Sessions, net_allows};
@@ -213,10 +213,11 @@ impl Decision {
     }
 }
 
+#[derive(Clone)]
 pub struct Engine {
     policy: Policy,
-    spent: Mutex<BTreeMap<Principal, u64>>,
-    money: Mutex<BTreeMap<Principal, f64>>,
+    spent: Arc<Mutex<BTreeMap<Principal, u64>>>,
+    money: Arc<Mutex<BTreeMap<Principal, f64>>>,
 }
 
 /// One narrowed list of net grants against one request (D110). A component or a server has a list
@@ -242,8 +243,8 @@ impl Engine {
     pub fn new(policy: Policy) -> Self {
         Self {
             policy,
-            spent: Mutex::new(BTreeMap::new()),
-            money: Mutex::new(BTreeMap::new()),
+            spent: Default::default(),
+            money: Default::default(),
         }
     }
 

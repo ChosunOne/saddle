@@ -21,6 +21,7 @@ struct Lists {
     write: Option<Vec<SandboxEntry>>,
 }
 
+#[derive(Clone)]
 pub struct Source {
     pub path: PathBuf,
     pub sha256: Option<String>,

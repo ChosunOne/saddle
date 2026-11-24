@@ -129,6 +129,7 @@ catalogue!(HostInterface {
     Budgets => ("saddle:host/budgets", Requirement::Ambient, true),
     TranscriptRead => ("saddle:host/transcript-read", Requirement::Scope(Scope::TranscriptRead), true),
     ContextContribute => ("saddle:host/context-contribute", Requirement::Scope(Scope::ContextContribute), true),
+    Workers => ("saddle:host/workers", Requirement::Scope(Scope::Tool), true),
     ModelInvoke => ("saddle:host/model-invoke", Requirement::Scope(Scope::ModelInvoke), true),
     Widgets => ("saddle:widgets/types", Requirement::Ambient, true),
     Ui => ("saddle:host/ui", Requirement::Scope(Scope::Ui), true),

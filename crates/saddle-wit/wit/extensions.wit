@@ -32,3 +32,10 @@ interface ui {
 
 world veto-hook { export saddle:plugin/veto@0.1.0; }
 world ui-hook { import saddle:widgets/types@0.1.0; export saddle:plugin/ui@0.1.0; }
+
+// Operations address only workers of the calling live team. No shell or executable parameter.
+interface workers {
+    record message { target: string, text: string }
+    variant operation { start(message), send(message), inspect(string), interrupt(string), stop(string), roster }
+    manage: func(op: operation) -> result<string, string>;
+}

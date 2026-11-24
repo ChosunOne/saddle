@@ -47,6 +47,7 @@ Inside `crates/saddle/src`:
 | `plugins` | protected/digest-pinned loading, tool registration, provenance and CLI installation (D128); worker-to-session host calls through the one engine/audit log, reload revocation and bounded reads (D129) |
 | `network`, `search_transport` | per-hop attributed HTTP and protected provider/Exa communication, bounded per-principal raw search snapshots; parsing/presentation is guest-owned (D143) |
 | `execution` | shared foreground/background subprocess lowering, bounded capture and deadlines (D142, D152, D153, D185) |
+| `team` | live workers of one session: typed start/send/inspect/interrupt/stop (D195), each an ordinary `Agent`/`Session` on its own thread with its own audit and derived policy; shared steering handles for the interface; no nesting, no MCP in workers |
 | `tasks` | session-owned background subprocess monitors, principal-isolated status/cancel, bounded retention and completion notices; proxy decisions and audit stay on the session thread (D153) |
 | `plugins/mutations` | bounded write/remove batches with all-target permission/precondition preflight, pinned staging and per-entry atomic publication under the plugin principal; not a filesystem-wide transaction (D140) |
 | `fs_access` | pinned no-follow directory/file opens for session roots and plugin artifacts/reads (D129) |
@@ -78,6 +79,11 @@ of them (D146, D147). `config_help` is `docs/settings.md` compiled into a guest 
 budgets snapshot, so its entry delegates no scope: `config_help = []` (D171). The one name that is
 the host's rather than a component's is `tool_search`, which is MCP discovery and decides nothing
 (D108).
+`agent` and `swarm` start and address **live workers** through the typed `saddle:host/workers`
+service (D195), available only to those shipped components and decided as the agent's
+`model-invoke`: ctrl+b in the TUI lists them, views a worker's live transcript and reasoning,
+steers it, interrupts one turn or stops it, and going back leaves it running. They also keep
+D194's saved-branch `post`/`read` for findings that must outlive the team.
 `patch` applies one apply-patch document across several files, deciding
 every path before writing any of them, and refuses the whole patch if one is denied (D56).
 `fetch` gets a URL that is already known and `websearch` finds one that is not: the request is carried

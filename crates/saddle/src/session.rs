@@ -54,6 +54,7 @@ use crate::plugins::{Entry as PluginEntry, HostFailure, Registry as PluginRegist
 use crate::provider::ToolDef;
 use crate::store::{Snapshot, Store};
 use crate::tasks::{self, Tasks};
+use crate::team::Manager;
 
 /// The header a workspace's own grant file starts with. Empty of grants on purpose: its presence
 /// and an empty file mean the same thing, and an empty file is an invitation to write a key in it.
@@ -659,6 +660,10 @@ pub struct Session {
     /// the agent did not snapshot (D163). Read-only in use: the agent's own store does the writing.
     transcripts: Option<Store>,
     _tmp: PrivateTmp,
+    /// live workers of this session (D195).
+    pub team: Manager,
+    /// Who this session is to its team: "lead", or the worker name (D195).
+    pub team_label: String,
 }
 
 impl Session {
@@ -754,6 +759,8 @@ impl Session {
             query_conversation: None,
             transcripts: None,
             _tmp: tmp,
+            team: Default::default(),
+            team_label: "lead".into(),
         };
         // Managed directories are pinned separately from policy-addressable roots (D138).
         session.tool_roots = configured_tool_roots(&session.setup);
@@ -764,6 +771,60 @@ impl Session {
         let (found, notes) = skills::discover(&mut session, &cfg)?;
         session.skills = found;
         session.skill_notes = notes;
+        let mut plugins = mem::take(&mut session.plugins);
+        let loaded = plugins.load(&mut session);
+        session.plugins = plugins;
+        loaded?;
+        Ok(session)
+    }
+
+    /// A worker of this session: the same protected setup and filesystem claims, with its own
+    /// audit log, engine and spending ledger (D195).
+    pub(crate) fn derive(&self, id: &str) -> Result<Self> {
+        let run = format!("{id}-{}", session_id());
+        let tmp = PrivateTmp::create(&run)?;
+        let setup = Setup::load(&self.setup.start, tmp.path(), &self.setup.overrides)?;
+        let policy = setup.parse_policy()?;
+        let mut audit = AuditLog::create(&setup.paths.audit_dir(), &run)?;
+        audit.event(
+            Kind::SessionStart,
+            None,
+            None,
+            None,
+            json!({"workspace": setup.workspace, "worker": id, "parent": self.audit.session()}),
+            "worker session opened",
+        )?;
+        let file_roots = setup
+            .roots
+            .iter()
+            .map(|(name, path)| Ok((name.clone(), fs_access::root(path)?)))
+            .collect::<Result<_>>()?;
+        let mut session = Self {
+            extensions: Default::default(),
+            plugin_events: Default::default(),
+            tasks: Tasks::default(),
+            file_roots,
+            plugins: PluginRegistry::new(setup.plugins.clone()),
+            launch_baselines: LaunchBaselines::default(),
+            setup,
+            engine: Engine::new(policy),
+            audit,
+            sandbox: self.sandbox.clone(),
+            host_env: self.host_env.clone(),
+            skills: Vec::new(),
+            skill_notes: Vec::new(),
+            tool_roots: Vec::new(),
+            search: self.search.clone(),
+            search_snapshots: BTreeMap::new(),
+            mcp: Registry::default(),
+            query_snapshot: None,
+            query_conversation: None,
+            transcripts: None,
+            _tmp: tmp,
+            team: self.team.child(),
+            team_label: id.to_owned(),
+        };
+        session.tool_roots = configured_tool_roots(&session.setup);
         let mut plugins = mem::take(&mut session.plugins);
         let loaded = plugins.load(&mut session);
         session.plugins = plugins;
@@ -832,6 +893,7 @@ impl Session {
             .iter()
             .map(|(name, path)| Ok((name.clone(), fs_access::root(path)?)))
             .collect::<Result<_>>()?;
+        let workers = self.team.stop_all();
         tasks::stop_all(self)?;
         self.tasks = Tasks::default();
         self.plugin_events = Default::default();
@@ -855,6 +917,7 @@ impl Session {
                         "path": self.setup.policy_path,
                         "sha256": self.setup.policy_sha256,
                         "previous_sha256": before,
+                        "workers_stopped": workers,
                     },
                 }),
                 "policy reloaded mid-session",
@@ -1090,6 +1153,7 @@ impl Session {
     /// Closes the audit log. An allowance is *not* dropped here: it outlives the session so it can
     /// be picked again later, and is removed with `saddle session revoke` (D61).
     pub fn close(mut self) -> Result<String> {
+        self.team.stop_all();
         tasks::stop_all(&mut self)?;
         self.mcp.close();
         Ok(self.audit.close(&self.setup.paths.sessions_index())?)
