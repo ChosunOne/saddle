@@ -5487,6 +5487,19 @@ mod tests {
         assert!(viewed.contains("worker runtime"), "{viewed}");
         assert!(viewed.contains("looking at the loader"), "{viewed}");
         assert!(viewed.contains("ctrl+b team"), "{viewed}");
+        // With no worker known, ctrl+b still opens the list and says so, and `/workers` does the
+        // same from the keyboard for a terminal that eats the key.
+        let mut empty = bare_app();
+        assert_eq!(empty.key(ctrl_b), Some(Action::Workers));
+        empty.workers = Some(0);
+        terminal.draw(|frame| draw(frame, &mut empty)).unwrap();
+        assert!(screen(&terminal).contains("no live workers"));
+        empty.workers = None;
+        empty.editor.set("/workers".into());
+        assert_eq!(
+            empty.key(KeyEvent::from(KeyCode::Enter)),
+            Some(Action::Workers)
+        );
         // A prompt typed here goes to the worker, not the lead.
         app.editor.set("keep going".to_string());
         assert!(matches!(

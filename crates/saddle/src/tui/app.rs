@@ -601,6 +601,11 @@ pub const COMMANDS: &[SlashCommand] = &[
         about: "list background shell tasks or cancel one",
     },
     SlashCommand {
+        name: "/workers",
+        args: "",
+        about: "the live workers of this session: view, steer, interrupt or stop one (ctrl+b)",
+    },
+    SlashCommand {
         name: "/session",
         args: "",
         about: "this conversation's id, messages, tokens and cost",
@@ -1246,10 +1251,7 @@ impl App {
             self.worker = None;
             return Some(Action::WorkerBack);
         }
-        if key.code == KeyCode::Char('b')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && !self.team.is_empty()
-        {
+        if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.workers = Some(0);
             return Some(Action::Workers);
         }
@@ -1970,6 +1972,7 @@ impl App {
             "/session" => Some(Action::SessionInfo),
             "/mcp" => Some(Action::Mcp(text["/mcp".len()..].trim().to_owned())),
             "/tasks" => Some(Action::Tasks(text["/tasks".len()..].trim().to_owned())),
+            "/workers" => Some(Action::Workers),
             "/profile" => Some(Action::Profile(text["/profile".len()..].trim().to_owned())),
             "/clone" if self.busy.is_some() => {
                 self.info("/clone waits for the turn to end; esc cancels it");
