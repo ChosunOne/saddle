@@ -3441,11 +3441,12 @@ fn draw_overview(frame: &mut Frame<'_>, app: &mut App, selected: usize, area: Re
 /// commands and reasons in the queue, newest at the end unless the person scrolled back (D196).
 fn draw_board(
     frame: &mut Frame<'_>,
-    app: &App,
+    app: &mut App,
     lines: Vec<Line<'static>>,
     empty: &str,
     inner: Rect,
 ) {
+    app.board_height = inner.height as usize;
     if lines.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(empty, dim(&app.theme)))),

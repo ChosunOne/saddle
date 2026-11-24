@@ -736,6 +736,8 @@ pub struct App {
     pub jobs: Vec<QueueItem>,
     /// How far the bus or queue board is scrolled back from its end, in rows (D196).
     pub board_scroll: usize,
+    /// The height a board was last drawn at, so PageUp/PageDown move a screen rather than a guess.
+    pub board_height: usize,
     /// The session overview page, while open, and which pane it has selected: `0` is the person's
     /// own conversation and `n` is the team's `n`th worker. `None` is the page closed.
     pub overview: Option<usize>,
@@ -864,6 +866,7 @@ impl App {
             bus: Vec::new(),
             jobs: Vec::new(),
             board_scroll: 0,
+            board_height: 0,
             overview: None,
             worker: None,
             worker_scroll: 0,
@@ -1970,7 +1973,7 @@ impl App {
     /// paragraph, each keeping its place while the list moves on (D195, D196).
     fn overview_scroll(&mut self, selected: usize, sessions: usize, back: bool) {
         if selected >= sessions {
-            let page = 10;
+            let page = self.board_height.saturating_sub(1).max(1);
             self.board_scroll = if back {
                 self.board_scroll.saturating_add(page)
             } else {

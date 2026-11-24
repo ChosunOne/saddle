@@ -47,7 +47,7 @@ Inside `crates/saddle/src`:
 | `plugins` | protected/digest-pinned loading, tool registration, provenance and CLI installation (D128); worker-to-session host calls through the one engine/audit log, reload revocation and bounded reads (D129) |
 | `network`, `search_transport` | per-hop attributed HTTP and protected provider/Exa communication, bounded per-principal raw search snapshots; parsing/presentation is guest-owned (D143) |
 | `execution` | shared foreground/background subprocess lowering, bounded capture and deadlines (D142, D152, D153, D185) |
-| `team` | live workers of one session: typed start/send/inspect/interrupt/stop (D195), each an ordinary `Agent`/`Session` on its own thread with its own audit and derived policy; shared steering handles for the interface; no nesting, no MCP in workers |
+| `team` | live workers of one session: typed start/send/status/roster/interrupt/stop, the per-team bus and serial command queue (D195, D196), each worker an ordinary `Agent`/`Session` on its own thread with its own audit and derived policy; shared steering handles for the interface; no nesting, no MCP in workers |
 | `tasks` | session-owned background subprocess monitors, principal-isolated status/cancel, bounded retention and completion notices; proxy decisions and audit stay on the session thread (D153) |
 | `plugins/mutations` | bounded write/remove batches with all-target permission/precondition preflight, pinned staging and per-entry atomic publication under the plugin principal; not a filesystem-wide transaction (D140) |
 | `fs_access` | pinned no-follow directory/file opens for session roots and plugin artifacts/reads (D129) |

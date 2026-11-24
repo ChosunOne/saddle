@@ -802,7 +802,7 @@ that must not overlap go on one queue per team:
 
 ```sh
 saddle tool agent '{"action":"enqueue","command":"cargo test -p saddle-cap","why":"serial build check"}'
-saddle tool agent '{"action":"claim"}'      # nothing while another member holds the queue
+saddle tool agent '{"action":"claim"}'      # refused while another member holds the queue
 saddle tool agent '{"action":"finish","id":1,"ok":true}'
 saddle tool agent '{"action":"queue"}'      # what is waiting, running and done
 saddle tool agent '{"action":"bus"}'        # the last messages, attributed
@@ -812,7 +812,10 @@ The host stores, orders and audits the queue but never runs it: the member that 
 runs it with its own `bash`, under its own grants and audit. A claim holds the queue for ten minutes
 at most, so a worker that dies mid-command does not stop the team; an expired claim is marked lost.
 The queue and bus are in memory, so a restart forgets them, and a finished worker may no longer
-enqueue, claim or finish. Closing Saddle or changing the policy stops every worker first.
+enqueue, claim or finish. A command is at most 4096 bytes, the queue holds 64 waiting items, and
+only the last 16 finished or lost ones are kept for `queue` and the board. `bus` answers with at
+most the last 20 messages that fit in 16 000 characters; the page's board keeps 200 messages of up
+to 8000 characters each. Closing Saddle or changing the policy stops every worker first.
 `saddle check` and `saddle tools --config` show the delegation the feature needs.
 
 For example, runtime calls `agent` with `{"action":"post","to":"review/tests","text":"Check the reload path at session.rs:17"}`.

@@ -4756,8 +4756,11 @@ workers the session has and how many are mid-turn, in the default template and a
 (D187); the interface reaches a worker
 mid-turn through a shared steering handle, so the lead being busy is not a reason a worker
 cannot be steered. `send` from a worker reaches a peer directly, labelled with its sender; the
-host resolves only live worker names, never arbitrary conversation ids. Closing the session, a
-policy reload or an interrupt from the person stops workers first and audits that. Workers
+host resolves only live worker names, never arbitrary conversation ids, so a worker never reaches the
+lead by name: the lead reads a worker's outbox or its own live status. Closing the session or
+replacing the policy stops every worker first (the reload's own record says so, and each stop the
+model asked for is a decision); a person's `i` reaches one worker's turn and leaves the rest
+running. Workers
 have no MCP servers and no nested teams, and budgets are per worker rather than pooled; those
 remain deferred. The saved-branch tools of D194 remain for findings that outlive a live team.
 
@@ -4765,7 +4768,8 @@ remain deferred. The saved-branch tools of D194 remain for findings that outlive
 live members is recorded on an in-memory bus (bounded, newest last) with its sender and target and
 the words it carried; the audit still records the operation's target and a hash, never the words,
 as for a brief. The page's bus board wraps each message in full and scrolls it, newest at the end,
-and a member can read a bounded recent tail with `agent {"action":"bus"}`. A message is kept up to
+and a member can read a bounded recent tail with `agent {"action":"bus"}` — at most the last 20
+messages that fit in 16 000 characters, with the count said when older ones are left out. A message is kept up to
 8000 characters on the bus (the receiving conversation holds it in full) and the bus holds 200 of
 them. The queue board likewise shows each item's full command and reason, not a truncated row. The
 bus conveys data, not
