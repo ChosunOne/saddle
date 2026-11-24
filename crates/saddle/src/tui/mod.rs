@@ -1296,8 +1296,17 @@ fn event_loop(
                 dirty = true;
             }
         }
+        // A running worker that is on screen keeps the frame moving as well: its elapsed times
+        // and any spinner in a call it is waiting on advance with the clock, even though the
+        // lead is idle (D172, D195).
+        let watching = app.workers.is_some() || app.worker.is_some();
         let working = app.busy.is_some()
             || app.background_running()
+            || (watching
+                && app
+                    .team
+                    .iter()
+                    .any(|worker| worker.state.starts_with("running")))
             || app.login.as_ref().is_some_and(|l| l.checking());
         // The "copied" note is timed, so its redraws stop on their own once it has expired.
         let noting = app.copied.is_some_and(|at| at.elapsed() < app::COPY_NOTE);

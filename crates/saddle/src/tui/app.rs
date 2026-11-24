@@ -198,7 +198,8 @@ pub enum Action {
     OpenWorker(String),
     /// A prompt for the worker being viewed; steering if its turn is running.
     WorkerInput(String),
-    /// Back to the conversation the person came from.
+    /// Back to the overview on the worker that was being viewed, and to the conversation the
+    /// person came from.
     WorkerBack,
     /// Interrupt the named worker's turn.
     WorkerInterrupt(String),
@@ -603,7 +604,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/workers",
         args: "",
-        about: "the live workers of this session: view, steer, interrupt or stop one (ctrl+b)",
+        about: "the live workers of this session: flip through them, steer, interrupt or stop one (ctrl+b)",
     },
     SlashCommand {
         name: "/session",
@@ -725,7 +726,8 @@ pub struct App {
     pub tree: Option<Tree>,
     /// The live workers of this session (D195).
     pub team: Vec<Render>,
-    /// Which worker the team list has selected.
+    /// The session overview, while open, and which session it shows: `0` is the person's own
+    /// conversation and `n` is the team's `n`th worker. `None` is neither screen open.
     pub workers: Option<usize>,
     /// The worker being viewed, by name, or `None` in the person's own conversation.
     pub worker: Option<String>,
@@ -1221,24 +1223,80 @@ impl App {
         if self.confirm.is_some() {
             return self.answer(key);
         }
-        // The team view is a keystroke away and owns the keys while it is open (D195).
+        // The session overview is a keystroke away and owns the keys while it is open: one tab for
+        // the person's own conversation, then a tab for each worker, and the selected conversation
+        // is drawn live underneath, reasoning and output included (D195).
         if let Some(selected) = self.workers {
-            let rows = self.team.len();
+            let rows = self.team.len() + 1;
+            let selected = selected.min(rows - 1);
+            let page = self.worker_height.saturating_sub(1).max(1);
+            // Scrolling belongs to the conversation on screen: the lead's own transcript has its
+            // own scroll, and a worker's is kept apart from it.
+            let scroll = |app: &mut App, forwards: usize, back: usize| {
+                if selected == 0 {
+                    app.scroll = if back > 0 {
+                        app.scroll.saturating_sub(back)
+                    } else {
+                        (app.scroll + forwards).min(app.total_lines)
+                    };
+                } else if back > 0 {
+                    app.worker_scroll = app.worker_scroll.saturating_sub(back);
+                } else {
+                    app.worker_scroll = (app.worker_scroll + forwards).min(app.worker_total);
+                }
+            };
             return match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => {
                     self.workers = None;
+                    self.selection = None;
                     None
                 }
-                KeyCode::Down | KeyCode::Char('j') if rows > 0 => {
-                    self.workers = Some((selected + 1).min(rows - 1));
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.workers = None;
+                    self.selection = None;
                     None
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.workers = Some(selected.saturating_sub(1));
+                KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('l') => {
+                    self.workers = Some((selected + 1) % rows);
+                    self.worker_scroll = 0;
+                    self.selection = None;
                     None
                 }
-                KeyCode::Enter if rows > 0 => {
-                    let name = self.team[selected.min(rows - 1)].name.clone();
+                KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('h') => {
+                    self.workers = Some((selected + rows - 1) % rows);
+                    self.worker_scroll = 0;
+                    self.selection = None;
+                    None
+                }
+                KeyCode::Char(digit @ '0'..='9') => {
+                    let index = digit as usize - '0' as usize;
+                    self.workers = Some(index.min(rows - 1));
+                    self.worker_scroll = 0;
+                    self.selection = None;
+                    None
+                }
+                KeyCode::PageUp => {
+                    scroll(self, page, 0);
+                    None
+                }
+                KeyCode::PageDown => {
+                    scroll(self, 0, page);
+                    None
+                }
+                KeyCode::Home => {
+                    scroll(self, usize::MAX / 2, 0);
+                    None
+                }
+                KeyCode::End => {
+                    if selected == 0 {
+                        self.scroll = 0;
+                    } else {
+                        self.worker_scroll = 0;
+                    }
+                    None
+                }
+                KeyCode::Enter if selected > 0 => {
+                    let name = self.team[selected - 1].name.clone();
                     self.workers = None;
                     self.worker = Some(name.clone());
                     self.worker_scroll = 0;
@@ -1246,12 +1304,17 @@ impl App {
                     self.selection = None;
                     Some(Action::OpenWorker(name))
                 }
-                KeyCode::Char('i') if rows > 0 => Some(Action::WorkerInterrupt(
-                    self.team[selected.min(rows - 1)].name.clone(),
+                KeyCode::Enter => {
+                    self.workers = None;
+                    self.selection = None;
+                    None
+                }
+                KeyCode::Char('i') if selected > 0 => Some(Action::WorkerInterrupt(
+                    self.team[selected - 1].name.clone(),
                 )),
-                KeyCode::Char('x') if rows > 0 => Some(Action::WorkerStop(
-                    self.team[selected.min(rows - 1)].name.clone(),
-                )),
+                KeyCode::Char('x') if selected > 0 => {
+                    Some(Action::WorkerStop(self.team[selected - 1].name.clone()))
+                }
                 _ => None,
             };
         }
@@ -1290,17 +1353,26 @@ impl App {
                 return None;
             }
         }
+        // Leaving a worker's transcript opens the overview on it, and the agent thread goes back
+        // to the conversation the person came from (D195).
         if self.worker.is_some()
-            && key.code == KeyCode::Char('b')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && (key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('b')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)))
         {
-            self.worker = None;
+            let name = self.worker.take().unwrap_or_default();
             self.worker_scroll = 0;
             self.selection = None;
+            self.workers = Some(
+                self.team
+                    .iter()
+                    .position(|worker| worker.name == name)
+                    .map_or(0, |index| index + 1),
+            );
             return Some(Action::WorkerBack);
         }
         if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.workers = Some(0);
+            self.open_overview();
             return Some(Action::Workers);
         }
         if let Some(login) = &mut self.login {
@@ -1881,6 +1953,19 @@ impl App {
 
     /// `queued` chooses what happens when a turn is already running: the prompt waits for the turn
     /// to finish, or enters the conversation at the next request (D149).
+    /// Opens the session overview on a worker that is doing something, or on the person's own
+    /// conversation when none is (D195).
+    fn open_overview(&mut self) {
+        let index = self
+            .team
+            .iter()
+            .position(|worker| worker.state.starts_with("running"))
+            .or_else(|| self.team.iter().position(|worker| !worker.finished));
+        self.workers = Some(index.map_or(0, |index| index + 1));
+        self.worker_scroll = 0;
+        self.selection = None;
+    }
+
     fn submit(&mut self, queued: bool) -> Option<Action> {
         let text = self.editor.text().trim().to_owned();
         if text.is_empty() {
@@ -2020,7 +2105,10 @@ impl App {
             "/session" => Some(Action::SessionInfo),
             "/mcp" => Some(Action::Mcp(text["/mcp".len()..].trim().to_owned())),
             "/tasks" => Some(Action::Tasks(text["/tasks".len()..].trim().to_owned())),
-            "/workers" => Some(Action::Workers),
+            "/workers" => {
+                self.open_overview();
+                Some(Action::Workers)
+            }
             "/profile" => Some(Action::Profile(text["/profile".len()..].trim().to_owned())),
             "/clone" if self.busy.is_some() => {
                 self.info("/clone waits for the turn to end; esc cancels it");
@@ -2214,6 +2302,9 @@ impl App {
             }
             AgentEvent::Workers(views) => {
                 self.team = views;
+                if let Some(selected) = self.workers {
+                    self.workers = Some(selected.min(self.team.len()));
+                }
                 if let Some(name) = &self.worker
                     && !self.team.iter().any(|worker| &worker.name == name)
                 {

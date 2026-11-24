@@ -2063,7 +2063,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     ])
     .areas(area);
 
-    if let Some(name) = &app.worker
+    if let Some(selected) = app.workers {
+        draw_overview(frame, app, selected, transcript_area);
+    } else if let Some(name) = &app.worker
         && let Some(worker) = app.team.iter().find(|worker| &worker.name == name).cloned()
     {
         draw_worker(frame, &worker, app, transcript_area);
@@ -2217,9 +2219,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let mut surface = None;
     if let Some(picker) = &app.resume {
         surface = Some(draw_resume(frame, picker, area, &app.theme));
-    }
-    if let Some(selected) = app.workers {
-        surface = Some(draw_workers(frame, &app.team, selected, area, &app.theme));
     }
     if let Some(tree) = &mut app.tree {
         surface = Some(draw_tree(frame, tree, area, &app.theme));
@@ -3315,6 +3314,131 @@ fn keep_tail(s: &str, max: usize) -> String {
     iter::once('…').chain(out.into_iter().rev()).collect()
 }
 
+/// The live team at a glance: a tab for the person's own conversation and one for each worker,
+/// and the selected conversation drawn by the lead's transcript renderer underneath, so flipping
+/// between sessions shows each one's reasoning and output as they stream (D195).
+fn draw_overview(frame: &mut Frame<'_>, app: &mut App, selected: usize, area: Rect) {
+    let [strip, hint, body] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .areas(area);
+    // The screen belongs to this view, so the conversation it replaced is cleared rather than
+    // showing in the cells the strip and hint rows do not reach (D195).
+    frame.render_widget(Clear, area);
+    let selected = selected.min(app.team.len());
+    draw_session_strip(frame, &app.team, selected, strip, &app.theme);
+    let mut text = String::new();
+    if let Some(worker) = selected.checked_sub(1).and_then(|i| app.team.get(i)) {
+        text.push_str(&worker.name);
+        text.push_str(" · ");
+        text.push_str(if worker.state.is_empty() {
+            "starting"
+        } else {
+            &worker.state
+        });
+        text.push_str(" · ");
+    }
+    text.push_str(if app.team.is_empty() {
+        "no live workers; ask the agent to start one · esc back"
+    } else {
+        "tab/↑↓ flip · 1-9 pick · enter view · i interrupt · x stop · esc back"
+    });
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, dim(&app.theme)))),
+        hint,
+    );
+    if selected == 0 {
+        draw_transcript(frame, app, body);
+    } else if let Some(worker) = app.team.get(selected - 1).cloned() {
+        draw_worker_transcript(frame, &worker, app, body);
+    } else {
+        draw_transcript(frame, app, body);
+    }
+}
+
+/// The tab strip of the overview: each session's name and, for a worker, what it is doing. The
+/// selected tab is drawn wider and in the accent, and the strip scrolls to keep it in view when
+/// the team does not fit (D195).
+fn draw_session_strip(
+    frame: &mut Frame<'_>,
+    team: &[Render],
+    selected: usize,
+    area: Rect,
+    theme: &Theme,
+) {
+    let active = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
+    let mut tabs: Vec<(String, Style)> = Vec::with_capacity(team.len() + 1);
+    tabs.push((
+        format!("{}lead  ", if selected == 0 { "▸ " } else { "" }),
+        if selected == 0 {
+            active
+        } else {
+            Style::new().fg(theme.text)
+        },
+    ));
+    for (index, worker) in team.iter().enumerate() {
+        let (glyph, colour) = overview_mark(&worker.state, theme);
+        let chosen = index + 1 == selected;
+        let state = worker.state.split_whitespace().next().unwrap_or("starting");
+        let text = if chosen {
+            format!("▸ {} {glyph} {state}  ", worker.name)
+        } else {
+            format!("{} {glyph}  ", worker.name)
+        };
+        tabs.push((
+            text,
+            if chosen {
+                active
+            } else {
+                Style::new().fg(colour)
+            },
+        ));
+    }
+    let width = area.width as usize;
+    let mut start = 0;
+    while start < selected
+        && tabs[start..=selected]
+            .iter()
+            .map(|(text, _)| text.chars().count())
+            .sum::<usize>()
+            > width
+    {
+        start += 1;
+    }
+    let mut spans = Vec::new();
+    let mut used = 0;
+    if start > 0 {
+        spans.push(Span::styled("… ", dim(theme)));
+        used = 2;
+    }
+    for (text, style) in tabs.iter().skip(start) {
+        let cells = text.chars().count();
+        if used + cells > width {
+            break;
+        }
+        spans.push(Span::styled(text.clone(), *style));
+        used += cells;
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// What a worker is doing, as one glyph and the colour it is drawn in (D195).
+fn overview_mark(state: &str, theme: &Theme) -> (char, Color) {
+    if state.starts_with("running") {
+        ('●', theme.success)
+    } else if state.starts_with("finished") {
+        ('✓', theme.muted)
+    } else if state.starts_with("failed") || state.starts_with("stopped") {
+        ('✗', theme.error)
+    } else if state.starts_with("idle") {
+        ('○', theme.muted)
+    } else {
+        ('…', theme.dim)
+    }
+}
+
 /// A worker's own conversation, drawn by the lead's transcript renderer — the same markdown,
 /// highlighted code, tool blocks, collapsed output, scrolling and pictures — under one line that
 /// says whose transcript this is (D195).
@@ -3337,13 +3461,20 @@ fn draw_worker(frame: &mut Frame<'_>, worker: &Render, app: &mut App, area: Rect
                 format!("{} · {state}", worker.name),
                 Style::new().fg(app.theme.accent),
             ),
-            Span::styled("  · ctrl+b back · ↑↓ scroll · enter steer", dim(&app.theme)),
+            Span::styled(
+                "  · esc/ctrl+b sessions · ↑↓ scroll · enter steer",
+                dim(&app.theme),
+            ),
         ])),
         head,
     );
-    // The body is the lead's own transcript path, with the worker's conversation swapped in: the
-    // rendering, the collapse, the scroll arithmetic and the picture placement are one
-    // implementation, so the two views cannot drift apart.
+    draw_worker_transcript(frame, worker, app, body);
+}
+
+/// The body of a worker view or of its tab in the overview: the lead's own transcript path, with
+/// the worker's conversation swapped in. The rendering, the collapse, the scroll arithmetic and
+/// the picture placement are one implementation, so the views cannot drift apart (D195).
+fn draw_worker_transcript(frame: &mut Frame<'_>, worker: &Render, app: &mut App, body: Rect) {
     let entries = worker_entries(worker);
     let fresh = iter::repeat_with(|| None).take(entries.len()).collect();
     let lead_cache = mem::replace(&mut app.cache, fresh);
@@ -3417,82 +3548,6 @@ fn worker_entries(worker: &Render) -> Vec<Entry> {
         }
     }
     out
-}
-
-/// The live team: one row per worker, with what it is doing (D195).
-fn draw_workers(
-    frame: &mut Frame<'_>,
-    team: &[Render],
-    selected: usize,
-    area: Rect,
-    theme: &Theme,
-) -> Seen {
-    let width = area.width.saturating_sub(4).min(76);
-    let height = (team.len() as u16 + 4).min(area.height.saturating_sub(2));
-    let rect = Rect::new(
-        area.x + (area.width.saturating_sub(width)) / 2,
-        area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    );
-    let rows: Vec<Line> = if team.is_empty() {
-        vec![Line::from(Span::styled(
-            "no live workers; ask the agent to start one",
-            dim(theme),
-        ))]
-    } else {
-        team.iter()
-            .enumerate()
-            .map(|(index, worker)| {
-                let mark = if index == selected { "› " } else { "  " };
-                let turns = format!("{} turns", worker.turns);
-                let text = format!(
-                    "{mark}{:<14} {:<18} {turns}",
-                    worker.name,
-                    if worker.state.is_empty() {
-                        "starting"
-                    } else {
-                        &worker.state
-                    }
-                );
-                let style = if index == selected {
-                    Style::new().fg(theme.accent)
-                } else {
-                    Style::new()
-                };
-                Line::from(Span::styled(text, style))
-            })
-            .collect()
-    };
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(theme.border_accent))
-        .title(" live workers ")
-        .title_bottom(Line::from(Span::styled(
-            "enter view · i interrupt · x stop · esc close",
-            dim(theme),
-        )));
-    // The list is a surface of its own: clear it first, or the transcript behind it shows in
-    // every inner cell the row text does not reach (D195).
-    frame.render_widget(Clear, rect);
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-    let shown: Vec<String> = rows
-        .iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect()
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(rows), inner);
-    Seen {
-        area: rect,
-        top: 0,
-        lines: shown,
-        pictures: Vec::new(),
-    }
 }
 
 fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -5532,71 +5587,120 @@ mod tests {
     }
 
     #[test]
-    fn the_team_list_and_a_worker_view_are_drawn_and_open_with_the_keys() {
-        // D195: ctrl+b lists the live workers, enter opens one, and its streamed transcript is
-        // drawn in place of the lead's while the team keeps its state.
+    fn the_session_overview_draws_each_agent_live_and_flips_between_them() {
+        // D195: ctrl+b opens the overview on the worker that is doing something, tab and the
+        // arrows flip between the person's own conversation and every worker, and each tab is
+        // drawn by the lead's transcript renderer while it streams.
         use crate::team::Beat;
         use crate::team::Render;
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        fn runtime() -> Render {
+            Render {
+                name: "runtime".into(),
+                brief: "probe the build".into(),
+                state: "running".into(),
+                turns: 1,
+                beats: vec![
+                    Beat::Prompt("probe the build".into()),
+                    Beat::Thinking("the reload path is here".into()),
+                    Beat::Text("Looking at **the loader** now.".into()),
+                    Beat::Call {
+                        name: "bash".into(),
+                        detail: "grep -n reload src".into(),
+                    },
+                    Beat::Result {
+                        ok: true,
+                        content: "src/lib.rs:17: fn reload".into(),
+                        diff: None,
+                        images: Vec::new(),
+                    },
+                ],
+                ..Render::default()
+            }
+        }
         let mut app = bare_app();
-        app.agent(AgentEvent::Workers(vec![Render {
-            name: "runtime".into(),
-            brief: "probe the build".into(),
-            state: "running".into(),
-            turns: 1,
-            beats: vec![
-                Beat::Prompt("probe the build".into()),
-                Beat::Thinking("the reload path is here".into()),
-                Beat::Text("Looking at **the loader** now.".into()),
-                Beat::Call {
-                    name: "bash".into(),
-                    detail: "grep -n reload src".into(),
-                },
-                Beat::Result {
-                    ok: true,
-                    content: "src/lib.rs:17: fn reload".into(),
-                    diff: None,
-                    images: Vec::new(),
-                },
-            ],
-            ..Render::default()
-        }]));
+        // Reasoning is drawn as it streams, in the overview and in a worker's own view alike.
+        app.show_thinking = true;
+        app.agent(AgentEvent::Text("the lead's own words".into()));
+        app.agent(AgentEvent::Workers(vec![
+            runtime(),
+            Render {
+                name: "tests".into(),
+                state: "idle".into(),
+                turns: 2,
+                ..Render::default()
+            },
+        ]));
         let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
         assert_eq!(app.key(ctrl_b), Some(Action::Workers));
-        app.workers = Some(0);
+        assert_eq!(app.workers, Some(1), "opens on the running worker");
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let listed = screen(&terminal);
-        assert!(listed.contains("live workers"), "{listed}");
-        assert!(listed.contains("runtime"), "{listed}");
-        // The list is opaque: with a full transcript behind it, its own rows carry no text from
-        // underneath past the end of a row.
+        let shown = screen(&terminal);
+        assert!(shown.contains("▸ runtime ● running"), "{shown}");
+        assert!(shown.contains("tests ○"), "{shown}");
+        assert!(shown.contains("tab/↑↓ flip"), "{shown}");
+        // The selected worker's conversation is drawn as the lead's is: reasoning, markdown
+        // without its markers, and the tool block with its call and answer.
+        assert!(shown.contains("the reload path is here"), "{shown}");
+        assert!(shown.contains("Looking at the loader now."), "{shown}");
+        assert!(
+            !shown.contains("**"),
+            "markdown markers were not rendered: {shown}"
+        );
+        assert!(shown.contains("grep -n reload src"), "{shown}");
+        assert!(shown.contains("src/lib.rs:17"), "{shown}");
+        // Flipping to the person's own conversation shows it, and back again shows the worker.
+        assert_eq!(app.key(KeyEvent::from(KeyCode::Char('0'))), None);
+        assert_eq!(app.workers, Some(0));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let lead = screen(&terminal);
+        assert!(lead.contains("▸ lead"), "{lead}");
+        assert!(lead.contains("the lead's own words"), "{lead}");
+        assert!(!lead.contains("Looking at the loader now."), "{lead}");
+        assert_eq!(app.key(KeyEvent::from(KeyCode::Char('1'))), None);
+        assert_eq!(app.workers, Some(1));
+        // tab and shift+tab wrap through every session; the digits jump straight to one.
+        assert_eq!(app.key(KeyEvent::from(KeyCode::Tab)), None);
+        assert_eq!(app.workers, Some(2), "tab reaches the idle worker");
+        assert_eq!(app.key(KeyEvent::from(KeyCode::BackTab)), None);
+        assert_eq!(app.workers, Some(1));
+        // ctrl+b closes it again, back to the person's own conversation.
+        assert_eq!(app.key(ctrl_b), None);
+        assert!(app.workers.is_none());
+        // The overview is opaque: the transcript underneath it does not show in its rows.
         let mut covered = bare_app();
         for _ in 0..20 {
             covered.agent(AgentEvent::Text("z".repeat(200)));
         }
-        covered.agent(AgentEvent::Workers(vec![Render {
-            name: "runtime".into(),
-            state: "running".into(),
-            turns: 1,
-            ..Render::default()
-        }]));
-        covered.workers = Some(0);
+        covered.agent(AgentEvent::Workers(vec![runtime()]));
+        covered.workers = Some(1);
         terminal.draw(|frame| draw(frame, &mut covered)).unwrap();
-        let row = screen(&terminal)
-            .lines()
-            .find(|line| line.contains("runtime"))
-            .expect("the list shows its worker")
-            .to_owned();
-        let (_, inside) = row.split_once('│').expect("the list has a left border");
-        let inside = inside
-            .rsplit_once('│')
-            .expect("the list has a right border")
-            .0;
+        let inside = screen(&terminal);
         assert!(
             !inside.contains('z'),
-            "the transcript showed through: {inside:?}"
+            "the transcript showed through: {inside}"
         );
+        // The view scrolls like a transcript, and the scroll belongs to the worker rather than
+        // to the lead's conversation.
+        app.agent(AgentEvent::Workers(vec![{
+            let mut many = runtime();
+            many.state = "idle".into();
+            many.beats = (0..40)
+                .map(|turn| Beat::Text(format!("line {turn}\n")))
+                .collect();
+            many
+        }]));
+        app.workers = Some(1);
+        app.worker_scroll = 0;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("line 39"));
+        app.key(KeyEvent::from(KeyCode::PageUp));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.worker_scroll > 0);
+        assert!(!screen(&terminal).contains("line 39"));
+        // Enter on a worker opens its own view — the same renderer under one naming line — and
+        // esc goes back to the overview on that worker.
         assert_eq!(
             app.key(KeyEvent::from(KeyCode::Enter)),
             Some(Action::OpenWorker("runtime".into()))
@@ -5604,57 +5708,42 @@ mod tests {
         app.worker = Some("runtime".into());
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let viewed = screen(&terminal);
-        // One line says whose transcript this is; everything under it is the lead's renderer.
         assert!(viewed.contains("agent transcript runtime"), "{viewed}");
-        // The worker's own conversation is drawn as the lead's is: markdown without its markers,
-        // the tool block with its call and answer, and the reasoning under its heading.
-        assert!(viewed.contains("Looking at the loader now."), "{viewed}");
-        assert!(
-            !viewed.contains("**"),
-            "markdown markers were not rendered: {viewed}"
+        assert!(viewed.contains("esc/ctrl+b sessions"), "{viewed}");
+        assert!(viewed.contains("idle"), "{viewed}");
+        assert_eq!(
+            app.key(KeyEvent::from(KeyCode::Esc)),
+            Some(Action::WorkerBack)
         );
-        assert!(viewed.contains("grep -n reload src"), "{viewed}");
-        assert!(viewed.contains("src/lib.rs:17"), "{viewed}");
-        assert!(viewed.contains("ctrl+b back"), "{viewed}");
-        assert!(viewed.contains("running"), "{viewed}");
-        // The view scrolls like a transcript, and the scroll belongs to it rather than to the
-        // lead's conversation.
-        app.worker_scroll = 0;
-        let mut many = Render {
-            name: "runtime".into(),
-            state: "idle".into(),
-            ..Render::default()
-        };
-        for turn in 0..40 {
-            many.beats.push(Beat::Text(format!("line {turn}\n")));
-        }
-        app.agent(AgentEvent::Workers(vec![many]));
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(screen(&terminal).contains("line 39"));
-        app.key(KeyEvent::from(KeyCode::PageUp));
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(app.worker_scroll > 0);
-        assert!(!screen(&terminal).contains("line 39"));
-        // With no worker known, ctrl+b still opens the list and says so, and `/workers` does the
-        // same from the keyboard for a terminal that eats the key.
+        assert_eq!(app.workers, Some(1));
+        assert!(app.worker.is_none());
+        // With no workers yet the overview still opens and says how to get one, and `/workers`
+        // is the same screen for a terminal that eats the key.
         let mut empty = bare_app();
         assert_eq!(empty.key(ctrl_b), Some(Action::Workers));
-        empty.workers = Some(0);
+        assert_eq!(empty.workers, Some(0));
         terminal.draw(|frame| draw(frame, &mut empty)).unwrap();
-        assert!(screen(&terminal).contains("no live workers"));
+        let none = screen(&terminal);
+        assert!(none.contains("no live workers"), "{none}");
+        assert!(none.contains("▸ lead"), "{none}");
         empty.workers = None;
         empty.editor.set("/workers".into());
         assert_eq!(
             empty.key(KeyEvent::from(KeyCode::Enter)),
             Some(Action::Workers)
         );
-        // A prompt typed here goes to the worker, not the lead.
+        assert_eq!(empty.workers, Some(0));
+        // A prompt typed in a worker's own view goes to the worker, not the lead, and ctrl+b
+        // there returns to the overview on that worker.
+        app.worker = Some("runtime".into());
+        app.workers = None;
         app.editor.set("keep going".to_string());
         assert!(matches!(
             app.key(KeyEvent::from(KeyCode::Enter)),
             Some(Action::WorkerInput(_))
         ));
         assert_eq!(app.key(ctrl_b), Some(Action::WorkerBack));
+        assert_eq!(app.workers, Some(1));
     }
 
     #[test]

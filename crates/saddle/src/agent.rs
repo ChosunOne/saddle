@@ -513,7 +513,7 @@ impl Agent {
         session.mcp.restore(&resumed.declared);
         self.refresh_tools(session.declared_tools());
         ui.note(&format!(
-            "viewing worker {name}; ctrl+b goes back to the team"
+            "viewing worker {name}; esc or ctrl+b goes back to the sessions"
         ));
         Ok(())
     }

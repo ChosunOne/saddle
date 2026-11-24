@@ -4734,12 +4734,17 @@ worker, so it is readable by id and through `session_query` (`sessions.worker = 
 offered by `/resume`: a team's transcripts belong to the team view, not to the person's own
 history. A conversation an earlier build saved before that column existed is recognised by its own
 audit log, whose session-start record names the worker, and marked when the list is opened; a
-conversation whose log is gone is left alone rather than guessed at. A person opens the team with ctrl+b, views a
-worker's live transcript and provider-exposed reasoning, types into it, interrupts one turn
-(keeping the worker), or stops it (keeping its conversation). A worker's conversation is kept as
-structured beats and drawn by the lead's own transcript path, so markdown, highlighted code, tool
-blocks with their diffs and collapsed output, formulas, returned pictures and scrolling are one
-implementation rather than two that drift; the only addition is one line above it naming it an
+conversation whose log is gone is left alone rather than guessed at. A person opens the team with ctrl+b (or `/workers`) into an overview: a tab for
+their own conversation and one for each worker, the selected one drawn live underneath with its
+streaming reasoning and output, `tab`/`shift+tab` or the arrows or a digit flipping between them,
+and `enter` opening one as a full transcript to type into (steering it if its turn is running),
+`i` interrupting one turn (keeping the worker), `x` stopping it (keeping its conversation) and
+`esc` going back. The overview opens on a worker that is mid-turn when there is one, and reads
+the shared handles rather than the session thread, so the worker shown keeps streaming while
+the lead is busy. A worker's conversation is kept as structured beats and drawn by the lead's own
+transcript path, so markdown, highlighted code, tool blocks with their diffs and collapsed output,
+formulas, returned pictures and scrolling are one implementation rather than two that drift; the
+overview adds a tab strip and a hint line above it, and the focused view one line naming it an
 agent's transcript. The list and view read the shared handles rather than the session thread, so a
 worker streams while the lead is busy, and the status line's `{workers}` says how many live
 workers the session has and how many are mid-turn, in the default template and absent with no team

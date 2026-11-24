@@ -786,11 +786,13 @@ Ask the agent to start a worker, or call it yourself with
 — with `model-invoke` and `[standard-tools] agent = ["transcript-read", "model-invoke", "fs-read", "fs-write"]`
 granted. `agent` also takes `send`, `status`, `interrupt` and `stop`; `swarm` with no arguments
 lists live workers. A worker is a real Saddle session: it owns a conversation, audit log and
-model-spend ledger derived from the same policy, and it cannot start another worker. While
-anything is live, **ctrl+b** opens the team list: enter views a worker's streaming output and
-reasoning, typing steers it (or wakes it when idle), `i` interrupts its turn and `x` stops it.
-`ctrl+b` again goes back to your own conversation; the workers keep running. Stopping a worker
-keeps its saved conversation. Closing Saddle or changing the policy stops every worker first.
+model-spend ledger derived from the same policy, and it cannot start another worker. **ctrl+b**
+(or `/workers`) opens the session overview: one tab for your own conversation and one for each
+worker, the selected one drawn live underneath with its streaming output and reasoning. `tab` or
+`shift+tab`, the arrows, or a digit flip between them; `enter` opens one as a full transcript,
+where typing steers it (or wakes it when idle); `i` interrupts its turn, `x` stops it, and `esc`
+goes back. `esc` from that view — or `ctrl+b` — returns to the overview, and `esc` again to your
+own conversation; the workers keep running. Stopping a worker keeps its saved conversation. Closing Saddle or changing the policy stops every worker first.
 `saddle check` and `saddle tools --config` show the delegation the feature needs.
 
 For example, runtime calls `agent` with `{"action":"post","to":"review/tests","text":"Check the reload path at session.rs:17"}`.
