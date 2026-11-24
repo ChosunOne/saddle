@@ -5,8 +5,10 @@ Responses providers, and gives the model a small, fixed set of tools whose autho
 set of grants: every file read, write, command, network request and plugin call is decided before it
 happens and recorded in a hash-chained audit log. Deny is the default.
 
-The design document is `docs/plan.md`; the configuration reference is `docs/settings.md` (and the
-`config_help` tool from inside a session); the plugin/tool surface is `docs/plugins.md`.
+`CONFIG.md` explains what every configuration feature is for, what it can and cannot do, and where
+its boundaries are. `docs/settings.md` is the key-by-key reference (also returned by the
+`config_help` tool inside a session), `docs/plan.md` is the design document and
+`docs/plugins.md` is the plugin and tool contract.
 
 ## Install
 
