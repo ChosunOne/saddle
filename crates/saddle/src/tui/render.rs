@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use std::borrow::Cow;
 use std::env;
 use std::iter;
@@ -29,6 +29,7 @@ use super::sessions::{ROWS as SESSION_ROWS, SessionPicker, age};
 use super::settings::{ROWS, SettingsDialog};
 use super::themes::{ROWS as THEME_ROWS, ThemePicker};
 use super::tree::Tree;
+use crate::team::Beat;
 use crate::team::Render;
 use crate::tui::image;
 use crate::tui::math;
@@ -1234,6 +1235,52 @@ fn user_rows(
 }
 
 /// Rows for entries drawn as plain text; tool calls are drawn as blocks by [`tool_block`].
+/// One entry, drawn as the transcript draws it: a tool block with its spinner and diff, a
+/// compaction, or wrapped markdown rows. Shared by the lead's transcript and a worker's view, so
+/// entering a worker shows the same rendering rather than a plain tail (D195).
+fn entry_render(
+    entry: &Entry,
+    view: View,
+    theme: &Theme,
+    now: Instant,
+) -> (Vec<Line<'static>>, Vec<Formula>) {
+    let width = view.room.0 as usize;
+    match entry {
+        Entry::Tool {
+            tasks,
+            name,
+            detail,
+            result,
+            diff,
+            spent,
+            ..
+        } => {
+            let elapsed = spent.map(|spent| tasks_elapsed_text(spent.elapsed(now)));
+            let (mut rows, mut bg) = tool_block(
+                name,
+                detail,
+                result.as_ref(),
+                diff.as_deref(),
+                &view,
+                elapsed.as_deref(),
+                theme,
+            );
+            background_block(&mut rows, &mut bg, tasks, view.spinner, now, theme);
+            (shaded(&rows, bg, width), Vec::new())
+        }
+        Entry::Compaction(v) => {
+            let (rows, bg) =
+                compaction_block(v, view.thinking, view.expand, view.spinner, theme, width);
+            (shaded(&rows, bg, width), Vec::new())
+        }
+        entry => {
+            let mut formulas = Vec::new();
+            let rows = entry_rows(entry, view, theme, &mut formulas);
+            (rows.iter().flat_map(|r| wrap(r, width)).collect(), formulas)
+        }
+    }
+}
+
 fn entry_rows(entry: &Entry, view: View, theme: &Theme, images: &mut Vec<Formula>) -> Vec<Row> {
     match entry {
         Entry::Thinking(text) => thinking_rows(text, view.thinking, theme, view.room.0 as usize),
@@ -1711,7 +1758,6 @@ fn transcript_with_images(app: &mut App, width: u16) -> (Vec<Line<'static>>, Vec
             c.width == width && c.expand == app.expand_tools && c.thinking == app.show_thinking
         });
         if !fresh || running {
-            let mut formulas: Vec<Formula> = Vec::new();
             let view = View {
                 expand: app.expand_tools,
                 thinking: app.show_thinking,
@@ -1720,45 +1766,7 @@ fn transcript_with_images(app: &mut App, width: u16) -> (Vec<Line<'static>>, Vec
                 images: app.protocol != image::Protocol::Text,
                 scale: app.header.math_scale,
             };
-            let rendered: Vec<Line<'static>> = match &app.entries[i] {
-                Entry::Tool {
-                    tasks,
-                    name,
-                    detail,
-                    result,
-                    diff,
-                    spent,
-                    ..
-                } => {
-                    let elapsed = spent.map(|spent| tasks_elapsed_text(spent.elapsed(app.now)));
-                    let (mut rows, mut bg) = tool_block(
-                        name,
-                        detail,
-                        result.as_ref(),
-                        diff.as_deref(),
-                        &view,
-                        elapsed.as_deref(),
-                        &app.theme,
-                    );
-                    background_block(&mut rows, &mut bg, tasks, view.spinner, app.now, &app.theme);
-                    shaded(&rows, bg, width as usize)
-                }
-                Entry::Compaction(v) => {
-                    let (rows, bg) = compaction_block(
-                        v,
-                        view.thinking,
-                        view.expand,
-                        view.spinner,
-                        &app.theme,
-                        width as usize,
-                    );
-                    shaded(&rows, bg, width as usize)
-                }
-                entry => {
-                    let rows = entry_rows(entry, view, &app.theme, &mut formulas);
-                    rows.iter().flat_map(|r| wrap(r, width as usize)).collect()
-                }
-            };
+            let (rendered, formulas) = entry_render(&app.entries[i], view, &app.theme, app.now);
             app.cache[i] = Some(Cached {
                 width,
                 expand: app.expand_tools,
@@ -2056,9 +2064,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     .areas(area);
 
     if let Some(name) = &app.worker
-        && let Some(worker) = app.team.iter().find(|worker| &worker.name == name)
+        && let Some(worker) = app.team.iter().find(|worker| &worker.name == name).cloned()
     {
-        draw_worker(frame, worker, transcript_area, &app.theme);
+        draw_worker(frame, &worker, app, transcript_area);
     } else {
         draw_transcript(frame, app, transcript_area);
     }
@@ -3298,29 +3306,43 @@ fn keep_tail(s: &str, max: usize) -> String {
     iter::once('…').chain(out.into_iter().rev()).collect()
 }
 
-/// A live worker's transcript, streamed by its own thread and read through the session (D195).
-fn draw_worker(frame: &mut Frame<'_>, worker: &Render, area: Rect, theme: &Theme) {
+/// A worker's own conversation, drawn with the lead's renderer — markdown, highlighted code, tool
+/// blocks with their diffs and collapsed output — instead of a plain tail, and scrolled the same
+/// way. It streams because the interface refreshes the team from the shared handles (D195).
+fn draw_worker(frame: &mut Frame<'_>, worker: &Render, app: &mut App, area: Rect) {
+    let theme = app.theme.clone();
     let state = if worker.state.is_empty() {
         "starting"
     } else {
         worker.state.as_str()
     };
-    let room = area.height.saturating_sub(2) as usize;
-    let mut lines: Vec<Line> = Vec::new();
-    if !worker.reasoning.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "thinking:",
-            Style::new().fg(theme.muted),
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme.border_accent))
+        .title(format!(" worker {} · {state} · ctrl+b back ", worker.name))
+        .title_bottom(Line::from(Span::styled(
+            "↑↓ scroll · ctrl+o expand · enter steer",
+            dim(&theme),
         )));
-        for line in worker.reasoning.lines().take(room.saturating_sub(2)) {
-            lines.push(Line::from(Span::styled(
-                line.to_owned(),
-                Style::new().fg(theme.muted).add_modifier(Modifier::ITALIC),
-            )));
+    let inner = block.inner(area);
+    let width = inner.width.max(1);
+    let view = View {
+        expand: app.expand_tools,
+        thinking: app.show_thinking,
+        spinner: app.spinner,
+        room: (width, image::MAX_ROWS),
+        // The worker's view is a transcript, not a surface of its own: a formula stays its source
+        // rather than reserving cells no picture is placed in (D165).
+        images: false,
+        scale: app.header.math_scale,
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (index, entry) in worker_entries(worker).iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::default());
         }
-    }
-    for line in &worker.lines {
-        lines.push(Line::from(line.clone()));
+        let (rendered, _) = entry_render(entry, view, &theme, app.now);
+        lines.extend(rendered);
     }
     if let Some(error) = &worker.error {
         lines.push(Line::from(Span::styled(
@@ -3328,23 +3350,59 @@ fn draw_worker(frame: &mut Frame<'_>, worker: &Render, area: Rect, theme: &Theme
             Style::new().fg(theme.error),
         )));
     }
-    let line_count = lines.len();
-    let shown: Vec<Line> = lines.split_off(line_count.saturating_sub(room));
-    let title = format!(" worker {} · {state} · ctrl+b team ", worker.name);
-    // A dialog is opaque: the lead's transcript is still drawn under it, and without this its
-    // text shows through every cell the worker's own lines do not cover.
+    let height = inner.height as usize;
+    let total = lines.len();
+    app.worker_total = total;
+    app.worker_height = height;
+    app.worker_scroll = app.worker_scroll.min(total.saturating_sub(height));
+    let top = total.saturating_sub(height + app.worker_scroll);
+    let shown: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(shown)
-            .block(
-                Block::bordered()
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::new().fg(theme.border_accent))
-                    .title(title),
-            )
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(shown), inner);
+}
+
+/// A worker's beats as the transcript entries the lead's renderer takes: streamed text and
+/// reasoning join the block before them, and a result belongs to the call it answered (D195).
+fn worker_entries(worker: &Render) -> Vec<Entry> {
+    let mut out: Vec<Entry> = Vec::new();
+    for beat in &worker.beats {
+        match beat {
+            Beat::Prompt(text) => out.push(Entry::User(text.clone())),
+            Beat::Text(text) => match out.last_mut() {
+                Some(Entry::Assistant(held)) => held.push_str(text),
+                _ => out.push(Entry::Assistant(text.clone())),
+            },
+            Beat::Thinking(text) => match out.last_mut() {
+                Some(Entry::Thinking(held)) => held.push_str(text),
+                _ => out.push(Entry::Thinking(text.clone())),
+            },
+            Beat::Call { name, detail } => out.push(Entry::Tool {
+                id: String::new(),
+                tasks: Vec::new(),
+                name: name.clone(),
+                detail: detail.clone(),
+                result: None,
+                diff: None,
+                spent: None,
+            }),
+            Beat::Result { ok, content, diff } => match out.last_mut() {
+                Some(Entry::Tool {
+                    result, diff: held, ..
+                }) => {
+                    *result = Some((*ok, content.clone()));
+                    *held = diff.clone();
+                }
+                _ => out.push(Entry::Note(NoteKind::Info, content.clone())),
+            },
+            Beat::Note(text) => out.push(Entry::Note(NoteKind::Info, text.clone())),
+            Beat::Spend { input, output, .. } => out.push(Entry::Note(
+                NoteKind::Info,
+                format!("{input} in · {output} out"),
+            )),
+        }
+    }
+    out
 }
 
 /// The live team: one row per worker, with what it is doing (D195).
@@ -5463,6 +5521,7 @@ mod tests {
     fn the_team_list_and_a_worker_view_are_drawn_and_open_with_the_keys() {
         // D195: ctrl+b lists the live workers, enter opens one, and its streamed transcript is
         // drawn in place of the lead's while the team keeps its state.
+        use crate::team::Beat;
         use crate::team::Render;
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = bare_app();
@@ -5471,8 +5530,20 @@ mod tests {
             brief: "probe the build".into(),
             state: "running".into(),
             turns: 1,
-            lines: vec!["looking at the loader".into()],
-            reasoning: "the reload path is here".into(),
+            beats: vec![
+                Beat::Prompt("probe the build".into()),
+                Beat::Thinking("the reload path is here".into()),
+                Beat::Text("Looking at **the loader** now.".into()),
+                Beat::Call {
+                    name: "bash".into(),
+                    detail: "grep -n reload src".into(),
+                },
+                Beat::Result {
+                    ok: true,
+                    content: "src/lib.rs:17: fn reload".into(),
+                    diff: None,
+                },
+            ],
             ..Render::default()
         }]));
         let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
@@ -5519,8 +5590,34 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let viewed = screen(&terminal);
         assert!(viewed.contains("worker runtime"), "{viewed}");
-        assert!(viewed.contains("looking at the loader"), "{viewed}");
-        assert!(viewed.contains("ctrl+b team"), "{viewed}");
+        // The worker's own conversation is drawn as the lead's is: markdown without its markers,
+        // the tool block with its call and answer, and the reasoning under its heading.
+        assert!(viewed.contains("Looking at the loader now."), "{viewed}");
+        assert!(
+            !viewed.contains("**"),
+            "markdown markers were not rendered: {viewed}"
+        );
+        assert!(viewed.contains("grep -n reload src"), "{viewed}");
+        assert!(viewed.contains("src/lib.rs:17"), "{viewed}");
+        assert!(viewed.contains("ctrl+b back"), "{viewed}");
+        // The view scrolls like a transcript, and the scroll belongs to it rather than to the
+        // lead's conversation.
+        app.worker_scroll = 0;
+        let mut many = Render {
+            name: "runtime".into(),
+            state: "idle".into(),
+            ..Render::default()
+        };
+        for turn in 0..40 {
+            many.beats.push(Beat::Text(format!("line {turn}\n")));
+        }
+        app.agent(AgentEvent::Workers(vec![many]));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("line 39"));
+        app.key(KeyEvent::from(KeyCode::PageUp));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.worker_scroll > 0);
+        assert!(!screen(&terminal).contains("line 39"));
         // With no worker known, ctrl+b still opens the list and says so, and `/workers` does the
         // same from the keyboard for a terminal that eats the key.
         let mut empty = bare_app();

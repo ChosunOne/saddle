@@ -34,7 +34,9 @@ use std::thread;
 use std::time::Duration;
 
 /// How much of a worker's transcript is kept for a person to read on screen.
-const RENDER_LINES: usize = 400;
+/// How many beats a worker's view keeps. Early ones fall off rather than growing without bound;
+/// the conversation itself is in the worker's own saved transcript.
+const RENDER_BEATS: usize = 2000;
 
 /// A live handle the interface can use without the agent thread: steering a worker, or asking it to
 /// stop, never needs the session that owns it.
@@ -71,6 +73,54 @@ impl Steering {
             peer.handle.cancel.store(true, Ordering::SeqCst);
         }
     }
+
+    /// Ends a worker for good, as the list's `x` does. The interface holds the lead's map, so it
+    /// is the conversation that owns the team doing it (D195).
+    pub fn stop(&self, name: &str) {
+        if let Ok(map) = self.0.lock()
+            && let Some(peer) = map.get(name)
+        {
+            peer.handle.stop.store(true, Ordering::SeqCst);
+            peer.handle.interrupt.store(true, Ordering::SeqCst);
+            peer.handle.cancel.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// What the interface draws, read straight from the shared handles so a worker streams while
+    /// the lead's thread is busy (D195).
+    pub fn views(&self) -> Vec<Render> {
+        match self.0.lock() {
+            Ok(map) => map.values().map(Peer::render).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+/// One piece of a worker's conversation, kept structured rather than as finished lines: the
+/// interface draws it with the same renderer as the lead's transcript — markdown, code, tool
+/// blocks and collapsed output — instead of a plain tail (D195).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Beat {
+    /// A prompt the worker was given: its brief, or a message from a person or a peer.
+    Prompt(String),
+    Text(String),
+    Thinking(String),
+    Call {
+        name: String,
+        detail: String,
+    },
+    Result {
+        ok: bool,
+        content: String,
+        diff: Option<String>,
+    },
+    Note(String),
+    /// What one reply used, as the status line of the lead's transcript states it.
+    Spend {
+        input: u64,
+        output: u64,
+        cost: f64,
+    },
 }
 
 /// What a person sees of one worker: its live transcript and what it is doing.
@@ -80,21 +130,53 @@ pub struct Render {
     pub brief: String,
     pub state: String,
     pub turns: usize,
-    pub lines: Vec<String>,
-    pub reasoning: String,
+    pub beats: Vec<Beat>,
     pub error: Option<String>,
     pub finished: bool,
 }
 
 impl Render {
-    fn push(&mut self, line: String) {
-        for line in line.split('\n') {
-            self.lines.push(line.to_owned());
+    /// Adds one piece, joining the streamed text and reasoning onto the block already at the end
+    /// so a token does not become a beat of its own.
+    fn push(&mut self, beat: Beat) {
+        match (&mut self.beats.last_mut(), &beat) {
+            (Some(Beat::Text(held)), Beat::Text(more)) => held.push_str(more),
+            (Some(Beat::Thinking(held)), Beat::Thinking(more)) => held.push_str(more),
+            _ => self.beats.push(beat),
         }
-        let over = self.lines.len().saturating_sub(RENDER_LINES);
+        let over = self.beats.len().saturating_sub(RENDER_BEATS);
         if over > 0 {
-            self.lines.drain(..over);
+            self.beats.drain(..over);
         }
+    }
+
+    /// The conversation as plain lines, for `agent status`: the whole transcript is in the
+    /// interface, and a line-mode reader needs the words rather than the rendering.
+    fn plain(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for beat in &self.beats {
+            match beat {
+                Beat::Prompt(text) => {
+                    out.push(String::new());
+                    out.push(format!("▸ {text}"));
+                }
+                Beat::Text(text) => out.extend(text.lines().map(str::to_owned)),
+                Beat::Thinking(text) => {
+                    out.push("thinking:".into());
+                    out.extend(text.lines().map(str::to_owned));
+                }
+                Beat::Call { name, detail } => out.push(format!("⚙ {name} {detail}")),
+                Beat::Result { ok, content, .. } => {
+                    let mark = if *ok { "✓" } else { "✗" };
+                    out.push(format!("{mark} {}", first_line(content)));
+                }
+                Beat::Note(text) => out.push(format!("· {text}")),
+                Beat::Spend { input, output, .. } => {
+                    out.push(format!("· {input} in · {output} out"))
+                }
+            }
+        }
+        out
     }
 }
 
@@ -248,7 +330,8 @@ impl Manager {
         if let Some(error) = &render.error {
             out.push_str(&format!("error: {error}\n"));
         }
-        let recent: Vec<&String> = render.lines.iter().rev().take(12).collect();
+        let lines = render.plain();
+        let recent: Vec<&String> = lines.iter().rev().take(12).collect();
         for line in recent.into_iter().rev() {
             out.push_str(line);
             out.push('\n');
@@ -414,18 +497,11 @@ impl Manager {
             ..Render::default()
         }));
         let (jobs, receive) = mpsc::channel();
-        let stop = handle.stop.clone();
-        let interrupt = handle.interrupt.clone();
-        let cancel = handle.cancel.clone();
-        let steer_in = steer.clone();
         let view = render.clone();
+        let watch = handle.clone();
         if let Err(error) = thread::Builder::new()
             .name(format!("saddle-worker-{name}"))
-            .spawn(move || {
-                run(
-                    agent, child, receive, view, stop, interrupt, cancel, steer_in,
-                )
-            })
+            .spawn(move || run(agent, child, receive, view, watch))
         {
             return Ok(Err(format!("could not start {name}: {error}")));
         }
@@ -453,17 +529,19 @@ fn run(
     mut session: Session,
     jobs: Receiver<Job>,
     view: Arc<Mutex<Render>>,
-    stop: Arc<AtomicBool>,
-    interrupt: Arc<AtomicBool>,
-    cancel: Arc<AtomicBool>,
-    steer: Steer,
+    handle: Handle,
 ) {
+    let Handle {
+        steer,
+        interrupt,
+        stop,
+        cancel,
+    } = handle;
     session.cancel = cancel.clone();
     let mut ui = WorkerUi {
         view: view.clone(),
         interrupt: interrupt.clone(),
         stop: stop.clone(),
-        reasoning: String::new(),
     };
     let mut first = true;
     loop {
@@ -512,8 +590,7 @@ fn run(
         set(&view, |render| {
             render.state = "running".into();
             render.turns += 1;
-            render.push(format!("\n▸ turn {}", render.turns));
-            render.push(format!("  {prompt}"));
+            render.push(Beat::Prompt(prompt.clone()));
         });
         let end = agent.turn(&mut session, &prompt, &mut ui);
         match end {
@@ -527,7 +604,7 @@ fn run(
                 set(&view, |r| {
                     r.state = "failed".into();
                     r.error = Some(text.clone());
-                    r.push(format!("error: {text}"));
+                    r.push(Beat::Note(format!("error: {text}")));
                 });
                 break;
             }
@@ -549,8 +626,10 @@ fn finish(mut agent: Agent, session: Session, view: &Arc<Mutex<Render>>) {
         render.state = "finished".into();
         render.finished = true;
         match &closed {
-            Ok(head) => render.push(format!("audit closed at {head}")),
-            Err(error) => render.push(format!("closing the worker's audit failed: {error:#}")),
+            Ok(head) => render.push(Beat::Note(format!("audit closed at {head}"))),
+            Err(error) => render.push(Beat::Note(format!(
+                "closing the worker's audit failed: {error:#}"
+            ))),
         }
     });
 }
@@ -602,10 +681,7 @@ pub fn manage(
             let mut team = mem::take(&mut session.team);
             let result = team.start(session, who, &caller, &message.target, &message.text);
             session.team = team;
-            match result {
-                Ok(result) => result,
-                Err(error) => return Err(error),
-            }
+            result?
         }
         Operation::Send(message) => {
             let from = session.team_label.clone();
@@ -653,26 +729,25 @@ struct WorkerUi {
     view: Arc<Mutex<Render>>,
     interrupt: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
-    reasoning: String,
 }
 
 impl Sink for WorkerUi {
     fn text(&mut self, text: &str) {
-        set(&self.view, |render| render.push(text.to_owned()));
+        set(&self.view, |render| {
+            render.push(Beat::Text(text.to_owned()))
+        });
     }
 
     fn note(&mut self, text: &str) {
-        set(&self.view, |render| render.push(format!("· {text}")));
+        set(&self.view, |render| {
+            render.push(Beat::Note(text.to_owned()))
+        });
     }
 
     fn reasoning(&mut self, text: &str) {
-        self.reasoning.push_str(text);
-        let tail: String = self
-            .reasoning
-            .chars()
-            .skip(self.reasoning.chars().count().saturating_sub(2000))
-            .collect();
-        set(&self.view, |render| render.reasoning = tail);
+        set(&self.view, |render| {
+            render.push(Beat::Thinking(text.to_owned()))
+        });
     }
 
     fn quota(&mut self, _: &Quota) {}
@@ -686,19 +761,32 @@ impl Ui for WorkerUi {
     fn call(&mut self, call: &ToolCall) {
         let detail = agent::call_detail(call);
         set(&self.view, |render| {
-            render.push(format!("⚙ {} {}", call.name, detail))
+            render.push(Beat::Call {
+                name: call.name.clone(),
+                detail,
+            })
         });
     }
 
     fn result(&mut self, out: &ToolOutput) {
-        let mark = if out.ok { "✓" } else { "✗" };
+        let visible = out.visible_content().to_owned();
         set(&self.view, |render| {
-            render.push(format!("{mark} {}", first_line(&out.content)))
+            render.push(Beat::Result {
+                ok: out.ok,
+                content: visible.clone(),
+                diff: out.diff.clone(),
+            })
         });
     }
 
-    fn reply(&mut self, _: &Reply, _: f64) {
-        set(&self.view, |render| render.push(String::new()));
+    fn reply(&mut self, reply: &Reply, cost: f64) {
+        set(&self.view, |render| {
+            render.push(Beat::Spend {
+                input: reply.usage.input,
+                output: reply.usage.output,
+                cost,
+            })
+        });
     }
 
     fn compaction(&mut self, _: compact::Event) {}

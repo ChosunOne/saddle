@@ -729,6 +729,11 @@ pub struct App {
     pub workers: Option<usize>,
     /// The worker being viewed, by name, or `None` in the person's own conversation.
     pub worker: Option<String>,
+    /// How far the worker view is scrolled back from its end, and the frame it was drawn in
+    /// (D195). Kept apart from the lead's scroll so switching between them does not move either.
+    pub worker_scroll: usize,
+    pub worker_total: usize,
+    pub worker_height: usize,
     /// The question a move in `/tree` asks when it would leave work behind (D167).
     pub confirm: Option<Confirm>,
     /// The permissions editor, drawn over everything else while open (D45).
@@ -846,6 +851,9 @@ impl App {
             team: Vec::new(),
             workers: None,
             worker: None,
+            worker_scroll: 0,
+            worker_total: 0,
+            worker_height: 0,
             confirm: None,
             permissions: None,
             themes: None,
@@ -1233,6 +1241,7 @@ impl App {
                     let name = self.team[selected.min(rows - 1)].name.clone();
                     self.workers = None;
                     self.worker = Some(name.clone());
+                    self.worker_scroll = 0;
                     Some(Action::OpenWorker(name))
                 }
                 KeyCode::Char('i') if rows > 0 => Some(Action::WorkerInterrupt(
@@ -1244,11 +1253,47 @@ impl App {
                 _ => None,
             };
         }
+        // The worker's own transcript scrolls like the lead's, and what is typed still goes to
+        // the worker: only the keys that cannot be words are taken here (D195).
+        if self.worker.is_some() {
+            let page = self.worker_height.saturating_sub(1).max(1);
+            let handled = match key.code {
+                KeyCode::Up => {
+                    self.worker_scroll = (self.worker_scroll + 1).min(self.worker_total);
+                    true
+                }
+                KeyCode::Down => {
+                    self.worker_scroll = self.worker_scroll.saturating_sub(1);
+                    true
+                }
+                KeyCode::PageUp => {
+                    self.worker_scroll = (self.worker_scroll + page).min(self.worker_total);
+                    true
+                }
+                KeyCode::PageDown => {
+                    self.worker_scroll = self.worker_scroll.saturating_sub(page);
+                    true
+                }
+                KeyCode::Home => {
+                    self.worker_scroll = self.worker_total;
+                    true
+                }
+                KeyCode::End => {
+                    self.worker_scroll = 0;
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                return None;
+            }
+        }
         if self.worker.is_some()
             && key.code == KeyCode::Char('b')
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
             self.worker = None;
+            self.worker_scroll = 0;
             return Some(Action::WorkerBack);
         }
         if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {

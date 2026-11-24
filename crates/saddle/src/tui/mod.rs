@@ -1285,6 +1285,17 @@ fn event_loop(
             }
             dirty = true;
         }
+        // The team list and a worker's view read the shared handles directly, so what a worker is
+        // saying arrives here even while the lead's thread is finishing a turn (D195).
+        if app.workers.is_some() || app.worker.is_some() {
+            let views = control.team.views();
+            if views != app.team {
+                if let Some(action) = app.agent(AgentEvent::Workers(views)) {
+                    control.perform(app, action);
+                }
+                dirty = true;
+            }
+        }
         let working = app.busy.is_some()
             || app.background_running()
             || app.login.as_ref().is_some_and(|l| l.checking());
@@ -1468,7 +1479,7 @@ impl Controller {
                 Ok(())
             }
             Action::WorkerStop(name) => {
-                self.team.interrupt(&name);
+                self.team.stop(&name);
                 Ok(())
             }
             Action::DeleteSession(id) => {
