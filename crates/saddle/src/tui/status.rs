@@ -14,7 +14,7 @@ use crate::provider::Usage;
 
 /// What the line shows when `[ui] status` is not set.
 pub const DEFAULT_STATUS: &str = "↑{input} ↓{output} {cache} {cachehit} · ctx {ctx}/{window} · \
-                                  {cost} · {quota} · {tasks} · {provider} {model}";
+                                  {cost} · {quota} · {tasks} · {workers} · {provider} {model}";
 
 /// The separator an empty field takes with it.
 const SEPARATOR: &str = " · ";
@@ -35,6 +35,8 @@ pub enum Field {
     Cost,
     Quota,
     Tasks,
+    /// The live workers of this session, and how many are mid-turn (D195).
+    Workers,
     Workspace,
 }
 
@@ -53,6 +55,7 @@ impl Field {
             "cost" => Field::Cost,
             "quota" => Field::Quota,
             "tasks" => Field::Tasks,
+            "workers" => Field::Workers,
             "workspace" => Field::Workspace,
             _ => return None,
         })
@@ -72,6 +75,7 @@ impl Field {
             "cost",
             "quota",
             "tasks",
+            "workers",
             "workspace",
         ]
     }
@@ -215,6 +219,35 @@ impl Template {
     }
 }
 
+/// The live workers of a session. A finished one is kept for inspection but is not an agent at
+/// work any more, so it is not counted (D195).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Workers {
+    pub live: usize,
+    pub active: usize,
+}
+
+impl Workers {
+    /// `2 agents: 1 active, 1 idle`, or nothing when the session has no team. Both counts are
+    /// named rather than implied, because "2 agents" alone cannot say whether either is doing
+    /// anything.
+    pub fn text(&self) -> String {
+        if self.live == 0 {
+            return String::new();
+        }
+        let noun = if self.live == 1 { "agent" } else { "agents" };
+        let idle = self.live.saturating_sub(self.active);
+        let mut parts = Vec::new();
+        if self.active > 0 {
+            parts.push(format!("{} active", self.active));
+        }
+        if idle > 0 || self.active == 0 {
+            parts.push(format!("{idle} idle"));
+        }
+        format!("{} {noun}: {}", self.live, parts.join(", "))
+    }
+}
+
 /// Everything the status line can be filled from.
 pub struct StatusData<'a> {
     pub provider: &'a str,
@@ -226,6 +259,7 @@ pub struct StatusData<'a> {
     pub priced: bool,
     pub quota: Option<&'a Quota>,
     pub running_tasks: usize,
+    pub workers: Workers,
     pub context: u64,
     pub window: u64,
     pub workspace: &'a str,
@@ -261,6 +295,7 @@ impl StatusData<'_> {
                 1 => "1 task".into(),
                 n => format!("{n} tasks"),
             },
+            Field::Workers => self.workers.text(),
             Field::Workspace => self.workspace.into(),
         }
     }
@@ -375,6 +410,7 @@ mod tests {
             priced: cost > 0.0,
             quota,
             running_tasks: 0,
+            workers: Workers::default(),
             context: 1_300,
             window: 128_000,
             // A fixed clock, so the line renders the same way twice (D49).
@@ -389,6 +425,30 @@ mod tests {
         let line = Template::default().render(&d);
         assert_eq!(line, "↑0 ↓0 cache 0 · ctx 1.3k/128.0k · mock mock-model");
         assert!(!line.contains(" ·  ·"), "{line}");
+    }
+
+    #[test]
+    fn the_team_shows_how_many_agents_are_active_and_idle() {
+        let with = |live, active| {
+            let mut d = data(Usage::default(), 0.0, None);
+            d.workers = Workers { live, active };
+            Template::parse("{workers}").unwrap().render(&d)
+        };
+        assert_eq!(with(0, 0), "", "no team, no words");
+        assert_eq!(with(1, 0), "1 agent: 1 idle");
+        assert_eq!(with(1, 1), "1 agent: 1 active");
+        assert_eq!(with(3, 1), "3 agents: 1 active, 2 idle");
+        assert_eq!(with(2, 2), "2 agents: 2 active");
+        // In the default line it sits where `{tasks}` does and disappears with no team, leaving no
+        // dangling separator behind (D187).
+        let d = data(Usage::default(), 0.0, None);
+        let line = Template::default().render(&d);
+        assert!(!line.contains("agent"), "{line}");
+        assert!(!line.contains(" ·  ·"), "{line}");
+        let mut with_team = data(Usage::default(), 0.0, None);
+        with_team.workers = Workers { live: 2, active: 1 };
+        let line = Template::default().render(&with_team);
+        assert!(line.contains("2 agents: 1 active, 1 idle"), "{line}");
     }
 
     #[test]

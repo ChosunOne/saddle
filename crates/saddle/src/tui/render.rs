@@ -36,7 +36,7 @@ use crate::tui::math;
 use crate::tui::math::Formula;
 #[cfg(test)]
 use crate::tui::plan_images;
-use crate::tui::status::{Field, StatusData};
+use crate::tui::status::{Field, StatusData, Workers};
 use crate::tui::syntax::{self, Language, State};
 use crate::tui::theme::Appearance;
 use crate::tui::theme::Theme;
@@ -2178,6 +2178,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         priced: app.header.priced,
         quota: app.quota.as_ref(),
         running_tasks: app.running_tasks,
+        // Finished workers keep their conversation but are not agents at work (D195).
+        workers: Workers {
+            live: app.team.iter().filter(|worker| !worker.finished).count(),
+            active: app
+                .team
+                .iter()
+                .filter(|worker| !worker.finished && worker.state == "running")
+                .count(),
+        },
         context: app.context,
         window: app.header.context_window,
         workspace: &home_relative(&app.header.workspace),

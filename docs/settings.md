@@ -380,7 +380,7 @@ two of them for one session.
 | `theme` | `default` | a built-in or `[themes.<name>]` theme; `"light/dark"` picks by the terminal (D71, D74) |
 | `show-reasoning` | `true` | whether reasoning is shown as it streams (D151) |
 | `expand-tools` | `false` | whether tool results start expanded (D124) |
-| `status` | the built-in template | the status line, from `{provider}`, `{model}`, `{input}`, `{output}`, `{cache}`, `{ctx}`, `{window}`, `{percent}`, `{cost}`, `{quota}`, `{tasks}`, `{workspace}` (D36, D187) |
+| `status` | the built-in template | the status line, from `{provider}`, `{model}`, `{input}`, `{output}`, `{cache}`, `{cachehit}`, `{ctx}`, `{window}`, `{percent}`, `{cost}`, `{quota}`, `{tasks}`, `{workers}`, `{workspace}` (D36, D187, D195) |
 | `mouse` | `true` | `false` hands the mouse back to the terminal, losing the wheel and drag-to-copy (D35) |
 | `notify` | `bell` | how a turn that ends while the window is not focused is announced: `bell`, `osc9`, `osc777`, `off` (D164) |
 | `images` | worked out | how a picture is drawn: `kitty`, `iterm2`, `none`, or unset to detect (D59) |
@@ -389,6 +389,11 @@ two of them for one session.
 `{tasks}` shows this session's running background tasks (for example, `2 tasks`). It is part of
 the default template and disappears when no tasks are running. Add `{tasks}` to a custom template
 to show it there too.
+
+`{workers}` shows the live workers of this session and how many are mid-turn, for example
+`2 agents: 1 active, 1 idle` or `1 agent: 1 idle`. It is part of the default template and
+disappears when the session has no live team. A worker that has finished keeps its conversation but
+is not counted, and neither is a stopped one.
 
 ## keys
 
