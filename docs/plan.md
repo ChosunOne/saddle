@@ -4716,6 +4716,15 @@ No process launches, permission transfers, delivery receipts or implicit turns r
 model post. Each interactive worker has its own ordinary session controls and audit. D6 still
 applies to plugin-initiated launches; no privileged spawn API is introduced here.
 
+**D195 (target, not implemented).** Saddle owns managed agent sessions. D194 describes
+saved findings, not the swarm lifecycle. From one running conversation, the lead must be
+able to request two workers through WASI tools. The host assigns session handles and runs
+the workers within delegated authority. In that same interface the person can open either
+live session, inspect its output and provider-visible reasoning, steer it and interrupt it
+without interrupting its sibling. A peer can address the other worker directly without a
+relay through the lead. Returning to the lead leaves both sessions intact. Starting other
+terminals or using a multiplexer is not an implementation of this acceptance case.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
