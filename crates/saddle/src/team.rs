@@ -512,7 +512,7 @@ impl Manager {
             .provider_twin()
             .map(|provider| provider.name.clone())
             .unwrap_or_else(|| "worker".into());
-        let conversation = store.begin(&provider_name, "")?;
+        let conversation = store.begin_worker(&provider_name, "")?;
         store.name(&conversation, name)?;
         let Some(provider) = session.provider_twin() else {
             return Ok(Err(

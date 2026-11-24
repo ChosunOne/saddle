@@ -1903,7 +1903,12 @@ impl Controller {
     }
 
     fn open_resume(&self, app: &mut App) -> Result<()> {
-        let sessions = self.store.list()?;
+        let sessions: Vec<_> = self
+            .store
+            .list()?
+            .into_iter()
+            .filter(|session| !session.worker)
+            .collect();
         if sessions.is_empty() {
             app.note(NoteKind::Info, "no saved sessions in this workspace yet");
         } else {

@@ -135,6 +135,7 @@ mod tests {
             messages: 3,
             model: "mock-model".into(),
             forked_from: None,
+            worker: false,
             updated: SystemTime::UNIX_EPOCH,
         }
     }

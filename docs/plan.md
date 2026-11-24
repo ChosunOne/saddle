@@ -3891,7 +3891,7 @@ either side is the narrow one.
 is the one for this workspace, and its listing is filtered by workspace path, so a query cannot name
 a session saved somewhere else at all. A query is against one conversation: absent a selector it is
 the one in hand, which is what the agent already snapshotted; a selector is an id or a unique prefix
-from a new `sessions(id, name, title, model, updated, messages, forked_from)` view, resolved the way
+from a new `sessions(id, name, title, model, updated, messages, forked_from, worker)` view, resolved the way
 `saddle session` resolves one, so a prefix that names two conversations is an error rather than a
 guess. The four views are still built into a fresh in-memory database per call, and the saved
 database is still never handed SQL.
@@ -4729,7 +4729,10 @@ inherits only the grants the session has and cannot exceed them. Workers cannot 
 A brief is written under the session's private temporary directory and read by the host from
 there, with no root involved; the audit records its path, hash and size, never its words. `tool-limits.team-workers` caps a
 team, and `team-steps`, when set, caps each worker turn: it has no default, because a turn has no
-default request limit (D37). A person opens the team with ctrl+b, views a
+default request limit (D37). A worker's conversation is saved like any other and marked as a
+worker, so it is readable by id and through `session_query` (`sessions.worker = 1`) and never
+offered by `/resume`: a team's transcripts belong to the team view, not to the person's own
+history. A person opens the team with ctrl+b, views a
 worker's live transcript and provider-exposed reasoning, types into it, interrupts one turn
 (keeping the worker), or stops it (keeping its conversation). A worker's conversation is kept as
 structured beats and drawn by the lead's own transcript path, so markdown, highlighted code, tool

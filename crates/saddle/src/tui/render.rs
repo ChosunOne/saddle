@@ -6117,6 +6117,7 @@ mod tests {
             messages: 9,
             model: "mock-model".into(),
             forked_from: None,
+            worker: false,
             updated: now - Duration::from_secs(600),
         }]));
         terminal.draw(|f| draw(f, &mut app)).unwrap();

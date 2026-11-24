@@ -151,8 +151,10 @@ pub struct CompletedCall {
 }
 
 /// The schema version this build writes. A database from a newer build is refused rather than
-/// guessed at, because a wrong guess here loses a conversation. Version 2 added `sessions.name`.
-const VERSION: u32 = 2;
+/// guessed at, because a wrong guess here loses a conversation. Version 2 added `sessions.name`;
+/// version 3 added `sessions.worker`, which keeps a live worker's conversation out of `/resume`
+/// while leaving it readable by id (D195).
+const VERSION: u32 = 3;
 
 /// One `usage` row as the transcript tool reports it (D94).
 ///
@@ -240,6 +242,11 @@ impl Store {
         if found < 2 {
             conn.execute_batch("ALTER TABLE sessions ADD COLUMN name TEXT")?;
         }
+        if found < 3 {
+            conn.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN worker INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
         conn.pragma_update(None, "user_version", VERSION)?;
         let store = Self { conn, workspace };
         store.import_legacy(path)?;
@@ -255,7 +262,8 @@ impl Store {
                  id TEXT PRIMARY KEY, workspace TEXT NOT NULL, created TEXT NOT NULL,
                  updated TEXT NOT NULL, provider TEXT NOT NULL DEFAULT '',
                  model TEXT NOT NULL DEFAULT '', leaf INTEGER,
-                 from_session TEXT, from_node INTEGER, name TEXT);
+                 from_session TEXT, from_node INTEGER, name TEXT,
+                 worker INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE nodes (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  session TEXT NOT NULL, parent INTEGER, kind TEXT NOT NULL,
@@ -271,12 +279,30 @@ impl Store {
     /// Starts a conversation. The id sorts by time, so the newest session is the first row of a
     /// listing without reading every row's timestamp.
     pub fn begin(&self, provider: &str, model: &str) -> Result<String> {
+        self.create(provider, model, false)
+    }
+
+    /// Starts a worker's conversation. It is saved and readable by id, so what a worker did is
+    /// still there afterwards, but it is not one of the conversations `/resume` offers: a team's
+    /// transcripts belong to the team view, not to the person's own history (D195).
+    pub fn begin_worker(&self, provider: &str, model: &str) -> Result<String> {
+        self.create(provider, model, true)
+    }
+
+    fn create(&self, provider: &str, model: &str, worker: bool) -> Result<String> {
         let id = session_id();
         let at = now();
         self.conn.execute(
-            "INSERT INTO sessions (id, workspace, created, updated, provider, model)
-             VALUES (?1, ?2, ?3, ?3, ?4, ?5)",
-            params![id, self.workspace.to_string_lossy(), at, provider, model],
+            "INSERT INTO sessions (id, workspace, created, updated, provider, model, worker)
+             VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6)",
+            params![
+                id,
+                self.workspace.to_string_lossy(),
+                at,
+                provider,
+                model,
+                i64::from(worker)
+            ],
         )?;
         Ok(id)
     }
@@ -643,7 +669,7 @@ impl Store {
     /// This workspace's conversations, most recently updated first.
     pub fn list(&self) -> Result<Vec<Summary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, updated, model, from_session, name,
+            "SELECT id, updated, model, from_session, name, worker,
                     (SELECT COUNT(*) FROM nodes n
                       WHERE n.session = s.id AND n.kind = 'item'
                         AND json_extract(n.body, '$.user') IS NOT NULL),
@@ -661,11 +687,12 @@ impl Store {
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, i64>(5)?,
                 r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, updated, model, from, name, prompts, messages) = row?;
+            let (id, updated, model, from, name, worker, prompts, messages) = row?;
             // A session with no prompt yet is not offered: it has nothing to resume.
             let Some(first) = self.first_prompt(&id)? else {
                 continue;
@@ -681,6 +708,7 @@ impl Store {
                 messages: messages.max(0) as usize,
                 model,
                 forked_from: from,
+                worker: worker != 0,
                 updated: humantime::parse_rfc3339(&updated).unwrap_or(UNIX_EPOCH),
             });
         }
@@ -1011,6 +1039,8 @@ pub struct Summary {
     pub model: String,
     /// The session this one was forked from, if it was.
     pub forked_from: Option<String>,
+    /// A live worker's conversation: readable by id, not offered by `/resume` (D195).
+    pub worker: bool,
     pub updated: SystemTime,
 }
 
@@ -1513,6 +1543,26 @@ mod tests {
         let from = listed.iter().find(|x| x.id == fork).unwrap();
         assert_eq!(from.forked_from.as_deref(), Some(id.as_str()));
         assert_eq!(from.title, "first");
+    }
+
+    #[test]
+    fn a_worker_conversation_is_saved_but_not_offered_for_resume() {
+        // D195: what a worker did stays readable by id, and `/resume` lists the person's own
+        // conversations only.
+        let s = store();
+        let mine = s.begin("p", "m").unwrap();
+        s.append(&mine, &Item::User("my own question".into()))
+            .unwrap();
+        let worker = s.begin_worker("p", "m").unwrap();
+        s.append(&worker, &Item::User("the brief".into())).unwrap();
+        s.name(&worker, "runtime").unwrap();
+
+        let listed = s.list().unwrap();
+        assert!(!listed.iter().find(|x| x.id == mine).unwrap().worker);
+        let kept = listed.iter().find(|x| x.id == worker).unwrap();
+        assert!(kept.worker);
+        assert_eq!(kept.name.as_deref(), Some("runtime"));
+        assert_eq!(s.load(&worker).unwrap().items.len(), 1);
     }
 
     #[test]

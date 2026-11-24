@@ -190,7 +190,8 @@ the provider's cache, `reasoning_dropped` the reasoning items the provider said 
 prompt (D97), `reasoning_tokens` how much of `output` was thinking (D99), and `after` the ordinal
 of the last message before it (D92, D94) — and `reasoning(ordinal, node,
 part, text)`, one row per reasoning block, joined to `messages` on `ordinal` and in arrival order by
-`part` (D98), and `sessions(id, name, title, model, updated, messages, forked_from)`, the
+`part` (D98), and `sessions(id, name, title, model, updated, messages, forked_from, worker)` — `worker = 1` marks a
+subagent's saved conversation, which is readable by id but kept out of `/resume` — the
 conversations a query may name (D163). Only the prose is a row: an encrypted or redacted block is kept and replayed (D95) but
 has nothing a query could read. That is what a poor cache hit rate is diagnosed
 with: `SELECT provider, model, sum(cache_read), sum(input + cache_read + cache_write) FROM requests

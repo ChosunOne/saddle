@@ -113,6 +113,7 @@ fn row(summary: &Summary) -> SessionRow {
             .map_or(0, |d| d.as_secs() as i64),
         messages: summary.messages as i64,
         forked_from: summary.forked_from.clone().unwrap_or_default(),
+        worker: i64::from(summary.worker),
     }
 }
 
@@ -186,6 +187,9 @@ struct SessionRow {
     updated: i64,
     messages: i64,
     forked_from: String,
+    /// 1 for a live worker's conversation, so a query can keep the team out of the person's own
+    /// history (D195).
+    worker: i64,
 }
 
 fn query_bounded(
@@ -218,9 +222,9 @@ fn query_bounded(
         CREATE VIEW reasoning AS SELECT ordinal, node, part, text FROM reasoning_snapshot;
         CREATE TABLE session_snapshot(
             id TEXT, name TEXT, title TEXT, model TEXT, updated INTEGER, messages INTEGER,
-            forked_from TEXT);
-        CREATE VIEW sessions AS SELECT id, name, title, model, updated, messages, forked_from
-            FROM session_snapshot;",
+            forked_from TEXT, worker INTEGER);
+        CREATE VIEW sessions AS SELECT id, name, title, model, updated, messages, forked_from,
+            worker FROM session_snapshot;",
     )?;
     {
         let mut insert = conn.prepare("INSERT INTO call_snapshot VALUES (?1,?2,?3,?4,?5,?6)")?;
@@ -282,7 +286,7 @@ fn query_bounded(
     }
     {
         let mut insert =
-            conn.prepare("INSERT INTO session_snapshot VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+            conn.prepare("INSERT INTO session_snapshot VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?;
         for row in sessions {
             insert.execute(params![
                 row.id,
@@ -291,6 +295,7 @@ fn query_bounded(
                 row.model,
                 row.updated,
                 row.messages,
+                row.worker,
                 row.forked_from
             ])?;
         }
@@ -432,6 +437,7 @@ mod tests {
             messages: 2,
             model: "glm".to_owned(),
             forked_from: None,
+            worker: false,
             updated: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         }
     }
@@ -465,6 +471,7 @@ mod tests {
             updated: 1_700_000_000,
             messages: 4,
             forked_from: String::new(),
+            worker: 0,
         }];
         let out = query_bounded(
             &messages(),
