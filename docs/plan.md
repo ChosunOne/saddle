@@ -4736,7 +4736,9 @@ structured beats and drawn by the lead's own transcript path, so markdown, highl
 blocks with their diffs and collapsed output, formulas, returned pictures and scrolling are one
 implementation rather than two that drift; the only addition is one line above it naming it an
 agent's transcript. The list and view read the shared handles rather than the session thread, so a
-worker streams while the lead is busy; the interface reaches a worker
+worker streams while the lead is busy, and the status line's `{workers}` says how many live
+workers the session has and how many are mid-turn, in the default template and absent with no team
+(D187); the interface reaches a worker
 mid-turn through a shared steering handle, so the lead being busy is not a reason a worker
 cannot be steered. `send` from a worker reaches a peer directly, labelled with its sender; the
 host resolves only live worker names, never arbitrary conversation ids. Closing the session, a
