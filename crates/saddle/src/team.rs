@@ -298,6 +298,7 @@ impl Manager {
     }
 
     pub fn interrupt(&self, name: &str) -> Result<String, String> {
+        self.owner()?;
         let peer = self
             .lookup(name)
             .ok_or_else(|| format!("no worker {name:?} in this team"))?;
@@ -958,6 +959,7 @@ mod tests {
             "{refused}"
         );
         assert!(team.stop("peer").is_err());
+        assert!(team.interrupt("peer").is_err());
         team.owns = true;
         assert!(team.owner().is_ok());
     }
