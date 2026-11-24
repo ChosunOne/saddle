@@ -1649,7 +1649,7 @@ fn a_live_worker_is_started_and_addressed_by_the_shipped_team_tool() {
     // D195: the lead's tool starts a real session on its own thread. The mock answers both
     // conversations, and a worker request carrying the brief proves the second session exists.
     let _ = std::fs::remove_file("/tmp/never");
-    let (base, seen) = serve_dynamic(6, |_, body| {
+    let (base, seen) = serve_dynamic(10, |_, body| {
         let text = body.to_string();
         let answer = if text.contains("find the reload path") {
             // The worker's own first turn.

@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -99,6 +99,8 @@ impl Render {
 /// as an ordinary turn with whose words it is stated first.
 enum Job {
     Start(String),
+    /// A message is waiting on the worker's steering handle; look for it (D195).
+    Wake,
 }
 
 /// One live worker as the team shares it: a worker's own session sees its peers through the same
@@ -108,6 +110,9 @@ struct Peer {
     conversation: String,
     handle: Handle,
     render: Arc<Mutex<Render>>,
+    /// Kept so the worker's thread stays alive between turns: dropping it would end the worker
+    /// after its first turn, before a peer or the interface could address it (D195).
+    jobs: Sender<Job>,
 }
 
 impl Peer {
@@ -213,9 +218,12 @@ impl Manager {
         if peer.render().finished {
             return Err(format!("{to} has finished; start a new worker"));
         }
-        // A running worker takes it at its next request boundary; an idle one wakes for it. The
-        // handle is shared with the worker's own thread, so a worker or the interface can do this
-        // while the agent that started the team is busy (D195).
+        // A running worker takes it at its next request boundary; an idle one is woken by this,
+        // and the handle is shared with its thread so a peer or the interface can do it while the
+        // agent that started the team is busy (D195).
+        peer.jobs
+            .send(Job::Wake)
+            .map_err(|_| format!("{to} has finished; start a new worker"))?;
         peer.handle
             .steer
             .push(format!("[message from {from}]\n{text}"));
@@ -410,6 +418,7 @@ impl Manager {
                     conversation: conversation.clone(),
                     handle,
                     render,
+                    jobs: jobs.clone(),
                 },
             );
         }
@@ -447,6 +456,7 @@ fn run(
             first = false;
             match jobs.recv() {
                 Ok(Job::Start(brief)) => brief,
+                Ok(Job::Wake) => continue,
                 Err(_) => break,
             }
         } else {
@@ -460,6 +470,7 @@ fn run(
                         text = Some(brief);
                         break;
                     }
+                    Ok(Job::Wake) => continue,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         finish(agent, session, &view);
                         return;
