@@ -5454,6 +5454,49 @@ mod tests {
     }
 
     #[test]
+    fn the_team_list_and_a_worker_view_are_drawn_and_open_with_the_keys() {
+        // D195: ctrl+b lists the live workers, enter opens one, and its streamed transcript is
+        // drawn in place of the lead's while the team keeps its state.
+        use crate::team::Render;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = bare_app();
+        app.agent(AgentEvent::Workers(vec![Render {
+            name: "runtime".into(),
+            brief: "probe the build".into(),
+            state: "running".into(),
+            turns: 1,
+            lines: vec!["looking at the loader".into()],
+            reasoning: "the reload path is here".into(),
+            ..Render::default()
+        }]));
+        let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert_eq!(app.key(ctrl_b), Some(Action::Workers));
+        app.workers = Some(0);
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let listed = screen(&terminal);
+        assert!(listed.contains("live workers"), "{listed}");
+        assert!(listed.contains("runtime"), "{listed}");
+        assert_eq!(
+            app.key(KeyEvent::from(KeyCode::Enter)),
+            Some(Action::OpenWorker("runtime".into()))
+        );
+        app.worker = Some("runtime".into());
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let viewed = screen(&terminal);
+        assert!(viewed.contains("worker runtime"), "{viewed}");
+        assert!(viewed.contains("looking at the loader"), "{viewed}");
+        assert!(viewed.contains("ctrl+b team"), "{viewed}");
+        // A prompt typed here goes to the worker, not the lead.
+        app.editor.set("keep going".to_string());
+        assert!(matches!(
+            app.key(KeyEvent::from(KeyCode::Enter)),
+            Some(Action::WorkerInput(_))
+        ));
+        assert_eq!(app.key(ctrl_b), Some(Action::WorkerBack));
+    }
+
+    #[test]
     fn reasoning_renders_markdown_emphasis_and_paragraphs_inside_its_gutter() {
         let theme = Theme::default();
         let reasoning = "***Testing the library***\n\nChecking **results**.\n\n- a long list entry that wraps onto another line";
