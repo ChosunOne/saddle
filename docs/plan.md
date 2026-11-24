@@ -4734,18 +4734,21 @@ worker, so it is readable by id and through `session_query` (`sessions.worker = 
 offered by `/resume`: a team's transcripts belong to the team view, not to the person's own
 history. A conversation an earlier build saved before that column existed is recognised by its own
 audit log, whose session-start record names the worker, and marked when the list is opened; a
-conversation whose log is gone is left alone rather than guessed at. A person opens the team with ctrl+b (or `/workers`) into an overview: a tab for
-their own conversation and one for each worker, the selected one drawn live underneath with its
-streaming reasoning and output, `tab`/`shift+tab` or the arrows or a digit flipping between them,
-and `enter` opening one as a full transcript to type into (steering it if its turn is running),
-`i` interrupting one turn (keeping the worker), `x` stopping it (keeping its conversation) and
-`esc` going back. The overview opens on a worker that is mid-turn when there is one, and reads
-the shared handles rather than the session thread, so the worker shown keeps streaming while
-the lead is busy. A worker's conversation is kept as structured beats and drawn by the lead's own
-transcript path, so markdown, highlighted code, tool blocks with their diffs and collapsed output,
-formulas, returned pictures and scrolling are one implementation rather than two that drift; the
-overview adds a tab strip and a hint line above it, and the focused view one line naming it an
-agent's transcript. The list and view read the shared handles rather than the session thread, so a
+conversation whose log is gone is left alone rather than guessed at. A person opens the team with ctrl+b (or `/workers`) into a full page: one bordered
+preview pane per session, the person's own conversation first and then each worker, each pane
+carrying the newest lines that session has streamed, so every agent's reasoning and output are on
+screen at once rather than one at a time. `tab`/`shift+tab`, the arrows or a digit move around the
+panes, `enter` opens one as a full transcript to type into (steering it if its turn is running),
+`i` interrupts one turn (keeping the worker), `x` stops it (keeping its conversation) and `esc`
+closes the page. It opens on a worker that is mid-turn when there is one, and reads the shared
+handles rather than the session thread, so the panes keep streaming while the lead is busy. A
+pane draws the session's newest entries with the lead's own entry renderer at the pane's width,
+cutting each to its tail, so a preview costs what it displays rather than the conversation behind
+it; pictures are left out, because a pane is not a screen to draw one in (D161). A worker's
+conversation is kept as structured beats and drawn by the lead's own transcript path, so markdown,
+highlighted code, tool blocks with their diffs and collapsed output, formulas, returned pictures
+and scrolling are one implementation rather than two that drift; the page adds the panes and their
+frames, and the focused view one line naming it an agent's transcript. The list and view read the shared handles rather than the session thread, so a
 worker streams while the lead is busy, and the status line's `{workers}` says how many live
 workers the session has and how many are mid-turn, in the default template and absent with no team
 (D187); the interface reaches a worker

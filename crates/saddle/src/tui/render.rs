@@ -21,7 +21,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
     Activity, App, COPY_NOTE, Cached, CompactState, CompactionView, Confirm, Entry, NoteKind,
-    Placed, Seen, Source,
+    Placed, Seen, Source, overview_columns,
 };
 use super::login::{Login, MODEL_ROWS, Purpose, Stage, matching};
 use super::permissions::{ADD_HELP, Draft, Kind, Permissions};
@@ -2063,9 +2063,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     ])
     .areas(area);
 
-    if let Some(selected) = app.workers {
-        draw_overview(frame, app, selected, transcript_area);
-    } else if let Some(name) = &app.worker
+    if let Some(name) = &app.worker
         && let Some(worker) = app.team.iter().find(|worker| &worker.name == name).cloned()
     {
         draw_worker(frame, &worker, app, transcript_area);
@@ -2217,6 +2215,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // A dialog owns the screen while it is open, and its text is selected and copied the way the
     // transcript's is, so the text it drew is kept for the mouse (D87).
     let mut surface = None;
+    if let Some(selected) = app.overview {
+        surface = Some(draw_overview(frame, app, selected, area));
+    }
     if let Some(picker) = &app.resume {
         surface = Some(draw_resume(frame, picker, area, &app.theme));
     }
@@ -3314,114 +3315,196 @@ fn keep_tail(s: &str, max: usize) -> String {
     iter::once('…').chain(out.into_iter().rev()).collect()
 }
 
-/// The live team at a glance: a tab for the person's own conversation and one for each worker,
-/// and the selected conversation drawn by the lead's transcript renderer underneath, so flipping
-/// between sessions shows each one's reasoning and output as they stream (D195).
-fn draw_overview(frame: &mut Frame<'_>, app: &mut App, selected: usize, area: Rect) {
-    let [strip, hint, body] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(1),
-    ])
-    .areas(area);
-    // The screen belongs to this view, so the conversation it replaced is cleared rather than
-    // showing in the cells the strip and hint rows do not reach (D195).
+/// The whole team on one page: a bordered preview pane per session — the person's own conversation
+/// first, then each worker — and each pane carries the newest lines that session has streamed, so
+/// what every agent is doing is on screen at once rather than one at a time (D195).
+fn draw_overview(frame: &mut Frame<'_>, app: &App, selected: usize, area: Rect) -> Seen {
+    let panes = app.team.len() + 1;
+    let selected = selected.min(panes - 1);
+    let columns = overview_columns(panes);
+    let rows = panes.div_ceil(columns);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(app.theme.border_accent))
+        .title(" agent sessions ")
+        .title_bottom(Line::from(Span::styled(
+            "tab/←→ next · ↑↓ row · enter open · i interrupt · x stop · esc back",
+            dim(&app.theme),
+        )));
     frame.render_widget(Clear, area);
-    let selected = selected.min(app.team.len());
-    draw_session_strip(frame, &app.team, selected, strip, &app.theme);
-    let mut text = String::new();
-    if let Some(worker) = selected.checked_sub(1).and_then(|i| app.team.get(i)) {
-        text.push_str(&worker.name);
-        text.push_str(" · ");
-        text.push_str(if worker.state.is_empty() {
-            "starting"
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let bands = Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(inner);
+    let sizes = vec![Constraint::Ratio(1, columns as u32); columns];
+    for index in 0..panes {
+        let band = bands[index / columns];
+        let cells = Layout::horizontal(sizes.clone()).split(band);
+        let rect = cells[index % columns];
+        let chosen = index == selected;
+        let (title, entries, empty) = if index == 0 {
+            (
+                Line::from(Span::styled(
+                    " lead ",
+                    if chosen {
+                        Style::new()
+                            .fg(app.theme.accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::new().fg(app.theme.text)
+                    },
+                )),
+                preview_tail(&app.entries),
+                "your conversation",
+            )
         } else {
-            &worker.state
-        });
-        text.push_str(" · ");
+            let worker = &app.team[index - 1];
+            let state = if worker.state.is_empty() {
+                "starting"
+            } else {
+                &worker.state
+            };
+            let (glyph, colour) = overview_mark(state, &app.theme);
+            let name = format!(" {} ", worker.name);
+            (
+                Line::from(vec![
+                    Span::styled(
+                        name,
+                        if chosen {
+                            Style::new()
+                                .fg(app.theme.accent)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::new().fg(app.theme.text)
+                        },
+                    ),
+                    Span::styled(format!("{glyph} {state} "), Style::new().fg(colour)),
+                ]),
+                preview_tail(&worker_entries(worker)),
+                "nothing yet",
+            )
+        };
+        let pane = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(if chosen {
+                app.theme.border_accent
+            } else {
+                app.theme.border_muted
+            }))
+            .title(title);
+        let pane_inner = pane.inner(rect);
+        frame.render_widget(pane, rect);
+        let lines = pane_lines(app, &entries, pane_inner.width, pane_inner.height as usize);
+        if lines.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(empty, dim(&app.theme)))),
+                pane_inner,
+            );
+        } else {
+            frame.render_widget(Paragraph::new(lines), pane_inner);
+        }
     }
-    text.push_str(if app.team.is_empty() {
-        "no live workers; ask the agent to start one · esc back"
-    } else {
-        "tab/↑↓ flip · 1-9 pick · enter view · i interrupt · x stop · esc back"
-    });
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(text, dim(&app.theme)))),
-        hint,
-    );
-    if selected == 0 {
-        draw_transcript(frame, app, body);
-    } else if let Some(worker) = app.team.get(selected - 1).cloned() {
-        draw_worker_transcript(frame, &worker, app, body);
-    } else {
-        draw_transcript(frame, app, body);
+    // The page is a surface of its own: what was drawn into it is what a drag copies, and the
+    // selection's rows map to the cells it covered (D87).
+    let lines = (0..inner.height)
+        .map(|y| {
+            (0..inner.width)
+                .map(|x| {
+                    frame.buffer_mut()[(inner.x + x, inner.y + y)]
+                        .symbol()
+                        .to_owned()
+                })
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect();
+    Seen {
+        area: inner,
+        top: 0,
+        lines,
+        pictures: Vec::new(),
     }
 }
 
-/// The tab strip of the overview: each session's name and, for a worker, what it is doing. The
-/// selected tab is drawn wider and in the accent, and the strip scrolls to keep it in view when
-/// the team does not fit (D195).
-fn draw_session_strip(
-    frame: &mut Frame<'_>,
-    team: &[Render],
-    selected: usize,
-    area: Rect,
-    theme: &Theme,
-) {
-    let active = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
-    let mut tabs: Vec<(String, Style)> = Vec::with_capacity(team.len() + 1);
-    tabs.push((
-        format!("{}lead  ", if selected == 0 { "▸ " } else { "" }),
-        if selected == 0 {
-            active
-        } else {
-            Style::new().fg(theme.text)
+/// The newest entries a preview pane shows: a few, and each cut to its own tail, so a pane costs
+/// what it can display rather than the conversation behind it (D195).
+const PREVIEW_ENTRIES: usize = 3;
+
+/// How much of one entry's text a preview keeps, counted from the end (D195).
+const PREVIEW_CHARS: usize = 1500;
+
+fn preview_tail(entries: &[Entry]) -> Vec<Entry> {
+    let start = entries.len().saturating_sub(PREVIEW_ENTRIES);
+    entries[start..].iter().map(short_entry).collect()
+}
+
+fn tail_chars(text: &str) -> String {
+    let count = text.chars().count();
+    if count <= PREVIEW_CHARS {
+        return text.to_owned();
+    }
+    let rest: String = text.chars().skip(count - PREVIEW_CHARS).collect();
+    format!("…{rest}")
+}
+
+fn short_entry(entry: &Entry) -> Entry {
+    match entry {
+        Entry::Tool {
+            id,
+            tasks,
+            name,
+            detail,
+            result,
+            diff,
+            spent,
+        } => Entry::Tool {
+            id: id.clone(),
+            tasks: tasks.clone(),
+            name: name.clone(),
+            detail: tail_chars(detail),
+            result: result.as_ref().map(|(ok, text)| (*ok, tail_chars(text))),
+            diff: diff.as_ref().map(|diff| tail_chars(diff)),
+            spent: *spent,
         },
-    ));
-    for (index, worker) in team.iter().enumerate() {
-        let (glyph, colour) = overview_mark(&worker.state, theme);
-        let chosen = index + 1 == selected;
-        let state = worker.state.split_whitespace().next().unwrap_or("starting");
-        let text = if chosen {
-            format!("▸ {} {glyph} {state}  ", worker.name)
-        } else {
-            format!("{} {glyph}  ", worker.name)
-        };
-        tabs.push((
-            text,
-            if chosen {
-                active
-            } else {
-                Style::new().fg(colour)
-            },
-        ));
+        Entry::Note(kind, text) => Entry::Note(kind.clone(), tail_chars(text)),
+        Entry::Compaction(view) => Entry::Compaction(Box::new(CompactionView {
+            header: view.header.clone(),
+            reasoning: tail_chars(&view.reasoning),
+            summary: tail_chars(&view.summary),
+            state: view.state.clone(),
+            blocks: view.blocks,
+        })),
+        Entry::User(text) => Entry::User(tail_chars(text)),
+        Entry::Assistant(text) => Entry::Assistant(tail_chars(text)),
+        Entry::Thinking(text) => Entry::Thinking(tail_chars(text)),
+        Entry::Image(image) => Entry::Image(image.clone()),
     }
-    let width = area.width as usize;
-    let mut start = 0;
-    while start < selected
-        && tabs[start..=selected]
-            .iter()
-            .map(|(text, _)| text.chars().count())
-            .sum::<usize>()
-            > width
-    {
-        start += 1;
+}
+
+/// A preview pane's lines: the tail entries rendered by the lead's own entry renderer at the pane's
+/// width, with pictures left out because a pane is not a screen to draw one in (D59, D195).
+fn pane_lines(app: &App, entries: &[Entry], width: u16, height: usize) -> Vec<Line<'static>> {
+    if height == 0 || entries.is_empty() {
+        return Vec::new();
     }
-    let mut spans = Vec::new();
-    let mut used = 0;
-    if start > 0 {
-        spans.push(Span::styled("… ", dim(theme)));
-        used = 2;
-    }
-    for (text, style) in tabs.iter().skip(start) {
-        let cells = text.chars().count();
-        if used + cells > width {
-            break;
+    let view = View {
+        expand: app.expand_tools,
+        thinking: app.show_thinking,
+        spinner: app.spinner,
+        room: (width.max(1), image::MAX_ROWS),
+        images: false,
+        scale: app.header.math_scale,
+    };
+    let mut lines = Vec::new();
+    for entry in entries {
+        if !lines.is_empty() {
+            lines.push(Line::default());
         }
-        spans.push(Span::styled(text.clone(), *style));
-        used += cells;
+        let (rendered, _) = entry_render(entry, view, &app.theme, app.now);
+        lines.extend(rendered);
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let start = lines.len().saturating_sub(height);
+    lines.split_off(start)
 }
 
 /// What a worker is doing, as one glyph and the colour it is drawn in (D195).
@@ -5587,10 +5670,10 @@ mod tests {
     }
 
     #[test]
-    fn the_session_overview_draws_each_agent_live_and_flips_between_them() {
-        // D195: ctrl+b opens the overview on the worker that is doing something, tab and the
-        // arrows flip between the person's own conversation and every worker, and each tab is
-        // drawn by the lead's transcript renderer while it streams.
+    fn the_session_overview_page_previews_every_agent_and_opens_one() {
+        // D195: ctrl+b opens a page with a live preview pane per session — the person's own
+        // conversation and every worker — each carrying what that session last streamed, so the
+        // reasoning and output of all of them are on screen at once.
         use crate::team::Beat;
         use crate::team::Render;
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -5619,7 +5702,7 @@ mod tests {
             }
         }
         let mut app = bare_app();
-        // Reasoning is drawn as it streams, in the overview and in a worker's own view alike.
+        // Reasoning is drawn as it streams, in a pane and in a worker's own view alike.
         app.show_thinking = true;
         app.agent(AgentEvent::Text("the lead's own words".into()));
         app.agent(AgentEvent::Workers(vec![
@@ -5633,74 +5716,49 @@ mod tests {
         ]));
         let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
         assert_eq!(app.key(ctrl_b), Some(Action::Workers));
-        assert_eq!(app.workers, Some(1), "opens on the running worker");
-        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        assert_eq!(app.overview, Some(1), "opens on the running worker");
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        // The editor is behind the page, so a prompt typed there cannot be on screen while it is
+        // open: the page owns the whole frame.
+        app.editor.set("zzz-prompt".into());
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let shown = screen(&terminal);
-        assert!(shown.contains("▸ runtime ● running"), "{shown}");
-        assert!(shown.contains("tests ○"), "{shown}");
-        assert!(shown.contains("tab/↑↓ flip"), "{shown}");
-        // The selected worker's conversation is drawn as the lead's is: reasoning, markdown
-        // without its markers, and the tool block with its call and answer.
+        assert!(shown.contains("agent sessions"), "{shown}");
+        assert!(shown.contains("runtime ● running"), "{shown}");
+        assert!(shown.contains("tests ○ idle"), "{shown}");
+        // Every session has a pane of its own, side by side rather than one at a time.
+        let top = shown
+            .lines()
+            .find(|line| line.contains("lead"))
+            .expect("the person's own pane is drawn");
+        assert!(top.contains("runtime"), "panes share a row: {top}");
+        // Each pane carries that session's newest streamed reasoning and output, drawn by the
+        // lead's own renderer: markdown without its markers, and the tool block with its call.
+        assert!(shown.contains("the lead's own words"), "{shown}");
         assert!(shown.contains("the reload path is here"), "{shown}");
         assert!(shown.contains("Looking at the loader now."), "{shown}");
-        assert!(
-            !shown.contains("**"),
-            "markdown markers were not rendered: {shown}"
-        );
+        assert!(!shown.contains("**"), "markdown markers: {shown}");
         assert!(shown.contains("grep -n reload src"), "{shown}");
-        assert!(shown.contains("src/lib.rs:17"), "{shown}");
-        // Flipping to the person's own conversation shows it, and back again shows the worker.
-        assert_eq!(app.key(KeyEvent::from(KeyCode::Char('0'))), None);
-        assert_eq!(app.workers, Some(0));
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let lead = screen(&terminal);
-        assert!(lead.contains("▸ lead"), "{lead}");
-        assert!(lead.contains("the lead's own words"), "{lead}");
-        assert!(!lead.contains("Looking at the loader now."), "{lead}");
+        // The page owns the whole screen: the editor and status line behind it are covered.
+        assert!(!shown.contains("zzz-prompt"), "{shown}");
+        // The arrows move around the grid, a digit picks a pane, and tab walks the sessions.
+        assert_eq!(app.key(KeyEvent::from(KeyCode::Right)), None);
+        assert_eq!(app.overview, Some(2));
+        assert_eq!(app.key(KeyEvent::from(KeyCode::Up)), None);
+        assert_eq!(app.overview, Some(0));
+        assert_eq!(app.key(KeyEvent::from(KeyCode::Down)), None);
+        assert_eq!(app.overview, Some(2));
         assert_eq!(app.key(KeyEvent::from(KeyCode::Char('1'))), None);
-        assert_eq!(app.workers, Some(1));
-        // tab and shift+tab wrap through every session; the digits jump straight to one.
+        assert_eq!(app.overview, Some(1));
         assert_eq!(app.key(KeyEvent::from(KeyCode::Tab)), None);
-        assert_eq!(app.workers, Some(2), "tab reaches the idle worker");
+        assert_eq!(app.overview, Some(2));
         assert_eq!(app.key(KeyEvent::from(KeyCode::BackTab)), None);
-        assert_eq!(app.workers, Some(1));
-        // ctrl+b closes it again, back to the person's own conversation.
+        assert_eq!(app.overview, Some(1));
+        // ctrl+b closes the page, back to the person's own conversation.
         assert_eq!(app.key(ctrl_b), None);
-        assert!(app.workers.is_none());
-        // The overview is opaque: the transcript underneath it does not show in its rows.
-        let mut covered = bare_app();
-        for _ in 0..20 {
-            covered.agent(AgentEvent::Text("z".repeat(200)));
-        }
-        covered.agent(AgentEvent::Workers(vec![runtime()]));
-        covered.workers = Some(1);
-        terminal.draw(|frame| draw(frame, &mut covered)).unwrap();
-        let inside = screen(&terminal);
-        assert!(
-            !inside.contains('z'),
-            "the transcript showed through: {inside}"
-        );
-        // The view scrolls like a transcript, and the scroll belongs to the worker rather than
-        // to the lead's conversation.
-        app.agent(AgentEvent::Workers(vec![{
-            let mut many = runtime();
-            many.state = "idle".into();
-            many.beats = (0..40)
-                .map(|turn| Beat::Text(format!("line {turn}\n")))
-                .collect();
-            many
-        }]));
-        app.workers = Some(1);
-        app.worker_scroll = 0;
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(screen(&terminal).contains("line 39"));
-        app.key(KeyEvent::from(KeyCode::PageUp));
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(app.worker_scroll > 0);
-        assert!(!screen(&terminal).contains("line 39"));
-        // Enter on a worker opens its own view — the same renderer under one naming line — and
-        // esc goes back to the overview on that worker.
+        assert!(app.overview.is_none());
+        // Enter on a worker opens its own full transcript, and esc returns to the page on it.
+        app.overview = Some(1);
         assert_eq!(
             app.key(KeyEvent::from(KeyCode::Enter)),
             Some(Action::OpenWorker("runtime".into()))
@@ -5710,40 +5768,40 @@ mod tests {
         let viewed = screen(&terminal);
         assert!(viewed.contains("agent transcript runtime"), "{viewed}");
         assert!(viewed.contains("esc/ctrl+b sessions"), "{viewed}");
-        assert!(viewed.contains("idle"), "{viewed}");
         assert_eq!(
             app.key(KeyEvent::from(KeyCode::Esc)),
             Some(Action::WorkerBack)
         );
-        assert_eq!(app.workers, Some(1));
+        assert_eq!(app.overview, Some(1));
         assert!(app.worker.is_none());
-        // With no workers yet the overview still opens and says how to get one, and `/workers`
-        // is the same screen for a terminal that eats the key.
+        // With no workers yet the page still opens, with the person's own pane and how to get one;
+        // `/workers` is the same page for a terminal that eats the key.
         let mut empty = bare_app();
         assert_eq!(empty.key(ctrl_b), Some(Action::Workers));
-        assert_eq!(empty.workers, Some(0));
+        assert_eq!(empty.overview, Some(0));
         terminal.draw(|frame| draw(frame, &mut empty)).unwrap();
         let none = screen(&terminal);
-        assert!(none.contains("no live workers"), "{none}");
-        assert!(none.contains("▸ lead"), "{none}");
-        empty.workers = None;
+        assert!(none.contains("agent sessions"), "{none}");
+        assert!(none.contains("╭ lead"), "{none}");
+        assert!(none.contains("esc back"), "{none}");
+        empty.overview = None;
         empty.editor.set("/workers".into());
         assert_eq!(
             empty.key(KeyEvent::from(KeyCode::Enter)),
             Some(Action::Workers)
         );
-        assert_eq!(empty.workers, Some(0));
+        assert_eq!(empty.overview, Some(0));
         // A prompt typed in a worker's own view goes to the worker, not the lead, and ctrl+b
-        // there returns to the overview on that worker.
+        // there returns to the page on that worker.
         app.worker = Some("runtime".into());
-        app.workers = None;
+        app.overview = None;
         app.editor.set("keep going".to_string());
         assert!(matches!(
             app.key(KeyEvent::from(KeyCode::Enter)),
             Some(Action::WorkerInput(_))
         ));
         assert_eq!(app.key(ctrl_b), Some(Action::WorkerBack));
-        assert_eq!(app.workers, Some(1));
+        assert_eq!(app.overview, Some(1));
     }
 
     #[test]

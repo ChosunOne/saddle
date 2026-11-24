@@ -726,9 +726,9 @@ pub struct App {
     pub tree: Option<Tree>,
     /// The live workers of this session (D195).
     pub team: Vec<Render>,
-    /// The session overview, while open, and which session it shows: `0` is the person's own
-    /// conversation and `n` is the team's `n`th worker. `None` is neither screen open.
-    pub workers: Option<usize>,
+    /// The session overview page, while open, and which pane it has selected: `0` is the person's
+    /// own conversation and `n` is the team's `n`th worker. `None` is the page closed.
+    pub overview: Option<usize>,
     /// The worker being viewed, by name, or `None` in the person's own conversation.
     pub worker: Option<String>,
     /// How far the worker view is scrolled back from its end, and the frame it was drawn in
@@ -794,6 +794,17 @@ pub fn help() -> String {
     text
 }
 
+/// How many panes wide the overview page is: one for the person alone, a pair for a small team,
+/// and a row of three or four as it grows, so every session keeps a readable preview (D195).
+pub fn overview_columns(panes: usize) -> usize {
+    match panes {
+        0 | 1 => 1,
+        2..=4 => 2,
+        5..=9 => 3,
+        _ => 4,
+    }
+}
+
 impl App {
     /// The image an entry holds, for the renderer that has to find a place to draw it (D59).
     pub fn cached_image(&self, i: usize) -> Option<Image> {
@@ -851,7 +862,7 @@ impl App {
             settings: None,
             tree: None,
             team: Vec::new(),
-            workers: None,
+            overview: None,
             worker: None,
             worker_scroll: 0,
             worker_total: 0,
@@ -1223,81 +1234,61 @@ impl App {
         if self.confirm.is_some() {
             return self.answer(key);
         }
-        // The session overview is a keystroke away and owns the keys while it is open: one tab for
-        // the person's own conversation, then a tab for each worker, and the selected conversation
-        // is drawn live underneath, reasoning and output included (D195).
-        if let Some(selected) = self.workers {
-            let rows = self.team.len() + 1;
-            let selected = selected.min(rows - 1);
-            let page = self.worker_height.saturating_sub(1).max(1);
-            // Scrolling belongs to the conversation on screen: the lead's own transcript has its
-            // own scroll, and a worker's is kept apart from it.
-            let scroll = |app: &mut App, forwards: usize, back: usize| {
-                if selected == 0 {
-                    app.scroll = if back > 0 {
-                        app.scroll.saturating_sub(back)
-                    } else {
-                        (app.scroll + forwards).min(app.total_lines)
-                    };
-                } else if back > 0 {
-                    app.worker_scroll = app.worker_scroll.saturating_sub(back);
-                } else {
-                    app.worker_scroll = (app.worker_scroll + forwards).min(app.worker_total);
-                }
+        // The session overview page is a keystroke away and owns the keys while it is open: one
+        // pane for the person's own conversation and one for each worker, every pane drawn live
+        // with what that session is streaming (D195).
+        if let Some(selected) = self.overview {
+            let panes = self.team.len() + 1;
+            let selected = selected.min(panes - 1);
+            let columns = overview_columns(panes);
+            let next = (selected + 1) % panes;
+            let previous = (selected + panes - 1) % panes;
+            let below = if selected + columns < panes {
+                selected + columns
+            } else {
+                selected
             };
+            let above = selected.saturating_sub(columns);
             return match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => {
-                    self.workers = None;
+                    self.overview = None;
                     self.selection = None;
                     None
                 }
                 KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.workers = None;
+                    self.overview = None;
                     self.selection = None;
                     None
                 }
-                KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('l') => {
-                    self.workers = Some((selected + 1) % rows);
-                    self.worker_scroll = 0;
+                KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                    self.overview = Some(next);
                     self.selection = None;
                     None
                 }
-                KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('h') => {
-                    self.workers = Some((selected + rows - 1) % rows);
-                    self.worker_scroll = 0;
+                KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                    self.overview = Some(previous);
+                    self.selection = None;
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.overview = Some(below);
+                    self.selection = None;
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.overview = Some(above);
                     self.selection = None;
                     None
                 }
                 KeyCode::Char(digit @ '0'..='9') => {
                     let index = digit as usize - '0' as usize;
-                    self.workers = Some(index.min(rows - 1));
-                    self.worker_scroll = 0;
+                    self.overview = Some(index.min(panes - 1));
                     self.selection = None;
-                    None
-                }
-                KeyCode::PageUp => {
-                    scroll(self, page, 0);
-                    None
-                }
-                KeyCode::PageDown => {
-                    scroll(self, 0, page);
-                    None
-                }
-                KeyCode::Home => {
-                    scroll(self, usize::MAX / 2, 0);
-                    None
-                }
-                KeyCode::End => {
-                    if selected == 0 {
-                        self.scroll = 0;
-                    } else {
-                        self.worker_scroll = 0;
-                    }
                     None
                 }
                 KeyCode::Enter if selected > 0 => {
                     let name = self.team[selected - 1].name.clone();
-                    self.workers = None;
+                    self.overview = None;
                     self.worker = Some(name.clone());
                     self.worker_scroll = 0;
                     // A selection belongs to the transcript it was made in.
@@ -1305,7 +1296,7 @@ impl App {
                     Some(Action::OpenWorker(name))
                 }
                 KeyCode::Enter => {
-                    self.workers = None;
+                    self.overview = None;
                     self.selection = None;
                     None
                 }
@@ -1363,7 +1354,7 @@ impl App {
             let name = self.worker.take().unwrap_or_default();
             self.worker_scroll = 0;
             self.selection = None;
-            self.workers = Some(
+            self.overview = Some(
                 self.team
                     .iter()
                     .position(|worker| worker.name == name)
@@ -1961,7 +1952,7 @@ impl App {
             .iter()
             .position(|worker| worker.state.starts_with("running"))
             .or_else(|| self.team.iter().position(|worker| !worker.finished));
-        self.workers = Some(index.map_or(0, |index| index + 1));
+        self.overview = Some(index.map_or(0, |index| index + 1));
         self.worker_scroll = 0;
         self.selection = None;
     }
@@ -2302,8 +2293,8 @@ impl App {
             }
             AgentEvent::Workers(views) => {
                 self.team = views;
-                if let Some(selected) = self.workers {
-                    self.workers = Some(selected.min(self.team.len()));
+                if let Some(selected) = self.overview {
+                    self.overview = Some(selected.min(self.team.len()));
                 }
                 if let Some(name) = &self.worker
                     && !self.team.iter().any(|worker| &worker.name == name)

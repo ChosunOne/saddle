@@ -1287,7 +1287,7 @@ fn event_loop(
         }
         // The team list and a worker's view read the shared handles directly, so what a worker is
         // saying arrives here even while the lead's thread is finishing a turn (D195).
-        if app.workers.is_some() || app.worker.is_some() {
+        if app.overview.is_some() || app.worker.is_some() {
             let views = control.team.views();
             if views != app.team {
                 if let Some(action) = app.agent(AgentEvent::Workers(views)) {
@@ -1299,7 +1299,7 @@ fn event_loop(
         // A running worker that is on screen keeps the frame moving as well: its elapsed times
         // and any spinner in a call it is waiting on advance with the clock, even though the
         // lead is idle (D172, D195).
-        let watching = app.workers.is_some() || app.worker.is_some();
+        let watching = app.overview.is_some() || app.worker.is_some();
         let working = app.busy.is_some()
             || app.background_running()
             || (watching
@@ -2909,7 +2909,7 @@ mod tests {
             paths,
             signing: Mutex::new(None),
             steering: Steer::default(),
-            team: crate::team::Steering::default(),
+            team: Steering::default(),
         }
     }
 
@@ -2968,7 +2968,7 @@ mod tests {
             paths,
             signing: Mutex::new(None),
             steering: Steer::default(),
-            team: crate::team::Steering::default(),
+            team: Steering::default(),
         };
         let mut app = an_app();
         // An unreachable endpoint is a failure the dialog has to be told about, not a hang: nothing
