@@ -72,7 +72,7 @@ intercepts `__sandbox` before clap parses anything — that is the helper proces
 first in `main`.
 
 The ordinary tool names are `read`, `write`, `edit`, `patch`, `ls`, `find`, `grep`, `bash`, `run_binary`, `tasks`,
-`fetch`, `websearch`, `session_query` and `config_help` (`tools::NAMES`); each runs a shipped WASI component
+`fetch`, `websearch`, `agent`, `swarm`, `session_query` and `config_help` (`tools::NAMES`); each runs a shipped WASI component
 chosen by the protected `[standard-tools]` table, and the binary holds no native implementation of any
 of them (D146, D147). `config_help` is `docs/settings.md` compiled into a guest that imports only the
 budgets snapshot, so its entry delegates no scope: `config_help = []` (D171). The one name that is
@@ -176,7 +176,7 @@ existing explicit `[agent]` tables remain as written, and `--revoke transcript-r
 one run. A bare grant covers every conversation of **this workspace**, which is the default; the
 grant may name `sessions = "self"` to cover only the conversation in hand (D163). A query is against
 one conversation — the one in hand unless an id or unique prefix from the `sessions` view is named —
-including pre-compaction messages, through four in-memory views:
+including pre-compaction messages, through in-memory views including `calls(node,part,name,arguments,principal,ok)` (D194),
 `messages(ordinal, id, role, text)`, `requests(ordinal, node, kind, provider, model, input,
 output, cache_read, cache_write, cached, cost, reasoning_dropped, reasoning_tokens, at, after)` —
 one row per model request, `kind` being `reply`, `summary` or `plugin`, `cached` 1 when the prompt came from

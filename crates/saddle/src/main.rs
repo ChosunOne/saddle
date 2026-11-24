@@ -98,6 +98,9 @@ struct Cli {
 
 #[derive(Args)]
 struct AgentArgs {
+    /// Give the new conversation a label at its first prompt (e.g. review/tests for a swarm).
+    #[arg(long, conflicts_with = "resume_latest")]
+    name: Option<String>,
     /// A built-in provider (synthetic, openai) or a [providers.*] table from config.toml.
     #[arg(long, short)]
     provider: Option<String>,
@@ -529,6 +532,7 @@ fn run_agent(
     );
     // Kept so the prompt can be rebuilt when discovery runs again (D70).
     agent.set_context(context.clone());
+    agent.set_initial_name(args.name);
 
     if interactive {
         // `/mcp` is where a failure shows in the interface; a line is the whole screen here.

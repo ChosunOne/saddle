@@ -33,6 +33,8 @@ run_binary = ["run-binary", "net"]
 tasks = ["exec"]
 fetch = ["net"]
 websearch = ["net"]
+agent = ["transcript-read"]
+swarm = ["transcript-read"]
 session_query = ["transcript-read"]
 config_help = []
 "#;

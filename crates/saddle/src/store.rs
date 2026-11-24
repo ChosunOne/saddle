@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{Contribution, Item, Part, ToolResult, Usage, reasoning_text};
+use crate::provider::{Contribution, Item, Part, ToolCall, ToolResult, Usage, reasoning_text};
 
 /// What a node holds. Every node is one of these, and the kind is a column so a query can pick
 /// one out without parsing the body.
@@ -133,9 +133,21 @@ pub struct ReasoningRow {
 pub struct Snapshot {
     /// `(node, role, text)` per message on the branch, in order.
     pub messages: Vec<(i64, String, String)>,
+    pub calls: Vec<CompletedCall>,
     pub requests: Vec<RequestRow>,
     /// Reasoning in branch order, each row naming the message it belongs to.
     pub reasoning: Vec<ReasoningRow>,
+}
+
+/// a completed call paired with its host-attributed result on the saved branch (D194).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompletedCall {
+    pub node: i64,
+    pub part: usize,
+    pub name: String,
+    pub arguments: String,
+    pub principal: String,
+    pub ok: bool,
 }
 
 /// The schema version this build writes. A database from a newer build is refused rather than
@@ -449,12 +461,36 @@ impl Store {
     /// prompt is only diagnosable next to that prompt.
     pub fn snapshot(&self, session: &str) -> Result<Snapshot> {
         let mut out = Vec::new();
+        let mut calls = Vec::new();
+        let mut pending: Vec<ToolCall> = Vec::new();
         let mut requests = Vec::new();
         let mut reasoning = Vec::new();
         for node in self.branch(session)? {
             if node.kind == kind::ITEM {
                 let item: Item = serde_json::from_str(&node.body)?;
                 let ordinal = out.len() + 1;
+                if let Item::ToolResults(results) = &item {
+                    for (part, (call, result)) in pending.drain(..).zip(results).enumerate() {
+                        if call.id == result.id
+                            && let Ok(input) = call.input
+                        {
+                            calls.push(CompletedCall {
+                                node: node.id,
+                                part,
+                                name: call.name,
+                                arguments: input.to_string(),
+                                ok: !result.is_error,
+                                principal: result
+                                    .provenance
+                                    .as_ref()
+                                    .map(|p| p.principal.clone())
+                                    .unwrap_or_default(),
+                            });
+                        }
+                    }
+                } else {
+                    pending.clear();
+                }
                 let (role, text) = match item {
                     Item::User(text) | Item::Attached { text, .. } => ("user", text),
                     Item::Contribution(value) => ("plugin", value.content),
@@ -479,7 +515,9 @@ impl Store {
                                 .filter_map(|part| match part {
                                     Part::Text(text) => Some(text),
                                     Part::Call(call) => {
-                                        Some(serde_json::to_string(&call).unwrap_or_default())
+                                        let text = serde_json::to_string(&call).unwrap_or_default();
+                                        pending.push(call);
+                                        Some(text)
                                     }
                                     _ => None,
                                 })
@@ -510,6 +548,7 @@ impl Store {
         }
         Ok(Snapshot {
             messages: out,
+            calls,
             requests,
             reasoning,
         })

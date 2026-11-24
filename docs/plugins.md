@@ -41,6 +41,8 @@ run_binary = ["run-binary", "net"]
 tasks = ["exec"]
 fetch = ["net"]
 websearch = ["net"]
+agent = ["transcript-read"]
+swarm = ["transcript-read"]
 session_query = ["transcript-read"]
 config_help = []                 # the reference: nothing to delegate
 ```
@@ -776,3 +778,27 @@ SDK fixture for veto fail-closed behavior, append-only contributions, isolated K
 isolated model transport and cancellation, and labelled read-only UI panels. MCP prompts, MCP resources, `codemode` and
 images in a tool result are refused by decision (D119), not deferred. This migration does not introduce
 automatic plugin updates, an authority picker, ambient native access or a second policy engine.
+
+## Working with a team
+
+Run `contrib/saddle-swarm review lead runtime tests` with the new `saddle` on PATH and tmux
+installed, or open ordinary terminals with `saddle --name review/runtime` and
+`saddle --name review/tests`. Each first prompt should give that member its brief and team
+handle. The tmux window picker (default `Ctrl-b w`) drops into the real member: its streaming
+output, provider-supplied reasoning, tool calls, steering and interrupt controls all work as
+usual. Detach without stopping the team (`Ctrl-b d`); quitting one member leaves the others
+alone. These are independent processes in the same checkout, not isolated worktrees.
+
+For example, runtime calls `agent` with `{"action":"post","to":"review/tests","text":"Check the reload path at session.rs:17"}`.
+Tests calls `swarm` with `{"team":"review"}` to find runtime's conversation id, then calls
+`agent` with `{"action":"read","session":"<runtime id>","to":"review/tests"}`. No lead has
+to forward the message. `inspect` takes a session id and returns recent saved activity. Only
+sessions that have had a first prompt appear. A saved conversation is not necessarily running;
+use a distinct team label for a new run. Reads follow the sender's current branch. A rewind
+can remove a post from future reads but does not retract a copy already read by a peer.
+
+These are pull-based outboxes, not private DMs. A post does not start a turn, interrupt or
+acknowledge delivery. Reading another conversation needs workspace transcript reach; a
+`self` grant does not become workspace reach by joining a team. Existing configurations
+are unchanged; `saddle tools --config` shows the shipped delegation entries. Budgets are
+per session, not a pooled team allowance.

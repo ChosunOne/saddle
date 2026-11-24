@@ -1,0 +1,4 @@
+id = "swarm"
+version = "0.1.0"
+component = "swarm.component.wasm"
+scopes = ["tool", "transcript-read"]

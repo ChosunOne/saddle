@@ -433,6 +433,7 @@ pub struct Agent {
     store: Option<Store>,
     /// The conversation being appended to, created at its first prompt (D53).
     saved: Option<String>,
+    initial_name: Option<String>,
     compaction: compact::Settings,
     /// Messages sent while a turn is running, taken between requests (D149).
     steering: Steer,
@@ -470,6 +471,7 @@ impl Agent {
             max_steps,
             store,
             saved: None,
+            initial_name: None,
             compaction,
             steering: Steer::default(),
             shown_panels: Vec::new(),
@@ -491,6 +493,11 @@ impl Agent {
     /// without saying anything useful (D37).
     pub fn set_max_steps(&mut self, max_steps: Option<usize>) {
         self.max_steps = max_steps.filter(|n| *n > 0);
+    }
+
+    /// name only the first new conversation, never a later /new or resumed branch (D194).
+    pub fn set_initial_name(&mut self, name: Option<String>) {
+        self.initial_name = name;
     }
 
     pub fn set_compaction(&mut self, settings: compact::Settings) {
@@ -1207,6 +1214,7 @@ impl Agent {
             .as_ref()
             .context("this session is not being saved, so there is nothing to resume")?;
         let loaded = store.load(id)?;
+        self.initial_name = None;
         self.saved = Some(id.to_owned());
         self.items = loaded.items.clone();
         self.context_tokens = 0;
@@ -1265,7 +1273,14 @@ impl Agent {
             && let Some(store) = &self.store
         {
             match store.begin(&name, &model) {
-                Ok(id) => self.saved = Some(id),
+                Ok(id) => {
+                    if let Some(label) = self.initial_name.take()
+                        && let Err(error) = store.name(&id, &label)
+                    {
+                        ui.note(&format!("could not name the conversation: {error:#}"));
+                    }
+                    self.saved = Some(id);
+                }
                 Err(e) => return self.saving_failed(e, ui),
             }
         }

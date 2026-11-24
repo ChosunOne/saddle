@@ -4705,6 +4705,17 @@ read reach, a profile that can read a credential can write it into the workspace
 can read it; that consequence belongs to the person choosing the profile. `check` reports both
 switches.
 
+**D194.** A person can run several ordinary sessions as a team. `--name TEAM/member`
+labels a new conversation at its first prompt. The `swarm` component discovers named
+conversations, and `agent` publishes and reads addressed findings on their saved branches.
+The read-only `calls(node,part,name,arguments,principal,ok)` projection pairs structured calls
+with actual results; the principal comes from host provenance, never a nested output tag.
+Only a completed, successful standard-agent post is a peer message. Reading a peer uses the
+existing D163 workspace transcript decision. A recipient label is routing metadata, not an ACL.
+No process launches, permission transfers, delivery receipts or implicit turns result from a
+model post. Each interactive worker has its own ordinary session controls and audit. D6 still
+applies to plugin-initiated launches; no privileged spawn API is introduced here.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

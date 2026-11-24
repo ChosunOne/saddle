@@ -1,0 +1,4 @@
+id = "agent"
+version = "0.1.0"
+component = "agent.component.wasm"
+scopes = ["tool", "transcript-read"]

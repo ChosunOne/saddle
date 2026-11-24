@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Open real Saddle TUIs, one per tmux window. No model-generated terminal input.
+set -euo pipefail
+usage() { echo 'usage: saddle-swarm TEAM MEMBER [MEMBER ...] [-- SADDLE_OPTIONS ...]' >&2; exit 2; }
+valid() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; }
+(( $# >= 2 )) || usage
+team=$1; shift
+valid "$team" || usage
+members=(); declare -A seen=()
+while (( $# )) && [[ $1 != -- ]]; do
+    valid "$1" || usage
+    [[ -z ${seen[$1]+present} ]] || usage
+    seen[$1]=1; members+=("$1"); shift
+done
+(( ${#members[@]} )) || usage
+if (( $# )); then shift; fi
+# The client chooses the executable and cwd, not a previously running tmux server.
+saddle=$(type -P saddle) || { echo 'saddle is not on PATH' >&2; exit 1; }
+saddle=$(realpath "$saddle")
+target="saddle-$team"
+# With multiple command arguments tmux execs argv directly, without a shell.
+tmux new-session -d -s "$target" -n "${members[0]}" -c "$PWD" "$saddle" --name "$team/${members[0]}" "$@"
+trap 'tmux kill-session -t "=$target" 2>/dev/null || :' EXIT
+for member in "${members[@]:1}"; do
+    tmux new-window -d -t "=$target:" -n "$member" -c "$PWD" "$saddle" --name "$team/$member" "$@"
+done
+trap - EXIT
+echo "team started; reattach with: tmux attach-session -t =$target" >&2
+if [[ -n ${TMUX:-} ]]; then exec tmux switch-client -t "=$target"; fi
+exec tmux attach-session -t "=$target"

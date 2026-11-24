@@ -77,6 +77,8 @@ pub const NAMES: &[&str] = &[
     "tasks",
     "fetch",
     "websearch",
+    "agent",
+    "swarm",
     "session_query",
     "tool_search",
     "config_help",

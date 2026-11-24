@@ -75,3 +75,11 @@ crate-type = ["cdylib"]
 
 [lints]
 workspace = true
+
+[[example]]
+name = "agent"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "swarm"
+crate-type = ["cdylib"]

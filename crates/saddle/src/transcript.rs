@@ -144,8 +144,11 @@ fn authorize(ctx: AuthContext<'_>) -> Authorization {
         AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
         AuthAction::Read { table_name, .. } => match (table_name, ctx.accessor) {
             // The three views, and the backing table each of them reads (D92, D94, D98).
-            ("messages" | "requests" | "reasoning" | "sessions", _) => Authorization::Allow,
-            ("message_snapshot", Some("messages"))
+            ("calls" | "messages" | "requests" | "reasoning" | "sessions", _) => {
+                Authorization::Allow
+            }
+            ("call_snapshot", Some("calls"))
+            | ("message_snapshot", Some("messages"))
             | ("request_snapshot", Some("requests"))
             | ("reasoning_snapshot", Some("reasoning"))
             | ("session_snapshot", Some("sessions")) => Authorization::Allow,
@@ -198,6 +201,8 @@ fn query_bounded(
     let mut conn = Connection::open_in_memory()?;
     conn.execute_batch(
         "PRAGMA temp_store=MEMORY;
+        CREATE TABLE call_snapshot(node INTEGER,part INTEGER,name TEXT,arguments TEXT,principal TEXT,ok INTEGER);
+        CREATE VIEW calls AS SELECT * FROM call_snapshot;
         CREATE TABLE message_snapshot(ordinal INTEGER, id INTEGER, role TEXT, text TEXT);
         CREATE VIEW messages AS SELECT ordinal, id, role, text FROM message_snapshot;
         CREATE TABLE request_snapshot(
@@ -217,6 +222,20 @@ fn query_bounded(
         CREATE VIEW sessions AS SELECT id, name, title, model, updated, messages, forked_from
             FROM session_snapshot;",
     )?;
+    {
+        let mut insert = conn.prepare("INSERT INTO call_snapshot VALUES (?1,?2,?3,?4,?5,?6)")?;
+        for row in &snapshot.calls {
+            check_deadline(deadline)?;
+            insert.execute(params![
+                row.node,
+                row.part as i64,
+                row.name,
+                row.arguments,
+                row.principal,
+                row.ok
+            ])?;
+        }
+    }
     {
         let mut insert = conn.prepare("INSERT INTO message_snapshot VALUES (?1, ?2, ?3, ?4)")?;
         for (ordinal, (id, role, text)) in snapshot.messages.iter().enumerate() {
@@ -357,6 +376,7 @@ mod tests {
 
     fn messages() -> Snapshot {
         Snapshot {
+            calls: Vec::new(),
             messages: vec![(7, "user".into(), "remember teal".into())],
             requests: Vec::new(),
             reasoning: Vec::new(),
@@ -474,6 +494,7 @@ mod tests {
         // provider's cache miss" was answerable only from the audit log. This is the query the
         // view exists for.
         let snapshot = Snapshot {
+            calls: Vec::new(),
             messages: messages().messages,
             requests: vec![
                 request("synthetic", "glm", 1_000, 0),
@@ -508,6 +529,7 @@ mod tests {
         let mut dropped = request("openai", "gpt", 500, 0);
         dropped.dropped = 2;
         let snapshot = Snapshot {
+            calls: Vec::new(),
             messages: messages().messages,
             requests: vec![
                 request("openai", "gpt", 500, 400),
@@ -531,6 +553,7 @@ mod tests {
         let mut thinking = request("openai", "gpt", 500, 400);
         thinking.reasoning_tokens = 850;
         let snapshot = Snapshot {
+            calls: Vec::new(),
             messages: messages().messages,
             requests: vec![request("openai", "gpt", 500, 400), thinking],
             reasoning: Vec::new(),
@@ -554,6 +577,7 @@ mod tests {
         // D98: reasoning was replayed to the model and stored on the item (D95, D96) and no view
         // could see it, so the transcript was searchable and the thinking behind it was not.
         let snapshot = Snapshot {
+            calls: Vec::new(),
             messages: vec![
                 (7, "user".into(), "how many rows".into()),
                 (8, "assistant".into(), "checking".into()),
@@ -585,6 +609,7 @@ mod tests {
     #[test]
     fn the_backing_tables_are_as_private_as_the_views() {
         let snapshot = Snapshot {
+            calls: Vec::new(),
             messages: messages().messages,
             requests: vec![request("openai", "gpt", 10, 0)],
             reasoning: Vec::new(),
@@ -626,6 +651,7 @@ mod tests {
     #[test]
     fn bounds_rows_and_recursive_work() {
         let snapshot = Snapshot {
+            calls: Vec::new(),
             messages: vec![(1, "user".into(), "hi".into()); 101],
             requests: Vec::new(),
             reasoning: Vec::new(),
@@ -639,6 +665,7 @@ mod tests {
     #[test]
     fn caps_serialized_bytes_and_rejects_oversized_sql() {
         let snapshot = Snapshot {
+            calls: Vec::new(),
             messages: vec![(1, "user".into(), "\"".repeat(30_000))],
             requests: Vec::new(),
             reasoning: Vec::new(),

@@ -1645,6 +1645,51 @@ fn reading_the_first_conversation(
 }
 
 #[test]
+fn swarm_peers_discover_and_read_attributed_posts_without_relaying_user_prompts() {
+    let db = Arc::new(Mutex::new(PathBuf::new()));
+    let first = db.clone();
+    let (base, seen) = serve_dynamic(4, move |index, _| {
+        let calls = match index {
+            0 => vec![(
+                "p",
+                "agent",
+                json!({"action":"post","to":"review/tests","text":"check line 17"}),
+            )],
+            2 => vec![
+                ("s", "swarm", json!({"team":"review"})),
+                (
+                    "r",
+                    "agent",
+                    json!({"action":"read","session":first_session(&first.lock().unwrap()),"to":"review/tests"}),
+                ),
+            ],
+            _ => Vec::new(),
+        };
+        sse_response(&openai_sse(
+            if calls.is_empty() { "done" } else { "" },
+            &calls,
+        ))
+    });
+    let env = Env::new(Api::Openai, &base);
+    *db.lock().unwrap() = env.xdg.path().join("state/saddle/sessions.db");
+    env.write_override("[agent]\ntranscript-read = {}\n");
+    for member in ["review/runtime", "review/tests"] {
+        let out = env.saddle(&["run", "--name", member, "investigate"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+    }
+    let seen = seen.lock().unwrap();
+    let results: Vec<Value> = seen[3].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| serde_json::from_str(tool_text(m["content"].as_str().unwrap())).unwrap())
+        .collect();
+    assert_eq!(results[0]["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(results[1]["rows"][0][2], "check line 17");
+}
+
+#[test]
 fn another_conversation_of_this_workspace_is_readable_and_listed() {
     // D163: the workspace's conversations are one person's work, so a bare `transcript-read`
     // covers them; the second call in the same turn shows what the `sessions` view says.
