@@ -1701,6 +1701,31 @@ fn a_live_worker_is_started_and_addressed_by_the_shipped_team_tool() {
         .expect("the tool result is in the next request");
     let result = tool_text(&started);
     assert!(result.contains("started runtime"), "{result}");
+    // The conversation the tool names is the one that holds the worker's messages: a worker that
+    // began a second, empty conversation would leave the printed id unresumable.
+    let id = result
+        .split("conversation ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .expect("the start names its conversation")
+        .trim()
+        .to_owned();
+    let db = Connection::open(env.xdg.path().join("state/saddle/sessions.db")).unwrap();
+    let rows: i64 = db
+        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        rows, 2,
+        "the lead and the worker, and no empty conversation beside them"
+    );
+    let stored: i64 = db
+        .query_row(
+            "SELECT count(*) FROM nodes WHERE session = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(stored > 0, "conversation {id} holds the worker's messages");
     // The audit names the brief by hash, never its words.
     // The lead's log and each worker's are separate files, so the whole audit directory is read.
     let dir = env.xdg.path().join("state/saddle/audit");

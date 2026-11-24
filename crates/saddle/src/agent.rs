@@ -556,6 +556,12 @@ impl Agent {
         self.initial_name = name;
     }
 
+    /// point the agent at a conversation its owner already recorded, so its first turn appends to
+    /// that one instead of beginning a second, empty conversation (D195).
+    pub fn set_conversation(&mut self, id: &str) {
+        self.saved = Some(id.to_owned());
+    }
+
     pub fn set_compaction(&mut self, settings: compact::Settings) {
         self.compaction = settings;
     }

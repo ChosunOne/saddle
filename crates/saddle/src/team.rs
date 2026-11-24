@@ -356,6 +356,8 @@ impl Manager {
         // view is taken from here rather than from the session it is derived from (D195).
         let mut child = session.derive(&id)?;
         child.team = self.child();
+        // Peers address each other by name; the random id names the audit log, not a mailbox.
+        child.team_label = name.to_owned();
         let store = Store::open(
             &child.setup.paths.session_db(),
             child.setup.workspace.clone(),
@@ -391,6 +393,7 @@ impl Manager {
             settings,
         );
         agent.set_context(Vec::new());
+        agent.set_conversation(&conversation);
         let steer = agent.steering();
         let handle = Handle {
             steer: steer.clone(),
