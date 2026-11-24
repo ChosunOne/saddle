@@ -4726,7 +4726,8 @@ session id and spending ledger, derived by re-reading the same protected configu
 inherits only the grants the session has and cannot exceed them. Workers cannot start workers.
 A brief is written under the session's private temporary directory and read by the host from
 there, with no root involved; the audit records its path, hash and size, never its words. `tool-limits.team-workers` caps a
-team and `team-steps` caps each worker turn. A person opens the team with ctrl+b, views a
+team, and `team-steps`, when set, caps each worker turn: it has no default, because a turn has no
+default request limit (D37). A person opens the team with ctrl+b, views a
 worker's live transcript and provider-exposed reasoning, types into it, interrupts one turn
 (keeping the worker), or stops it (keeping its conversation). A worker's conversation is kept as
 structured beats and drawn by the lead's own transcript path, so markdown, highlighted code, tool

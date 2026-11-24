@@ -18,7 +18,7 @@ macro_rules! budgets {
         impl Budgets {
             /// reject zero/unrepresentable budgets instead of wrapping at the guest ABI.
             pub fn validate(&self) -> Result<(), String> {
-                $(if (self.$name == 0 && !matches!(stringify!($name), "http_redirects" | "exec_report_paths" | "exec_report_denials" | "web_quotes" | "image_count")) || (stringify!($ty) == "usize" && self.$name as u64 > u64::from(u32::MAX)) {
+                $(if (self.$name == 0 && !matches!(stringify!($name), "http_redirects" | "exec_report_paths" | "exec_report_denials" | "web_quotes" | "image_count" | "team_steps")) || (stringify!($ty) == "usize" && self.$name as u64 > u64::from(u32::MAX)) {
                     return Err(format!("tool-limits.{} must be positive (except disabled report/redirect/image counts) and fit its ABI representation", stringify!($name).replace('_', "-")));
                 })*
                 Ok(())
@@ -41,7 +41,9 @@ budgets! {
     persist_total_bytes: usize = 4 * 1024 * 1024,
     persist_changes: usize = 32,
     team_workers: usize = 8,
-    team_steps: usize = 16,
+    // no default request limit, as a conversation has none (D37): 0 means a worker turn runs
+    // until it answers.
+    team_steps: usize = 0,
     model_input_bytes: usize = 64 * 1024,
     model_output_tokens: usize = 4096,
     model_reply_bytes: usize = 64 * 1024,
@@ -189,6 +191,25 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+        // A worker turn has no request limit by default, so zero is a meaning here rather than a
+        // missing budget (D37, D195).
+        assert_eq!(DEFAULTS.team_steps, 0);
+        assert!(
+            Budgets {
+                team_steps: 0,
+                ..original.clone()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            Budgets {
+                team_steps: 4,
+                ..original
+            }
+            .validate()
+            .is_ok()
         );
     }
 }

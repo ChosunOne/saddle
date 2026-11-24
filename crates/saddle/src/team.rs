@@ -385,7 +385,12 @@ impl Manager {
             return Ok(Err("a worker needs a brief".into()));
         }
         let team_workers = session.setup.tool_limits.team_workers;
-        let team_steps = session.setup.tool_limits.team_steps;
+        // A worker turn has no request limit unless `tool-limits.team-steps` sets one, as the
+        // lead's turn has none unless `[agent] max-steps` does (D37).
+        let team_steps = match session.setup.tool_limits.team_steps {
+            0 => None,
+            steps => Some(steps),
+        };
         if self.views().len() >= team_workers {
             return Ok(Err(format!(
                 "this session already has {} workers (tool-limits.team-workers)",
@@ -479,7 +484,7 @@ impl Manager {
             system.clone(),
             agent::base_prompt(&child, &[]),
             declared,
-            Some(team_steps),
+            team_steps,
             Some(store),
             settings,
         );

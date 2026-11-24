@@ -516,7 +516,7 @@ most often wants:
 | `request-image-bytes` | the pictures one request carries; older ones become a note (D162) |
 | `network-seconds`, `http-redirects` | one HTTP request |
 | `query-rows`, `query-result-bytes` | one `session_query` answer |
-| `team-workers`, `team-steps` | live workers per session, and model requests one worker turn may take |
+| `team-workers`, `team-steps` | live workers per session, and, when set, the model requests one worker turn may take; `0` (the default) means no limit, as the lead's own turn has none |
 
 ## commands
 
