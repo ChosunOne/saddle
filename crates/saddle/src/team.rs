@@ -352,7 +352,10 @@ impl Manager {
             "live worker started from a delegated brief",
         )?;
         let id = session_id();
-        let child = session.derive(&id)?;
+        // `session.team` is this manager, temporarily taken out of the session, so the child's
+        // view is taken from here rather than from the session it is derived from (D195).
+        let mut child = session.derive(&id)?;
+        child.team = self.child();
         let store = Store::open(
             &child.setup.paths.session_db(),
             child.setup.workspace.clone(),
