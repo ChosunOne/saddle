@@ -279,12 +279,17 @@ fn append(doc: &mut DocumentMut, what: &str, roots: &Roots, base: Option<&str>) 
             let tokens =
                 i64::try_from(tokens).context("that is more tokens than a policy can hold")?;
             let table = agent(doc)?;
-            if table.get("model-invoke").is_some() {
+            if table.get("model-invoke").is_none() {
+                table.insert("model-invoke", Item::Table(Table::new()));
+            }
+            let budget = match table.get_mut("model-invoke") {
+                Some(Item::Table(budget)) => budget,
+                _ => bail!("model-invoke in this policy is not a table; edit it to add a budget"),
+            };
+            if budget.get("tokens-per-session").is_some() {
                 bail!("this policy already sets a token budget; edit it to change the number");
             }
-            let mut budget = Table::new();
             budget.insert("tokens-per-session", value(tokens));
-            table.insert("model-invoke", Item::Table(budget));
             Ok(Preview {
                 summary: format!("{tokens} tokens per session"),
                 line: format!("[agent.model-invoke]  tokens-per-session = {tokens}"),
@@ -753,6 +758,18 @@ mod tests {
         assert!(text.contains("tokens-per-session = 250000"), "{text}");
         // Both would be a second grant of the same scope.
         assert!(add(&path, "exec", &roots).is_err());
+        assert!(add(&path, "tokens 1", &roots).is_err());
+    }
+
+    #[test]
+    fn a_budget_is_added_into_an_existing_grant_that_has_none() {
+        // A worker grant may be written as the capability alone; asking for a budget here fills
+        // the table in rather than refusing to touch it.
+        let (_d, path, roots) = temp("version = 1\n[agent.model-invoke]\nwhy = \"workers\"\n");
+        add(&path, "tokens 5000", &roots).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("tokens-per-session = 5000"), "{text}");
+        assert!(text.contains(r#"why = "workers""#), "{text}");
         assert!(add(&path, "tokens 1", &roots).is_err());
     }
 

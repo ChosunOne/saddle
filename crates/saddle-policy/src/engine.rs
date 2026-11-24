@@ -275,12 +275,13 @@ impl Engine {
                     format!("{owner} has no model-invoke grant"),
                 );
             };
-            if spent
-                .get(&owner)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(tokens)
-                > grant.tokens_per_session
+            if let Some(limit) = grant.tokens_per_session
+                && spent
+                    .get(&owner)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(tokens)
+                    > limit
             {
                 return Decision::deny(
                     Scope::ModelInvoke,
@@ -416,12 +417,14 @@ impl Engine {
                 };
                 let mut spent = self.spent.lock().unwrap_or_else(|e| e.into_inner());
                 let used = spent.entry(who.clone()).or_insert(0);
-                if used.saturating_add(*tokens) > g.tokens_per_session {
+                if let Some(limit) = g.tokens_per_session
+                    && used.saturating_add(*tokens) > limit
+                {
                     return Decision::deny(
                         scope,
                         format!(
-                            "{who} has used {used} of {} tokens this session; {tokens} more would exceed {}",
-                            g.tokens_per_session, g.rule
+                            "{who} has used {used} of {limit} tokens this session; {tokens} more would exceed {}",
+                            g.rule
                         ),
                     );
                 }
@@ -827,6 +830,34 @@ model-invoke = { tokens-per-session = 100, why = "summaries" }
         assert_eq!(d.explanation, "plugin.ghost has no grants in the policy");
         let d = e.decide(&Principal::Agent, &Request::Plain(Scope::Persist));
         assert_eq!(d.explanation, "agent has no persist grant");
+    }
+
+    #[test]
+    fn a_grant_without_a_token_budget_does_not_cap_spending() {
+        // A grant written as the capability alone: the model-invoke table may carry no budgets, so
+        // nothing here turns the absence of one into a ceiling of zero (D37, D156).
+        let ws = tempfile::tempdir().unwrap();
+        let roots = Roots::resolve([(RootName::workspace(), ws.path().into())], &[]).unwrap();
+        let policy = Policy::parse(
+            "version = 1\n[agent]\nmodel-invoke = { why = \"workers\" }\n",
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(
+            policy
+                .grants(&Principal::Agent)
+                .unwrap()
+                .model_invoke
+                .as_ref()
+                .unwrap()
+                .tokens_per_session,
+            None
+        );
+        let engine = Engine::new(policy);
+        for tokens in [1_000, 500_000_000] {
+            let d = engine.decide(&Principal::Agent, &Request::ModelInvoke { tokens });
+            assert!(d.allow, "{}", d.explanation);
+        }
     }
 
     #[test]

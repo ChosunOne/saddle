@@ -70,7 +70,15 @@ pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationEr
             .as_ref()
             .ok_or(DelegationError::Scope(Scope::ModelInvoke))?;
         let mut grant = want.clone();
-        grant.tokens_per_session = want.tokens_per_session.min(parent.tokens_per_session);
+        // A delegated grant is never wider than the one it comes from: no token budget in the
+        // parent leaves the child's own choice, and a child that asks for none still inherits the
+        // parent's cap rather than escaping it.
+        grant.tokens_per_session = match (want.tokens_per_session, parent.tokens_per_session) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
         grant.cost_per_session = match (want.cost_per_session, parent.cost_per_session) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),

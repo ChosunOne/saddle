@@ -183,8 +183,9 @@ front (`direct`), only after `tool_search` finds it (`deferred`, the default), o
 
 `tool`, `ui`, `veto`, `context-contribute`, `persist`, `model-invoke`, `event-publish` and
 `event-subscribe` are the interfaces a plugin can hold (see §7). Two of them spend real resources:
-`model-invoke` carries `tokens-per-session` and `cost-per-session` budgets that are charged like the
-agent's own spending, and `persist` gives a plugin private key-value storage isolated by workspace
+`model-invoke` may carry `tokens-per-session` and `cost-per-session` budgets that are charged like the
+agent's own spending; both are optional, and a grant without them caps nothing, so a worker is not
+given a default ceiling. `persist` gives a plugin private key-value storage isolated by workspace
 and plugin identity.
 
 ## 4. Permission profiles

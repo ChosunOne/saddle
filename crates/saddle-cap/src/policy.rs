@@ -277,7 +277,9 @@ impl NetGrant {
 pub struct BudgetGrant {
     pub rule: RuleId,
     pub why: String,
-    pub tokens_per_session: u64,
+    /// `None` is no token budget: a grant written without `tokens-per-session` leaves spending
+    /// uncapped by tokens, as it is by cost when `cost-per-session` is absent.
+    pub tokens_per_session: Option<u64>,
     pub cost_per_session: Option<f64>,
 }
 
@@ -779,7 +781,8 @@ struct RawMcp {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct RawBudget {
-    tokens_per_session: u64,
+    #[serde(default)]
+    tokens_per_session: Option<u64>,
     cost_per_session: Option<f64>,
     #[serde(default)]
     why: Option<String>,
@@ -920,7 +923,10 @@ impl Policy {
             }
             if let Some(b) = &g.model_invoke {
                 lines.push(with_why(
-                    format!("{} = {} tokens per session", b.rule, b.tokens_per_session),
+                    match b.tokens_per_session {
+                        Some(tokens) => format!("{} = {tokens} tokens per session", b.rule),
+                        None => format!("{} = no token budget", b.rule),
+                    },
                     &b.why,
                 ));
             }
@@ -1531,7 +1537,7 @@ exec = { timeout-secs = 60 }
                 .as_ref()
                 .unwrap()
                 .tokens_per_session,
-            500
+            Some(500)
         );
 
         // What is still refused is a grant that makes no sense for the session: an unknown root,

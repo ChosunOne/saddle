@@ -2387,7 +2387,10 @@ impl Controller {
             rows.push(Row {
                 rule: b.rule.to_string(),
                 kind: Kind::ModelInvoke,
-                root: format!("{} tokens per session", b.tokens_per_session),
+                root: match b.tokens_per_session {
+                    Some(tokens) => format!("{tokens} tokens per session"),
+                    None => "no token budget".into(),
+                },
                 exclude: String::new(),
                 on: true,
                 editable: false,

@@ -3673,9 +3673,11 @@ reach and manifest ceiling; `tool` remains registration rather than operational 
 - `saddle:host/model-invoke` uses the session's selected provider and refreshed host credentials for
   an isolated, tool-free request. No main transcript, opaque reasoning payload, provider selector,
   credential or endpoint reaches the guest. Text, prose reasoning and usage are returned; requested
-  tools are never run. Admission atomically reserves parent and plugin token/cost budgets. Reported
-  usage reconciles reservations; failed/unmetered requests retain theirs. Optional `cost-per-session`
-  refuses unknown pricing rather than inventing a subscription bill. Reservation uses a conservative
+  tools are never run. Admission atomically reserves parent and plugin token/cost budgets when the grant
+  sets them. Reported usage reconciles reservations; failed/unmetered requests retain theirs. Both
+  budgets are optional, and a `model-invoke` grant without them caps neither: absent is the capability
+  alone, not a ceiling of zero. Optional `cost-per-session` refuses unknown pricing rather than
+  inventing a subscription bill. Reservation uses a conservative
   input-byte/framing estimate and output ceiling; provider-reported overruns are charged and block
   further requests, not claimed to undo remote billing. Deadlines cancel local waits and remote
   cancellation is best effort. Credential-refresh HTTP and mutex waits also respect the caller deadline.
@@ -4805,7 +4807,7 @@ delegation on every call; registration and event interest never grant its author
 | observe turn/tool lifecycle events | `transcript-read` | built: typed `observer` subscriptions and bounded delivery (D155) |
 | custom plugin events | `event-publish`, `event-subscribe` | built: disjoint publishing/subscription APIs (D155) |
 | block a pending tool call | `veto` | built: fail-closed deny/abstain callbacks (D156) |
-| invoke the model | `model-invoke` | built: isolated requests with shared parent/plugin budgets (D156) |
+| invoke the model | `model-invoke` | built: isolated requests with shared parent/plugin budgets when set (D156) |
 | render UI | `ui` | built: closed widgets in labelled host panels (D156) |
 | persist state | `persist` | built: workspace/plugin-isolated transactional KV (D156) |
 

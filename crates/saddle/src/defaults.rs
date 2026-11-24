@@ -71,8 +71,10 @@ exec     = {{ why = "runs builds, tests and git" }}
 # `sessions = "self"` to keep session_query to the conversation in hand.
 transcript-read = {{ why = "reads this workspace's conversations" }}
 # What the model itself may spend on the agent's own behalf, including a worker it starts.
-# A budget, not a capability: it never widens a filesystem or network grant.
-model-invoke = {{ tokens-per-session = 2000000, cost-per-session = 20.0, why = "lets the agent start and brief its own workers" }}
+# A budget, not a capability: it never widens a filesystem or network grant. Add
+# `tokens-per-session` and/or `cost-per-session` here to cap it; without them the grant is the
+# capability alone and spending is uncapped, as the conversation's own turn is (D37).
+model-invoke = {{ why = "lets the agent start and brief its own workers" }}
 
 # Directories outside the workspace, by name, so a policy can grant them to the tools. A root is
 # what read, ls, find, grep, write and edit decide over: a tool path has to fall inside one, and the

@@ -118,7 +118,7 @@ mod worker_delegation_tests {
                 child
                     .model_invoke
                     .as_ref()
-                    .is_some_and(|g| g.tokens_per_session == 100),
+                    .is_some_and(|g| g.tokens_per_session == Some(100)),
                 "{name} inherits the budget"
             );
         }

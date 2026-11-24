@@ -64,7 +64,7 @@ replaces a scope it names. `saddle check` prints the result, and `--grant`/`--re
 | `tool-write` | the same | `write`, `edit` and `patch` on one |
 | `transcript-read` | `{ why, sessions }` | `session_query` over this workspace's conversations; `sessions = "self"` narrows it to the conversation in hand (D92, D163) |
 | `mcp` | list of `{ server, tools, why, fs-read, fs-write, net }` | one server's named tools; every tool is named, never a pattern, and its reach is narrowed to the agent's (D103, D105) |
-| `model-invoke` | `{ tokens-per-session, cost-per-session, why }` | requests a plugin may make on its own behalf (D156) |
+| `model-invoke` | `{ tokens-per-session, cost-per-session, why }` | requests a plugin may make on its own behalf (D156). Both budgets are optional: a grant written without them is the capability alone |
 | `event-publish`, `event-subscribe` | `{ why }` | publishing and subscribing to custom plugin events (D155) |
 | `context-contribute`, `veto`, `tool`, `ui`, `persist` | `{ why }` | the other typed extension interfaces (D156) |
 
