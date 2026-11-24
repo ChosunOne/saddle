@@ -3306,60 +3306,49 @@ fn keep_tail(s: &str, max: usize) -> String {
     iter::once('…').chain(out.into_iter().rev()).collect()
 }
 
-/// A worker's own conversation, drawn with the lead's renderer — markdown, highlighted code, tool
-/// blocks with their diffs and collapsed output — instead of a plain tail, and scrolled the same
-/// way. It streams because the interface refreshes the team from the shared handles (D195).
+/// A worker's own conversation, drawn by the lead's transcript renderer — the same markdown,
+/// highlighted code, tool blocks, collapsed output, scrolling and pictures — under one line that
+/// says whose transcript this is (D195).
 fn draw_worker(frame: &mut Frame<'_>, worker: &Render, app: &mut App, area: Rect) {
-    let theme = app.theme.clone();
     let state = if worker.state.is_empty() {
         "starting"
     } else {
         worker.state.as_str()
     };
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(theme.border_accent))
-        .title(format!(" worker {} · {state} · ctrl+b back ", worker.name))
-        .title_bottom(Line::from(Span::styled(
-            "↑↓ scroll · ctrl+o expand · enter steer",
-            dim(&theme),
-        )));
-    let inner = block.inner(area);
-    let width = inner.width.max(1);
-    let view = View {
-        expand: app.expand_tools,
-        thinking: app.show_thinking,
-        spinner: app.spinner,
-        room: (width, image::MAX_ROWS),
-        // The worker's view is a transcript, not a surface of its own: a formula stays its source
-        // rather than reserving cells no picture is placed in (D165).
-        images: false,
-        scale: app.header.math_scale,
-    };
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for (index, entry) in worker_entries(worker).iter().enumerate() {
-        if index > 0 {
-            lines.push(Line::default());
-        }
-        let (rendered, _) = entry_render(entry, view, &theme, app.now);
-        lines.extend(rendered);
-    }
-    if let Some(error) = &worker.error {
-        lines.push(Line::from(Span::styled(
-            error.clone(),
-            Style::new().fg(theme.error),
-        )));
-    }
-    let height = inner.height as usize;
-    let total = lines.len();
-    app.worker_total = total;
-    app.worker_height = height;
-    app.worker_scroll = app.worker_scroll.min(total.saturating_sub(height));
-    let top = total.saturating_sub(height + app.worker_scroll);
-    let shown: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
-    frame.render_widget(Clear, area);
-    frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(shown), inner);
+    let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "▸ agent transcript ",
+                Style::new()
+                    .fg(app.theme.border_accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} · {state}", worker.name),
+                Style::new().fg(app.theme.accent),
+            ),
+            Span::styled("  · ctrl+b back · ↑↓ scroll · enter steer", dim(&app.theme)),
+        ])),
+        head,
+    );
+    // The body is the lead's own transcript path, with the worker's conversation swapped in: the
+    // rendering, the collapse, the scroll arithmetic and the picture placement are one
+    // implementation, so the two views cannot drift apart.
+    let entries = worker_entries(worker);
+    let fresh = iter::repeat_with(|| None).take(entries.len()).collect();
+    let lead_cache = mem::replace(&mut app.cache, fresh);
+    let lead_entries = mem::replace(&mut app.entries, entries);
+    let (lead_scroll, lead_total) = (app.scroll, app.total_lines);
+    app.scroll = app.worker_scroll;
+    draw_transcript(frame, app, body);
+    app.worker_scroll = app.scroll;
+    app.worker_total = app.total_lines;
+    app.worker_height = app.view_height;
+    app.scroll = lead_scroll;
+    app.total_lines = lead_total;
+    app.entries = lead_entries;
+    app.cache = lead_cache;
 }
 
 /// A worker's beats as the transcript entries the lead's renderer takes: streamed text and
@@ -3386,15 +3375,31 @@ fn worker_entries(worker: &Render) -> Vec<Entry> {
                 diff: None,
                 spent: None,
             }),
-            Beat::Result { ok, content, diff } => match out.last_mut() {
-                Some(Entry::Tool {
-                    result, diff: held, ..
-                }) => {
-                    *result = Some((*ok, content.clone()));
-                    *held = diff.clone();
+            Beat::Result {
+                ok,
+                content,
+                diff,
+                images,
+            } => {
+                // A picture a tool returned is kept the way an attached one is, above the block
+                // that answered (D58, D59).
+                for image in images {
+                    out.push(Entry::Image(image.clone()));
                 }
-                _ => out.push(Entry::Note(NoteKind::Info, content.clone())),
-            },
+                match out
+                    .iter_mut()
+                    .rev()
+                    .find(|entry| matches!(entry, Entry::Tool { result: None, .. }))
+                {
+                    Some(Entry::Tool {
+                        result, diff: held, ..
+                    }) => {
+                        *result = Some((*ok, content.clone()));
+                        *held = diff.clone();
+                    }
+                    _ => out.push(Entry::Note(NoteKind::Info, content.clone())),
+                }
+            }
             Beat::Note(text) => out.push(Entry::Note(NoteKind::Info, text.clone())),
             Beat::Spend { input, output, .. } => out.push(Entry::Note(
                 NoteKind::Info,
@@ -5542,6 +5547,7 @@ mod tests {
                     ok: true,
                     content: "src/lib.rs:17: fn reload".into(),
                     diff: None,
+                    images: Vec::new(),
                 },
             ],
             ..Render::default()
@@ -5589,7 +5595,8 @@ mod tests {
         app.worker = Some("runtime".into());
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let viewed = screen(&terminal);
-        assert!(viewed.contains("worker runtime"), "{viewed}");
+        // One line says whose transcript this is; everything under it is the lead's renderer.
+        assert!(viewed.contains("agent transcript runtime"), "{viewed}");
         // The worker's own conversation is drawn as the lead's is: markdown without its markers,
         // the tool block with its call and answer, and the reasoning under its heading.
         assert!(viewed.contains("Looking at the loader now."), "{viewed}");
@@ -5600,6 +5607,7 @@ mod tests {
         assert!(viewed.contains("grep -n reload src"), "{viewed}");
         assert!(viewed.contains("src/lib.rs:17"), "{viewed}");
         assert!(viewed.contains("ctrl+b back"), "{viewed}");
+        assert!(viewed.contains("running"), "{viewed}");
         // The view scrolls like a transcript, and the scroll belongs to it rather than to the
         // lead's conversation.
         app.worker_scroll = 0;

@@ -4729,10 +4729,11 @@ there, with no root involved; the audit records its path, hash and size, never i
 team and `team-steps` caps each worker turn. A person opens the team with ctrl+b, views a
 worker's live transcript and provider-exposed reasoning, types into it, interrupts one turn
 (keeping the worker), or stops it (keeping its conversation). A worker's conversation is kept as
-structured beats and drawn by the same renderer as the lead's — markdown, highlighted code, tool
-blocks with their diffs and collapsed output — scrollable in its own frame, and the list and view
-read the shared handles rather than the session thread, so a worker streams while the lead is
-busy; the interface reaches a worker
+structured beats and drawn by the lead's own transcript path, so markdown, highlighted code, tool
+blocks with their diffs and collapsed output, formulas, returned pictures and scrolling are one
+implementation rather than two that drift; the only addition is one line above it naming it an
+agent's transcript. The list and view read the shared handles rather than the session thread, so a
+worker streams while the lead is busy; the interface reaches a worker
 mid-turn through a shared steering handle, so the lead being busy is not a reason a worker
 cannot be steered. `send` from a worker reaches a peer directly, labelled with its sender; the
 host resolves only live worker names, never arbitrary conversation ids. Closing the session, a

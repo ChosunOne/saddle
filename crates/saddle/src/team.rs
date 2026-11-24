@@ -12,7 +12,7 @@ use crate::agent::{self, Agent, End, Steer, Ui};
 use crate::cancel;
 use crate::compact;
 use crate::config::CompactionConfig;
-use crate::provider::{Contribution, Quota, Reply, Sink, ToolCall};
+use crate::provider::{Contribution, Image, Quota, Reply, Sink, ToolCall};
 use crate::session::{Session, session_id};
 use crate::store::Store;
 use crate::tools::ToolOutput;
@@ -113,6 +113,8 @@ pub enum Beat {
         ok: bool,
         content: String,
         diff: Option<String>,
+        /// Pictures the call returned, drawn where the terminal can (D58).
+        images: Vec<Image>,
     },
     Note(String),
     /// What one reply used, as the status line of the lead's transcript states it.
@@ -775,6 +777,7 @@ impl Ui for WorkerUi {
                 ok: out.ok,
                 content: visible.clone(),
                 diff: out.diff.clone(),
+                images: out.images.clone(),
             })
         });
     }

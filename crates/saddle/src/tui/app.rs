@@ -1242,6 +1242,8 @@ impl App {
                     self.workers = None;
                     self.worker = Some(name.clone());
                     self.worker_scroll = 0;
+                    // A selection belongs to the transcript it was made in.
+                    self.selection = None;
                     Some(Action::OpenWorker(name))
                 }
                 KeyCode::Char('i') if rows > 0 => Some(Action::WorkerInterrupt(
@@ -1294,6 +1296,7 @@ impl App {
         {
             self.worker = None;
             self.worker_scroll = 0;
+            self.selection = None;
             return Some(Action::WorkerBack);
         }
         if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
