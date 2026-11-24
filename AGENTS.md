@@ -81,10 +81,12 @@ the host's rather than a component's is `tool_search`, which is MCP discovery an
 (D108).
 `agent` and `swarm` start and address **live workers** through the typed `saddle:host/workers`
 service (D195), available only to those shipped components and decided as the agent's
-`model-invoke`: ctrl+b in the TUI opens a page with a live preview pane per conversation (the
-person's own and each worker), each showing what that session has streamed; tab and the arrows move
-between panes, enter opens one to steer it, and interrupts or stops one turn while the rest keep
-running. They also keep
+`model-invoke`: ctrl+b in the TUI opens a page with the sessions in a list on the left and the
+selected one drawn live beside it, plus rows for the team's **message bus** and its **shared command
+queue** (D196); tab and the arrows move through the list, enter opens one to steer it, and
+interrupts or stops one turn while the rest keep running. `agent` also takes `enqueue`, `claim`,
+`finish`, `queue` and `bus`: a claimed command is run by that member's own `bash` under its own
+grants, and the queue only orders the work. They also keep
 D194's saved-branch `post`/`read` for findings that must outlive the team.
 `patch` applies one apply-patch document across several files, deciding
 every path before writing any of them, and refuses the whole patch if one is denied (D56).

@@ -4734,17 +4734,18 @@ worker, so it is readable by id and through `session_query` (`sessions.worker = 
 offered by `/resume`: a team's transcripts belong to the team view, not to the person's own
 history. A conversation an earlier build saved before that column existed is recognised by its own
 audit log, whose session-start record names the worker, and marked when the list is opened; a
-conversation whose log is gone is left alone rather than guessed at. A person opens the team with ctrl+b (or `/workers`) into a full page: one bordered
-preview pane per session, the person's own conversation first and then each worker, each pane
-carrying the newest lines that session has streamed, so every agent's reasoning and output are on
-screen at once rather than one at a time. `tab`/`shift+tab`, the arrows or a digit move around the
-panes, `enter` opens one as a full transcript to type into (steering it if its turn is running),
-`i` interrupts one turn (keeping the worker), `x` stops it (keeping its conversation) and `esc`
-closes the page. It opens on a worker that is mid-turn when there is one, and reads the shared
-handles rather than the session thread, so the panes keep streaming while the lead is busy. A
-pane draws the session's newest entries with the lead's own entry renderer at the pane's width,
-cutting each to its tail, so a preview costs what it displays rather than the conversation behind
-it; pictures are left out, because a pane is not a screen to draw one in (D161). A worker's
+conversation whose log is gone is left alone rather than guessed at. A person opens the team with ctrl+b (or `/workers`) into a full page: the sessions in
+a list on the left — the person's own conversation first, then each worker, then the team's bus and
+queue boards — and the selected one drawn large on the right with what it has streamed, so moving
+down the list is the only navigation there is. `tab`/`shift+tab` or the arrows move through the
+list, a digit picks a row, `enter` opens a session as a full transcript to type into (steering it
+if its turn is running), `i` interrupts one turn (keeping the worker), `x` stops it (keeping its
+conversation) and `esc` closes the page. It opens on a worker that is mid-turn when there is one,
+and reads the shared handles rather than the session thread, so the detail keeps streaming while
+the lead is busy. The detail draws the session's newest entries with the lead's own entry renderer
+at its width, cutting each to its tail, so a preview costs what it displays rather than the
+conversation behind it; pictures are left out, because a pane is not a screen to draw one in
+(D161). A worker's
 conversation is kept as structured beats and drawn by the lead's own transcript path, so markdown,
 highlighted code, tool blocks with their diffs and collapsed output, formulas, returned pictures
 and scrolling are one implementation rather than two that drift; the page adds the panes and their
@@ -4758,6 +4759,23 @@ host resolves only live worker names, never arbitrary conversation ids. Closing 
 policy reload or an interrupt from the person stops workers first and audits that. Workers
 have no MCP servers and no nested teams, and budgets are per worker rather than pooled; those
 remain deferred. The saved-branch tools of D194 remain for findings that outlive a live team.
+
+**D196.** A team shares a message bus and one serially claimed command queue. A delivery between
+live members is recorded on an in-memory bus (bounded, newest last) with its sender and target and
+the words it carried; the audit still records the operation's target and a hash, never the words,
+as for a brief. The page's bus board shows who spoke to whom and the first line of each message, and
+a member can read the recent tail with `agent {"action":"bus"}`. The bus conveys data, not
+authority: a message is delivered through the same `say` path, labelled with its sender, and the
+receiver's prompt treats it as data. Commands that must not overlap are put on one queue per team:
+`agent {"action":"enqueue","command":…,"why":…}` appends, `claim` takes the next item only while no
+other claim holds the queue, and `finish` with its id releases it. A claim's lease is ten minutes,
+so a worker that dies mid-command cannot stop the queue for good; an expired claim is marked lost
+rather than run again, and the next `claim` may proceed. The host only stores, orders and audits the
+queue — it never executes a queued command. The member that claimed it runs it through its own
+`bash`, under its own principal, grants and audit, so no principal borrows another's authority
+(D105, D195). Enqueue's audit record carries the command's length and sha256, never its words; the
+queue and bus are per-team and in memory, so they do not survive a restart, and a finished worker no
+longer counts as a member that may enqueue, claim or finish.
 
 ## 4. Scope enumeration
 

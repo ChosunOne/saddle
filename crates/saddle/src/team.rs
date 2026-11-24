@@ -1,5 +1,6 @@
 //! live teams of ordinary agent sessions, requested by the shipped team component and owned by the
-//! session that started them (D195).
+//! session that started them (D195), with the team's message bus and its serially claimed command
+//! queue (D196).
 //!
 //! A worker is not a second implementation of a session: it is [`Agent`] and [`Session`] on a
 //! thread, with the same policy, roots and audit rules. It inherits only the caller's delegated
@@ -24,19 +25,123 @@ use saddle_policy::audit::sha256_hex;
 use saddle_policy::{Kind, Request};
 use saddle_wit::saddle::host::workers::Operation;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How much of a worker's transcript is kept for a person to read on screen.
 /// How many beats a worker's view keeps. Early ones fall off rather than growing without bound;
 /// the conversation itself is in the worker's own saved transcript.
 const RENDER_BEATS: usize = 2000;
+
+/// One delivery on the team's live message bus, kept for the page's bus view (D195). The words are
+/// held in memory only: the audit records who spoke to whom, never what was said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusMessage {
+    pub from: String,
+    pub to: String,
+    pub text: String,
+}
+
+/// What a queued command is doing: waiting its turn, claimed by one member (so the queue runs one
+/// command at a time), finished, or lost when a claim's lease ran out (D195).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueState {
+    Pending,
+    Claimed { by: String },
+    Done { ok: bool },
+    Lost,
+}
+
+/// One item of the team's shared command queue (D195).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueItem {
+    pub id: u64,
+    pub command: String,
+    pub why: String,
+    pub owner: String,
+    pub state: QueueState,
+}
+
+impl Queue {
+    /// The commands the queue is holding or has finished, oldest first (D195).
+    fn view(&self) -> Vec<QueueItem> {
+        self.items
+            .iter()
+            .map(|item| QueueItem {
+                id: item.id,
+                command: item.command.clone(),
+                why: item.why.clone(),
+                owner: item.owner.clone(),
+                state: item.state.clone(),
+            })
+            .collect()
+    }
+
+    fn waiting(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| matches!(item.state, QueueState::Pending | QueueState::Claimed { .. }))
+            .count()
+    }
+
+    /// Keeps the finished history bounded; waiting commands are the team's and are never dropped.
+    fn trim(&mut self) {
+        let done = self
+            .items
+            .iter()
+            .filter(|item| matches!(item.state, QueueState::Done { .. } | QueueState::Lost))
+            .count();
+        let mut over = done.saturating_sub(QUEUE_DONE);
+        if over == 0 {
+            return;
+        }
+        self.items.retain(|item| {
+            let finished = matches!(item.state, QueueState::Done { .. } | QueueState::Lost);
+            if finished && over > 0 {
+                over -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
+/// One queued command as the host holds it, with when it was claimed, so a dead member's claim
+/// does not stop the queue for good.
+struct Queued {
+    id: u64,
+    command: String,
+    why: String,
+    owner: String,
+    state: QueueState,
+    claimed_at: Option<Instant>,
+}
+
+#[derive(Default)]
+struct Queue {
+    items: Vec<Queued>,
+    next: u64,
+}
+
+/// How many bus deliveries are kept for the page.
+const BUS_MESSAGES: usize = 200;
+/// How much of one message the bus keeps: enough to recognise it, with the full words in the
+/// worker's own conversation.
+const BUS_CHARS: usize = 2000;
+/// How many commands may wait at once.
+const QUEUE_ITEMS: usize = 64;
+/// How many finished commands the queue keeps for its view.
+const QUEUE_DONE: usize = 16;
+/// How long a claim holds the queue before another member may take it: a worker that dies mid-build
+/// must not stop the team for good.
+const QUEUE_LEASE: Duration = Duration::from_secs(600);
 
 /// A live handle the interface can use without the agent thread: steering a worker, or asking it to
 /// stop, never needs the session that owns it.
@@ -54,11 +159,15 @@ pub struct Handle {
 /// The handles the interface keeps, so a message or an interrupt reaches a worker while the agent
 /// that started it is busy (D195).
 #[derive(Clone, Default)]
-pub struct Steering(Arc<Mutex<BTreeMap<String, Peer>>>);
+pub struct Steering {
+    shared: Arc<Mutex<BTreeMap<String, Peer>>>,
+    bus: Arc<Mutex<VecDeque<BusMessage>>>,
+    queue: Arc<Mutex<Queue>>,
+}
 
 impl Steering {
     pub fn say(&self, name: &str, text: String) {
-        if let Ok(map) = self.0.lock()
+        if let Ok(map) = self.shared.lock()
             && let Some(peer) = map.get(name)
         {
             peer.handle.steer.push(text);
@@ -66,7 +175,7 @@ impl Steering {
     }
 
     pub fn interrupt(&self, name: &str) {
-        if let Ok(map) = self.0.lock()
+        if let Ok(map) = self.shared.lock()
             && let Some(peer) = map.get(name)
             && peer.running()
         {
@@ -78,7 +187,7 @@ impl Steering {
     /// Ends a worker for good, as the list's `x` does. The interface holds the lead's map, so it
     /// is the conversation that owns the team doing it (D195).
     pub fn stop(&self, name: &str) {
-        if let Ok(map) = self.0.lock()
+        if let Ok(map) = self.shared.lock()
             && let Some(peer) = map.get(name)
             && peer.live()
         {
@@ -91,10 +200,26 @@ impl Steering {
     /// What the interface draws, read straight from the shared handles so a worker streams while
     /// the lead's thread is busy (D195).
     pub fn views(&self) -> Vec<Render> {
-        match self.0.lock() {
+        match self.shared.lock() {
             Ok(map) => map.values().map(Peer::render).collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// The team's message bus, for the page's bus view (D195).
+    pub fn bus(&self) -> Vec<BusMessage> {
+        self.bus
+            .lock()
+            .map(|bus| bus.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The shared command queue, for the page's queue view (D195).
+    pub fn queue(&self) -> Vec<QueueItem> {
+        self.queue
+            .lock()
+            .map(|queue| queue.view())
+            .unwrap_or_default()
     }
 }
 
@@ -236,6 +361,10 @@ impl Peer {
 /// with `owns` false: it can address peers but not start or stop the team.
 pub struct Manager {
     shared: Arc<Mutex<BTreeMap<String, Peer>>>,
+    /// What the team has said to itself, newest last, for the page's bus view (D195).
+    bus: Arc<Mutex<VecDeque<BusMessage>>>,
+    /// Commands the team wants run one at a time, whoever gets to them (D195).
+    queue: Arc<Mutex<Queue>>,
     owns: bool,
 }
 
@@ -243,6 +372,8 @@ impl Default for Manager {
     fn default() -> Self {
         Self {
             shared: Default::default(),
+            bus: Default::default(),
+            queue: Default::default(),
             owns: true,
         }
     }
@@ -253,13 +384,19 @@ impl Manager {
     pub(crate) fn child(&self) -> Self {
         Self {
             shared: self.shared.clone(),
+            bus: self.bus.clone(),
+            queue: self.queue.clone(),
             owns: false,
         }
     }
     /// A handle map the interface can use without the agent thread. It reads the peers' handles
     /// each time, so a worker started after the interface was built is still reachable.
     pub fn steering(&self) -> Steering {
-        Steering(self.shared.clone())
+        Steering {
+            shared: self.shared.clone(),
+            bus: self.bus.clone(),
+            queue: self.queue.clone(),
+        }
     }
 
     pub fn views(&self) -> Vec<Render> {
@@ -350,6 +487,18 @@ impl Manager {
         peer.handle
             .steer
             .push(format!("[message from {from}]\n{text}"));
+        // The bus keeps who spoke to whom and the words, for the page and for peers that ask; the
+        // conversation itself holds the full text (D195).
+        if let Ok(mut bus) = self.bus.lock() {
+            bus.push_back(BusMessage {
+                from: from.to_owned(),
+                to: to.to_owned(),
+                text: text.chars().take(BUS_CHARS).collect(),
+            });
+            while bus.len() > BUS_MESSAGES {
+                bus.pop_front();
+            }
+        }
         Ok(format!("delivered to {to}"))
     }
 
@@ -390,6 +539,181 @@ impl Manager {
             ));
         }
         out
+    }
+
+    /// Adds a command to the team's shared queue. Whoever gets to it runs it through their own
+    /// `bash`; the queue only decides the order (D195).
+    pub fn enqueue(&self, from: &str, command: &str, why: &str) -> Result<String, String> {
+        self.member(from)?;
+        let command = command.trim();
+        if command.is_empty() {
+            return Err("a queued command needs a command".into());
+        }
+        if command.len() > 4096 {
+            return Err("a queued command is at most 4096 bytes".into());
+        }
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|_| "the command queue is unavailable".to_string())?;
+        if queue.waiting() >= QUEUE_ITEMS {
+            return Err(format!(
+                "the command queue is full ({QUEUE_ITEMS} commands waiting)"
+            ));
+        }
+        queue.next += 1;
+        let id = queue.next;
+        queue.items.push(Queued {
+            id,
+            command: command.to_owned(),
+            why: why.trim().to_owned(),
+            owner: from.to_owned(),
+            state: QueueState::Pending,
+            claimed_at: None,
+        });
+        queue.trim();
+        Ok(format!("queued #{id} for the team: {command}"))
+    }
+
+    /// Claims the next command, which holds the queue until it is finished or the lease runs out,
+    /// so two workers never run the queue's commands at the same time (D195).
+    pub fn claim(&self, from: &str) -> Result<String, String> {
+        self.member(from)?;
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|_| "the command queue is unavailable".to_string())?;
+        let now = Instant::now();
+        if let Some(held) = queue
+            .items
+            .iter_mut()
+            .find(|item| matches!(item.state, QueueState::Claimed { .. }))
+        {
+            let expired = held
+                .claimed_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= QUEUE_LEASE);
+            if !expired {
+                let QueueState::Claimed { by } = &held.state else {
+                    return Err("the command queue is unavailable".into());
+                };
+                return Err(format!(
+                    "the queue runs one command at a time: #{} is claimed by {by}",
+                    held.id
+                ));
+            }
+            held.state = QueueState::Lost;
+            held.claimed_at = None;
+        }
+        let Some(item) = queue
+            .items
+            .iter_mut()
+            .find(|item| item.state == QueueState::Pending)
+        else {
+            return Ok("nothing queued".into());
+        };
+        item.state = QueueState::Claimed {
+            by: from.to_owned(),
+        };
+        item.claimed_at = Some(now);
+        let why = if item.why.is_empty() {
+            String::new()
+        } else {
+            format!("\nwhy: {}", item.why)
+        };
+        Ok(format!(
+            "claimed #{}: {}{why}\nrun it with your own bash, then finish it with {{\"action\":\"finish\",\"id\":{},\"ok\":true}}",
+            item.id, item.command, item.id
+        ))
+    }
+
+    /// Marks a claimed command finished, which lets the next one be claimed (D195).
+    pub fn finish(&self, from: &str, id: u64, ok: bool) -> Result<String, String> {
+        self.member(from)?;
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|_| "the command queue is unavailable".to_string())?;
+        let Some(item) = queue.items.iter_mut().find(|item| item.id == id) else {
+            return Err(format!("no queued command #{id}"));
+        };
+        match &item.state {
+            QueueState::Claimed { by } if by == from => {}
+            QueueState::Claimed { by } => {
+                return Err(format!("#{id} is claimed by {by}, not {from}"));
+            }
+            _ => return Err(format!("#{id} is not claimed")),
+        }
+        item.state = QueueState::Done { ok };
+        item.claimed_at = None;
+        queue.trim();
+        Ok(format!("#{id} {}", if ok { "done" } else { "failed" }))
+    }
+
+    /// The queue as the model reads it: what is waiting, what is running, what has finished
+    /// (D195).
+    pub fn queue_text(&self) -> String {
+        let Ok(queue) = self.queue.lock() else {
+            return "the command queue is unavailable".into();
+        };
+        if queue.items.is_empty() {
+            return "the command queue is empty".into();
+        }
+        let mut out = String::new();
+        for item in &queue.items {
+            let state = match &item.state {
+                QueueState::Pending => "pending".to_owned(),
+                QueueState::Claimed { by } => format!("running ({by})"),
+                QueueState::Done { ok: true } => "done".to_owned(),
+                QueueState::Done { ok: false } => "failed".to_owned(),
+                QueueState::Lost => "lost (its claim expired)".to_owned(),
+            };
+            out.push_str(&format!(
+                "#{:<3} {:<18} {}  · enqueued by {}",
+                item.id, state, item.command, item.owner
+            ));
+            if !item.why.is_empty() {
+                out.push_str(&format!(" · {}", item.why));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The bus as the model reads it: the last messages, oldest first, attributed (D195).
+    pub fn bus_text(&self) -> String {
+        let Ok(bus) = self.bus.lock() else {
+            return "the message bus is unavailable".into();
+        };
+        if bus.is_empty() {
+            return "no messages on the team bus yet".into();
+        }
+        let mut out = String::new();
+        for message in bus
+            .iter()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            out.push_str(&format!(
+                "{} → {}: {}\n",
+                message.from, message.to, message.text
+            ));
+        }
+        out
+    }
+
+    /// Whether a name is the lead or a live worker, so a finished worker's old tool call cannot
+    /// claim or finish in the team's queue (D195).
+    fn member(&self, name: &str) -> Result<(), String> {
+        if name == "lead" {
+            return Ok(());
+        }
+        match self.lookup(name) {
+            Some(peer) if peer.live() => Ok(()),
+            _ => Err(format!("{name:?} is not a live worker of this team")),
+        }
     }
 
     /// Whether this conversation is the one that started the team. A worker sees its peers and can
@@ -754,6 +1078,15 @@ pub fn manage(
         Operation::Interrupt(name) => session.team.interrupt(&name),
         Operation::Stop(name) => session.team.stop(&name),
         Operation::Roster => Ok(session.team.roster()),
+        Operation::Enqueue(job) => {
+            session
+                .team
+                .enqueue(&session.team_label, &job.command, &job.why)
+        }
+        Operation::Claim => session.team.claim(&session.team_label),
+        Operation::Finish(done) => session.team.finish(&session.team_label, done.id, done.ok),
+        Operation::Queue => Ok(session.team.queue_text()),
+        Operation::Bus => Ok(session.team.bus_text()),
     };
     let allowed = result.is_ok();
     session.audit.event(
@@ -782,7 +1115,13 @@ pub fn arguments(op: &Operation) -> serde_json::Value {
         Operation::Inspect(name) | Operation::Interrupt(name) | Operation::Stop(name) => {
             json!({ "name": name })
         }
-        Operation::Roster => json!({}),
+        Operation::Roster | Operation::Claim | Operation::Queue | Operation::Bus => json!({}),
+        Operation::Enqueue(job) => json!({
+            "command_bytes": job.command.len(),
+            "command_sha256": sha256_hex(job.command.as_bytes()),
+            "why_bytes": job.why.len(),
+        }),
+        Operation::Finish(done) => json!({ "id": done.id, "ok": done.ok }),
     }
 }
 
@@ -871,7 +1210,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use saddle_wit::saddle::host::workers::Message;
+    use saddle_wit::saddle::host::workers::{Job, Message};
     use std::sync::Mutex;
 
     #[test]
@@ -917,6 +1256,8 @@ mod tests {
         }
         Manager {
             shared: Arc::new(Mutex::new(map)),
+            bus: Default::default(),
+            queue: Default::default(),
             owns: true,
         }
     }
@@ -972,6 +1313,81 @@ mod tests {
         let peer = team.lookup("idle").unwrap();
         assert!(!peer.handle.interrupt.load(Ordering::SeqCst));
         assert!(!peer.handle.cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn the_shared_queue_runs_one_claim_at_a_time() {
+        // Two workers share one queue: a claim holds it until the command is finished, so the
+        // commands that must not overlap are run serially (D195).
+        let team = with_peers(vec![("runtime", "idle", false), ("tests", "idle", false)]);
+        assert_eq!(
+            team.enqueue("lead", "cargo test -p saddle-cap", "not two at once")
+                .unwrap(),
+            "queued #1 for the team: cargo test -p saddle-cap"
+        );
+        team.enqueue("lead", "cargo test -p saddle-policy", "")
+            .unwrap();
+        let claimed = team.claim("runtime").unwrap();
+        assert!(claimed.contains("cargo test -p saddle-cap"), "{claimed}");
+        let busy = team.claim("tests").unwrap_err();
+        assert!(busy.contains("one command at a time"), "{busy}");
+        let wrong = team.finish("tests", 1, true).unwrap_err();
+        assert!(wrong.contains("claimed by runtime"), "{wrong}");
+        assert_eq!(team.finish("runtime", 1, true).unwrap(), "#1 done");
+        let next = team.claim("tests").unwrap();
+        assert!(next.contains("cargo test -p saddle-policy"), "{next}");
+        let view = team.steering().queue();
+        assert_eq!(view.len(), 2);
+        assert_eq!(view[1].state, QueueState::Claimed { by: "tests".into() });
+        assert_eq!(team.finish("tests", 2, false).unwrap(), "#2 failed");
+        assert_eq!(
+            team.steering().queue()[1].state,
+            QueueState::Done { ok: false }
+        );
+        // Only a live member may queue or claim; a finished worker's late call is refused.
+        let gone = with_peers(vec![("done", "finished", true)]);
+        assert!(gone.enqueue("done", "true", "").is_err());
+        assert!(gone.claim("done").is_err());
+    }
+
+    #[test]
+    fn a_claim_whose_lease_ran_out_frees_the_queue() {
+        // A worker that dies mid-command must not hold the queue for ever: after the lease another
+        // member may take the next command, and the abandoned one is marked lost (D196).
+        let team = with_peers(vec![("runtime", "idle", false), ("tests", "idle", false)]);
+        team.enqueue("lead", "cargo test -p saddle-cap", "")
+            .unwrap();
+        team.enqueue("lead", "cargo test -p saddle-policy", "")
+            .unwrap();
+        team.claim("runtime").unwrap();
+        {
+            let mut queue = team.queue.lock().unwrap();
+            queue.items[0].claimed_at = Some(Instant::now() - QUEUE_LEASE);
+        }
+        let next = team.claim("tests").unwrap();
+        assert!(next.contains("saddle-policy"), "{next}");
+        let view = team.steering().queue();
+        assert_eq!(view[0].state, QueueState::Lost);
+        assert_eq!(view[1].state, QueueState::Claimed { by: "tests".into() });
+    }
+
+    #[test]
+    fn the_bus_keeps_who_spoke_to_whom() {
+        let team = with_peers(vec![("runtime", "idle", false)]);
+        team.say("lead", "runtime", "check the loader\nsecond line")
+            .unwrap();
+        let bus = team.steering().bus();
+        assert_eq!(bus.len(), 1);
+        assert_eq!(bus[0].from, "lead");
+        assert_eq!(bus[0].to, "runtime");
+        assert!(bus[0].text.starts_with("check the loader"));
+        assert!(team.bus_text().contains("lead → runtime"));
+        // A queue entry's audit names the length and hash, never the command.
+        let op = Operation::Enqueue(Job {
+            command: "rm -rf secret".into(),
+            why: "test".into(),
+        });
+        assert!(!arguments(&op).to_string().contains("secret"));
     }
 
     #[test]

@@ -1295,6 +1295,20 @@ fn event_loop(
                 }
                 dirty = true;
             }
+            // The page also shows what the team shares — its message bus and its command queue —
+            // read from the same handles rather than the session thread (D195).
+            if app.overview.is_some() {
+                let bus = control.team.bus();
+                if bus != app.bus {
+                    app.agent(AgentEvent::Bus(bus));
+                    dirty = true;
+                }
+                let jobs = control.team.queue();
+                if jobs != app.jobs {
+                    app.agent(AgentEvent::Queue(jobs));
+                    dirty = true;
+                }
+            }
         }
         // A running worker that is on screen keeps the frame moving as well: its elapsed times
         // and any spinner in a call it is waiting on advance with the clock, even though the

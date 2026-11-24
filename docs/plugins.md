@@ -787,12 +787,31 @@ Ask the agent to start a worker, or call it yourself with
 granted. `agent` also takes `send`, `status`, `interrupt` and `stop`; `swarm` with no arguments
 lists live workers. A worker is a real Saddle session: it owns a conversation, audit log and
 model-spend ledger derived from the same policy, and it cannot start another worker. **ctrl+b**
-(or `/workers`) opens a page with one preview pane per session — your own conversation first, then
-each worker — and every pane shows what that session has streamed, so the whole team is visible at
-once. `tab`/`shift+tab`, the arrows or a digit move around the panes; `enter` opens one as a full
-transcript, where typing steers it (or wakes it when idle); `i` interrupts its turn, `x` stops it,
-and `esc` closes the page. `esc` from that view returns to the page, and `esc` again to your own
-conversation; the workers keep running. Stopping a worker keeps its saved conversation. Closing Saddle or changing the policy stops every worker first.
+(or `/workers`) opens a page with the sessions in a list on the left and the selected one drawn
+large beside it: your own conversation first, then each worker, then the team's **bus** and
+**queue** boards. `tab`/`shift+tab`, the arrows or a digit move through the list; `enter` opens a
+session as a full transcript, where typing steers it (or wakes it when idle); `i` interrupts its
+turn, `x` stops it, and `esc` closes the page. `esc` from that view returns to the page, and `esc`
+again to your own conversation; the workers keep running. Stopping a worker keeps its saved
+conversation.
+
+The bus board shows who spoke to whom and the first line of each message; the audit records the
+target and a hash, never the words, and the full text is in the receiving conversation. Commands
+that must not overlap go on one queue per team:
+
+```sh
+saddle tool agent '{"action":"enqueue","command":"cargo test -p saddle-cap","why":"serial build check"}'
+saddle tool agent '{"action":"claim"}'      # nothing while another member holds the queue
+saddle tool agent '{"action":"finish","id":1,"ok":true}'
+saddle tool agent '{"action":"queue"}'      # what is waiting, running and done
+saddle tool agent '{"action":"bus"}'        # the last messages, attributed
+```
+
+The host stores, orders and audits the queue but never runs it: the member that claimed the command
+runs it with its own `bash`, under its own grants and audit. A claim holds the queue for ten minutes
+at most, so a worker that dies mid-command does not stop the team; an expired claim is marked lost.
+The queue and bus are in memory, so a restart forgets them, and a finished worker may no longer
+enqueue, claim or finish. Closing Saddle or changing the policy stops every worker first.
 `saddle check` and `saddle tools --config` show the delegation the feature needs.
 
 For example, runtime calls `agent` with `{"action":"post","to":"review/tests","text":"Check the reload path at session.rs:17"}`.

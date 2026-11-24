@@ -10,7 +10,7 @@ use crate::provider::{reasoning_text, visible_tool_text};
 use crate::skills;
 use crate::skills::Skill;
 use crate::store::Point;
-use crate::team::Render;
+use crate::team::{BusMessage, QueueItem, Render};
 use crate::tui::image::Fit;
 use crate::tui::image::Protocol;
 use crate::tui::keys::Keys;
@@ -95,6 +95,10 @@ pub enum AgentEvent {
     Tasks(Vec<TaskView>),
     /// The live workers of this session, in the order the team lists them (D195).
     Workers(Vec<Render>),
+    /// What the team has said to itself, for the page's bus view (D195).
+    Bus(Vec<BusMessage>),
+    /// The commands the team shares, for the page's queue view (D195).
+    Queue(Vec<QueueItem>),
     BackgroundReady,
     TurnEnd(End),
     /// The host failed (for example, the audit log could not be written). The session is over.
@@ -726,6 +730,10 @@ pub struct App {
     pub tree: Option<Tree>,
     /// The live workers of this session (D195).
     pub team: Vec<Render>,
+    /// The team's live message bus, newest last (D195).
+    pub bus: Vec<BusMessage>,
+    /// The team's shared command queue (D195).
+    pub jobs: Vec<QueueItem>,
     /// The session overview page, while open, and which pane it has selected: `0` is the person's
     /// own conversation and `n` is the team's `n`th worker. `None` is the page closed.
     pub overview: Option<usize>,
@@ -794,17 +802,6 @@ pub fn help() -> String {
     text
 }
 
-/// How many panes wide the overview page is: one for the person alone, a pair for a small team,
-/// and a row of three or four as it grows, so every session keeps a readable preview (D195).
-pub fn overview_columns(panes: usize) -> usize {
-    match panes {
-        0 | 1 => 1,
-        2..=4 => 2,
-        5..=9 => 3,
-        _ => 4,
-    }
-}
-
 impl App {
     /// The image an entry holds, for the renderer that has to find a place to draw it (D59).
     pub fn cached_image(&self, i: usize) -> Option<Image> {
@@ -862,6 +859,8 @@ impl App {
             settings: None,
             tree: None,
             team: Vec::new(),
+            bus: Vec::new(),
+            jobs: Vec::new(),
             overview: None,
             worker: None,
             worker_scroll: 0,
@@ -1234,21 +1233,15 @@ impl App {
         if self.confirm.is_some() {
             return self.answer(key);
         }
-        // The session overview page is a keystroke away and owns the keys while it is open: one
-        // pane for the person's own conversation and one for each worker, every pane drawn live
-        // with what that session is streaming (D195).
+        // The session overview page is a keystroke away and owns the keys while it is open: the
+        // sessions and the team's two boards in one list, with the selected one drawn large
+        // beside it (D195).
         if let Some(selected) = self.overview {
-            let panes = self.team.len() + 1;
-            let selected = selected.min(panes - 1);
-            let columns = overview_columns(panes);
-            let next = (selected + 1) % panes;
-            let previous = (selected + panes - 1) % panes;
-            let below = if selected + columns < panes {
-                selected + columns
-            } else {
-                selected
-            };
-            let above = selected.saturating_sub(columns);
+            let sessions = self.team.len() + 1;
+            let rows = sessions + 2;
+            let selected = selected.min(rows - 1);
+            let next = (selected + 1) % rows;
+            let previous = (selected + rows - 1) % rows;
             return match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => {
                     self.overview = None;
@@ -1260,33 +1253,23 @@ impl App {
                     self.selection = None;
                     None
                 }
-                KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                KeyCode::Tab | KeyCode::Down | KeyCode::Right | KeyCode::Char('j') => {
                     self.overview = Some(next);
                     self.selection = None;
                     None
                 }
-                KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                KeyCode::BackTab | KeyCode::Up | KeyCode::Left | KeyCode::Char('k') => {
                     self.overview = Some(previous);
-                    self.selection = None;
-                    None
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.overview = Some(below);
-                    self.selection = None;
-                    None
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.overview = Some(above);
                     self.selection = None;
                     None
                 }
                 KeyCode::Char(digit @ '0'..='9') => {
                     let index = digit as usize - '0' as usize;
-                    self.overview = Some(index.min(panes - 1));
+                    self.overview = Some(index.min(rows - 1));
                     self.selection = None;
                     None
                 }
-                KeyCode::Enter if selected > 0 => {
+                KeyCode::Enter if selected > 0 && selected < sessions => {
                     let name = self.team[selected - 1].name.clone();
                     self.overview = None;
                     self.worker = Some(name.clone());
@@ -1295,15 +1278,15 @@ impl App {
                     self.selection = None;
                     Some(Action::OpenWorker(name))
                 }
-                KeyCode::Enter => {
+                KeyCode::Enter if selected == 0 => {
                     self.overview = None;
                     self.selection = None;
                     None
                 }
-                KeyCode::Char('i') if selected > 0 => Some(Action::WorkerInterrupt(
-                    self.team[selected - 1].name.clone(),
-                )),
-                KeyCode::Char('x') if selected > 0 => {
+                KeyCode::Char('i') if selected > 0 && selected < sessions => Some(
+                    Action::WorkerInterrupt(self.team[selected - 1].name.clone()),
+                ),
+                KeyCode::Char('x') if selected > 0 && selected < sessions => {
                     Some(Action::WorkerStop(self.team[selected - 1].name.clone()))
                 }
                 _ => None,
@@ -2291,6 +2274,8 @@ impl App {
                 }
                 // A queued human prompt will carry the completion at its safe request point.
             }
+            AgentEvent::Bus(bus) => self.bus = bus,
+            AgentEvent::Queue(jobs) => self.jobs = jobs,
             AgentEvent::Workers(views) => {
                 self.team = views;
                 if let Some(selected) = self.overview {

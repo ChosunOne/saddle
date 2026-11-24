@@ -33,9 +33,25 @@ interface ui {
 world veto-hook { export saddle:plugin/veto@0.1.0; }
 world ui-hook { import saddle:widgets/types@0.1.0; export saddle:plugin/ui@0.1.0; }
 
-// Operations address only workers of the calling live team. No shell or executable parameter.
+// Operations address only workers of the calling live team. A queued command is a string the
+// member that claims it runs with its own bash, under its own grants; the host never runs it.
+// A message's words are delivered to its target and kept in memory for the team's bus view.
 interface workers {
     record message { target: string, text: string }
-    variant operation { start(message), send(message), inspect(string), interrupt(string), stop(string), roster }
+    record job { command: string, why: string }
+    record done { id: u64, ok: bool }
+    variant operation {
+        start(message),
+        send(message),
+        inspect(string),
+        interrupt(string),
+        stop(string),
+        roster,
+        enqueue(job),
+        claim,
+        finish(done),
+        queue,
+        bus,
+    }
     manage: func(op: operation) -> result<string, string>;
 }
