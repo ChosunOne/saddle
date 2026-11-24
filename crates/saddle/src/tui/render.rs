@@ -3319,7 +3319,7 @@ fn keep_tail(s: &str, max: usize) -> String {
 /// The whole team on one page: the sessions in a list on the left, and the selected one drawn
 /// large on the right with what it has streamed, so moving down the list is the only navigation
 /// there is (D195).
-fn draw_overview(frame: &mut Frame<'_>, app: &App, selected: usize, area: Rect) -> Seen {
+fn draw_overview(frame: &mut Frame<'_>, app: &mut App, selected: usize, area: Rect) -> Seen {
     let sessions = app.team.len() + 1;
     let rows = sessions + 2;
     let selected = selected.min(rows - 1);
@@ -3328,13 +3328,13 @@ fn draw_overview(frame: &mut Frame<'_>, app: &App, selected: usize, area: Rect) 
         .border_style(Style::new().fg(app.theme.border_accent))
         .title(" agent sessions ")
         .title_bottom(Line::from(Span::styled(
-            "tab/↑↓ select · enter open · i interrupt · x stop · esc back",
+            "tab/↑↓ select · enter open · PgUp/PgDn history · i/x · esc back",
             dim(&app.theme),
         )));
     frame.render_widget(Clear, area);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    // A third of the page for the list, so the preview keeps room for a wrapped paragraph even
+    // A third of the page for the list, so the detail keeps room for a wrapped paragraph even
     // on a narrow terminal.
     let list_width = (inner.width / 3)
         .clamp(20, 36)
@@ -3342,7 +3342,7 @@ fn draw_overview(frame: &mut Frame<'_>, app: &App, selected: usize, area: Rect) 
     let [list_area, detail_area] =
         Layout::horizontal([Constraint::Length(list_width), Constraint::Min(0)]).areas(inner);
     draw_session_list(frame, app, selected, list_area);
-    let (heading, entries, empty) = match selected {
+    let (heading, empty) = match selected {
         0 => (
             Line::from(Span::styled(
                 " lead ",
@@ -3350,7 +3350,6 @@ fn draw_overview(frame: &mut Frame<'_>, app: &App, selected: usize, area: Rect) 
                     .fg(app.theme.accent)
                     .add_modifier(Modifier::BOLD),
             )),
-            preview_tail(&app.entries),
             "your conversation",
         ),
         index if index < sessions => {
@@ -3371,7 +3370,6 @@ fn draw_overview(frame: &mut Frame<'_>, app: &App, selected: usize, area: Rect) 
                     ),
                     Span::styled(format!("{glyph} {state} "), Style::new().fg(colour)),
                 ]),
-                preview_tail(&worker_entries(worker)),
                 "nothing yet",
             )
         }
@@ -3384,7 +3382,6 @@ fn draw_overview(frame: &mut Frame<'_>, app: &App, selected: usize, area: Rect) 
                         .fg(app.theme.accent)
                         .add_modifier(Modifier::BOLD),
                 )),
-                Vec::new(),
                 if bus {
                     "no messages yet; workers reach each other directly"
                 } else {
@@ -3399,32 +3396,23 @@ fn draw_overview(frame: &mut Frame<'_>, app: &App, selected: usize, area: Rect) 
         .title(heading);
     let detail_inner = detail.inner(detail_area);
     frame.render_widget(detail, detail_area);
-    let (lines, empty) = match selected {
-        index if index >= sessions => (
-            if index == sessions {
-                bus_lines(app, detail_inner.width, detail_inner.height as usize)
+    match selected {
+        // A session's detail is its own transcript, drawn by the lead's renderer from the start
+        // of what is kept, so PgUp walks back through its turns and reasoning (D195).
+        0 => draw_transcript(frame, app, detail_inner),
+        index if index < sessions => {
+            let worker = app.team[index - 1].clone();
+            draw_worker_transcript(frame, &worker, app, detail_inner);
+        }
+        index => {
+            let bus = index == sessions;
+            let lines = if bus {
+                bus_lines(app)
             } else {
-                queue_lines(app, detail_inner.width, detail_inner.height as usize)
-            },
-            empty,
-        ),
-        _ => (
-            pane_lines(
-                app,
-                &entries,
-                detail_inner.width,
-                detail_inner.height as usize,
-            ),
-            empty,
-        ),
-    };
-    if lines.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(empty, dim(&app.theme)))),
-            detail_inner,
-        );
-    } else {
-        frame.render_widget(Paragraph::new(lines), detail_inner);
+                queue_lines(app)
+            };
+            draw_board(frame, app, lines, empty, detail_inner);
+        }
     }
     // The page is a surface of its own: what was drawn into it is what a drag copies, and the
     // selection's rows map to the cells it covered (D87).
@@ -3447,6 +3435,65 @@ fn draw_overview(frame: &mut Frame<'_>, app: &App, selected: usize, area: Rect) 
         lines,
         pictures: Vec::new(),
     }
+}
+
+/// A board is one wrapped paragraph scrolled as a whole: the full messages on the bus, the full
+/// commands and reasons in the queue, newest at the end unless the person scrolled back (D196).
+fn draw_board(
+    frame: &mut Frame<'_>,
+    app: &App,
+    lines: Vec<Line<'static>>,
+    empty: &str,
+    inner: Rect,
+) {
+    if lines.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(empty, dim(&app.theme)))),
+            inner,
+        );
+        return;
+    }
+    let wrapped = wrap_styled(lines, inner.width as usize);
+    let height = inner.height as usize;
+    let start = wrapped
+        .len()
+        .saturating_sub(height.saturating_add(app.board_scroll.min(wrapped.len())));
+    frame.render_widget(Paragraph::new(wrapped[start..].to_vec()), inner);
+}
+
+/// Wraps styled lines at a column count, splitting a span and carrying its style onto the next
+/// row, so a board's full text can be read and scrolled by row rather than cut to one line
+/// (D196).
+fn wrap_styled(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return lines;
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for line in lines {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut used = 0;
+        for span in line.spans {
+            let style = span.style;
+            let mut chunk = String::new();
+            for ch in span.content.chars() {
+                let cells = ch.width().unwrap_or(0);
+                if used > 0 && used + cells > width {
+                    if !chunk.is_empty() {
+                        spans.push(Span::styled(mem::take(&mut chunk), style));
+                    }
+                    out.push(Line::from(mem::take(&mut spans)));
+                    used = 0;
+                }
+                chunk.push(ch);
+                used += cells;
+            }
+            if !chunk.is_empty() {
+                spans.push(Span::styled(chunk, style));
+            }
+        }
+        out.push(Line::from(spans));
+    }
+    out
 }
 
 /// One row per session, the person's own first, then the two team boards — the message bus and
@@ -3544,142 +3591,71 @@ fn index_row(
     ])
 }
 
-/// The live message bus as one line per delivery, oldest first, the tail that fits the pane: who
-/// wrote to whom, and the first line of what was said (D195).
-fn bus_lines(app: &App, width: u16, height: usize) -> Vec<Line<'static>> {
-    let room = width.saturating_sub(24) as usize;
-    let mut lines: Vec<Line> = app
-        .bus
-        .iter()
-        .map(|message| {
-            let text = message.text.lines().next().unwrap_or_default();
-            Line::from(vec![
-                Span::styled(
-                    format!("{} → {}  ", message.from, message.to),
-                    Style::new().fg(app.theme.accent),
-                ),
-                Span::styled(
-                    keep_head(&text.replace('\n', " "), room),
-                    Style::new().fg(app.theme.text),
-                ),
-            ])
-        })
-        .collect();
-    let start = lines.len().saturating_sub(height);
-    lines.split_off(start)
-}
-
-/// The shared command queue: pending items in order, the one claimed, then what has finished.
-/// One row each, so the queue's order is what the pane shows (D195).
-fn queue_lines(app: &App, width: u16, height: usize) -> Vec<Line<'static>> {
-    let room = width.saturating_sub(40) as usize;
-    let mut lines: Vec<Line> = app
-        .jobs
-        .iter()
-        .map(|item| {
-            let (state, colour) = match &item.state {
-                QueueState::Pending => ("pending".to_owned(), app.theme.muted),
-                QueueState::Claimed { by, .. } => (format!("running ({by})"), app.theme.success),
-                QueueState::Done { ok: true } => ("done".to_owned(), app.theme.success),
-                QueueState::Done { ok: false } => ("failed".to_owned(), app.theme.error),
-                QueueState::Lost => ("lost".to_owned(), app.theme.warning),
-            };
-            Line::from(vec![
-                Span::styled(
-                    format!("#{:<3} {:<20}", item.id, state),
-                    Style::new().fg(colour),
-                ),
-                Span::styled(
-                    keep_head(&item.command.replace('\n', " "), room),
-                    Style::new().fg(app.theme.text),
-                ),
-                Span::styled(format!("  · {}", item.owner), dim(&app.theme)),
-            ])
-        })
-        .collect();
-    let start = lines.len().saturating_sub(height);
-    lines.split_off(start)
-}
-
-/// The newest entries a preview pane shows: a few, and each cut to its own tail, so a pane costs
-/// what it can display rather than the conversation behind it (D195).
-const PREVIEW_ENTRIES: usize = 3;
-
-/// How much of one entry's text a preview keeps, counted from the end (D195).
-const PREVIEW_CHARS: usize = 1500;
-
-fn preview_tail(entries: &[Entry]) -> Vec<Entry> {
-    let start = entries.len().saturating_sub(PREVIEW_ENTRIES);
-    entries[start..].iter().map(short_entry).collect()
-}
-
-fn tail_chars(text: &str) -> String {
-    let count = text.chars().count();
-    if count <= PREVIEW_CHARS {
-        return text.to_owned();
-    }
-    let rest: String = text.chars().skip(count - PREVIEW_CHARS).collect();
-    format!("…{rest}")
-}
-
-fn short_entry(entry: &Entry) -> Entry {
-    match entry {
-        Entry::Tool {
-            id,
-            tasks,
-            name,
-            detail,
-            result,
-            diff,
-            spent,
-        } => Entry::Tool {
-            id: id.clone(),
-            tasks: tasks.clone(),
-            name: name.clone(),
-            detail: tail_chars(detail),
-            result: result.as_ref().map(|(ok, text)| (*ok, tail_chars(text))),
-            diff: diff.as_ref().map(|diff| tail_chars(diff)),
-            spent: *spent,
-        },
-        Entry::Note(kind, text) => Entry::Note(kind.clone(), tail_chars(text)),
-        Entry::Compaction(view) => Entry::Compaction(Box::new(CompactionView {
-            header: view.header.clone(),
-            reasoning: tail_chars(&view.reasoning),
-            summary: tail_chars(&view.summary),
-            state: view.state.clone(),
-            blocks: view.blocks,
-        })),
-        Entry::User(text) => Entry::User(tail_chars(text)),
-        Entry::Assistant(text) => Entry::Assistant(tail_chars(text)),
-        Entry::Thinking(text) => Entry::Thinking(tail_chars(text)),
-        Entry::Image(image) => Entry::Image(image.clone()),
-    }
-}
-
-/// A preview pane's lines: the tail entries rendered by the lead's own entry renderer at the pane's
-/// width, with pictures left out because a pane is not a screen to draw one in (D59, D195).
-fn pane_lines(app: &App, entries: &[Entry], width: u16, height: usize) -> Vec<Line<'static>> {
-    if height == 0 || entries.is_empty() {
-        return Vec::new();
-    }
-    let view = View {
-        expand: app.expand_tools,
-        thinking: app.show_thinking,
-        spinner: app.spinner,
-        room: (width.max(1), image::MAX_ROWS),
-        images: false,
-        scale: app.header.math_scale,
-    };
-    let mut lines = Vec::new();
-    for entry in entries {
+/// The live message bus, as a paragraph: who wrote to whom and every line of what was said, so a
+/// long finding is readable in full rather than reduced to one row (D196).
+fn bus_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for message in &app.bus {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
-        let (rendered, _) = entry_render(entry, view, &app.theme, app.now);
-        lines.extend(rendered);
+        lines.push(Line::from(Span::styled(
+            format!("{} → {}", message.from, message.to),
+            Style::new()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for text in message.text.lines() {
+            lines.push(Line::from(Span::styled(
+                text.to_owned(),
+                Style::new().fg(app.theme.text),
+            )));
+        }
     }
-    let start = lines.len().saturating_sub(height);
-    lines.split_off(start)
+    lines
+}
+
+/// The shared command queue as a paragraph: each item's full command and reason, with its state
+/// and who enqueued it, so nothing is cut to fit a row (D196).
+fn queue_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for item in &app.jobs {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        let (state, colour) = match &item.state {
+            QueueState::Pending => ("pending".to_owned(), app.theme.muted),
+            QueueState::Claimed { by } => (format!("running ({by})"), app.theme.success),
+            QueueState::Done { ok: true } => ("done".to_owned(), app.theme.success),
+            QueueState::Done { ok: false } => ("failed".to_owned(), app.theme.error),
+            QueueState::Lost => ("lost".to_owned(), app.theme.warning),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("#{} ", item.id),
+                Style::new()
+                    .fg(app.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(state, Style::new().fg(colour)),
+            Span::styled(format!("  · enqueued by {}", item.owner), dim(&app.theme)),
+        ]));
+        for command in item.command.lines() {
+            lines.push(Line::from(Span::styled(
+                command.to_owned(),
+                Style::new().fg(app.theme.text),
+            )));
+        }
+        if !item.why.is_empty() {
+            for why in item.why.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("why: {why}"),
+                    dim(&app.theme),
+                )));
+            }
+        }
+    }
+    lines
 }
 
 /// What a worker is doing, as one glyph and the colour it is drawn in (D195).
@@ -3835,7 +3811,8 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         || app.settings.is_some()
         || app.permissions.is_some()
         || app.themes.is_some()
-        || app.login.is_some();
+        || app.login.is_some()
+        || app.overview.is_some();
     if let Some(sel) = app.selection
         && !sel.is_empty()
         && !dialog_open
@@ -6015,6 +5992,71 @@ mod tests {
         app.agent(AgentEvent::Bus(Vec::new()));
         app.agent(AgentEvent::Queue(Vec::new()));
         assert_eq!(app.overview, Some(2), "the queue row keeps the selection");
+    }
+
+    #[test]
+    fn the_page_scrolls_a_sessions_history_and_a_boards_full_text() {
+        // D195/D196: the detail is a session's own transcript from the start of what is kept, so
+        // PgUp walks back through its turns and reasoning, and a board wraps its full text so a
+        // long message or a multi-line command is readable rather than cut to a row.
+        use crate::team::{Beat, BusMessage, QueueItem, QueueState, Render};
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        let mut app = bare_app();
+        app.show_thinking = true;
+        let mut many = Render {
+            name: "runtime".into(),
+            state: "idle".into(),
+            ..Render::default()
+        };
+        many.beats = (0..60)
+            .map(|line| Beat::Text(format!("turn line {line}\n")))
+            .collect();
+        app.agent(AgentEvent::Workers(vec![many]));
+        app.agent(AgentEvent::Bus(vec![BusMessage {
+            from: "lead".into(),
+            to: "runtime".into(),
+            text: (0..60)
+                .map(|line| format!("bus line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }]));
+        app.agent(AgentEvent::Queue(vec![QueueItem {
+            id: 7,
+            command: "cargo test -p saddle-cap\ncargo test -p saddle-policy".into(),
+            why: "one after the other".into(),
+            owner: "lead".into(),
+            state: QueueState::Pending,
+        }]));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        app.overview = Some(1);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let tail = screen(&terminal);
+        assert!(tail.contains("turn line 59"), "{tail}");
+        app.key(KeyEvent::from(KeyCode::PageUp));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.worker_scroll > 0);
+        let older = screen(&terminal);
+        assert!(!older.contains("turn line 59"), "{older}");
+        assert!(older.contains("PgUp/PgDn history"), "{older}");
+        // The bus shows every line of the message; the bottom of the log is where it opens, and
+        // Home takes the reader to its beginning.
+        app.overview = Some(2);
+        app.board_scroll = 0;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let bus = screen(&terminal);
+        assert!(bus.contains("bus line 59"), "{bus}");
+        app.key(KeyEvent::from(KeyCode::Home));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let oldest = screen(&terminal);
+        assert!(oldest.contains("bus line 0"), "{oldest}");
+        // A queued command's own newlines are kept, so a multi-command item is read as written.
+        app.overview = Some(3);
+        app.board_scroll = 0;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let queue = screen(&terminal);
+        assert!(queue.contains("cargo test -p saddle-cap"), "{queue}");
+        assert!(queue.contains("cargo test -p saddle-policy"), "{queue}");
+        assert!(queue.contains("why: one after the other"), "{queue}");
     }
 
     #[test]

@@ -4742,10 +4742,11 @@ list, a digit picks a row, `enter` opens a session as a full transcript to type 
 if its turn is running), `i` interrupts one turn (keeping the worker), `x` stops it (keeping its
 conversation) and `esc` closes the page. It opens on a worker that is mid-turn when there is one,
 and reads the shared handles rather than the session thread, so the detail keeps streaming while
-the lead is busy. The detail draws the session's newest entries with the lead's own entry renderer
-at its width, cutting each to its tail, so a preview costs what it displays rather than the
-conversation behind it; pictures are left out, because a pane is not a screen to draw one in
-(D161). A worker's
+the lead is busy. The detail is that session's own transcript drawn by the lead's renderer from the
+start of what is kept — a worker keeps its recent beats, the person's conversation all of it —
+with `PgUp`/`PgDn` and `Home`/`End` walking back through its turns, reasoning and tool blocks, so
+the page is also where the history is read. Pictures are left out, because a pane is not a screen
+to draw one in (D161). A worker's
 conversation is kept as structured beats and drawn by the lead's own transcript path, so markdown,
 highlighted code, tool blocks with their diffs and collapsed output, formulas, returned pictures
 and scrolling are one implementation rather than two that drift; the page adds the panes and their
@@ -4763,8 +4764,11 @@ remain deferred. The saved-branch tools of D194 remain for findings that outlive
 **D196.** A team shares a message bus and one serially claimed command queue. A delivery between
 live members is recorded on an in-memory bus (bounded, newest last) with its sender and target and
 the words it carried; the audit still records the operation's target and a hash, never the words,
-as for a brief. The page's bus board shows who spoke to whom and the first line of each message, and
-a member can read the recent tail with `agent {"action":"bus"}`. The bus conveys data, not
+as for a brief. The page's bus board wraps each message in full and scrolls it, newest at the end,
+and a member can read a bounded recent tail with `agent {"action":"bus"}`. A message is kept up to
+8000 characters on the bus (the receiving conversation holds it in full) and the bus holds 200 of
+them. The queue board likewise shows each item's full command and reason, not a truncated row. The
+bus conveys data, not
 authority: a message is delivered through the same `say` path, labelled with its sender, and the
 receiver's prompt treats it as data. Commands that must not overlap are put on one queue per team:
 `agent {"action":"enqueue","command":…,"why":…}` appends, `claim` takes the next item only while no

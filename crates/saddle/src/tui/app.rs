@@ -734,6 +734,8 @@ pub struct App {
     pub bus: Vec<BusMessage>,
     /// The team's shared command queue (D195).
     pub jobs: Vec<QueueItem>,
+    /// How far the bus or queue board is scrolled back from its end, in rows (D196).
+    pub board_scroll: usize,
     /// The session overview page, while open, and which pane it has selected: `0` is the person's
     /// own conversation and `n` is the team's `n`th worker. `None` is the page closed.
     pub overview: Option<usize>,
@@ -861,6 +863,7 @@ impl App {
             team: Vec::new(),
             bus: Vec::new(),
             jobs: Vec::new(),
+            board_scroll: 0,
             overview: None,
             worker: None,
             worker_scroll: 0,
@@ -1255,18 +1258,40 @@ impl App {
                 }
                 KeyCode::Tab | KeyCode::Down | KeyCode::Right | KeyCode::Char('j') => {
                     self.overview = Some(next);
+                    self.worker_scroll = 0;
+                    self.board_scroll = 0;
                     self.selection = None;
                     None
                 }
                 KeyCode::BackTab | KeyCode::Up | KeyCode::Left | KeyCode::Char('k') => {
                     self.overview = Some(previous);
+                    self.worker_scroll = 0;
+                    self.board_scroll = 0;
                     self.selection = None;
                     None
                 }
                 KeyCode::Char(digit @ '0'..='9') => {
                     let index = digit as usize - '0' as usize;
                     self.overview = Some(index.min(rows - 1));
+                    self.worker_scroll = 0;
+                    self.board_scroll = 0;
                     self.selection = None;
+                    None
+                }
+                KeyCode::PageUp => {
+                    self.overview_scroll(selected, sessions, true);
+                    None
+                }
+                KeyCode::PageDown => {
+                    self.overview_scroll(selected, sessions, false);
+                    None
+                }
+                KeyCode::Home => {
+                    self.overview_jump(selected, sessions, false);
+                    None
+                }
+                KeyCode::End => {
+                    self.overview_jump(selected, sessions, true);
                     None
                 }
                 KeyCode::Enter if selected > 0 && selected < sessions => {
@@ -1937,7 +1962,46 @@ impl App {
             .or_else(|| self.team.iter().position(|worker| !worker.finished));
         self.overview = Some(index.map_or(0, |index| index + 1));
         self.worker_scroll = 0;
+        self.board_scroll = 0;
         self.selection = None;
+    }
+
+    /// Scrolls the page's detail by a screen: a session's own transcript or the board's one
+    /// paragraph, each keeping its place while the list moves on (D195, D196).
+    fn overview_scroll(&mut self, selected: usize, sessions: usize, back: bool) {
+        if selected >= sessions {
+            let page = 10;
+            self.board_scroll = if back {
+                self.board_scroll.saturating_add(page)
+            } else {
+                self.board_scroll.saturating_sub(page)
+            };
+        } else if selected == 0 {
+            let page = self.view_height.saturating_sub(1).max(1);
+            self.scroll = if back {
+                (self.scroll + page).min(self.total_lines)
+            } else {
+                self.scroll.saturating_sub(page)
+            };
+        } else {
+            let page = self.worker_height.saturating_sub(1).max(1);
+            self.worker_scroll = if back {
+                (self.worker_scroll + page).min(self.worker_total)
+            } else {
+                self.worker_scroll.saturating_sub(page)
+            };
+        }
+    }
+
+    /// Jumps the detail to the start of the history or back to its newest line (D195, D196).
+    fn overview_jump(&mut self, selected: usize, sessions: usize, newest: bool) {
+        if selected >= sessions {
+            self.board_scroll = if newest { 0 } else { usize::MAX };
+        } else if selected == 0 {
+            self.scroll = if newest { 0 } else { self.total_lines };
+        } else {
+            self.worker_scroll = if newest { 0 } else { self.worker_total };
+        }
     }
 
     fn submit(&mut self, queued: bool) -> Option<Action> {

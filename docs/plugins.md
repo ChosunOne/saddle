@@ -790,13 +790,14 @@ model-spend ledger derived from the same policy, and it cannot start another wor
 (or `/workers`) opens a page with the sessions in a list on the left and the selected one drawn
 large beside it: your own conversation first, then each worker, then the team's **bus** and
 **queue** boards. `tab`/`shift+tab`, the arrows or a digit move through the list; `enter` opens a
-session as a full transcript, where typing steers it (or wakes it when idle); `i` interrupts its
-turn, `x` stops it, and `esc` closes the page. `esc` from that view returns to the page, and `esc`
+session as a full transcript, where typing steers it (or wakes it when idle); `PgUp`/`PgDn` (with
+`Home`/`End`) walk back through the selected session's turns and reasoning, or through a board's
+full text; `i` interrupts its turn, `x` stops it, and `esc` closes the page. `esc` from that view returns to the page, and `esc`
 again to your own conversation; the workers keep running. Stopping a worker keeps its saved
 conversation.
 
-The bus board shows who spoke to whom and the first line of each message; the audit records the
-target and a hash, never the words, and the full text is in the receiving conversation. Commands
+The bus board shows who spoke to whom and each message in full, wrapped and scrollable; the audit
+records the target and a hash, never the words, and the full text is in the receiving conversation. Commands
 that must not overlap go on one queue per team:
 
 ```sh

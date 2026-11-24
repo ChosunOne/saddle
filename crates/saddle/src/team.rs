@@ -132,9 +132,9 @@ struct Queue {
 
 /// How many bus deliveries are kept for the page.
 const BUS_MESSAGES: usize = 200;
-/// How much of one message the bus keeps: enough to recognise it, with the full words in the
-/// worker's own conversation.
-const BUS_CHARS: usize = 2000;
+/// How much of one message the bus keeps: the full finding in practice, bounded so a team cannot
+/// grow the bus without limit.
+const BUS_CHARS: usize = 8000;
 /// How many commands may wait at once.
 const QUEUE_ITEMS: usize = 64;
 /// How many finished commands the queue keeps for its view.

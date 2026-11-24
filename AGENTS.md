@@ -83,8 +83,9 @@ the host's rather than a component's is `tool_search`, which is MCP discovery an
 service (D195), available only to those shipped components and decided as the agent's
 `model-invoke`: ctrl+b in the TUI opens a page with the sessions in a list on the left and the
 selected one drawn live beside it, plus rows for the team's **message bus** and its **shared command
-queue** (D196); tab and the arrows move through the list, enter opens one to steer it, and
-interrupts or stops one turn while the rest keep running. `agent` also takes `enqueue`, `claim`,
+queue** (D196); tab and the arrows move through the list, enter opens one to steer it,
+`PgUp`/`PgDn` walk the selected transcript's turns and a board's full text, and interrupts or stops
+one turn while the rest keep running. `agent` also takes `enqueue`, `claim`,
 `finish`, `queue` and `bus`: a claimed command is run by that member's own `bash` under its own
 grants, and the queue only orders the work. They also keep
 D194's saved-branch `post`/`read` for findings that must outlive the team.
