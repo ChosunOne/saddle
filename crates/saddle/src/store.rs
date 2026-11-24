@@ -355,6 +355,63 @@ impl Store {
         Ok(())
     }
 
+    /// The audit session of the conversation's first turn. A worker's own audit log names it, so
+    /// this is how a conversation saved by a build without the worker column is recognised (D195).
+    pub fn audit_of(&self, session: &str) -> Result<Option<String>> {
+        let body: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT body FROM nodes WHERE session = ?1 AND kind = ?2 ORDER BY id LIMIT 1",
+                params![session, kind::TURN],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_str(&body)?;
+        Ok(value["audit"].as_str().map(str::to_owned))
+    }
+
+    /// Marks a conversation as a worker's, so `/resume` stops offering it (D195).
+    pub fn mark_worker(&self, session: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET worker = 1 WHERE id = ?1",
+            params![session],
+        )?;
+        Ok(())
+    }
+
+    /// Marks the conversations an earlier build saved without the marker: each worker's own audit
+    /// log opens with a session-start record naming the worker, so the fact that a conversation
+    /// belonged to a worker is still on disk. A conversation whose log is gone is left alone
+    /// rather than guessed at. Returns how many it marked.
+    pub fn adopt_workers(&self, audit_dir: &Path, sessions: &mut [Summary]) -> Result<usize> {
+        let mut marked = 0;
+        for summary in sessions.iter_mut().filter(|summary| !summary.worker) {
+            let Some(audit) = self.audit_of(&summary.id)? else {
+                continue;
+            };
+            let path = audit_dir.join(format!("{audit}.jsonl"));
+            let Ok(file) = File::open(&path) else {
+                continue;
+            };
+            let mut first = String::new();
+            if BufReader::new(file).read_line(&mut first).is_err() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(first.trim()) else {
+                continue;
+            };
+            if record["args"].get("worker").is_some() {
+                self.mark_worker(&summary.id)?;
+                summary.worker = true;
+                marked += 1;
+            }
+        }
+        Ok(marked)
+    }
+
     /// Records that the conversation moved to another model (D91).
     ///
     /// The row is what a resumed conversation is read back from, and what the resume list shows, so
@@ -1543,6 +1600,47 @@ mod tests {
         let from = listed.iter().find(|x| x.id == fork).unwrap();
         assert_eq!(from.forked_from.as_deref(), Some(id.as_str()));
         assert_eq!(from.title, "first");
+    }
+
+    #[test]
+    fn an_older_worker_conversation_is_recognised_by_its_audit_log() {
+        // A build before the worker column saved these without the marker; the audit log's first
+        // record still names the worker, and that is enough to mark it once (D195).
+        let s = store();
+        let mine = s.begin("p", "m").unwrap();
+        s.append(&mine, &Item::User("mine".into())).unwrap();
+        s.turn(&mine, "audit-mine", "p", "m").unwrap();
+        let theirs = s.begin("p", "m").unwrap();
+        s.append(&theirs, &Item::User("the brief".into())).unwrap();
+        s.turn(&theirs, "audit-worker", "p", "m").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("audit-worker.jsonl"),
+            "{\"args\":{\"worker\":\"runtime\"},\"kind\":\"session-start\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("audit-mine.jsonl"),
+            "{\"args\":{\"workspace\":\"/ws\"},\"kind\":\"session-start\"}\n",
+        )
+        .unwrap();
+
+        let mut listed = s.list().unwrap();
+        assert_eq!(s.adopt_workers(dir.path(), &mut listed).unwrap(), 1);
+        assert!(listed.iter().find(|x| x.id == theirs).unwrap().worker);
+        assert!(!listed.iter().find(|x| x.id == mine).unwrap().worker);
+        // Marked in the database, not only in this listing.
+        assert!(
+            s.list()
+                .unwrap()
+                .iter()
+                .find(|x| x.id == theirs)
+                .unwrap()
+                .worker
+        );
+        // A second pass finds nothing left to adopt.
+        let mut again = s.list().unwrap();
+        assert_eq!(s.adopt_workers(dir.path(), &mut again).unwrap(), 0);
     }
 
     #[test]

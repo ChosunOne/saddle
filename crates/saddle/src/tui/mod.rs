@@ -1903,9 +1903,12 @@ impl Controller {
     }
 
     fn open_resume(&self, app: &mut App) -> Result<()> {
-        let sessions: Vec<_> = self
-            .store
-            .list()?
+        let mut listed = self.store.list()?;
+        // A conversation saved before the worker column existed is recognised by its own audit
+        // log and marked once, so the person's history does not keep a team's transcripts (D195).
+        self.store
+            .adopt_workers(&self.paths.audit_dir(), &mut listed)?;
+        let sessions: Vec<_> = listed
             .into_iter()
             .filter(|session| !session.worker)
             .collect();

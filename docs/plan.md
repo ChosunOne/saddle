@@ -4732,7 +4732,9 @@ team, and `team-steps`, when set, caps each worker turn: it has no default, beca
 default request limit (D37). A worker's conversation is saved like any other and marked as a
 worker, so it is readable by id and through `session_query` (`sessions.worker = 1`) and never
 offered by `/resume`: a team's transcripts belong to the team view, not to the person's own
-history. A person opens the team with ctrl+b, views a
+history. A conversation an earlier build saved before that column existed is recognised by its own
+audit log, whose session-start record names the worker, and marked when the list is opened; a
+conversation whose log is gone is left alone rather than guessed at. A person opens the team with ctrl+b, views a
 worker's live transcript and provider-exposed reasoning, types into it, interrupts one turn
 (keeping the worker), or stops it (keeping its conversation). A worker's conversation is kept as
 structured beats and drawn by the lead's own transcript path, so markdown, highlighted code, tool
