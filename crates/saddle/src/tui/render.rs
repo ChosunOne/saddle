@@ -5999,6 +5999,25 @@ mod tests {
     }
 
     #[test]
+    fn a_board_stays_selected_when_the_team_has_no_workers() {
+        // The views event arrives on every agent-thread tick; bounding the selection by the team
+        // (zero workers) pulled the bus and queue rows back to the lead at once (D195).
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        let mut app = bare_app();
+        app.overview = Some(0);
+        app.agent(AgentEvent::Workers(Vec::new()));
+        app.key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.overview, Some(1));
+        app.agent(AgentEvent::Workers(Vec::new()));
+        assert_eq!(app.overview, Some(1), "the bus row keeps the selection");
+        app.key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.overview, Some(2));
+        app.agent(AgentEvent::Bus(Vec::new()));
+        app.agent(AgentEvent::Queue(Vec::new()));
+        assert_eq!(app.overview, Some(2), "the queue row keeps the selection");
+    }
+
+    #[test]
     fn reasoning_renders_markdown_emphasis_and_paragraphs_inside_its_gutter() {
         let theme = Theme::default();
         let reasoning = "***Testing the library***\n\nChecking **results**.\n\n- a long list entry that wraps onto another line";

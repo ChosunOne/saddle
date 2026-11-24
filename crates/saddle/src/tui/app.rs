@@ -2279,7 +2279,10 @@ impl App {
             AgentEvent::Workers(views) => {
                 self.team = views;
                 if let Some(selected) = self.overview {
-                    self.overview = Some(selected.min(self.team.len()));
+                    // The last two rows are the bus and queue boards, so the selection is bounded
+                    // by the rows, not by the workers: clamping to the team would pull a board's
+                    // selection back to the lead as soon as a views event arrived (D195).
+                    self.overview = Some(selected.min(self.team.len() + 2));
                 }
                 if let Some(name) = &self.worker
                     && !self.team.iter().any(|worker| &worker.name == name)
