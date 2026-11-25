@@ -624,10 +624,13 @@ fn converse(
         for note in tasks::notices(session, false)? {
             out.info(&note);
         }
+        for note in session.team.notices(false) {
+            out.info(&note);
+        }
         let line = match input.recv_timeout(Duration::from_millis(50)) {
             Ok(line) => line?,
             Err(RecvTimeoutError::Timeout) => {
-                if tasks::pending(session)? {
+                if tasks::pending(session)? || session.team.pending() {
                     cancel::reset();
                     let _sigint = cancel::SigintGuard::install();
                     if let Some(end) = agent.background_turn(session, out)? {
@@ -670,7 +673,7 @@ fn wake_turns(
         if cancel::requested() {
             return Ok(last);
         }
-        while tasks::waiting(session)? {
+        while tasks::waiting(session)? || session.team.working() {
             // The monitors, the proxy and the audit are serviced from here, as they are on an idle
             // tick (D153, D159). Ctrl+C ends the wait, not the process: the session still closes
             // through its own cleanup.
@@ -679,7 +682,7 @@ fn wake_turns(
             }
             thread::sleep(Duration::from_millis(50));
         }
-        if !tasks::pending(session)? {
+        if !(tasks::pending(session)? || session.team.pending()) {
             return Ok(last);
         }
         // The turn consumes the completion itself: it notes it to the person and puts the

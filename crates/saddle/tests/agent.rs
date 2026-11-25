@@ -1645,6 +1645,54 @@ fn reading_the_first_conversation(
 }
 
 #[test]
+fn a_worker_at_rest_wakes_the_lead_without_a_poll() {
+    // D195: the lead starts a worker and then says nothing. When the worker's turn ends the run is
+    // woken by that event, and the lead's next request carries a notice naming it — no `status`
+    // call is needed for the lead to learn that it stopped, and the notice carries no words the
+    // worker itself wrote.
+    let (base, seen) = serve_dynamic(12, |_, body| {
+        let text = body.to_string();
+        if text.contains("You are the worker `runtime`") {
+            sse_response(&openai_sse("the reload path is in session.rs", &[]))
+        } else if text.contains("[saddle worker notification]") {
+            // A lead that has read the notice and needs nothing further must not be woken again:
+            // answering a worker with a message is what starts another turn, not silence.
+            sse_response(&openai_sse("noted", &[]))
+        } else if text.contains("started runtime") {
+            sse_response(&openai_sse("done", &[]))
+        } else {
+            sse_response(&openai_sse(
+                "",
+                &[(
+                    "t",
+                    "agent",
+                    serde_json::json!({
+                        "action":"start","name":"runtime","brief":"find the reload path"
+                    }),
+                )],
+            ))
+        }
+    });
+    let env = Env::new(Api::Openai, &base);
+    env.write_override(
+        "[agent]\nmodel-invoke = { tokens-per-session = 100000, cost-per-session = 10.0 }\ntranscript-read = {}\n",
+    );
+    let out = env.saddle(&["run", "start a worker"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let seen = seen.lock().unwrap();
+    let wake = seen
+        .iter()
+        .find(|s| s.body.to_string().contains("[saddle worker notification]"))
+        .expect("the lead's next request carries the worker's completion");
+    let carried = wake.body.to_string();
+    assert!(carried.contains("worker runtime"), "{carried}");
+    assert!(carried.contains("status or inspect"), "{carried}");
+    assert!(
+        !carried.contains("the reload path is in session.rs"),
+        "the notice names the worker, never its words: {carried}"
+    );
+}
+#[test]
 fn a_live_worker_is_started_and_addressed_by_the_shipped_team_tool() {
     // D195: the lead's tool starts a real session on its own thread. The mock answers both
     // conversations, and a worker request carrying the brief proves the second session exists.

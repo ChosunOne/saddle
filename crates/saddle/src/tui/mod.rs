@@ -342,13 +342,16 @@ fn work(
             fatal = Some(msg);
             break;
         }
+        for note in session.team.notices(false) {
+            let _ = events.send(AgentEvent::Note(note));
+        }
         let views = session.tasks.views();
         if views != shown_tasks {
             ui.tasks(&views);
             shown_tasks = views;
         }
         ui.workers(&session.team.views());
-        if !session.tasks.pending() {
+        if !(session.tasks.pending() || session.team.pending()) {
             completion_requested = false;
         }
         let command = match commands.recv_timeout(tick) {
@@ -362,7 +365,7 @@ fn work(
                     fatal = Some(msg);
                     break;
                 }
-                if session.tasks.pending() && !completion_requested {
+                if (session.tasks.pending() || session.team.pending()) && !completion_requested {
                     // Let the UI arbitrate with a prompt typed at the same instant. The worker
                     // must not start a turn behind an editor that still thinks it is idle.
                     let _ = events.send(AgentEvent::BackgroundReady);

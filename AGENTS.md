@@ -87,7 +87,10 @@ queue** (D196); tab and the arrows move through the list, enter opens one to ste
 `PgUp`/`PgDn` walk the selected transcript's turns and a board's full text, and interrupts or stops
 one turn while the rest keep running. `agent` also takes `enqueue`, `claim`,
 `finish`, `queue` and `bus`: a claimed command is run by that member's own `bash` under its own
-grants, and the queue only orders the work. They also keep
+grants, and the queue only orders the work. A worker cannot send to the lead; when it comes to
+rest (idle, interrupted or failed) the lead is handed a notice naming it — mid-turn at its next
+request, or as an idle follow-up turn like a finished task's (D174, D195) — and answers with
+`send`, which wakes the worker. They also keep
 D194's saved-branch `post`/`read` for findings that must outlive the team.
 `patch` applies one apply-patch document across several files, deciding
 every path before writing any of them, and refuses the whole patch if one is denied (D56).

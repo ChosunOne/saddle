@@ -171,6 +171,8 @@ impl Steering {
             && let Some(peer) = map.get(name)
         {
             peer.handle.steer.push(text);
+            // An idle worker waits on its channel, so the message itself is what wakes it (D195).
+            let _ = peer.jobs.send(Job::Wake);
         }
     }
 
@@ -194,6 +196,7 @@ impl Steering {
             peer.handle.stop.store(true, Ordering::SeqCst);
             peer.handle.interrupt.store(true, Ordering::SeqCst);
             peer.handle.cancel.store(true, Ordering::SeqCst);
+            let _ = peer.jobs.send(Job::Wake);
         }
     }
 
@@ -365,8 +368,27 @@ pub struct Manager {
     bus: Arc<Mutex<VecDeque<BusMessage>>>,
     /// Commands the team wants run one at a time, whoever gets to them (D195).
     queue: Arc<Mutex<Queue>>,
+    /// What the workers have finished since the lead last read it, oldest first, so the lead is
+    /// woken by an event rather than by asking (D195).
+    completions: Arc<Mutex<VecDeque<Completion>>>,
     owns: bool,
 }
+
+/// One thing a worker did that its lead has not been told yet: it came to rest after a turn, or it
+/// failed. The notice names the worker and its state, never its words; the lead reads those with
+/// `status` or `inspect` and answers with `send` (D195).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Completion {
+    name: String,
+    state: String,
+    /// Whether the lead's model has been shown it.
+    announced: bool,
+    /// Whether the person's transcript has shown it.
+    shown: bool,
+}
+
+/// How many completions are kept before the oldest already-shown one is dropped.
+const COMPLETIONS: usize = 32;
 
 impl Default for Manager {
     fn default() -> Self {
@@ -374,6 +396,7 @@ impl Default for Manager {
             shared: Default::default(),
             bus: Default::default(),
             queue: Default::default(),
+            completions: Default::default(),
             owns: true,
         }
     }
@@ -386,6 +409,7 @@ impl Manager {
             shared: self.shared.clone(),
             bus: self.bus.clone(),
             queue: self.queue.clone(),
+            completions: self.completions.clone(),
             owns: false,
         }
     }
@@ -415,6 +439,89 @@ impl Manager {
         self.shared.lock().ok()?.get(name).cloned()
     }
 
+    /// Records that a worker came to rest, so the lead's next turn carries it: an event, never
+    /// something the lead has to poll for (D195). The same worker resting in the same state is one
+    /// notice until it is read, so a worker that idles twice is not announced twice.
+    pub fn completed(&self, name: &str, state: &str) {
+        let Ok(mut done) = self.completions.lock() else {
+            return;
+        };
+        if let Some(last) = done.back()
+            && last.name == name
+            && last.state == state
+            && !last.announced
+            && !last.shown
+        {
+            return;
+        }
+        done.push_back(Completion {
+            name: name.to_owned(),
+            state: state.to_owned(),
+            announced: false,
+            shown: false,
+        });
+        while done.len() > COMPLETIONS {
+            // Drop the oldest one both readers have seen; with none, the oldest anyway.
+            match done
+                .iter()
+                .position(|completion| completion.announced && completion.shown)
+            {
+                Some(index) => {
+                    done.remove(index);
+                }
+                None => {
+                    done.pop_front();
+                }
+            }
+        }
+    }
+
+    /// Whether a worker's completion is waiting for the lead's next turn (D195).
+    pub fn pending(&self) -> bool {
+        self.completions
+            .lock()
+            .map(|done| done.iter().any(|completion| !completion.announced))
+            .unwrap_or(false)
+    }
+
+    /// Whether a worker is still starting or mid-turn, so a one-shot run waits for it instead of
+    /// closing the session out from under it (D174's rule, for a team — D195).
+    pub fn working(&self) -> bool {
+        match self.shared.lock() {
+            Ok(map) => map.values().any(|peer| {
+                let state = peer.render().state;
+                state == "starting" || state == "running"
+            }),
+            Err(_) => false,
+        }
+    }
+
+    /// What has not been told yet: the model's notices are marked announced so one turn carries
+    /// them, the person's are shown in the transcript (D153's shape, for workers — D195).
+    pub fn notices(&self, model: bool) -> Vec<String> {
+        let Ok(mut done) = self.completions.lock() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for completion in done.iter_mut() {
+            let unseen = if model {
+                !completion.announced
+            } else {
+                !completion.shown
+            };
+            if !unseen {
+                continue;
+            }
+            if model {
+                completion.announced = true;
+            } else {
+                completion.shown = true;
+            }
+            out.push(notice_line(&completion.name, &completion.state));
+        }
+        out
+    }
+
     /// Stops everything and says how many were stopped; used before a policy replacement and at
     /// session close, when the grants a worker was built on no longer exist (D47, D153).
     pub fn stop_all(&mut self) -> usize {
@@ -429,8 +536,9 @@ impl Manager {
             peer.handle.stop.store(true, Ordering::SeqCst);
             peer.handle.interrupt.store(true, Ordering::SeqCst);
             peer.handle.cancel.store(true, Ordering::SeqCst);
-            cancel::request();
+            let _ = peer.jobs.send(Job::Wake);
         }
+        cancel::request();
         count
     }
 
@@ -463,6 +571,7 @@ impl Manager {
         peer.handle.stop.store(true, Ordering::SeqCst);
         peer.handle.interrupt.store(true, Ordering::SeqCst);
         peer.handle.cancel.store(true, Ordering::SeqCst);
+        let _ = peer.jobs.send(Job::Wake);
         Ok(format!(
             "stopping {name}; its conversation and findings are kept"
         ))
@@ -470,7 +579,15 @@ impl Manager {
 
     pub fn say(&self, from: &str, to: &str, text: &str) -> Result<String, String> {
         let peer = self.lookup(to).ok_or_else(|| {
-            format!("no worker {to:?}; workers exchange messages directly, without a lead relay")
+            if to == "lead" {
+                "a worker cannot message the lead: the lead is told when a worker comes to rest \
+                 and reads it with status or inspect, so put findings and questions in your reply"
+                    .to_owned()
+            } else {
+                format!(
+                    "no worker {to:?}; workers exchange messages directly, without a lead relay"
+                )
+            }
         })?;
         if text.trim().is_empty() {
             return Err("empty message".into());
@@ -513,6 +630,17 @@ impl Manager {
         );
         if let Some(error) = &render.error {
             out.push_str(&format!("error: {error}\n"));
+        }
+        // What the lead is supposed to do about it, so a notice and a status answer the same
+        // question the same way (D195).
+        if render.state.starts_with("idle") {
+            out.push_str(&format!(
+                "waiting for you: reply with agent send to {name}\n"
+            ));
+        } else if render.state == "failed" {
+            out.push_str(
+                "a failed worker cannot be sent to; start another if the work continues\n",
+            );
         }
         let lines = render.plain();
         let recent: Vec<&String> = lines.iter().rev().take(12).collect();
@@ -918,6 +1046,10 @@ fn run(
         cancel,
     } = handle;
     session.cancel = cancel.clone();
+    let name = view
+        .lock()
+        .map(|render| render.name.clone())
+        .unwrap_or_default();
     let mut ui = WorkerUi {
         view: view.clone(),
         interrupt: interrupt.clone(),
@@ -943,24 +1075,24 @@ fn run(
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
-                match jobs.try_recv() {
+                // The thread sleeps on its channel rather than polling the steering handle: every
+                // message, interrupt and stop sends a job to wake it (D195).
+                match jobs.recv() {
                     Ok(Job::Start(brief)) => {
                         text = Some(brief);
                         break;
                     }
-                    Ok(Job::Wake) => continue,
-                    Err(mpsc::TryRecvError::Disconnected) => {
+                    Ok(Job::Wake) => {}
+                    Err(_) => {
                         finish(agent, session, &view);
                         return;
                     }
-                    Err(mpsc::TryRecvError::Empty) => {}
                 }
                 let pending = steer.take();
                 if !pending.is_empty() {
                     text = Some(pending.join("\n\n"));
                     break;
                 }
-                thread::sleep(Duration::from_millis(50));
             }
             match text {
                 Some(text) => text,
@@ -973,21 +1105,30 @@ fn run(
             render.push(Beat::Prompt(prompt.clone()));
         });
         let end = agent.turn(&mut session, &prompt, &mut ui);
-        match end {
-            Ok(End::Cancelled) => set(&view, |r| r.state = "idle (interrupted)".into()),
-            Ok(End::Answered) => set(&view, |r| r.state = "idle".into()),
-            Ok(end) => set(&view, |r| {
-                r.state = format!("stopped ({end:?})").to_lowercase()
-            }),
+        let (state, failure) = match end {
+            Ok(End::Cancelled) => ("idle (interrupted)".to_owned(), None),
+            Ok(End::Answered) => ("idle".to_owned(), None),
+            Ok(end) => (format!("stopped ({end:?})").to_lowercase(), None),
             Err(error) => {
                 let text = format!("{error:#}");
-                set(&view, |r| {
-                    r.state = "failed".into();
-                    r.error = Some(text.clone());
-                    r.push(Beat::Note(format!("error: {text}")));
-                });
-                break;
+                ("failed".to_owned(), Some(text))
             }
+        };
+        set(&view, |render| {
+            render.state = state.clone();
+            if let Some(text) = &failure {
+                render.error = Some(text.clone());
+                render.push(Beat::Note(format!("error: {text}")));
+            }
+        });
+        // A worker that comes to rest is an event for the lead's next turn, which may be idle now:
+        // this is what replaces the lead having to ask. A stop the lead asked for is not announced
+        // (D195).
+        if !stop.load(Ordering::SeqCst) {
+            session.team.completed(&name, &state);
+        }
+        if failure.is_some() {
+            break;
         }
         if stop.load(Ordering::SeqCst) {
             break;
@@ -1017,6 +1158,30 @@ fn finish(mut agent: Agent, session: Session, view: &Arc<Mutex<Render>>) {
 fn set(view: &Arc<Mutex<Render>>, change: impl FnOnce(&mut Render)) {
     if let Ok(mut render) = view.lock() {
         change(&mut render);
+    }
+}
+
+/// What one notice says: which worker, what it is now, and how the lead reads it and answers. A
+/// worker's own words stay in its conversation, as a task's output stays in its record (D153), so
+/// the notice carries host-owned state only (D195).
+fn notice_line(name: &str, state: &str) -> String {
+    let what = match state {
+        "idle" => "finished its turn and is waiting",
+        "idle (interrupted)" => "was interrupted and is waiting",
+        "failed" => "failed",
+        other if other.starts_with("stopped") => "stopped its turn",
+        other => other,
+    };
+    if state == "failed" {
+        format!(
+            "worker {name} {what}; read it with the agent tool (action: status or inspect), then \
+             start another if the work continues"
+        )
+    } else {
+        format!(
+            "worker {name} {what}; read it with the agent tool (action: status or inspect) and \
+             answer with action send"
+        )
     }
 }
 
@@ -1258,8 +1423,57 @@ mod tests {
             shared: Arc::new(Mutex::new(map)),
             bus: Default::default(),
             queue: Default::default(),
+            completions: Default::default(),
             owns: true,
         }
+    }
+
+    #[test]
+    fn a_worker_at_rest_is_one_notice_each_reader_sees_once() {
+        // D195: the lead is woken by an event, not by asking, and a repeated rest is not a second
+        // wakeup while the first is still unread.
+        let team = Manager::default();
+        assert!(!team.pending());
+        team.completed("runtime", "idle");
+        team.completed("runtime", "idle");
+        assert!(team.pending());
+        let model = team.notices(true);
+        assert_eq!(model.len(), 1);
+        assert!(model[0].contains("runtime"), "{model:?}");
+        assert!(model[0].contains("is waiting"), "{model:?}");
+        assert!(model[0].contains("status or inspect"), "{model:?}");
+        assert!(model[0].contains("action send"), "{model:?}");
+        assert!(!team.pending());
+        assert!(team.notices(true).is_empty(), "one turn carries it");
+        // The person's own transcript still shows the line, once.
+        assert_eq!(team.notices(false).len(), 1);
+        assert!(team.notices(false).is_empty());
+    }
+
+    #[test]
+    fn a_failed_worker_says_so_and_is_not_answered() {
+        let team = Manager::default();
+        team.completed("runtime", "failed");
+        let notice = team.notices(true).remove(0);
+        assert!(notice.contains("runtime failed"), "{notice}");
+        assert!(notice.contains("start another"), "{notice}");
+    }
+
+    #[test]
+    fn only_a_worker_mid_turn_keeps_a_one_shot_run_waiting() {
+        assert!(with_peers(vec![("a", "running", false)]).working());
+        assert!(with_peers(vec![("a", "starting", false)]).working());
+        assert!(!with_peers(vec![("a", "idle", false)]).working());
+        assert!(!with_peers(vec![("a", "finished", true)]).working());
+    }
+
+    #[test]
+    fn a_worker_cannot_address_the_lead_and_is_told_where_its_answer_goes() {
+        let team = with_peers(vec![("a", "idle", false)]);
+        let refused = team.say("a", "lead", "a finding").unwrap_err();
+        assert!(refused.contains("cannot message the lead"), "{refused}");
+        assert!(refused.contains("status or inspect"), "{refused}");
+        assert!(refused.contains("reply"), "{refused}");
     }
 
     #[test]

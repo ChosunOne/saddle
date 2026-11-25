@@ -4757,10 +4757,19 @@ workers the session has and how many are mid-turn, in the default template and a
 mid-turn through a shared steering handle, so the lead being busy is not a reason a worker
 cannot be steered. `send` from a worker reaches a peer directly, labelled with its sender; the
 host resolves only live worker names, never arbitrary conversation ids, so a worker never reaches the
-lead by name: the lead reads a worker's outbox or its own live status. Closing the session or
-replacing the policy stops every worker first (the reload's own record says so, and each stop the
-model asked for is a decision); a person's `i` reaches one worker's turn and leaves the rest
-running. Workers
+lead by name; it ends its turn with the finding, the question or the blocker instead. A worker
+coming to rest — idle after a turn, interrupted, or failed — records a completion in the team's
+shared state, so the lead learns of it without asking: a running lead's next request carries
+`[saddle worker notification] …`, naming the worker and its state, and an idle lead is started on a
+follow-up turn exactly as a finished task starts one (D174). The notice carries host-owned state
+only, never the worker's words; the lead reads those with `status` or `inspect` and answers with
+`send`, which wakes the worker. An identical rest is one notice until it is read, and a stop the
+lead itself asked for is not announced. The worker's thread sleeps on its job channel rather than
+polling its steering handle: a message, an interrupt or a stop is the event that wakes it, and a
+one-shot run waits while any worker is still starting or mid-turn instead of closing the session
+out from under it. Closing the session or replacing the policy stops every worker first (the
+reload's own record says so, and each stop the model asked for is a decision); a person's `i`
+reaches one worker's turn and leaves the rest running. Workers
 have no MCP servers and no nested teams, and budgets are per worker rather than pooled; those
 remain deferred. The saved-branch tools of D194 remain for findings that outlive a live team.
 
