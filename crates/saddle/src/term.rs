@@ -13,6 +13,7 @@ use crate::agent::{Ui, call_detail};
 use crate::compact;
 use crate::provider::{Reply, Sink, ToolCall};
 use crate::tools::ToolOutput;
+use crate::tools::timeout;
 
 pub struct Terminal {
     /// stdout holds text without a trailing newline.
@@ -113,8 +114,12 @@ impl Sink for Terminal {
 impl Ui for Terminal {
     fn call(&mut self, call: &ToolCall) {
         self.end_line();
+        let limit = match timeout::requested(call) {
+            Some(seconds) => format!(" · {seconds}s limit"),
+            None => String::new(),
+        };
         eprintln!(
-            "{}● {} {}{}",
+            "{}● {} {}{limit}{}",
             self.dim,
             clean(&call.name),
             one_line(&clean(&call_detail(call)), 120),

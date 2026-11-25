@@ -1256,6 +1256,7 @@ fn entry_render(
             detail,
             result,
             diff,
+            timeout,
             spent,
             ..
         } => {
@@ -1267,6 +1268,7 @@ fn entry_render(
                 diff.as_deref(),
                 &view,
                 elapsed.as_deref(),
+                *timeout,
                 theme,
             );
             background_block(&mut rows, &mut bg, tasks, view.spinner, now, theme);
@@ -1519,8 +1521,10 @@ fn tool_block(
     result: Option<&(bool, String)>,
     diff: Option<&str>,
     view: &View,
-    // How long it has been running, or took once it answered (D172).
+    // How long it has been running, or took once it answered (D172), and what the call is capped
+    // at when the model set a deadline (D152).
     elapsed: Option<&str>,
+    timeout: Option<u64>,
     theme: &Theme,
 ) -> (Vec<Row>, Color) {
     let (expand, spinner) = (view.expand, view.spinner);
@@ -1551,8 +1555,21 @@ fn tool_block(
     }
     // A stopwatch beside the call: running while it works, and the total once it has answered, so a
     // command that took a minute says so afterwards (D172).
+    // A stopwatch, and the deadline the call set when it set one: `· 5.0s of 30s` while it runs,
+    // and `· 30s limit` when there is no stopwatch to put it after (D152).
+    let mut tail = String::new();
     if let Some(elapsed) = elapsed {
-        header.push(Span::styled(format!(" · {elapsed}"), dim(theme)));
+        tail.push_str(&format!(" · {elapsed}"));
+    }
+    if let Some(seconds) = timeout {
+        if elapsed.is_some() {
+            tail.push_str(&format!(" of {seconds}s"));
+        } else {
+            tail.push_str(&format!(" · {seconds}s limit"));
+        }
+    }
+    if !tail.is_empty() {
+        header.push(Span::styled(tail, dim(theme)));
     }
     let mut rows = vec![Row::plain(header)];
     let more: Vec<&str> = detail_lines.collect();
@@ -3754,13 +3771,18 @@ fn worker_entries(worker: &Render) -> Vec<Entry> {
                 Some(Entry::Thinking(held)) => held.push_str(text),
                 _ => out.push(Entry::Thinking(text.clone())),
             },
-            Beat::Call { name, detail } => out.push(Entry::Tool {
+            Beat::Call {
+                name,
+                detail,
+                timeout,
+            } => out.push(Entry::Tool {
                 id: String::new(),
                 tasks: Vec::new(),
                 name: name.clone(),
                 detail: detail.clone(),
                 result: None,
                 diff: None,
+                timeout: *timeout,
                 spent: None,
             }),
             Beat::Result {
@@ -4651,6 +4673,7 @@ mod tests {
                 None,
                 &view(expand),
                 None,
+                None,
                 &Theme::default(),
             );
             let lines: Vec<String> = rows.iter().flat_map(|r| text(&wrap(r, 80))).collect();
@@ -4700,6 +4723,7 @@ mod tests {
             None,
             &view(false),
             None,
+            None,
             &Theme::default(),
         );
         let diff = "~\n-12 old line\n+12 new line, long enough to wrap around\n 13 next\n";
@@ -4709,6 +4733,7 @@ mod tests {
             Some(&(true, "edited src/x.rs at line 12".into())),
             Some(diff),
             &view(false),
+            None,
             None,
             &Theme::default(),
         );
@@ -4742,6 +4767,7 @@ mod tests {
             id: "c1".into(),
             name: "bash".into(),
             detail: "sleep 9".into(),
+            timeout: None,
         });
         if let Some(Entry::Tool { spent, .. }) = app.entries.last_mut() {
             *spent = Some(Spent::Running(now - Duration::from_secs(5)));
@@ -4761,12 +4787,63 @@ mod tests {
         worker.beats = vec![Beat::Call {
             name: "bash".into(),
             detail: "sleep 9".into(),
+            timeout: None,
         }];
         app.agent(AgentEvent::Workers(vec![worker]));
         app.worker = Some("runtime".into());
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let viewed = screen(&terminal);
         assert!(viewed.contains("⠋ $ sleep 9"), "{viewed}");
+    }
+
+    #[test]
+    fn a_call_with_a_deadline_says_what_it_is_capped_at() {
+        // D152: the deadline the model set belongs on the call's own line — after the stopwatch
+        // while it runs, and as a bare limit where there is no stopwatch to put it after.
+        let (rows, _) = tool_block(
+            "bash",
+            "sleep 9",
+            None,
+            None,
+            &view(false),
+            Some("5.0s"),
+            Some(30),
+            &Theme::default(),
+        );
+        assert_eq!(text(&wrap(&rows[0], 80)), ["⠋ $ sleep 9 · 5.0s of 30s"]);
+        let (rows, _) = tool_block(
+            "read",
+            "src/lib.rs",
+            None,
+            None,
+            &view(false),
+            None,
+            Some(30),
+            &Theme::default(),
+        );
+        assert_eq!(text(&wrap(&rows[0], 80)), ["⠋ read src/lib.rs · 30s limit"]);
+    }
+
+    #[test]
+    fn the_transcript_shows_the_deadline_the_call_was_given() {
+        // The whole path: the call event carries the timeout, and the frame draws it beside the
+        // stopwatch the frame's own clock keeps.
+        let mut app = bare_app();
+        let now = Instant::now();
+        app.now = now;
+        app.agent(AgentEvent::Call {
+            id: "c1".into(),
+            name: "bash".into(),
+            detail: "cargo test".into(),
+            timeout: Some(60),
+        });
+        if let Some(Entry::Tool { spent, .. }) = app.entries.last_mut() {
+            *spent = Some(Spent::Running(now - Duration::from_secs(5)));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("$ cargo test · 5.0s of 60s"), "{shown}");
     }
 
     #[test]
@@ -4781,6 +4858,7 @@ mod tests {
             id: "c1".into(),
             name: "bash".into(),
             detail: "sleep 9".into(),
+            timeout: None,
         });
         if let Some(Entry::Tool { spent, .. }) = app.entries.last_mut() {
             *spent = Some(Spent::Running(now - Duration::from_secs(5)));
@@ -4868,6 +4946,7 @@ mod tests {
             None,
             &view(false),
             Some("5.0s"),
+            None,
             &Theme::default(),
         );
         assert_eq!(text(&wrap(&rows[0], 80)), ["⠋ $ sleep 9 · 5.0s"]);
@@ -4879,6 +4958,7 @@ mod tests {
             None,
             &view(false),
             Some("1m 05s"),
+            None,
             &Theme::default(),
         );
         assert_eq!(text(&wrap(&rows[0], 80)), ["$ cargo test · 1m 05s"]);
@@ -4890,6 +4970,7 @@ mod tests {
             Some(&(true, "exit code 0".into())),
             None,
             &view(false),
+            None,
             None,
             &Theme::default(),
         );
@@ -5901,6 +5982,7 @@ mod tests {
                     Beat::Call {
                         name: "bash".into(),
                         detail: "grep -n reload src".into(),
+                        timeout: None,
                     },
                     Beat::Result {
                         ok: true,
@@ -6645,6 +6727,7 @@ mod tests {
             id: "test-call".into(),
             name: "bash".into(),
             detail: "cargo build".into(),
+            timeout: None,
         });
         app.agent(AgentEvent::Result {
             images: Vec::new(),
@@ -6721,6 +6804,7 @@ mod tests {
                 Some(&(true, "launch succeeded".into())),
                 None,
                 &view(false),
+                None,
                 None,
                 &theme,
             );

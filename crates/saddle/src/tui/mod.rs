@@ -99,6 +99,7 @@ use crate::provider::{self, Provider, Reply, Sink, ToolCall};
 use crate::session::{Session, Setup};
 use crate::store;
 use crate::tools::ToolOutput;
+use crate::tools::timeout;
 use sessions::SessionPicker;
 use settings::{Change, SettingsDialog, Values};
 use status::Template;
@@ -838,6 +839,7 @@ impl Ui for ChannelUi {
             id: call.id.clone(),
             name: call.name.clone(),
             detail: call_detail(call),
+            timeout: timeout::requested(call),
         });
     }
 

@@ -11,6 +11,7 @@ use crate::skills;
 use crate::skills::Skill;
 use crate::store::Point;
 use crate::team::{BusMessage, QueueItem, Render};
+use crate::tools::timeout;
 use crate::tui::image::Fit;
 use crate::tui::image::Protocol;
 use crate::tui::keys::Keys;
@@ -73,6 +74,8 @@ pub enum AgentEvent {
         id: String,
         name: String,
         detail: String,
+        /// `timeout_secs` from the call's own arguments, for the block to show (D152).
+        timeout: Option<u64>,
     },
     Result {
         ok: bool,
@@ -412,6 +415,9 @@ pub enum Entry {
         result: Option<(bool, String)>,
         /// The file change, for edit and write.
         diff: Option<String>,
+        /// The per-call deadline the model set, in seconds, so the block says what it is capped at
+        /// (D152). `None` when the call set none.
+        timeout: Option<u64>,
         /// How long the call has been running (D172). Only a `bash` call is timed, and a resumed
         /// one shows none: the store keeps what was said, not how long it took.
         spent: Option<Spent>,
@@ -2253,7 +2259,12 @@ impl App {
             }
             AgentEvent::Skills(skills) => self.skills = skills,
             AgentEvent::Note(s) => self.push(Entry::Note(NoteKind::Warn, display(&s))),
-            AgentEvent::Call { id, name, detail } => {
+            AgentEvent::Call {
+                id,
+                name,
+                detail,
+                timeout,
+            } => {
                 self.busy = Some(Activity::Tool(display(&name)));
                 let name = display(&name);
                 // A command is the call whose duration a person is waiting on, and the one that can
@@ -2265,6 +2276,7 @@ impl App {
                     tasks: Vec::new(),
                     name,
                     detail: display(&detail),
+                    timeout,
                     result: None,
                     diff: None,
                     spent,
@@ -2543,6 +2555,7 @@ pub fn entries_from(items: &[Item]) -> Vec<Entry> {
                         detail: format!("$ {command}"),
                         result: Some((shell_ok(output), display(output))),
                         diff: None,
+                        timeout: None,
                         spent: None,
                     }),
                     None => out.push(Entry::User(display(text))),
@@ -2578,6 +2591,7 @@ pub fn entries_from(items: &[Item]) -> Vec<Entry> {
                                 detail: display(&call_detail(c)),
                                 result: found.map(|(ok, content, _)| (*ok, display(content))),
                                 diff: found.and_then(|(_, _, d)| d.map(display)),
+                                timeout: timeout::requested(c),
                                 spent: None,
                             });
                         }
@@ -3015,6 +3029,7 @@ mod tests {
             id: "test-call".into(),
             name: "bash".into(),
             detail: "ls".into(),
+            timeout: None,
         });
         assert_eq!(a.busy, Some(Activity::Tool("bash".into())));
         a.agent(AgentEvent::Result {
@@ -3528,6 +3543,7 @@ mod tests {
             id: "c1".into(),
             name: "bash".into(),
             detail: "sleep 1".into(),
+            timeout: None,
         });
         let Some(Entry::Tool {
             spent: Some(Spent::Running(started)),
@@ -3588,6 +3604,7 @@ mod tests {
                     tasks: Vec::new(),
                     name: "bash".into(),
                     detail: "$ printf hi".into(),
+                    timeout: None,
                     result: Some((true, "exit code 0\n--- stdout ---\nhi".into())),
                     diff: None,
                     spent: None,
@@ -3597,6 +3614,7 @@ mod tests {
                     tasks: Vec::new(),
                     name: "bash".into(),
                     detail: "$ false".into(),
+                    timeout: None,
                     result: Some((false, "exit code 1".into())),
                     diff: None,
                     spent: None,
@@ -3652,6 +3670,7 @@ mod tests {
                     tasks: Vec::new(),
                     name: "read".into(),
                     detail: "src/x.rs".into(),
+                    timeout: None,
                     result: Some((true, "fn x() {}".into())),
                     diff: None,
                     spent: None,
@@ -4094,6 +4113,7 @@ mod tests {
             id: "launch".into(),
             name: "bash".into(),
             detail: "sleep 9".into(),
+            timeout: None,
         });
         a.agent(AgentEvent::Result {
             ok: true,
@@ -4116,6 +4136,7 @@ mod tests {
             id: "other".into(),
             name: "read".into(),
             detail: "file".into(),
+            timeout: None,
         });
         a.agent(AgentEvent::Result {
             ok: true,

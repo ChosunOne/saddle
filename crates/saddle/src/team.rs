@@ -17,6 +17,7 @@ use crate::provider::{Contribution, Image, Quota, Reply, Sink, ToolCall};
 use crate::session::{Session, provider_for, session_id};
 use crate::store::Store;
 use crate::tools::ToolOutput;
+use crate::tools::timeout;
 use crate::{provider, tools};
 use anyhow::{Context, Result};
 use saddle_cap::Principal;
@@ -243,6 +244,8 @@ pub enum Beat {
     Call {
         name: String,
         detail: String,
+        /// The deadline the call set, in seconds, for the worker's view to show (D152).
+        timeout: Option<u64>,
     },
     Result {
         ok: bool,
@@ -304,7 +307,7 @@ impl Render {
                     out.push("thinking:".into());
                     out.extend(text.lines().map(str::to_owned));
                 }
-                Beat::Call { name, detail } => out.push(format!("⚙ {name} {detail}")),
+                Beat::Call { name, detail, .. } => out.push(format!("⚙ {name} {detail}")),
                 Beat::Result { ok, content, .. } => {
                     let mark = if *ok { "✓" } else { "✗" };
                     out.push(format!("{mark} {}", first_line(content)));
@@ -1446,6 +1449,7 @@ impl Ui for WorkerUi {
             render.push(Beat::Call {
                 name: call.name.clone(),
                 detail,
+                timeout: timeout::requested(call),
             })
         });
     }

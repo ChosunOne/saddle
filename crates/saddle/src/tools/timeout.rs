@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::provider::ToolDef;
+use crate::provider::{ToolCall, ToolDef};
 
 #[derive(Debug)]
 pub struct TimedOut;
@@ -46,6 +46,17 @@ pub fn remaining(ceiling: Duration) -> Result<Duration> {
         return Err(TimedOut.into());
     }
     Ok(left)
+}
+
+/// The deadline this call asked for, in seconds, for an interface to show (D152). Absent when the
+/// model set none, whatever ceiling the tool or the budgets would otherwise apply.
+pub fn requested(call: &ToolCall) -> Option<u64> {
+    call.input
+        .as_ref()
+        .ok()
+        .and_then(|input| input.get("timeout_secs"))
+        .and_then(Value::as_u64)
+        .filter(|seconds| *seconds > 0)
 }
 
 pub fn parse(input: &Value) -> Result<Option<Instant>, String> {
@@ -103,6 +114,27 @@ pub fn arguments(input: &Value, schema: &Value) -> Value {
 mod tests {
     use super::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn a_call_deadline_is_read_from_its_own_arguments() {
+        // D152: only a deadline the model set is shown; the tool's or the budgets' own ceiling is
+        // not a number the call asked for.
+        let call = |input: Value| ToolCall {
+            id: "c".into(),
+            name: "bash".into(),
+            input: Ok(input),
+        };
+        assert_eq!(requested(&call(json!({"timeout_secs": 30}))), Some(30));
+        assert_eq!(requested(&call(json!({}))), None);
+        assert_eq!(requested(&call(json!({"timeout_secs": 0}))), None);
+        assert_eq!(requested(&call(json!({"timeout_secs": "30"}))), None);
+        let broken = ToolCall {
+            id: "c".into(),
+            name: "bash".into(),
+            input: Err("bad".into()),
+        };
+        assert_eq!(requested(&broken), None);
+    }
 
     #[test]
     fn timeout_is_optional_strict_and_overflow_checked() {

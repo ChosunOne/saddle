@@ -186,7 +186,10 @@ Every tool accepts optional `timeout_secs`, a positive integer number of seconds
 
 This is a **total wall-clock deadline**, including component initialization and host I/O waits.
 Omit it to retain existing behavior. Protected CPU/fuel, host-wait, command and MCP server limits
-still apply and may stop the call sooner; this option never raises them. Zero, negative, fractional,
+still apply and may stop the call sooner; this option never raises them. A deadline you set is
+visible in the interface on the call's own block — `· 5.0s of 30s` beside the stopwatch, or
+`· 30s limit` when the call is not timed — so a command that stops at its limit is read with the
+limit in view. Zero, negative, fractional,
 null, string and overflowing values are rejected before effects.
 
 The host adds the optional execution field to model-facing schemas and removes it from forwarded

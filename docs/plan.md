@@ -3560,6 +3560,13 @@ operations and D19's escaped-process-group limitation still apply. The deadline 
 unwind-safe, passed explicitly to the component worker and never leaks to subsequent invocations.
 No SDK ABI, component build variant, digest or operational authority changes.
 
+The deadline a model set is visible where the call is: the transcript's tool block says
+`· 5.0s of 30s` beside its stopwatch while it runs and after it answers, or `· 30s limit` for a call
+that is not timed (D172), and a worker's own view and line mode say the same. The interface reads it
+from the call's own arguments, so the tool's or the budgets' ceiling is not shown as though the call
+had asked for it. A background start's `timeout_secs` likewise caps that task's lifetime, and the
+launch call carries the number it was given.
+
 **D153.** Background shell work is explicit and session-owned, not a detached `&` command or a
 persistent Wasm instance. The bash guest accepts `background: true`, returns a host-generated task id
 promptly, and the `tasks` guest owns the `status`, `list`, `cancel` and `wait` workflows and their

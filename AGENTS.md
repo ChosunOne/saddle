@@ -151,7 +151,8 @@ repinning. `docs/plugins.md` lists every key/default. Keep budget defaults in `s
 permission checks independent, and do not add a hard-coded second ceiling in a guest or adapter.
 
 Every tool accepts optional `timeout_secs`, a positive integer total wall-clock deadline (D152),
-including component work and host waits, without raising protected limits. The host consumes the
+including component work and host waits, without raising protected limits. A deadline the model set
+is shown on the call's own block (`· 5.0s of 30s`, or `· 30s limit` when the call is not timed). The host consumes the
 execution option unless the underlying schema already declares it. Expiry stops local execution and
 returns a failed result; cleanup/restore/audit still finish, committed effects are not rolled back,
 and remote MCP work cannot be guaranteed cancelled. Omission retains existing defaults.
