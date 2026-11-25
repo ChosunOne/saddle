@@ -390,7 +390,8 @@ struct Completion {
     shown: bool,
 }
 
-/// How many completions are kept before the oldest already-shown one is dropped.
+/// How many completions are kept: past this the oldest one the lead's model has already read is
+/// dropped, and an unread one that has to go is counted and said in the next notice.
 const COMPLETIONS: usize = 32;
 
 impl Default for Manager {
