@@ -581,7 +581,8 @@ impl Manager {
         let peer = self.lookup(to).ok_or_else(|| {
             if to == "lead" {
                 "a worker cannot message the lead: the lead is told when a worker comes to rest \
-                 and reads it with status or inspect, so put findings and questions in your reply"
+                 and reads it with status (action: status), so put findings and questions in your \
+                 reply"
                     .to_owned()
             } else {
                 format!(
@@ -1174,13 +1175,13 @@ fn notice_line(name: &str, state: &str) -> String {
     };
     if state == "failed" {
         format!(
-            "worker {name} {what}; read it with the agent tool (action: status or inspect), then \
-             start another if the work continues"
+            "worker {name} {what}; read it with the agent tool (action: status), then start \
+             another if the work continues"
         )
     } else {
         format!(
-            "worker {name} {what}; read it with the agent tool (action: status or inspect) and \
-             answer with action send"
+            "worker {name} {what}; read it with the agent tool (action: status) and answer with \
+             action send"
         )
     }
 }
@@ -1441,7 +1442,7 @@ mod tests {
         assert_eq!(model.len(), 1);
         assert!(model[0].contains("runtime"), "{model:?}");
         assert!(model[0].contains("is waiting"), "{model:?}");
-        assert!(model[0].contains("status or inspect"), "{model:?}");
+        assert!(model[0].contains("action: status"), "{model:?}");
         assert!(model[0].contains("action send"), "{model:?}");
         assert!(!team.pending());
         assert!(team.notices(true).is_empty(), "one turn carries it");
@@ -1472,7 +1473,7 @@ mod tests {
         let team = with_peers(vec![("a", "idle", false)]);
         let refused = team.say("a", "lead", "a finding").unwrap_err();
         assert!(refused.contains("cannot message the lead"), "{refused}");
-        assert!(refused.contains("status or inspect"), "{refused}");
+        assert!(refused.contains("action: status"), "{refused}");
         assert!(refused.contains("reply"), "{refused}");
     }
 

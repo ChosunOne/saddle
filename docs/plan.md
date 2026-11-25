@@ -4762,8 +4762,8 @@ coming to rest — idle after a turn, interrupted, or failed — records a compl
 shared state, so the lead learns of it without asking: a running lead's next request carries
 `[saddle worker notification] …`, naming the worker and its state, and an idle lead is started on a
 follow-up turn exactly as a finished task starts one (D174). The notice carries host-owned state
-only, never the worker's words; the lead reads those with `status` or `inspect` and answers with
-`send`, which wakes the worker. An identical rest is one notice until it is read, and a stop the
+only, never the worker's words; the lead reads those with `status` — whose answer says the worker
+is waiting — and replies with `send`, which wakes it. An identical rest is one notice until it is read, and a stop the
 lead itself asked for is not announced. The worker's thread sleeps on its job channel rather than
 polling its steering handle: a message, an interrupt or a stop is the event that wakes it, and a
 one-shot run waits while any worker is still starting or mid-turn instead of closing the session

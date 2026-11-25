@@ -801,8 +801,8 @@ never one of them. A worker ends its turn with its finding, question or blocker,
 woken by an event rather than by polling — a worker that comes to rest (idle, interrupted or
 failed) is named in a `[saddle worker notification]` the lead's next request carries, or, when the
 lead is idle, in a follow-up turn of its own, the same way a finished background task does it
-(D174). The note says which worker and what it is now; the lead reads its reply with `status` or
-`inspect` and answers with `send`, which wakes it. A stop the lead asked for is not announced, and
+(D174). The note says which worker and what it is now; the lead reads its reply with `status`
+(which also says the worker is waiting) and answers with `send`, which wakes it. A stop the lead asked for is not announced, and
 an identical rest is one notice until it is read.
 
 The bus board shows who spoke to whom and each message in full, wrapped and scrollable; the audit

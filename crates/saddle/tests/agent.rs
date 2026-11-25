@@ -1686,7 +1686,7 @@ fn a_worker_at_rest_wakes_the_lead_without_a_poll() {
         .expect("the lead's next request carries the worker's completion");
     let carried = wake.body.to_string();
     assert!(carried.contains("worker runtime"), "{carried}");
-    assert!(carried.contains("status or inspect"), "{carried}");
+    assert!(carried.contains("action: status"), "{carried}");
     assert!(
         !carried.contains("the reload path is in session.rs"),
         "the notice names the worker, never its words: {carried}"
