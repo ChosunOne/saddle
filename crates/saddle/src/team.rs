@@ -440,18 +440,19 @@ impl Manager {
     }
 
     /// Records that a worker came to rest, so the lead's next turn carries it: an event, never
-    /// something the lead has to poll for (D195). The same worker resting in the same state is one
-    /// notice until it is read, so a worker that idles twice is not announced twice.
+    /// something the lead has to poll for (D195).
+    ///
+    /// One worker resting in the same state is one wakeup until the lead has read it, however many
+    /// times the person's transcript has shown it and whatever other workers did in between: the
+    /// reader that ends the coalescing is the lead's next turn, not the next idle tick.
     pub fn completed(&self, name: &str, state: &str) {
         let Ok(mut done) = self.completions.lock() else {
             return;
         };
-        if let Some(last) = done.back()
-            && last.name == name
-            && last.state == state
-            && !last.announced
-            && !last.shown
-        {
+        let unread = |completion: &&Completion| !completion.announced;
+        if done.iter().any(|completion| {
+            unread(&completion) && completion.name == name && completion.state == state
+        }) {
             return;
         }
         done.push_back(Completion {
@@ -461,11 +462,10 @@ impl Manager {
             shown: false,
         });
         while done.len() > COMPLETIONS {
-            // Drop the oldest one both readers have seen; with none, the oldest anyway.
-            match done
-                .iter()
-                .position(|completion| completion.announced && completion.shown)
-            {
+            // Bound the record by dropping the oldest the model has already read. A notice nobody
+            // has read yet is kept unless every entry is unread, which takes a team far past the
+            // worker limit and a lead that has not taken a turn in between.
+            match done.iter().position(|completion| completion.announced) {
                 Some(index) => {
                     done.remove(index);
                 }
@@ -1470,6 +1470,27 @@ mod tests {
         assert!(!worker.pending());
         assert!(worker.notices(true).is_empty());
         assert_eq!(lead.notices(true).len(), 1);
+    }
+
+    #[test]
+    fn one_unread_rest_is_one_wakeup_whatever_the_transcript_showed() {
+        // D195: the person's transcript showing the line does not mean the lead has answered it,
+        // so the next rest in the same state adds nothing to read. D195's reader is the turn.
+        let team = Manager::default();
+        team.completed("a", "idle");
+        assert_eq!(team.notices(false).len(), 1, "the transcript shows it once");
+        team.completed("a", "idle");
+        assert!(team.pending());
+        let model = team.notices(true);
+        assert_eq!(model.len(), 1, "one wakeup, not two: {model:?}");
+        assert!(!team.pending());
+        // A rest after the read is a new event; one in a different state is its own event; and a
+        // repeat of an unread rest stays one, even with another worker in between.
+        team.completed("a", "idle");
+        team.completed("b", "idle");
+        team.completed("a", "idle");
+        team.completed("a", "failed");
+        assert_eq!(team.notices(true).len(), 3);
     }
 
     #[test]
