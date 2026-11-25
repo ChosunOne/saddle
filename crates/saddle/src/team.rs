@@ -371,6 +371,9 @@ pub struct Manager {
     /// What the workers have finished since the lead last read it, oldest first, so the lead is
     /// woken by an event rather than by asking (D195).
     completions: Arc<Mutex<VecDeque<Completion>>>,
+    /// Rests that did not fit the queue and were never announced, said in the next notice rather
+    /// than lost silently (D195).
+    dropped: Arc<Mutex<usize>>,
     owns: bool,
 }
 
@@ -397,6 +400,7 @@ impl Default for Manager {
             bus: Default::default(),
             queue: Default::default(),
             completions: Default::default(),
+            dropped: Default::default(),
             owns: true,
         }
     }
@@ -410,6 +414,7 @@ impl Manager {
             bus: self.bus.clone(),
             queue: self.queue.clone(),
             completions: self.completions.clone(),
+            dropped: self.dropped.clone(),
             owns: false,
         }
     }
@@ -470,7 +475,12 @@ impl Manager {
                     done.remove(index);
                 }
                 None => {
+                    // Every entry is unread: the oldest is lost, so the count is said in the next
+                    // notice instead of the rest vanishing (D195).
                     done.pop_front();
+                    if let Ok(mut dropped) = self.dropped.lock() {
+                        *dropped += 1;
+                    }
                 }
             }
         }
@@ -482,6 +492,9 @@ impl Manager {
     pub fn pending(&self) -> bool {
         if !self.owns {
             return false;
+        }
+        if self.dropped.lock().map(|count| *count > 0).unwrap_or(false) {
+            return true;
         }
         self.completions
             .lock()
@@ -526,6 +539,16 @@ impl Manager {
                 completion.shown = true;
             }
             out.push(notice_line(&completion.name, &completion.state));
+        }
+        if model
+            && let Ok(mut dropped) = self.dropped.lock()
+            && *dropped > 0
+        {
+            out.push(format!(
+                "{dropped} earlier worker completions did not fit the notice list; read the team \
+                 with agent status or roster"
+            ));
+            *dropped = 0;
         }
         out
     }
@@ -1433,6 +1456,7 @@ mod tests {
             bus: Default::default(),
             queue: Default::default(),
             completions: Default::default(),
+            dropped: Default::default(),
             owns: true,
         }
     }
@@ -1457,6 +1481,27 @@ mod tests {
         // The person's own transcript still shows the line, once.
         assert_eq!(team.notices(false).len(), 1);
         assert!(team.notices(false).is_empty());
+    }
+
+    #[test]
+    fn a_rest_that_does_not_fit_is_counted_rather_than_lost_silently() {
+        // D195: the notice list is bounded, and a drop must not leave the lead believing it has
+        // heard from everyone.
+        let team = Manager::default();
+        for index in 0..COMPLETIONS {
+            team.completed(&format!("w{index}"), "idle");
+        }
+        team.completed("overflow", "idle");
+        assert!(team.pending());
+        let notes = team.notices(true);
+        assert!(
+            notes
+                .last()
+                .is_some_and(|note| note.contains("1 earlier worker completions")),
+            "{notes:?}"
+        );
+        assert!(!team.pending());
+        assert!(team.notices(true).is_empty());
     }
 
     #[test]
