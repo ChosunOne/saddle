@@ -149,6 +149,37 @@ fn launch_profile_runtime_is_independent_of_bash_and_revocable() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn a_named_launch_starts_in_the_workspace_it_claims() {
+    // D184: a launch's cwd is the workspace it claims, so a repository tool finds its repository
+    // without being handed an absolute path; only a profile that claims neither the read (D190)
+    // nor the write (D193) starts in the private launch directory.
+    if saddle_sandbox::launch_availability().is_err() {
+        return;
+    }
+    let env = Env::new();
+    let workspace = env.ws.path().to_str().unwrap().to_owned();
+    env.write_config("[launch-profiles.where]\nexecutable = '/usr/bin/pwd'\n");
+    env.write_override("[agent]\nrun-binary = [{profile='where'}]\n");
+    let (ok, text) = env.tool("run_binary", json!({"profile":"where","argv":[]}));
+    assert!(ok, "{text}");
+    assert!(
+        text.contains(&workspace),
+        "cwd is not the workspace: {text}"
+    );
+
+    env.write_override(
+        "[agent]\nrun-binary = [{profile='where'}]\n\
+         [launch-profiles.where]\nread-workspace = false\nwrite-workspace = false\n",
+    );
+    let (ok, text) = env.tool("run_binary", json!({"profile":"where","argv":[]}));
+    assert!(ok, "{text}");
+    assert!(
+        !text.contains(&workspace),
+        "a profile claiming no workspace kept the checkout as cwd: {text}"
+    );
+}
 #[test]
 fn launch_profile_fields_inherit_replace_and_clear() {
     let env = Env::new();

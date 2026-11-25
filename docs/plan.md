@@ -4613,8 +4613,10 @@ decision for that name carries no ordinary `exec` or filesystem authority.
 
 The runtime is one shipped foreground tool with literal arguments and a named launch grant
 independent of `exec`. Scope binding and exact profile delegation use the normal component gate.
-The host resolves the definition into a separate child spec: private cwd, no writable claims, a
-minimal environment, and dedicated read-only claims (including the workspace by default, D190). Network uses D79
+The host resolves the definition into a separate child spec: the workspace as cwd when the profile
+claims it (D190, D193) and a private launch directory when it claims neither, no writable claims
+beyond those, a minimal environment, and dedicated read-only claims (including the workspace by
+default, D190). Network uses D79
 but only when both the profile's exact HTTPS/443 host list and the caller's grants allow it. The
 ordinary sandbox is unchanged. The helper validates and pins the whitelisted ELF executable (see
 D188), refuses executable paths overlapping protected locations or agent write reach, and executes

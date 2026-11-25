@@ -610,7 +610,9 @@ rather than loosening it.
   and helpers; reload does not refresh an existing baseline (D189). Do not add these paths to
   roots, file-tool access, or the ordinary exec sandbox. Named launches read the current workspace
   by default; `read-workspace = false` opts out without changing the extra `read` list (D190)
-  and `write-workspace = false` removes the D193 write claim.
+  and `write-workspace = false` removes the D193 write claim. The launch's cwd is that workspace
+  while either claim is held, so a repository tool finds its repository; a profile holding neither
+  starts in a private launch directory (D184).
   `ssh-hosts` narrows named-launch CONNECT tunnels on port 22 to exact hosts, and each tunnel
   still needs a delegated `net` grant with `scheme = "ssh"` (D192). No SSH agent socket is exposed.
 - **`exec` is Linux-only** and needs landlock ABI 3 as a hard requirement. A command now has a network

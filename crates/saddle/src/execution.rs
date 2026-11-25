@@ -365,9 +365,18 @@ pub fn launch(
     } else {
         None
     };
+    // D184: a launch starts where its relative paths belong. For a profile that claims the
+    // workspace — the default, read (D190) or write (D193) — that is the checkout itself, so a
+    // repository tool finds its repository without being told a path. A profile that claims
+    // neither starts in the private launch directory instead, rather than in a tree it cannot open.
+    let cwd = if profile.read_workspace || profile.write_workspace {
+        session.setup.workspace.clone()
+    } else {
+        dir.path().to_path_buf()
+    };
     let spec = SandboxSpec {
         argv: [program.to_owned()].into_iter().chain(argv).collect(),
-        cwd: dir.path().into(),
+        cwd: cwd.into(),
         env: environment,
         // D190: the workspace is a read claim of the named launch only. The helper still
         // opens it without symlink traversal and checks for protected-path overlap.
