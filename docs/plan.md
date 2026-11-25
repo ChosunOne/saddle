@@ -4289,6 +4289,11 @@ shipped WASI component.
   when its reply landed, and the view carries both, so a task started before this interface drew it
   — or surviving a `/reload` — is still measured from its own start rather than from when a row first
   appeared. `/tasks` prints the same numbers.
+- **One spinner per frame.** A call in flight is marked by its pending shade and its stopwatch, and
+  by the frame's activity line (`running bash  esc to cancel`). The block itself does not lead with a
+  second spinner where that line already names it: two spinners for one command read as two things
+  happening. A worker's transcript, or the page's detail, has no activity line of its own, so there
+  the block keeps its spinner.
 - **Only a command is timed.** A `read`, `ls` or `grep` is a call into the session's own state that
   takes milliseconds, and a number on every block is noise; `bash` is the call a person waits on and
   the one that starts background work. The timer is a property of the tool's name, in one place.

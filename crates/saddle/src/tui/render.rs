@@ -1162,6 +1162,9 @@ struct View {
     expand: bool,
     thinking: bool,
     spinner: usize,
+    /// True when the frame's activity line already names the call in flight, so a tool block that
+    /// is still running does not lead with a second spinner (D172).
+    activity: bool,
     /// The transcript width, so an image's reserved rows match what is drawn (D59).
     room: (u16, u16),
     /// Whether the terminal can draw a picture, which decides whether an attachment gets rows
@@ -1530,7 +1533,7 @@ fn tool_block(
     let mut detail_lines = detail.lines();
     let first = detail_lines.next().unwrap_or_default().to_owned();
     let mut header = Vec::new();
-    if result.is_none() {
+    if result.is_none() && !view.activity {
         header.push(Span::styled(
             format!("{} ", SPINNER[spinner % SPINNER.len()]),
             Style::new().fg(theme.warning),
@@ -1744,7 +1747,11 @@ struct Picture {
     cells: image::Fit,
 }
 
-fn transcript_with_images(app: &mut App, width: u16) -> (Vec<Line<'static>>, Vec<At>) {
+fn transcript_with_images(
+    app: &mut App,
+    width: u16,
+    activity: bool,
+) -> (Vec<Line<'static>>, Vec<At>) {
     let mut images: Vec<At> = Vec::new();
     let mut lines = Vec::new();
     for i in 0..app.entries.len() {
@@ -1763,6 +1770,7 @@ fn transcript_with_images(app: &mut App, width: u16) -> (Vec<Line<'static>>, Vec
                 expand: app.expand_tools,
                 thinking: app.show_thinking,
                 spinner: app.spinner,
+                activity,
                 room: (width, image::MAX_ROWS),
                 images: app.protocol != image::Protocol::Text,
                 scale: app.header.math_scale,
@@ -2069,7 +2077,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     {
         draw_worker(frame, &worker, app, transcript_area);
     } else {
-        draw_transcript(frame, app, transcript_area);
+        // This transcript is the one the frame's activity line speaks for, so a call in flight is
+        // named there and does not spin in its own block as well (D172).
+        draw_transcript(frame, app, transcript_area, true);
     }
     draw_panels(frame, &app.plugin_panels, panels_area, &app.theme);
 
@@ -3399,7 +3409,7 @@ fn draw_overview(frame: &mut Frame<'_>, app: &mut App, selected: usize, area: Re
     match selected {
         // A session's detail is its own transcript, drawn by the lead's renderer from the start
         // of what is kept, so PgUp walks back through its turns and reasoning (D195).
-        0 => draw_transcript(frame, app, detail_inner),
+        0 => draw_transcript(frame, app, detail_inner, false),
         index if index < sessions => {
             let worker = app.team[index - 1].clone();
             draw_worker_transcript(frame, &worker, app, detail_inner);
@@ -3716,7 +3726,7 @@ fn draw_worker_transcript(frame: &mut Frame<'_>, worker: &Render, app: &mut App,
     let lead_entries = mem::replace(&mut app.entries, entries);
     let (lead_scroll, lead_total) = (app.scroll, app.total_lines);
     app.scroll = app.worker_scroll;
-    draw_transcript(frame, app, body);
+    draw_transcript(frame, app, body, false);
     app.worker_scroll = app.scroll;
     app.worker_total = app.total_lines;
     app.worker_height = app.view_height;
@@ -3785,8 +3795,8 @@ fn worker_entries(worker: &Render) -> Vec<Entry> {
     out
 }
 
-fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let (mut lines, at) = transcript_with_images(app, area.width.max(1));
+fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect, activity: bool) {
+    let (mut lines, at) = transcript_with_images(app, area.width.max(1), activity);
     let mut placed: Vec<Placed> = Vec::new();
     let height = area.height as usize;
     let total = lines.len();
@@ -3920,6 +3930,7 @@ mod tests {
     use crate::provider::Image;
     use crate::provider::Usage;
     use crate::store::{Point, PointKind, Summary};
+    use crate::team::{Beat, Render};
     use crate::tui::app::{Action, Cell, Selection};
     use crate::tui::app::{AgentEvent, Header, Spent};
     use crate::tui::keys::Keys;
@@ -4034,7 +4045,7 @@ mod tests {
         // The marker line, then one blank row per row of the picture, and nothing else: this entry
         // is the last one in the transcript. Four columns narrower and the fit is one row shorter,
         // which is what the layout used to reserve against.
-        let (lines, at) = transcript_with_images(&mut app, area.width);
+        let (lines, at) = transcript_with_images(&mut app, area.width, false);
         let start = at[0].line;
         let reserved = lines.len().saturating_sub(start);
         assert_eq!(reserved, box_.rows as usize, "{box_:?}");
@@ -4065,7 +4076,7 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let seen = app.seen.as_ref().unwrap();
         let (width, height, total) = (seen.area.width, app.view_height, app.total_lines);
-        let (_, at) = transcript_with_images(&mut app, width);
+        let (_, at) = transcript_with_images(&mut app, width, false);
         let start = at[0].line;
 
         // Put the picture's own first row above the top of the view, so that one row of it is off
@@ -4150,6 +4161,7 @@ mod tests {
             expand: true,
             thinking: false,
             spinner: 0,
+            activity: false,
             room: (80, 24),
             images: false,
             scale: 1.0,
@@ -4225,6 +4237,7 @@ mod tests {
                 expand: true,
                 thinking: false,
                 spinner: 0,
+                activity: false,
                 room: (80, 24),
                 images: false,
                 scale: 1.0,
@@ -4242,6 +4255,7 @@ mod tests {
                 expand: true,
                 thinking: false,
                 spinner: 0,
+                activity: false,
                 room: (80, 24),
                 images: false,
                 scale: 1.0,
@@ -4274,6 +4288,7 @@ mod tests {
                 expand: true,
                 thinking: false,
                 spinner: 0,
+                activity: false,
                 room: (80, 24),
                 images: false,
                 scale: 1.0,
@@ -4616,6 +4631,7 @@ mod tests {
             expand,
             thinking: false,
             spinner: 0,
+            activity: false,
             room: (80, image::MAX_ROWS),
             images: false,
             scale: 1.0,
@@ -4711,6 +4727,46 @@ mod tests {
     }
 
     #[test]
+    fn a_call_in_flight_spins_at_the_bottom_and_not_in_its_block() {
+        // D172: the frame's activity line already says what is running, so the block it is running
+        // from does not lead with a second spinner. The pending shade and the stopwatch still mark
+        // the call, and a worker's view keeps its block spinner because that frame has no activity
+        // line of its own.
+        let mut app = bare_app();
+        let now = Instant::now();
+        app.now = now;
+        app.agent(AgentEvent::Call {
+            id: "c1".into(),
+            name: "bash".into(),
+            detail: "sleep 9".into(),
+        });
+        if let Some(Entry::Tool { spent, .. }) = app.entries.last_mut() {
+            *spent = Some(Spent::Running(now - Duration::from_secs(5)));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("running bash"), "{shown}");
+        assert!(shown.contains("$ sleep 9 · 5.0s"), "{shown}");
+        assert_eq!(shown.matches('⠋').count(), 1, "one spinner: {shown}");
+
+        let mut worker = Render {
+            name: "runtime".into(),
+            state: "running".into(),
+            ..Render::default()
+        };
+        worker.beats = vec![Beat::Call {
+            name: "bash".into(),
+            detail: "sleep 9".into(),
+        }];
+        app.agent(AgentEvent::Workers(vec![worker]));
+        app.worker = Some("runtime".into());
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let viewed = screen(&terminal);
+        assert!(viewed.contains("⠋ $ sleep 9"), "{viewed}");
+    }
+
+    #[test]
     fn the_transcript_ticks_a_running_command_and_a_running_task_from_its_own_start() {
         // The whole path, not just the block: the frame's clock times a call in flight (D172), and a
         // task is timed from when the session started it, which may be before this interface drew a
@@ -4726,7 +4782,7 @@ mod tests {
         if let Some(Entry::Tool { spent, .. }) = app.entries.last_mut() {
             *spent = Some(Spent::Running(now - Duration::from_secs(5)));
         }
-        let (lines, _) = transcript_with_images(&mut app, 80);
+        let (lines, _) = transcript_with_images(&mut app, 80, false);
         let shown = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
         assert!(shown.contains("⠋ $ sleep 9 · 5.0s"), "{shown}");
 
@@ -4745,7 +4801,7 @@ mod tests {
             stopped: None,
         }]));
         app.now = now;
-        let (lines, _) = transcript_with_images(&mut app, 120);
+        let (lines, _) = transcript_with_images(&mut app, 120, false);
         let shown = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
         assert!(shown.contains("[task-1: running · 12s]"), "{shown}");
         assert!(shown.contains("⠋ $ sleep 9"), "still pending: {shown}");
@@ -4759,7 +4815,7 @@ mod tests {
             stopped: Some(now - Duration::from_secs(2)),
         }]));
         app.now = now + Duration::from_secs(30);
-        let (lines, _) = transcript_with_images(&mut app, 120);
+        let (lines, _) = transcript_with_images(&mut app, 120, false);
         let shown = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
         assert!(shown.contains("[task-1: completed · 10s]"), "{shown}");
     }
@@ -5422,7 +5478,7 @@ mod tests {
             "and therefore $$\\frac{1}{3}$$ holds".into(),
         ));
         app.cache.push(None);
-        let (lines, at) = transcript_with_images(&mut app, 80);
+        let (lines, at) = transcript_with_images(&mut app, 80, false);
         assert_eq!(at.len(), 1, "one formula, one picture");
         let At { line, picture, .. } = &at[0];
         // The marker line is blanked, and the picture's cells are the box the terminal is asked
@@ -5485,7 +5541,7 @@ mod tests {
         app.entries
             .push(Entry::Assistant("so \\(x^2\\) holds".into()));
         app.cache.push(None);
-        let (lines, at) = transcript_with_images(&mut app, 80);
+        let (lines, at) = transcript_with_images(&mut app, 80, false);
         assert_eq!(at.len(), 1, "one formula, one picture");
         assert_eq!(at[0].column, Some(3), "{:?}", plain(&lines[at[0].line]));
         assert!(
@@ -5544,7 +5600,7 @@ mod tests {
                 .into(),
         ));
         app.cache.push(None);
-        let (lines, at) = transcript_with_images(&mut app, 80);
+        let (lines, at) = transcript_with_images(&mut app, 80, false);
         assert_eq!(at.len(), 1, "one fence is a formula");
         let shown: Vec<String> = lines.iter().map(plain).collect();
         assert_eq!(
@@ -5574,7 +5630,7 @@ mod tests {
         app.entries
             .push(Entry::Assistant("```typst-math\nzzz qqq\n```\n".into()));
         app.cache.push(None);
-        let (lines, at) = transcript_with_images(&mut app, 80);
+        let (lines, at) = transcript_with_images(&mut app, 80, false);
         assert!(at.is_empty(), "nothing was typeset, so nothing is placed");
         let shown: Vec<String> = lines.iter().map(plain).collect();
         assert!(
@@ -5646,7 +5702,7 @@ mod tests {
         app.entries
             .push(Entry::Assistant("if $x^2$ holds then".into()));
         app.cache.push(None);
-        let (lines, at) = transcript_with_images(&mut app, 80);
+        let (lines, at) = transcript_with_images(&mut app, 80, false);
         assert_eq!(at.len(), 1, "one formula, one picture");
         let At {
             line,
@@ -5691,7 +5747,7 @@ mod tests {
         app.entries
             .push(Entry::Assistant(format!("{words} $\\frac{{a}}{{b}}$ end")));
         app.cache.push(None);
-        let (lines, at) = transcript_with_images(&mut app, 40);
+        let (lines, at) = transcript_with_images(&mut app, 40, false);
         assert_eq!(at.len(), 1, "one formula, one picture");
         let At {
             line,
@@ -5722,7 +5778,7 @@ mod tests {
         app.entries
             .push(Entry::Assistant("if $x^2$ holds then".into()));
         app.cache.push(None);
-        let (lines, at) = transcript_with_images(&mut app, 80);
+        let (lines, at) = transcript_with_images(&mut app, 80, false);
         assert!(at.is_empty(), "nothing to place");
         assert!(
             lines.iter().any(|l| plain(l).contains("$x^2$")),
@@ -5740,7 +5796,7 @@ mod tests {
             "| a | b |\n|---|---|\n| $x^2$ | y |".into(),
         ));
         app.cache.push(None);
-        let (lines, at) = transcript_with_images(&mut app, 80);
+        let (lines, at) = transcript_with_images(&mut app, 80, false);
         assert!(at.is_empty(), "nothing to place");
         assert!(
             lines.iter().any(|l| plain(l).contains("$x^2$")),
@@ -6700,7 +6756,7 @@ mod tests {
             "a push moves it by \\(\\delta\\). The very same fixed rule\nbecomes\n$$\nr^\\top \\delta > b-r^\\top h_q.\n$$\n\nand the rule could be $r^\\top h>b(c)$ itself".into(),
         ));
         app.cache.push(None);
-        let (lines, at) = transcript_with_images(&mut app, 80);
+        let (lines, at) = transcript_with_images(&mut app, 80, false);
         assert_eq!(at.len(), 3, "one in a line, one block, one more in a line");
         assert!(
             lines.iter().all(|l| !plain(l).contains("\\top")),
@@ -6720,7 +6776,7 @@ mod tests {
             "becomes\n$$\nr^\\foo > b\n\\qquad \\bar{y} < c\n$$".into(),
         ));
         app.cache.push(None);
-        let (lines, at) = transcript_with_images(&mut app, 80);
+        let (lines, at) = transcript_with_images(&mut app, 80, false);
         assert!(at.is_empty(), "a terminal with no pictures places none");
         let shown: Vec<String> = lines
             .iter()
