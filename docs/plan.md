@@ -4734,7 +4734,13 @@ A worker is an ordinary `Agent` and `Session` on its own thread, with its own au
 session id and spending ledger, derived by re-reading the same protected configuration, so it
 inherits only the grants the session has and cannot exceed them. Workers cannot start workers.
 A brief is written under the session's private temporary directory and read by the host from
-there, with no root involved; the audit records its path, hash and size, never its words. `tool-limits.team-workers` caps a
+there, with no root involved; the audit records its path, hash and size, never its words. `start`
+may also name the model the worker runs on: empty keeps the lead's provider and model, a bare name
+is a model of the lead's own provider, and `provider/model` names another only when that prefix is
+a provider the run knows — a model's own name may contain a slash. The worker's provider is built
+by the same rules as `/model` (D91), from the same config and stored credential, and the choice is
+audited with the start; `status`, `roster` and the page name the model in force, so a worker on a
+different model is never a guess. `tool-limits.team-workers` caps a
 team, and `team-steps`, when set, caps each worker turn: it has no default, because a turn has no
 default request limit (D37). A worker's conversation is saved like any other and marked as a
 worker, so it is readable by id and through `session_query` (`sessions.worker = 1`) and never

@@ -3379,6 +3379,9 @@ fn draw_overview(frame: &mut Frame<'_>, app: &mut App, selected: usize, area: Re
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(format!("{glyph} {state} "), Style::new().fg(colour)),
+                    // Which model it is on, so the page says what a worker costs before a person
+                    // opens it (D195).
+                    Span::styled(format!("· {} ", worker.model), dim(&app.theme)),
                 ]),
                 "nothing yet",
             )

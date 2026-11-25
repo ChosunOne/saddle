@@ -42,6 +42,7 @@ use saddle_policy::audit::sha256_hex;
 use saddle_policy::{AuditLog, Decision, Engine, Kind, Request, net_decision};
 use serde_json::{Value, json};
 
+use crate::auth::AuthStore;
 use crate::config::UserConfig;
 use crate::config::launch_profiles::{
     self, Baselines as LaunchBaselines, Resolved as LaunchProfile,
@@ -624,6 +625,20 @@ fn configured_tool_roots(setup: &Setup) -> Vec<ToolRoot> {
         });
     }
     roots
+}
+
+/// Builds a provider from this run's config and stored credentials, so `/model` and a worker's
+/// model are chosen by the same rules: one place a named provider and model become a client (D91,
+/// D195). The credentials come from `auth.json`, else the provider's environment variable.
+pub fn provider_for(paths: &Paths, name: &str, model: Option<&str>) -> Result<provider::Provider> {
+    let user = UserConfig::load(&paths.user_config())?;
+    let auth = AuthStore::load(&paths.auth_store())?;
+    let reported = provider::Reported::stored(&paths.reported_windows());
+    let config = provider::resolve(name, &user.providers, model)?;
+    Ok(
+        provider::Provider::new(name, config, auth.key(name), &reported)
+            .with_stored_oauth(&paths.auth_store()),
+    )
 }
 
 pub struct Session {

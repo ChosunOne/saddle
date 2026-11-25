@@ -12,9 +12,9 @@
 use crate::agent::{self, Agent, End, Steer, Ui};
 use crate::cancel;
 use crate::compact;
-use crate::config::CompactionConfig;
+use crate::config::{CompactionConfig, UserConfig};
 use crate::provider::{Contribution, Image, Quota, Reply, Sink, ToolCall};
-use crate::session::{Session, session_id};
+use crate::session::{Session, provider_for, session_id};
 use crate::store::Store;
 use crate::tools::ToolOutput;
 use crate::{provider, tools};
@@ -260,6 +260,8 @@ pub enum Beat {
 pub struct Render {
     pub name: String,
     pub brief: String,
+    /// The provider and model this worker runs on, as `provider/model` (D195).
+    pub model: String,
     pub state: String,
     pub turns: usize,
     pub beats: Vec<Beat>,
@@ -658,8 +660,8 @@ impl Manager {
             .ok_or_else(|| format!("no worker {name:?} in this team"))?;
         let render = peer.render();
         let mut out = format!(
-            "{} · {}\nbrief: {}\nturns: {}\n",
-            render.name, render.state, render.brief, render.turns
+            "{} · {}\nmodel: {}\nbrief: {}\nturns: {}\n",
+            render.name, render.state, render.model, render.brief, render.turns
         );
         if let Some(error) = &render.error {
             out.push_str(&format!("error: {error}\n"));
@@ -695,8 +697,8 @@ impl Manager {
         for (name, peer) in map.iter() {
             let render = peer.render();
             out.push_str(&format!(
-                "{name} · {} · {} turns\n",
-                render.state, render.turns
+                "{name} · {} · {} · {} turns\n",
+                render.state, render.model, render.turns
             ));
         }
         out
@@ -892,7 +894,8 @@ impl Manager {
 
     /// Starts a worker. The brief is written inside the session's temporary root and read back
     /// through the read gate, so the exact text the worker was given is a branch item attributable
-    /// to a real file rather than an unrecorded argument (D195).
+    /// to a real file rather than an unrecorded argument (D195). `model` empty keeps the lead's own
+    /// provider and model; otherwise it names a model, or `provider/model` (D195).
     pub fn start(
         &mut self,
         session: &mut Session,
@@ -900,6 +903,7 @@ impl Manager {
         origin_principal: &str,
         name: &str,
         brief: &str,
+        model: &str,
     ) -> Result<Result<String, String>> {
         if origin_principal != "plugin.standard-agent"
             && origin_principal != "plugin.standard-swarm"
@@ -966,6 +970,32 @@ impl Manager {
             Err(error) => return Ok(Err(format!("could not read the worker's brief: {error}"))),
         };
         let brief_label = brief_path.display().to_string();
+        // Which model the worker runs on: its brief may name one, and a bare name is a model of
+        // this conversation's own provider (D195). Empty keeps the lead's provider and model, twin
+        // and all, so a refreshed credential is not re-read from disk.
+        let chosen = model.trim();
+        let provider = if chosen.is_empty() {
+            match session.provider_twin() {
+                Some(provider) => provider,
+                None => {
+                    return Ok(Err(
+                        "no provider is active in this session to give a worker".into(),
+                    ));
+                }
+            }
+        } else {
+            match worker_provider(session, chosen) {
+                Ok(provider) => provider,
+                Err(why) => return Ok(Err(why)),
+            }
+        };
+        if provider.missing_key().is_some() {
+            return Ok(Err(
+                "the provider needs a credential a worker cannot hold".into()
+            ));
+        }
+        let provider_name = provider.name.clone();
+        let model_label = format!("{}/{}", provider.name, provider.config.model);
         session.audit.event(
             Kind::Decision,
             Some(who),
@@ -977,6 +1007,7 @@ impl Manager {
                 "brief": brief_label,
                 "brief_sha256": sha256_hex(text.as_bytes()),
                 "brief_bytes": text.len(),
+                "model": model_label,
                 "workers": live + 1,
             }),
             "live worker started from a delegated brief",
@@ -993,22 +1024,8 @@ impl Manager {
             child.setup.workspace.clone(),
         )
         .context("opening the worker's conversation store")?;
-        let provider_name = session
-            .provider_twin()
-            .map(|provider| provider.name.clone())
-            .unwrap_or_else(|| "worker".into());
         let conversation = store.begin_worker(&provider_name, "")?;
         store.name(&conversation, name)?;
-        let Some(provider) = session.provider_twin() else {
-            return Ok(Err(
-                "no provider is active in this session to give a worker".into(),
-            ));
-        };
-        if provider.missing_key().is_some() {
-            return Ok(Err(
-                "the provider needs a credential a worker cannot hold".into()
-            ));
-        }
         let system = agent::system_prompt(&child, &[]);
         let mut declared = tools::definitions();
         declared.extend(child.declared_tools());
@@ -1034,6 +1051,7 @@ impl Manager {
         let render = Arc::new(Mutex::new(Render {
             name: name.to_owned(),
             brief: first_line(&text),
+            model: model_label.clone(),
             state: "starting".into(),
             ..Render::default()
         }));
@@ -1059,7 +1077,7 @@ impl Manager {
         }
         let _ = jobs.send(Job::Start(text));
         Ok(Ok(format!(
-            "started {name} (conversation {conversation}) · inspect, interrupt or stop it from the team view (ctrl+b); peers reach it with agent send"
+            "started {name} on {model_label} (conversation {conversation}) · inspect, interrupt or stop it from the team view (ctrl+b); peers reach it with agent send"
         )))
     }
 }
@@ -1218,6 +1236,37 @@ fn notice_line(name: &str, state: &str) -> String {
     }
 }
 
+/// The provider an `agent start` model asks for (D195). A bare name is a model of this
+/// conversation's own provider; `provider/model` names another only when the prefix is a provider
+/// this run knows, because a model's own name may carry a slash (`meta-llama/Llama-3`).
+fn worker_provider(session: &Session, chosen: &str) -> Result<provider::Provider, String> {
+    let paths = &session.setup.paths;
+    let user = UserConfig::load(&paths.user_config())
+        .map_err(|error| format!("could not read the provider configuration: {error:#}"))?;
+    let (named, model) = split_pick(chosen, |name| {
+        provider::endpoint(name, &user.providers).is_ok()
+    });
+    let name = match named {
+        Some(name) => name.to_owned(),
+        None => match session.provider_twin() {
+            Some(provider) => provider.name,
+            None => return Err("no provider is active in this session to give a worker".into()),
+        },
+    };
+    provider_for(paths, &name, Some(model))
+        .map_err(|error| format!("could not give a worker {chosen:?}: {error:#}"))
+}
+
+/// Splits `provider/model` only when the prefix is a provider this run knows (D195).
+fn split_pick<'a>(chosen: &'a str, known: impl Fn(&str) -> bool) -> (Option<&'a str>, &'a str) {
+    match chosen.split_once('/') {
+        Some((prefix, model)) if !prefix.is_empty() && !model.is_empty() && known(prefix) => {
+            (Some(prefix), model)
+        }
+        _ => (None, chosen),
+    }
+}
+
 fn valid_name(name: &str) -> Result<(), String> {
     // "lead" is what a peer message from the conversation in hand is called, so a worker with that
     // name would make whose words they are ambiguous (D195).
@@ -1262,9 +1311,16 @@ pub fn manage(
     let caller = origin.principal.clone();
     let record = arguments(&op);
     let result = match op {
-        Operation::Start(message) => {
+        Operation::Start(brief) => {
             let mut team = mem::take(&mut session.team);
-            let result = team.start(session, who, &caller, &message.target, &message.text);
+            let result = team.start(
+                session,
+                who,
+                &caller,
+                &brief.name,
+                &brief.brief,
+                &brief.model,
+            );
             session.team = team;
             result?
         }
@@ -1305,7 +1361,13 @@ pub fn manage(
 /// What the audit records: who it addresses and how much it says, never the words themselves.
 pub fn arguments(op: &Operation) -> serde_json::Value {
     match op {
-        Operation::Start(message) | Operation::Send(message) => json!({
+        Operation::Start(brief) => json!({
+            "target": brief.name,
+            "model": brief.model,
+            "text_bytes": brief.brief.len(),
+            "text_sha256": sha256_hex(brief.brief.as_bytes()),
+        }),
+        Operation::Send(message) => json!({
             "target": message.target,
             "text_bytes": message.text.len(),
             "text_sha256": sha256_hex(message.text.as_bytes()),
@@ -1460,6 +1522,24 @@ mod tests {
             dropped: Default::default(),
             owns: true,
         }
+    }
+
+    #[test]
+    fn a_model_pick_names_a_provider_only_when_the_prefix_is_one() {
+        // D195: `provider/model` is a provider only when that prefix is a provider this run knows;
+        // a model's own name may carry a slash (`meta-llama/Llama-3`).
+        let known = |name: &str| name == "openai" || name == "mock";
+        assert_eq!(split_pick("gpt-x", &known), (None, "gpt-x"));
+        assert_eq!(
+            split_pick("openai/gpt-x", &known),
+            (Some("openai"), "gpt-x")
+        );
+        assert_eq!(
+            split_pick("meta-llama/Llama-3", &known),
+            (None, "meta-llama/Llama-3")
+        );
+        assert_eq!(split_pick("/x", &known), (None, "/x"));
+        assert_eq!(split_pick("openai/", &known), (None, "openai/"));
     }
 
     #[test]

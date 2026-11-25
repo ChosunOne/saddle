@@ -38,10 +38,13 @@ world ui-hook { import saddle:widgets/types@0.1.0; export saddle:plugin/ui@0.1.0
 // A message's words are delivered to its target and kept in memory for the team's bus view.
 interface workers {
     record message { target: string, text: string }
+    /// A worker's start: its name, the brief it is given, and the model it runs on. An empty model
+    /// is the conversation's own (D195).
+    record brief { name: string, brief: string, model: string }
     record job { command: string, why: string }
     record done { id: u64, ok: bool }
     variant operation {
-        start(message),
+        start(brief),
         send(message),
         inspect(string),
         interrupt(string),

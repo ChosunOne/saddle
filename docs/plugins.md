@@ -785,7 +785,11 @@ Ask the agent to start a worker, or call it yourself with
 `saddle tool agent '{"action":"start","name":"runtime","brief":"trace the reload path; return file:line evidence"}'`
 — with `model-invoke` and `[standard-tools] agent = ["transcript-read", "model-invoke", "fs-read", "fs-write"]`
 granted. `agent` also takes `send`, `status`, `interrupt` and `stop`; `swarm` with no arguments
-lists live workers. A worker is a real Saddle session: it owns a conversation, audit log and
+lists live workers. `start` takes an optional `model`: leave it out and the worker runs on the
+provider and model of the conversation that started it; a bare name is another model of that same
+provider, and `provider/model` chooses another configured provider when that prefix is one. The
+worker's provider and its credential are built exactly as `/model` builds them (D91), and
+`status`, `roster` and the team page say which model a worker is on. A worker is a real Saddle session: it owns a conversation, audit log and
 model-spend ledger derived from the same policy, and it cannot start another worker. **ctrl+b**
 (or `/workers`) opens a page with the sessions in a list on the left and the selected one drawn
 large beside it: your own conversation first, then each worker, then the team's **bus** and

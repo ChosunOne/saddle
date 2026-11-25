@@ -87,7 +87,9 @@ queue** (D196); tab and the arrows move through the list, enter opens one to ste
 `PgUp`/`PgDn` walk the selected transcript's turns and a board's full text, and interrupts or stops
 one turn while the rest keep running. `agent` also takes `enqueue`, `claim`,
 `finish`, `queue` and `bus`: a claimed command is run by that member's own `bash` under its own
-grants, and the queue only orders the work. A worker cannot send to the lead; when it comes to
+grants, and the queue only orders the work. `start` also takes `model`: empty keeps the lead's provider and model, a bare name is a model of
+the lead's own provider, and `provider/model` names another when that prefix is a known provider;
+the worker's `status` and the page name the model in force. A worker cannot send to the lead; when it comes to
 rest (idle, interrupted or failed) the lead is handed a notice naming it — mid-turn at its next
 request, or as an idle follow-up turn like a finished task's (D174, D195) — and answers with
 `send`, which wakes the worker; `status` on a waiting worker says so. They also keep

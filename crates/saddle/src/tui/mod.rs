@@ -2544,12 +2544,7 @@ impl Controller {
     /// A provider as config.toml has it, except for the model: a model chosen for one conversation
     /// is not in the file, so it is handed in rather than read back (D91).
     fn build_model(&self, name: &str, model: Option<&str>) -> Result<Provider> {
-        let user = UserConfig::load(&self.paths.user_config())?;
-        let auth = AuthStore::load(&self.paths.auth_store())?;
-        let reported = provider::Reported::stored(&self.paths.reported_windows());
-        let config = provider::resolve(name, &user.providers, model)?;
-        Ok(Provider::new(name, config, auth.key(name), &reported)
-            .with_stored_oauth(&self.paths.auth_store()))
+        session::provider_for(&self.paths, name, model)
     }
 
     fn switch(&self, app: &mut App, provider: Provider) {

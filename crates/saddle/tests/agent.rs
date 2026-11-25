@@ -1645,6 +1645,52 @@ fn reading_the_first_conversation(
 }
 
 #[test]
+fn a_worker_can_be_started_on_a_model_of_its_own() {
+    // D195: `agent start` can name the model the worker runs on, and the worker's own requests
+    // carry it while the lead's stay on the lead's model.
+    let (base, seen) = serve_dynamic(10, |_, body| {
+        let text = body.to_string();
+        if text.contains("You are the worker `runtime`") {
+            sse_response(&openai_sse("worker finished", &[]))
+        } else if text.contains("started runtime") {
+            sse_response(&openai_sse("done", &[]))
+        } else {
+            sse_response(&openai_sse(
+                "",
+                &[(
+                    "t",
+                    "agent",
+                    serde_json::json!({
+                        "action":"start","name":"runtime","brief":"find the reload path",
+                        "model":"mock-model-2"
+                    }),
+                )],
+            ))
+        }
+    });
+    let env = Env::new(Api::Openai, &base);
+    env.write_override(
+        "[agent]\nmodel-invoke = { tokens-per-session = 100000, cost-per-session = 10.0 }\ntranscript-read = {}\n",
+    );
+    let out = env.saddle(&["run", "start a worker on another model"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter().any(|s| s.body["model"] == "mock-model-2"
+            && s.body.to_string().contains("You are the worker `runtime`")),
+        "the worker's own requests use the model it was started on"
+    );
+    assert!(
+        seen.iter().any(|s| s.body["model"] == "mock-model"),
+        "the lead kept its own model"
+    );
+    assert!(
+        !seen.iter().any(|s| s.body["model"] == "mock-model-2"
+            && !s.body.to_string().contains("You are the worker `runtime`")),
+        "only the worker moved to the chosen model"
+    );
+}
+#[test]
 fn a_worker_at_rest_wakes_the_lead_without_a_poll() {
     // D195: the lead starts a worker and then says nothing. When the worker's turn ends the run is
     // woken by that event, and the lead's next request carries a notice naming it — no `status`
