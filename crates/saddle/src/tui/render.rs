@@ -2088,10 +2088,21 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .map(|panel| panel.rows.len() + 2)
         .sum::<usize>()
         .min(area.height as usize / 3);
+    // A question takes a band of its own just above the input box, so it never covers the
+    // transcript and the person can see what was said before it (D197).
+    let ask_rows = app.ask.as_ref().map_or(0, |dialog| {
+        ask_height(
+            dialog,
+            area.width as usize,
+            area.height as usize,
+            &app.theme,
+        )
+    });
     let [
         transcript_area,
         panels_area,
         queue_area,
+        ask_area,
         activity_area,
         editor_area,
         status_area,
@@ -2099,6 +2110,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Constraint::Min(1),
         Constraint::Length(panel_rows as u16),
         Constraint::Length(queue_rows as u16),
+        Constraint::Length(ask_rows as u16),
         Constraint::Length(1),
         Constraint::Length(editor_rows as u16 + 2),
         Constraint::Length(1),
@@ -2288,11 +2300,14 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         app.open_url_at = link;
         surface = Some(seen);
     }
+    // The other dialogs are modals drawn over everything; the question is a band with its own rows.
+    let modal = surface.is_some();
+    let mut band = None;
     if let Some(dialog) = &app.ask {
-        // The question is what the turn is waiting on, so it is drawn over every other dialog, and
-        // a click on one of those links underneath is not a click at all (D86, D197).
+        // A click on a link of a dialog underneath is not a click at all (D86).
         app.open_url_at = None;
-        surface = Some(draw_ask(frame, dialog, area, &app.theme));
+        band = Some(ask_area);
+        surface = Some(draw_ask(frame, dialog, ask_area, &app.theme));
     }
     let had_dialog = app.dialog_seen.is_some();
     let opened = !had_dialog && surface.is_some();
@@ -2303,8 +2318,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         app.selection = None;
     }
     if app.dialog_seen.is_some() {
-        // A dialog owns the screen: no picture is drawn anywhere while it is open (D161).
-        app.covered.push(area);
+        // A modal owns the screen, so no picture is drawn while it is open; the question owns only
+        // its own band, and the transcript's pictures stay where they are (D161, D197).
+        let covered = if modal { area } else { band.unwrap_or(area) };
+        app.covered.push(covered);
     }
     shade_dialog(frame, app);
 }
@@ -2351,47 +2368,89 @@ fn shade_dialog(frame: &mut Frame<'_>, app: &App) {
 ///
 /// One keystroke either way, and escape leaves the conversation where it is: the move is the
 /// person's decision already, and the summary is the only part of it that spends a request.
-/// A tool's question (D197): the choices, the preview of the one under the cursor, and the line the
-/// person writes their note or their own answer on.
+/// The rows a question needs, capped so the transcript keeps most of the screen (D197).
+fn ask_height(dialog: &AskDialog, width: usize, screen: usize, theme: &Theme) -> usize {
+    let inner = width.saturating_sub(2);
+    let natural = ask_body(dialog, inner, usize::MAX, theme).0.len() + 2;
+    natural.min(screen.saturating_sub(6).max(4))
+}
+
+/// A tool's question (D197): the choices with their subtext, the preview of the one under the
+/// cursor, and the line the person writes their note or their own answer on. Laid out as a band of
+/// its own, so the transcript above it is never covered.
 fn draw_ask(frame: &mut Frame<'_>, dialog: &AskDialog, area: Rect, theme: &Theme) -> Seen {
-    let width = area.width.saturating_sub(4).clamp(30, 84);
-    let inner = width.saturating_sub(2) as usize;
-    // Everything the box can hold; a preview that does not fit is cut rather than pushing the help
-    // line off the bottom, where nobody would find it.
-    let room = area.height.saturating_sub(2) as usize;
+    let inner = area.width.saturating_sub(2) as usize;
+    let (lines, cursor) = ask_body(dialog, inner, area.height.saturating_sub(2) as usize, theme);
+    // What each row says, cut to the cells it occupies: a drag copies the text that was drawn (D87).
+    let text: Vec<String> = lines
+        .iter()
+        .map(|line| plain(line).chars().take(inner).collect())
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(theme.border_accent))
+                .title(" Question "),
+        ),
+        area,
+    );
+    if let Some((row, col)) = cursor {
+        frame.set_cursor_position(Position::new(
+            area.x + 1 + col as u16,
+            area.y + 1 + row as u16,
+        ));
+    }
+    Seen {
+        area: Rect::new(
+            area.x.saturating_add(1),
+            area.y.saturating_add(1),
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+        ),
+        top: 0,
+        lines: text,
+        pictures: Vec::new(),
+    }
+}
+
+/// The question's rows, at most `room` of them, and the cell inside the box the cursor belongs on.
+fn ask_body(
+    dialog: &AskDialog,
+    inner: usize,
+    room: usize,
+    theme: &Theme,
+) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
     let accent = Style::new().fg(theme.accent);
     let question = &dialog.asked.question;
-    let mut lines: Vec<Line> = Vec::new();
-    for line in wrap_columns(&question.question, inner.saturating_sub(2), 6) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for line in wrap_columns(&question.question, inner, 3) {
         lines.push(Line::from(Span::styled(
             line,
             Style::new().add_modifier(Modifier::BOLD),
         )));
     }
-    if !question.choices.is_empty() {
-        lines.push(Line::default());
-    }
     let rows = dialog.rows();
     for (index, choice) in question.choices.iter().enumerate() {
-        let mut row = format!("{}. {}", index + 1, choice.label);
-        if !choice.description.is_empty() {
-            row.push_str("  ");
-            row.push_str(&choice.description);
-        }
-        lines.push(ask_row(
+        lines.extend(choice_rows(
+            inner,
+            index + 1,
+            &choice.label,
+            &choice.description,
+            choice.recommended,
             index == dialog.selected,
-            &clip(&row, inner.saturating_sub(2)),
-            &accent,
+            theme,
         ));
     }
     if question.allow_other && rows > 0 {
-        lines.push(ask_row(
+        lines.extend(choice_rows(
+            inner,
+            question.choices.len() + 1,
+            "Type something…",
+            "an answer of your own",
+            false,
             dialog.selected + 1 == rows,
-            &clip(
-                &format!("{}. Type something…", question.choices.len() + 1),
-                inner.saturating_sub(2),
-            ),
-            &accent,
+            theme,
         ));
     }
     // The preview belongs to the choice under the cursor, and only to a choice.
@@ -2402,14 +2461,16 @@ fn draw_ask(frame: &mut Frame<'_>, dialog: &AskDialog, area: Rect, theme: &Theme
         .unwrap_or_default();
     let editing = usize::from(!matches!(dialog.stage, AskStage::Choosing));
     let error = usize::from(dialog.error.is_some());
-    // A blank line, the text line and the error if there is one, the help line, then the preview's
-    // own blank and label.
-    let fixed = lines.len() + 1 + editing + error + 1;
-    let left = room.saturating_sub(fixed + 2);
-    if !preview.is_empty() && left >= 1 {
+    // A blank, the line being written if there is one, the error if there is one, the help line.
+    let reserved = 1 + editing + error + 1;
+    if lines.len().saturating_add(reserved) > room {
+        lines.truncate(room.saturating_sub(reserved));
+    }
+    let left = room.saturating_sub(lines.len().saturating_add(reserved));
+    if !preview.is_empty() && left >= 3 {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled("preview", dim(theme))));
-        for line in wrap_columns(preview, inner, left) {
+        for line in wrap_columns(preview, inner, left - 2) {
             lines.push(Line::from(Span::styled(line, Style::new())));
         }
     }
@@ -2443,20 +2504,46 @@ fn draw_ask(frame: &mut Frame<'_>, dialog: &AskDialog, area: Rect, theme: &Theme
         AskStage::Typing { .. } => "enter send this answer · esc back",
     };
     lines.push(Line::from(Span::styled(help, dim(theme))));
-    modal(frame, area, width, " Question ", lines, cursor, theme).seen
+    (lines, cursor)
 }
 
-/// One row of the list, marked with `›` while it is the one the cursor is on.
-fn ask_row(selected: bool, text: &str, accent: &Style) -> Line<'static> {
+/// One choice: its number and label, the recommended marker on the one the asker advises, and the
+/// description as subtext under it in a quieter colour than the label (D197).
+fn choice_rows(
+    inner: usize,
+    number: usize,
+    label: &str,
+    description: &str,
+    recommended: bool,
+    selected: bool,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let accent = Style::new().fg(theme.accent);
     let style = if selected {
         Style::new().add_modifier(Modifier::BOLD)
     } else {
         Style::new()
     };
-    Line::from(vec![
-        Span::styled(if selected { "› " } else { "  " }, *accent),
-        Span::styled(text.to_owned(), style),
-    ])
+    let marker = if recommended { "  (recommended)" } else { "" };
+    let budget = inner.saturating_sub(2 + marker.chars().count()).max(4);
+    let mut spans = vec![
+        Span::styled(if selected { "› " } else { "  " }, accent),
+        Span::styled(format!("{number}. {}", clip(label, budget)), style),
+    ];
+    if recommended {
+        spans.push(Span::styled(marker, Style::new().fg(theme.success)));
+    }
+    let mut lines = vec![Line::from(spans)];
+    for line in wrap_columns(description, inner.saturating_sub(4), 2) {
+        if line.is_empty() {
+            continue;
+        }
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(line, dim(theme)),
+        ]));
+    }
+    lines
 }
 
 fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm, area: Rect, theme: &Theme) -> Seen {
@@ -6871,7 +6958,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tools_question_draws_its_choices_preview_and_note_line_over_any_other_dialog() {
+    fn a_tools_question_takes_a_band_of_its_own_with_subtext_and_a_recommendation() {
         let mut app = bare_app();
         let (asked, _answers) = Asked::pair(AskedQuestion {
             question: "Which approach should the loader take?".into(),
@@ -6881,28 +6968,40 @@ mod tests {
                     description: "cleaner boundary".into(),
                     preview: "+ let host = prepare(component)?;\n- let host = legacy(component)?;"
                         .into(),
+                    recommended: true,
                 },
                 AskChoice {
                     label: "patch it".into(),
                     description: String::new(),
                     preview: String::new(),
+                    recommended: false,
                 },
             ],
             allow_other: true,
             allow_note: true,
         });
-        let mut dialog = AskDialog::new(asked);
-        dialog.selected = 0;
-        app.ask = Some(dialog);
+        app.ask = Some(AskDialog::new(asked));
+        app.note(
+            NoteKind::Info,
+            "a line of the conversation that must stay visible",
+        );
         let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let all = screen(&terminal);
+        // The question owns a band of its own: what was said above it is still on the screen.
+        assert!(
+            all.contains("a line of the conversation that must stay visible"),
+            "the transcript was covered:\n{all}"
+        );
         for want in [
             "Question",
             "Which approach should the loader take?",
-            "› 1. rewrite it  cleaner boundary",
+            "› 1. rewrite it",
+            "(recommended)",
+            "cleaner boundary",
             "2. patch it",
             "3. Type something…",
+            "an answer of your own",
             "preview",
             "+ let host = prepare(component)?;",
             "↑↓ choose · enter select · 1-9 pick · esc dismiss",
@@ -6910,7 +7009,33 @@ mod tests {
             assert!(all.contains(want), "missing {want:?} in\n{all}");
         }
 
-        // The note line belongs to the choice the person picked, and the cursor sits on it.
+        // The label is the theme's text; its subtext is the muted colour, so the two read apart.
+        let row_of = |needle: &str| {
+            let buf = terminal.backend().buffer();
+            (0..buf.area.height).find(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains(needle)
+            })
+        };
+        let subtext = row_of("cleaner boundary").expect("the subtext row");
+        let below = row_of("Which approach").expect("the question row");
+        assert!(
+            subtext > below,
+            "the question sits at the bottom, under the transcript and above the input box"
+        );
+        let buf = terminal.backend().buffer();
+        let col = (0..buf.area.width)
+            .find(|x| buf[(*x, subtext)].symbol() == "c")
+            .unwrap();
+        assert_eq!(
+            buf[(col, subtext)].style().fg,
+            Some(app.theme.muted),
+            "the subtext is drawn in the quiet colour"
+        );
+
+        // The chosen row asks for its note in the same band, and the cursor sits on that line.
         if let Some(dialog) = &mut app.ask {
             dialog.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             assert!(matches!(dialog.stage, AskStage::Noting { .. }));
@@ -6921,6 +7046,10 @@ mod tests {
         assert!(
             all.contains("enter answer with this note"),
             "the help line says what enter does: {all}"
+        );
+        assert!(
+            all.contains("a line of the conversation that must stay visible"),
+            "the note line did not cover the transcript either:\n{all}"
         );
     }
 

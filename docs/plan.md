@@ -4821,9 +4821,11 @@ queue and bus are per-team and in memory, so they do not survive a restart, and 
 longer counts as a member that may enqueue, claim or finish.
 
 **D197.** A tool can ask the person a question, and the answer is theirs to give. The service is
-`saddle:host/ask`: a question, its choices, and for each choice a preview that the interface shows
-while that choice is selected; the person may attach a note to the choice they make, or type an
-answer of their own. The shipped `ask` tool is the guest — it owns the schema, the bounds and how the
+`saddle:host/ask`: a question; its choices, each with a label, a line of subtext under it drawn in the
+theme's muted colour, an optional preview shown while that choice is selected, and at most one marked
+as the one the asker recommends; the person may attach a note to the choice they make, or type an
+answer of their own. The question is a band of its own above the input box, so it never covers the
+transcript: a decision is easier with what led to it still on the screen. The shipped `ask` tool is the guest — it owns the schema, the bounds and how the
 answer is put to the model — and the host owns the surface, the wait and the record. Asking is
 available to any component registered as a tool (`tool` scope), because a question grants no resource
 and the person may always dismiss it; the dialog belongs to the tool that asked, and a dismissal is
@@ -4838,7 +4840,7 @@ the host extends the invocation's deadline across the question and restores it a
 question by size and hash and the answer by choice index and by the note's or typed answer's size and
 hash, never either's words (D10, D24). The bounds are `[tool-limits]` (`ask-bytes`, `ask-options`,
 `ask-option-bytes`, `ask-preview-bytes`, `ask-reply-bytes`); the guest refuses a question the
-interface could not draw before it reaches the person.
+interface could not draw before it reaches the person, including one that recommends two choices.
 
 ## 4. Scope enumeration
 

@@ -34,7 +34,8 @@ pub struct Arguments {
     pub allow_note: bool,
 }
 
-/// One choice as the model writes it: a label, an optional line about it, and an optional preview.
+/// One choice as the model writes it: a label, an optional line of subtext under it, an optional
+/// preview shown while it is selected, and whether it is the one being recommended.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Choice {
@@ -43,6 +44,8 @@ pub struct Choice {
     pub description: String,
     #[serde(default)]
     pub preview: String,
+    #[serde(default)]
+    pub recommended: bool,
 }
 
 impl Arguments {
@@ -66,6 +69,15 @@ impl Arguments {
                  allow an answer of the person's own, or allow a note"
                     .into(),
             );
+        }
+        if self
+            .options
+            .iter()
+            .filter(|choice| choice.recommended)
+            .count()
+            > 1
+        {
+            return Err("at most one choice can be recommended".into());
         }
         for (index, choice) in self.options.iter().enumerate() {
             let number = index + 1;
@@ -148,12 +160,13 @@ impl Tool for Ask {
             name: "ask".into(),
             description: "ask the person a question when only they can decide — a preference, which \
                           of two acceptable directions to take, or a detail you cannot read from the \
-                          repository. Each choice may carry a preview, shown while that choice is \
-                          selected, so a diff, a sketch or a paragraph can be judged rather than \
-                          only a label; the person may attach a note to the choice they make, or type \
-                          an answer of their own. The result is their answer. This is not a \
-                          permission prompt: a grant decides what you may do. A dismissed question \
-                          is not consent, so do not ask it again."
+                          repository. Each choice has a label and may carry a line of subtext under \
+                          it, a preview shown while that choice is selected (a diff, a sketch or a \
+                          paragraph, so it can be judged rather than only a label), and \
+                          `recommended: true` on the one you advise. The person may attach a note to \
+                          the choice they make, or type an answer of their own. The result is their \
+                          answer. This is not a permission prompt: a grant decides what you may do. \
+                          A dismissed question is not consent, so do not ask it again."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -175,11 +188,16 @@ impl Tool for Ask {
                                 },
                                 "description": {
                                     "type": "string",
-                                    "description": "one line on what the choice means, or empty",
+                                    "description": "subtext under the label, drawn in a quieter colour; one line, or empty",
                                 },
                                 "preview": {
                                     "type": "string",
                                     "description": "what the person sees while this choice is selected: a diff, a sketch or a paragraph, or empty",
+                                },
+                                "recommended": {
+                                    "type": "boolean",
+                                    "default": false,
+                                    "description": "mark this as the choice you advise; at most one may be recommended",
                                 },
                             },
                             "required": ["label"],
@@ -224,6 +242,7 @@ impl Tool for Ask {
                             label: choice.label.clone(),
                             description: choice.description.clone(),
                             preview: choice.preview.clone(),
+                            recommended: choice.recommended,
                         })
                         .collect(),
                     allow_other: arguments.allow_other,
@@ -257,6 +276,7 @@ mod tests {
                     label: (*label).into(),
                     description: (*description).into(),
                     preview: (*preview).into(),
+                    recommended: false,
                 })
                 .collect(),
             allow_other: true,
@@ -280,6 +300,21 @@ mod tests {
             arguments(&[("a", "", &"p".repeat(budgets::ask_preview_bytes() + 1))])
                 .validate()
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn at_most_one_choice_is_the_one_being_recommended() {
+        let mut question = arguments(&[("a", "", ""), ("b", "", "")]);
+        assert!(question.validate().is_ok());
+        question.options[1].recommended = true;
+        assert!(question.validate().is_ok());
+        question.options[0].recommended = true;
+        assert!(
+            question
+                .validate()
+                .unwrap_err()
+                .contains("at most one choice")
         );
     }
 

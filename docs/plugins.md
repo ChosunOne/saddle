@@ -285,9 +285,10 @@ steer publication through a swapped symlink or multiply-linked inode outside its
   headers. Credentials stay in core and only reach the configured provider/fixed Exa endpoints.
   Search snapshots are principal-scoped, not shared with siblings; expansion rechecks current endpoint
   reach and reload evicts data above narrowed cache budgets.
-- **ask:** a question to the person, with numbered choices, an optional preview shown for the choice
-  under the cursor, an optional note attached to the choice they make, and a choice whose answer they
-  type themselves. The guest owns the schema, the bounds and the wording returned to the model; the
+- **ask:** a question to the person, drawn in a band above the input box so the transcript stays
+  visible: numbered choices, each with a line of subtext in a quieter colour, an optional preview
+  shown for the choice under the cursor, and at most one choice marked `recommended`. The person may
+  attach a note to the choice they make, or type an answer of their own. The guest owns the schema, the bounds and the wording returned to the model; the
   host owns the surface, the wait and the audit. Asking needs no grant beyond the `tool` registration
   that runs the component: the person may always dismiss the question, and a dismissal is reported as
   a failed result the model must not ask again. A session with nobody to reach — a piped `saddle run`,
