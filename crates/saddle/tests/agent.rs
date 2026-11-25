@@ -1662,7 +1662,7 @@ fn a_worker_can_be_started_on_a_model_of_its_own() {
                     "agent",
                     serde_json::json!({
                         "action":"start","name":"runtime","brief":"find the reload path",
-                        "model":"mock-model-2"
+                        "provider":"mock","model":"mock-model-2"
                     }),
                 )],
             ))
@@ -1688,6 +1688,45 @@ fn a_worker_can_be_started_on_a_model_of_its_own() {
         !seen.iter().any(|s| s.body["model"] == "mock-model-2"
             && !s.body.to_string().contains("You are the worker `runtime`")),
         "only the worker moved to the chosen model"
+    );
+}
+#[test]
+fn a_worker_started_on_an_unknown_provider_is_refused() {
+    // D195: provider and model are separate choices, and a provider this run does not know is a
+    // failed call rather than a worker on some fallback.
+    let (base, seen) = serve_dynamic(8, |_, body| {
+        let text = body.to_string();
+        if text.contains("could not give a worker") {
+            sse_response(&openai_sse("done", &[]))
+        } else {
+            sse_response(&openai_sse(
+                "",
+                &[(
+                    "t",
+                    "agent",
+                    serde_json::json!({
+                        "action":"start","name":"runtime","brief":"find it",
+                        "provider":"nowhere","model":"x"
+                    }),
+                )],
+            ))
+        }
+    });
+    let env = Env::new(Api::Openai, &base);
+    env.write_override(
+        "[agent]\nmodel-invoke = { tokens-per-session = 100000, cost-per-session = 10.0 }\ntranscript-read = {}\n",
+    );
+    let out = env.saddle(&["run", "start a worker on a provider that does not exist"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let shown = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(shown.contains("could not give a worker"), "{shown}");
+    assert!(shown.contains("nowhere"), "{shown}");
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .all(|s| !s.body.to_string().contains("You are the worker `runtime`")),
+        "no worker conversation was started"
     );
 }
 #[test]

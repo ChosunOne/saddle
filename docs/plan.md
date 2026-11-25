@@ -4735,12 +4735,13 @@ session id and spending ledger, derived by re-reading the same protected configu
 inherits only the grants the session has and cannot exceed them. Workers cannot start workers.
 A brief is written under the session's private temporary directory and read by the host from
 there, with no root involved; the audit records its path, hash and size, never its words. `start`
-may also name the model the worker runs on: empty keeps the lead's provider and model, a bare name
-is a model of the lead's own provider, and `provider/model` names another only when that prefix is
-a provider the run knows — a model's own name may contain a slash. The worker's provider is built
-by the same rules as `/model` (D91), from the same config and stored credential, and the choice is
-audited with the start; `status`, `roster` and the page name the model in force, so a worker on a
-different model is never a guess. `tool-limits.team-workers` caps a
+may also name the worker's `provider` and `model`, as two separate arguments, and neither is parsed
+out of the other: an empty provider is the lead's own, an empty model is that provider's configured
+model, and both empty keeps the lead's provider and model. A model whose name carries a slash
+(`meta-llama/Llama-3`, an OpenRouter route) is therefore just a model name. The worker's provider is
+built by the same rules as `/model` (D91), from the same config and stored credential, and the two
+choices are audited with the start; `status`, `roster` and the page name the model in force, so a
+worker on a different model is never a guess. `tool-limits.team-workers` caps a
 team, and `team-steps`, when set, caps each worker turn: it has no default, because a turn has no
 default request limit (D37). A worker's conversation is saved like any other and marked as a
 worker, so it is readable by id and through `session_query` (`sessions.worker = 1`) and never

@@ -12,7 +12,7 @@
 use crate::agent::{self, Agent, End, Steer, Ui};
 use crate::cancel;
 use crate::compact;
-use crate::config::{CompactionConfig, UserConfig};
+use crate::config::CompactionConfig;
 use crate::provider::{Contribution, Image, Quota, Reply, Sink, ToolCall};
 use crate::session::{Session, provider_for, session_id};
 use crate::store::Store;
@@ -914,8 +914,9 @@ impl Manager {
 
     /// Starts a worker. The brief is written inside the session's temporary root and read back
     /// through the read gate, so the exact text the worker was given is a branch item attributable
-    /// to a real file rather than an unrecorded argument (D195). `model` empty keeps the lead's own
-    /// provider and model; otherwise it names a model, or `provider/model` (D195).
+    /// to a real file rather than an unrecorded argument (D195). `provider` and `model` are separate
+    /// choices: empty provider is the lead's own, empty model is that provider's own, and both empty
+    /// keeps the lead's provider and model. Neither name is parsed out of the other.
     pub fn start(
         &mut self,
         session: &mut Session,
@@ -923,6 +924,7 @@ impl Manager {
         origin_principal: &str,
         name: &str,
         brief: &str,
+        provider: &str,
         model: &str,
     ) -> Result<Result<String, String>> {
         if origin_principal != "plugin.standard-agent"
@@ -990,11 +992,11 @@ impl Manager {
             Err(error) => return Ok(Err(format!("could not read the worker's brief: {error}"))),
         };
         let brief_label = brief_path.display().to_string();
-        // Which model the worker runs on: its brief may name one, and a bare name is a model of
-        // this conversation's own provider (D195). Empty keeps the lead's provider and model, twin
-        // and all, so a refreshed credential is not re-read from disk.
-        let chosen = model.trim();
-        let provider = if chosen.is_empty() {
+        // Which provider and model the worker runs on: both may be named, separately (D195). Empty
+        // provider is this conversation's own; empty model is that provider's configured model; both
+        // empty keeps the lead's provider and model, twin and all, so a refreshed credential is not
+        // re-read from disk.
+        let provider = if provider.trim().is_empty() && model.trim().is_empty() {
             match session.provider_twin() {
                 Some(provider) => provider,
                 None => {
@@ -1004,7 +1006,7 @@ impl Manager {
                 }
             }
         } else {
-            match worker_provider(session, chosen) {
+            match worker_provider(session, provider.trim(), model.trim()) {
                 Ok(provider) => provider,
                 Err(why) => return Ok(Err(why)),
             }
@@ -1027,7 +1029,8 @@ impl Manager {
                 "brief": brief_label,
                 "brief_sha256": sha256_hex(text.as_bytes()),
                 "brief_bytes": text.len(),
-                "model": model_label,
+                "provider": provider.name,
+                "model": provider.config.model,
                 "workers": live + 1,
             }),
             "live worker started from a delegated brief",
@@ -1256,35 +1259,30 @@ fn notice_line(name: &str, state: &str) -> String {
     }
 }
 
-/// The provider an `agent start` model asks for (D195). A bare name is a model of this
-/// conversation's own provider; `provider/model` names another only when the prefix is a provider
-/// this run knows, because a model's own name may carry a slash (`meta-llama/Llama-3`).
-fn worker_provider(session: &Session, chosen: &str) -> Result<provider::Provider, String> {
+/// The provider and model an `agent start` asks for (D195). An empty provider is this
+/// conversation's own, and an empty model is that provider's configured one; the two are separate
+/// arguments, so a model whose name carries a slash is simply a model name.
+fn worker_provider(
+    session: &Session,
+    provider: &str,
+    model: &str,
+) -> Result<provider::Provider, String> {
     let paths = &session.setup.paths;
-    let user = UserConfig::load(&paths.user_config())
-        .map_err(|error| format!("could not read the provider configuration: {error:#}"))?;
-    let (named, model) = split_pick(chosen, |name| {
-        provider::endpoint(name, &user.providers).is_ok()
-    });
-    let name = match named {
-        Some(name) => name.to_owned(),
-        None => match session.provider_twin() {
-            Some(provider) => provider.name,
+    let name = if provider.is_empty() {
+        match session.provider_twin() {
+            Some(current) => current.name,
             None => return Err("no provider is active in this session to give a worker".into()),
-        },
-    };
-    provider_for(paths, &name, Some(model))
-        .map_err(|error| format!("could not give a worker {chosen:?}: {error:#}"))
-}
-
-/// Splits `provider/model` only when the prefix is a provider this run knows (D195).
-fn split_pick<'a>(chosen: &'a str, known: impl Fn(&str) -> bool) -> (Option<&'a str>, &'a str) {
-    match chosen.split_once('/') {
-        Some((prefix, model)) if !prefix.is_empty() && !model.is_empty() && known(prefix) => {
-            (Some(prefix), model)
         }
-        _ => (None, chosen),
-    }
+    } else {
+        provider.to_owned()
+    };
+    let model = Some(model).filter(|model| !model.is_empty());
+    let asked = match model {
+        Some(model) => format!("{name}/{model}"),
+        None => name.clone(),
+    };
+    provider_for(paths, &name, model)
+        .map_err(|error| format!("could not give a worker {asked:?}: {error:#}"))
 }
 
 fn valid_name(name: &str) -> Result<(), String> {
@@ -1339,6 +1337,7 @@ pub fn manage(
                 &caller,
                 &brief.name,
                 &brief.brief,
+                &brief.provider,
                 &brief.model,
             );
             session.team = team;
@@ -1383,6 +1382,7 @@ pub fn arguments(op: &Operation) -> serde_json::Value {
     match op {
         Operation::Start(brief) => json!({
             "target": brief.name,
+            "provider": brief.provider,
             "model": brief.model,
             "text_bytes": brief.brief.len(),
             "text_sha256": sha256_hex(brief.brief.as_bytes()),
@@ -1570,24 +1570,6 @@ mod tests {
             &text[..40.min(text.len())]
         );
         assert!(text.contains(" of 20 messages)"), "{text}");
-    }
-
-    #[test]
-    fn a_model_pick_names_a_provider_only_when_the_prefix_is_one() {
-        // D195: `provider/model` is a provider only when that prefix is a provider this run knows;
-        // a model's own name may carry a slash (`meta-llama/Llama-3`).
-        let known = |name: &str| name == "openai" || name == "mock";
-        assert_eq!(split_pick("gpt-x", &known), (None, "gpt-x"));
-        assert_eq!(
-            split_pick("openai/gpt-x", &known),
-            (Some("openai"), "gpt-x")
-        );
-        assert_eq!(
-            split_pick("meta-llama/Llama-3", &known),
-            (None, "meta-llama/Llama-3")
-        );
-        assert_eq!(split_pick("/x", &known), (None, "/x"));
-        assert_eq!(split_pick("openai/", &known), (None, "openai/"));
     }
 
     #[test]
