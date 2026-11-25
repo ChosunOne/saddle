@@ -135,6 +135,11 @@ const BUS_MESSAGES: usize = 200;
 /// How much of one message the bus keeps: the full finding in practice, bounded so a team cannot
 /// grow the bus without limit.
 const BUS_CHARS: usize = 8000;
+
+/// How much of the bus `agent bus` hands a model: the newest messages that fit, so a tool result
+/// has a ceiling of its own (D196).
+const BUS_TEXT_MESSAGES: usize = 20;
+const BUS_TEXT_CHARS: usize = 16_000;
 /// How many commands may wait at once.
 const QUEUE_ITEMS: usize = 64;
 /// How many finished commands the queue keeps for its view.
@@ -850,15 +855,30 @@ impl Manager {
         if bus.is_empty() {
             return "no messages on the team bus yet".into();
         }
+        // A tool result is bounded too: the newest messages that fit in the budget, with the count
+        // said when older ones are left out rather than a silent cut (D196).
+        let mut chosen = Vec::new();
+        let mut used = 0;
+        for message in bus.iter().rev() {
+            let size = message.from.len() + message.to.len() + message.text.len() + 4;
+            if !chosen.is_empty() && used + size > BUS_TEXT_CHARS {
+                break;
+            }
+            used += size;
+            chosen.push(message);
+            if chosen.len() == BUS_TEXT_MESSAGES {
+                break;
+            }
+        }
         let mut out = String::new();
-        for message in bus
-            .iter()
-            .rev()
-            .take(20)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-        {
+        if chosen.len() < bus.len() {
+            out.push_str(&format!(
+                "(the last {} of {} messages)\n",
+                chosen.len(),
+                bus.len()
+            ));
+        }
+        for message in chosen.into_iter().rev() {
             out.push_str(&format!(
                 "{} → {}: {}\n",
                 message.from, message.to, message.text
@@ -1522,6 +1542,34 @@ mod tests {
             dropped: Default::default(),
             owns: true,
         }
+    }
+
+    #[test]
+    fn a_long_bus_is_bounded_and_says_what_it_left_out() {
+        // D196: the newest messages that fit, and a count when older ones are not sent.
+        let team = with_peers(vec![("b", "idle", false)]);
+        for index in 0..25 {
+            team.say("a", "b", &format!("m{index}")).unwrap();
+        }
+        let text = team.bus_text();
+        assert!(text.contains("m24"), "{text}");
+        assert!(!text.contains("m0\n"), "{text}");
+        assert!(text.contains("(the last 20 of 25 messages)"), "{text}");
+
+        // The character budget bounds it too: twenty long messages do not all reach the model.
+        let team = with_peers(vec![("b", "idle", false)]);
+        for index in 0..20 {
+            team.say("a", "b", &format!("{index} {}", "y".repeat(1000)))
+                .unwrap();
+        }
+        let text = team.bus_text();
+        assert!(text.len() <= BUS_TEXT_CHARS + 200, "{}", text.len());
+        assert!(
+            text.contains("(the last "),
+            "{}",
+            &text[..40.min(text.len())]
+        );
+        assert!(text.contains(" of 20 messages)"), "{text}");
     }
 
     #[test]
