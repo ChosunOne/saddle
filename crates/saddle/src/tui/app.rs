@@ -1,5 +1,6 @@
 //! TUI state and input handling. Nothing here touches the terminal, so it is tested directly.
 
+use super::ask::{Answer as AskAnswer, AskDialog};
 use super::files;
 use crate::agent::shared_shell;
 use crate::agent::shell_ok;
@@ -7,6 +8,7 @@ use crate::provider;
 use crate::provider::Image;
 use crate::provider::Quota;
 use crate::provider::{reasoning_text, visible_tool_text};
+use crate::questions::Asked;
 use crate::skills;
 use crate::skills::Skill;
 use crate::store::Point;
@@ -28,6 +30,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::mem;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -110,6 +113,10 @@ pub enum AgentEvent {
     Closed,
     /// The answer to a model listing started by the login dialog or the picker (D89).
     Models(u64, Result<Listed, ModelsError>),
+    /// A tool's question, waiting for the person to answer it (D197). The answer goes back through
+    /// the question itself: the agent thread is blocked on it, so the command channel it reads is
+    /// not the way to reach it.
+    Ask(Arc<Asked>),
     /// The code to type for a device sign-in: where to go, and what to enter there (D85).
     DeviceCode(u64, Result<(String, String), String>),
     /// A link could not be opened, with the reason (D86). Sent from the thread that watched the
@@ -760,6 +767,8 @@ pub struct App {
     pub permissions: Option<Permissions>,
     /// The theme list, drawn over everything else while open, and previewed as it moves (D74).
     pub themes: Option<ThemePicker>,
+    /// A tool's question, waiting for this person to answer it (D197).
+    pub ask: Option<AskDialog>,
     /// The theme in force when the list opened — its name and its colours — so escape puts back
     /// exactly what was there (D74).
     theme_before: Option<(String, Theme)>,
@@ -881,6 +890,7 @@ impl App {
             confirm: None,
             permissions: None,
             themes: None,
+            ask: None,
             theme_before: None,
             history: Vec::new(),
             history_pos: None,
@@ -921,6 +931,7 @@ impl App {
             || self.resume.is_some()
             || self.settings.is_some()
             || self.themes.is_some()
+            || self.ask.is_some()
     }
 
     fn compaction(&mut self, event: CompactEvent) {
@@ -1235,6 +1246,25 @@ impl App {
     pub fn key(&mut self, key: KeyEvent) -> Option<Action> {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return None;
+        }
+        // A question a tool is waiting on owns the keyboard until it is answered: the turn cannot
+        // move on without it, so nothing under it should take a keystroke (D197).
+        if let Some(dialog) = &mut self.ask {
+            return match dialog.key(key) {
+                AskAnswer::Stay => None,
+                AskAnswer::Given(outcome) => {
+                    if let Some(dialog) = self.ask.take() {
+                        dialog.asked.answer(outcome);
+                    }
+                    None
+                }
+                AskAnswer::Cancel => {
+                    // The dialog goes away without an answer; the wait ends on the turn's own
+                    // cancellation flag, and the tool is told the person dismissed it (D183).
+                    self.ask = None;
+                    Some(Action::Cancel)
+                }
+            };
         }
         // Any other key breaks the pair, so escape then `a` then escape is not a double escape.
         if key.code != KeyCode::Esc {
@@ -1602,6 +1632,12 @@ impl App {
     }
 
     pub fn paste(&mut self, text: &str) {
+        // A question owns the keyboard, so pasted words belong to the note or answer it is asking
+        // for rather than to the prompt underneath (D197).
+        if let Some(dialog) = &mut self.ask {
+            dialog.paste(text);
+            return;
+        }
         if let Some(login) = &mut self.login {
             login.paste(text);
         } else if let Some(picker) = &mut self.resume {
@@ -2258,6 +2294,12 @@ impl App {
                 self.push(Entry::Note(NoteKind::Plugin, contribution_text(&value)))
             }
             AgentEvent::Skills(skills) => self.skills = skills,
+            // The dialog takes the keyboard from here; the answer travels back through the
+            // question, not through the command channel the turn is blocking (D197).
+            AgentEvent::Ask(asked) => {
+                self.ask = Some(AskDialog::new(asked));
+                return None;
+            }
             AgentEvent::Note(s) => self.push(Entry::Note(NoteKind::Warn, display(&s))),
             AgentEvent::Call {
                 id,

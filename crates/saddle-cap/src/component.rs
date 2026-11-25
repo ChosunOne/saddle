@@ -131,6 +131,9 @@ catalogue!(HostInterface {
     ContextContribute => ("saddle:host/context-contribute", Requirement::Scope(Scope::ContextContribute), true),
     Workers => ("saddle:host/workers", Requirement::Scope(Scope::Tool), true),
     ModelInvoke => ("saddle:host/model-invoke", Requirement::Scope(Scope::ModelInvoke), true),
+    // A question reaches only the person in front of this session, who may dismiss it; a registered
+    // tool needs no grant beyond the one that registered it (D197).
+    Ask => ("saddle:host/ask", Requirement::Scope(Scope::Tool), true),
     Widgets => ("saddle:widgets/types", Requirement::Ambient, true),
     Ui => ("saddle:host/ui", Requirement::Scope(Scope::Ui), true),
     Persist => ("saddle:host/persist", Requirement::Scope(Scope::Persist), true),

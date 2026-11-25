@@ -13,6 +13,7 @@ use crate::provider::Contribution;
 use crate::provider::Image;
 use crate::provider::Price;
 use crate::provider::Quota;
+use crate::questions::{Asked, Outcome as QuestionOutcome, Questioner};
 use crate::session;
 use crate::skills;
 use crate::tasks;
@@ -42,6 +43,7 @@ use std::rc::Rc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 mod app;
+mod ask;
 mod browser;
 pub mod catppuccin;
 mod editor;
@@ -325,6 +327,10 @@ fn work(
     events: Sender<AgentEvent>,
 ) -> Result<()> {
     let mut ui = ChannelUi(events.clone());
+    // The person in front of this interface is who a tool's question reaches (D197).
+    session.questions = Some(Box::new(ChannelQuestions {
+        events: events.clone(),
+    }));
     let mut fatal = None;
     let mut shown_tasks = Vec::new();
     let mut completion_requested = false;
@@ -861,6 +867,20 @@ impl Ui for ChannelUi {
 
     fn compaction(&mut self, event: CompactEvent) {
         let _ = self.0.send(AgentEvent::Compaction(event));
+    }
+}
+
+/// How a tool's question reaches the person (D197): the event carries the question and the answer
+/// travels back through it, because the agent thread is blocked inside the tool call.
+struct ChannelQuestions {
+    events: Sender<AgentEvent>,
+}
+
+impl Questioner for ChannelQuestions {
+    fn ask(&mut self, asked: Arc<Asked>, _until: Instant) {
+        if self.events.send(AgentEvent::Ask(asked.clone())).is_err() {
+            asked.answer(QuestionOutcome::Unavailable("the interface closed".into()));
+        }
     }
 }
 

@@ -37,6 +37,7 @@ agent = ["transcript-read", "model-invoke", "fs-read", "fs-write"]
 swarm = ["transcript-read", "model-invoke"]
 session_query = ["transcript-read"]
 config_help = []
+ask = []
 "#;
 
 /// sdk compatibility fixture, built automatically alongside the standard tools.

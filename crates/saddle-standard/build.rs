@@ -29,6 +29,7 @@ const NAMES: &[&str] = &[
     "swarm",
     "session_query",
     "config_help",
+    "ask",
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {

@@ -73,10 +73,12 @@ intercepts `__sandbox` before clap parses anything — that is the helper proces
 first in `main`.
 
 The ordinary tool names are `read`, `write`, `edit`, `patch`, `ls`, `find`, `grep`, `bash`, `run_binary`, `tasks`,
-`fetch`, `websearch`, `agent`, `swarm`, `session_query` and `config_help` (`tools::NAMES`); each runs a shipped WASI component
+`fetch`, `websearch`, `agent`, `swarm`, `session_query`, `config_help` and `ask` (`tools::NAMES`); each runs a shipped WASI component
 chosen by the protected `[standard-tools]` table, and the binary holds no native implementation of any
 of them (D146, D147). `config_help` is `docs/settings.md` compiled into a guest that imports only the
-budgets snapshot, so its entry delegates no scope: `config_help = []` (D171). The one name that is
+budgets snapshot, so its entry delegates no scope: `config_help = []` (D171). `ask` is the same shape —
+`ask = []`: its guest owns the schema and the wording, while the person is reached through
+`saddle:host/ask` and may always dismiss the question (D197). The one name that is
 the host's rather than a component's is `tool_search`, which is MCP discovery and decides nothing
 (D108).
 `agent` and `swarm` start and address **live workers** through the typed `saddle:host/workers`
@@ -451,7 +453,7 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D181 at the time of writing) in `docs/plan.md` §3, and
+Decisions are cited by number as **D1** onward (D197 at the time of writing) in `docs/plan.md` §3, and
 nearly every module header names the ones it implements, for example:
 
 ```rust

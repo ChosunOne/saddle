@@ -83,3 +83,7 @@ crate-type = ["cdylib"]
 [[example]]
 name = "swarm"
 crate-type = ["cdylib"]
+
+[[example]]
+name = "ask"
+crate-type = ["cdylib"]

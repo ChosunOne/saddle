@@ -30,7 +30,9 @@ implementation picker. `[standard-tools]` in the protected config selects which 
 and every operation scope delegates the agent's *current* reach instead of new resources (D132–D137).
 The privileged half stays in the core behind SDK services: path resolution, permissions, audit,
 sandboxed execution, HTTP and credentials, branch-only transcript SQL (D138–D143). `tool_search`
-alone is host MCP discovery, not a component.
+alone is host MCP discovery, not a component. `ask` is a component too: its question reaches the
+person in front of the session, with choices, previews, a note on the choice they make and an answer
+of their own (D197).
 
 **Third-party plugins are explicit and local.** `saddle plugin install <manifest>` copies a
 digest-pinned artifact into protected storage; enabling it and granting it are two further steps in a
@@ -4818,6 +4820,26 @@ queue — it never executes a queued command. The member that claimed it runs it
 queue and bus are per-team and in memory, so they do not survive a restart, and a finished worker no
 longer counts as a member that may enqueue, claim or finish.
 
+**D197.** A tool can ask the person a question, and the answer is theirs to give. The service is
+`saddle:host/ask`: a question, its choices, and for each choice a preview that the interface shows
+while that choice is selected; the person may attach a note to the choice they make, or type an
+answer of their own. The shipped `ask` tool is the guest — it owns the schema, the bounds and how the
+answer is put to the model — and the host owns the surface, the wait and the record. Asking is
+available to any component registered as a tool (`tool` scope), because a question grants no resource
+and the person may always dismiss it; the dialog belongs to the tool that asked, and a dismissal is
+not consent: the guest reports it as a failed result and says not to ask again. A session with nobody
+in front of it answers `unavailable` with the reason — a piped `saddle run`, a `--json` stream, a live
+worker and `saddle tool` all have no one to reach, and a worker puts its question in its reply, where
+the lead reads it. In the interface, escape dismisses the question and ctrl+c cancels the turn it
+belongs to, which also ends the wait. The wait is bounded by `host-wait-seconds` rather than
+`plugin-timeout-ms`, because reading a few choices takes longer than a guest's CPU ceiling allows:
+the host extends the invocation's deadline across the question and restores it afterwards, while a
+`timeout_secs` the model itself set still bounds the whole call (D152). The audit records the
+question by size and hash and the answer by choice index and by the note's or typed answer's size and
+hash, never either's words (D10, D24). The bounds are `[tool-limits]` (`ask-bytes`, `ask-options`,
+`ask-option-bytes`, `ask-preview-bytes`, `ask-reply-bytes`); the guest refuses a question the
+interface could not draw before it reaches the person.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
@@ -4833,7 +4855,7 @@ longer counts as a member that may enqueue, claim or finish.
 | `event-publish` | publishing custom events as the calling plugin | `saddle:host/plugin-events` import | per publication, principal attribution and queue/size budgets |
 | `event-subscribe` | receiving custom events, never harness events | `saddle:plugin/plugin-events` export | registration and every delivery |
 | `context-contribute` | adding notes and diagnostics to the context | `saddle:host/context-contribute` import | policy per call, slot schemas (D26) |
-| `tool` | registering tools the model can call | `saddle:plugin/tool` export | load-time check, catalogue rendering (D26) |
+| `tool` | registering tools the model can call, and asking the person a question | `saddle:plugin/tool` export, `saddle:host/ask` import (D197) | load-time check, catalogue rendering (D26); the person answers or dismisses |
 | `veto` | denying a pending tool call | `saddle:plugin/veto` export | policy per call (D21) |
 | `model-invoke` | spending tokens on the session provider | `saddle:host/model-invoke` import | policy per call, against a budget |
 | `ui` | rendering widgets in the terminal | `saddle:plugin/ui` export, `saddle:host/ui` import | per call, read-only render phase and closed widget vocabulary (D27, D156) |
@@ -4883,6 +4905,7 @@ delegation on every call; registration and event interest never grant its author
 | block a pending tool call | `veto` | built: fail-closed deny/abstain callbacks (D156) |
 | invoke the model | `model-invoke` | built: isolated requests with shared parent/plugin budgets when set (D156) |
 | render UI | `ui` | built: closed widgets in labelled host panels (D156) |
+| ask the person a question | `tool` | built: the shipped `ask` component over `saddle:host/ask`, with choices, previews, a note and an answer of the person's own (D197) |
 | persist state | `persist` | built: workspace/plugin-isolated transactional KV (D156) |
 
 ## 7. Milestones

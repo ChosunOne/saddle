@@ -1,0 +1,4 @@
+id = "ask"
+version = "0.1.0"
+component = "ask.component.wasm"
+scopes = ["tool"]

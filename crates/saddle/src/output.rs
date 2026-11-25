@@ -12,9 +12,13 @@ use crate::plugins::services::ModelUsage;
 use crate::plugins::services::panel::PanelView;
 use crate::provider::Image;
 use crate::provider::{Contribution, visible_tool_text};
+use crate::questions::{Asked, Outcome, Question, Questioner, Reply as Answer, Selection};
 use crate::term;
 use std::io;
+use std::io::IsTerminal;
 use std::io::Write;
+use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::{Value, json};
 
@@ -296,6 +300,117 @@ impl Ui for Output {
                 compact::Event::Reasoning(_) | compact::Event::Text(_) => {}
             },
         }
+    }
+}
+
+/// Line mode's question surface (D197): the choices and their previews go to stderr, where every
+/// other line of tool output goes, and the answer is read from stdin. A piped run never installs
+/// this, so a prompt line is never eaten by a question.
+pub struct LineQuestions;
+
+impl Questioner for LineQuestions {
+    fn ask(&mut self, asked: Arc<Asked>, until: Instant) {
+        asked.answer(at_terminal(&asked.question, until));
+    }
+}
+
+/// Asks one question in the plainest way a terminal allows: number the choices, print the previews,
+/// and read a line. An empty line dismisses the question, which is an answer rather than an error.
+fn at_terminal(question: &Question, until: Instant) -> Outcome {
+    if !io::stdin().is_terminal() {
+        return Outcome::Unavailable("stdin is not a terminal".into());
+    }
+    let mut err = io::stderr();
+    let _ = writeln!(err, "\n{}", term::clean(&question.question));
+    for (index, choice) in question.choices.iter().enumerate() {
+        let description = if choice.description.is_empty() {
+            String::new()
+        } else {
+            format!("  ({})", term::clean(&choice.description))
+        };
+        let _ = writeln!(
+            err,
+            "  {}. {}{description}",
+            index + 1,
+            term::clean(&choice.label)
+        );
+        for line in choice.preview.lines().take(20) {
+            let _ = writeln!(err, "     {}", term::clean(line));
+        }
+    }
+    if question.allow_other {
+        let _ = writeln!(
+            err,
+            "  {}. type something",
+            question.choices.len().saturating_add(1)
+        );
+    }
+    loop {
+        let _ = write!(
+            err,
+            "choose 1-{} (empty dismisses): ",
+            question.choices.len()
+        );
+        let _ = err.flush();
+        let Some(line) = read_line() else {
+            return Outcome::Unavailable("the input ended".into());
+        };
+        // Reading a line cannot be interrupted from here, so a deadline or a cancelled turn is
+        // noticed the moment the person — or the end of the input — arrives, rather than never.
+        if cancel::requested() {
+            return Outcome::Dismissed;
+        }
+        if Instant::now() >= until {
+            return Outcome::Unavailable("the person did not answer in time".into());
+        }
+        let typed = line.trim();
+        if typed.is_empty() {
+            return Outcome::Dismissed;
+        }
+        let other = question.choices.len().saturating_add(1);
+        if question.allow_other && (typed == "t" || typed == other.to_string()) {
+            let _ = write!(err, "answer: ");
+            let _ = err.flush();
+            let Some(text) = read_line() else {
+                return Outcome::Unavailable("the input ended".into());
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            return Outcome::Answered(Answer {
+                selection: Selection::Typed(text.trim().to_owned()),
+                note: String::new(),
+            });
+        }
+        let Ok(choice) = typed.parse::<usize>() else {
+            let _ = writeln!(err, "not one of the choices");
+            continue;
+        };
+        if choice == 0 || choice > question.choices.len() {
+            let _ = writeln!(err, "not one of the choices");
+            continue;
+        }
+        let mut note = String::new();
+        if question.allow_note {
+            let _ = write!(err, "note (empty for none): ");
+            let _ = err.flush();
+            note = read_line()
+                .map(|line| line.trim().to_owned())
+                .unwrap_or_default();
+        }
+        return Outcome::Answered(Answer {
+            selection: Selection::Chosen(choice as u32 - 1),
+            note,
+        });
+    }
+}
+
+fn read_line() -> Option<String> {
+    let mut line = String::new();
+    match io::stdin().read_line(&mut line) {
+        Ok(0) => None,
+        Ok(_) => Some(line),
+        Err(_) => None,
     }
 }
 

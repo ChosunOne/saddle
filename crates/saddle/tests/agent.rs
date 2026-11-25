@@ -468,6 +468,7 @@ fn tool_loop(api: Api) {
         names,
         [
             "tool_search",
+            "ask",
             "bash",
             "config_help",
             "edit",

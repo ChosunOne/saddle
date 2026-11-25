@@ -280,6 +280,13 @@ fn every_shipped_tool_accepts_the_optional_host_timeout_without_guest_schema_cha
         ),
         ("tool_search", serde_json::json!({"query":""}), true),
         ("config_help", serde_json::json!({}), true),
+        // A standalone run has nobody to ask: the call is shaped, answered and failed, and it is
+        // the shipped component that did it (D197).
+        (
+            "ask",
+            serde_json::json!({"question":"which one?", "options":[{"label":"this"}]}),
+            false,
+        ),
     ] {
         input["timeout_secs"] = serde_json::json!(5);
         let (ok, text) = env.tool(name, input);
@@ -428,6 +435,46 @@ fn existing_configs_need_explicit_standard_profiles_and_omitted_scopes_never_inh
     doc.insert("standard-tools".into(), profiles.into());
     fs::write(env.policy_path(), toml::to_string(&doc).unwrap()).unwrap();
     assert!(env.tool("read", serde_json::json!({"path":"README"})).0);
+}
+
+/// D197: a question reaches a person rather than a file or a socket, and the shipped component owns
+/// the schema and the answer's shape. A standalone `saddle tool ask` has nobody to ask, and says so.
+#[test]
+fn ask_reaches_a_person_and_says_when_there_is_none() {
+    let env = ready();
+    let (ok, text) = env.tool(
+        "ask",
+        serde_json::json!({
+            "question": "which approach?",
+            "options": [
+                {"label": "first", "description": "the smaller change"},
+                {"label": "second", "preview": "a preview of the second"},
+            ],
+        }),
+    );
+    assert!(!ok, "{text}");
+    assert!(text.contains("No person could be asked"), "{text}");
+
+    // Nothing granted, and the question still reaches the same answer: it asks for no resource.
+    env.edit_agent(toml::Table::clear);
+    let (ok, text) = env.tool(
+        "ask",
+        serde_json::json!({"question": "which one?", "options": [{"label": "only"}]}),
+    );
+    assert!(text.contains("No person could be asked"), "{text}");
+    assert!(!ok);
+
+    // A question the interface could not draw is refused before any person sees it.
+    let (ok, text) = env.tool(
+        "ask",
+        serde_json::json!({"question": "which one?", "options": []}),
+    );
+    assert!(!ok && text.contains("between 1"), "{text}");
+
+    // The record keeps the question's size and hash, never its words (D24, D197).
+    let audit = env.audit();
+    assert!(audit.contains("question_sha256"), "{audit}");
+    assert!(!audit.contains("which approach?"), "{audit}");
 }
 
 #[test]

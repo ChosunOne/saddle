@@ -22,6 +22,7 @@ use saddle_wit::exports::saddle::plugin::tool::{Definition, Output};
 use saddle_wit::harness::exports::saddle::plugin::observer::{
     Event as HarnessEvent, Kind as HarnessKind,
 };
+use saddle_wit::saddle::host::ask::{self, Host as AskHost, Outcome as AskOutcome, Question};
 use saddle_wit::saddle::host::budgets::{self as budgets_interface, Host as BudgetsHost};
 use saddle_wit::saddle::host::context_contribute::{self, Contribution, Host as ContextHost};
 use saddle_wit::saddle::host::exec::{self, Command, Host as ExecHost, Reply as ExecReply};
@@ -282,6 +283,16 @@ pub trait HostServices: Send + 'static {
     ) -> anyhow::Result<Result<(), String>> {
         Ok(Err("host does not implement diff presentation".into()))
     }
+    /// Ask the person this session is attached to; `allowance` bounds the wait, not the guest's CPU
+    /// ceiling, and a session with nobody in front of it answers `unavailable` (D197).
+    fn ask(
+        &mut self,
+        _call: &Invocation,
+        _question: Question,
+        _allowance: Duration,
+    ) -> anyhow::Result<Result<AskOutcome, String>> {
+        Ok(Err("host does not implement questions".into()))
+    }
     fn apply_changes(
         &mut self,
         _call: &Invocation,
@@ -502,6 +513,31 @@ impl<H: HostServices> UiHost for State<H> {
     }
 }
 impl<H: HostServices> widget_types::Host for State<H> {}
+
+impl<H: HostServices> AskHost for State<H> {
+    fn ask(&mut self, question: Question) -> anyhow::Result<Result<AskOutcome, String>> {
+        if question.question.len() > budgets::ask_bytes()
+            || question.choices.is_empty()
+            || question.choices.len() > budgets::ask_options()
+            || question.choices.iter().any(|choice| {
+                choice.label.trim().is_empty()
+                    || choice.label.len().saturating_add(choice.description.len())
+                        > budgets::ask_option_bytes()
+                    || choice.preview.len() > budgets::ask_preview_bytes()
+            })
+        {
+            return Ok(Err(
+                "question or its choices exceed the configured limits".into()
+            ));
+        }
+        // D197: the person may take longer than the guest's own CPU ceiling allows, so the wait is
+        // bounded by the host-wait budget instead, and the guest gets its ceiling back after.
+        self.host_wait(
+            Duration::from_secs(budgets::host_wait_seconds() as u64),
+            |host, call, allowance| host.ask(call, question, allowance),
+        )
+    }
+}
 
 impl<H: HostServices> EventsHost for State<H> {
     fn emit(&mut self, name: String, data: String) -> anyhow::Result<Result<(), String>> {
@@ -1355,6 +1391,7 @@ fn bind_host<H: HostServices>(
             model_invoke::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
         }
         HostInterface::Ui => ui::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
+        HostInterface::Ask => ask::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
         HostInterface::Widgets => {
             widget_types::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
         }

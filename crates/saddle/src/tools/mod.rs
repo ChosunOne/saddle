@@ -82,6 +82,7 @@ pub const NAMES: &[&str] = &[
     "session_query",
     "tool_search",
     "config_help",
+    "ask",
 ];
 
 /// The tools as the model sees them. The descriptions say when to use each one.

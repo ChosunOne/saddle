@@ -42,8 +42,9 @@ use crate::network::Operation;
 use crate::provider::{Image, Provenance};
 use crate::session::Session;
 use crate::tools::timeout;
-use crate::{cancel, fs_access, transcript};
+use crate::{cancel, fs_access, questions, transcript};
 use crate::{network, search_transport};
+use saddle_wit::saddle::host::ask::{Outcome as AskOutcome, Question};
 use saddle_wit::saddle::host::exec::{Command, Reply as ExecReply};
 use saddle_wit::saddle::host::http::{Request as HttpRequest, Response as HttpResponse};
 use saddle_wit::saddle::host::web_search::Snapshot as SearchSnapshot;
@@ -148,6 +149,12 @@ enum Event {
         who: Principal,
         text: String,
         answer: SyncSender<HostReply<(), String>>,
+    },
+    Ask {
+        who: Principal,
+        question: Question,
+        allowance: Duration,
+        answer: SyncSender<HostReply<AskOutcome, String>>,
     },
     Mutate {
         who: Principal,
@@ -419,6 +426,29 @@ impl HostServices for Host {
             .map_err(|_| anyhow!("plugin diff request timed out"))?
             .map_err(|why| anyhow!(why))
     }
+    fn ask(
+        &mut self,
+        call: &Invocation,
+        question: Question,
+        allowance: Duration,
+    ) -> Result<Result<AskOutcome, String>> {
+        let (answer, result) = mpsc::sync_channel(1);
+        self.events
+            .send(Event::Ask {
+                who: call.principal().clone(),
+                question,
+                allowance,
+                answer,
+            })
+            .map_err(|_| anyhow!("plugin session ended"))?;
+        // A person answers in their own time; the caller bounded the wait already, and this side
+        // only has to outlive it by a poll so the answer is never dropped on a rounding edge (D197).
+        result
+            .recv_timeout(allowance + Duration::from_millis(500))
+            .map_err(|_| anyhow!("question answer timed out"))?
+            .map_err(|why| anyhow!(why))
+    }
+
     fn apply_changes(
         &mut self,
         call: &Invocation,
@@ -941,6 +971,30 @@ fn execute_inner(
                         Ok(())
                     }
                 }).map_err(Into::into);
+                respond(result, answer, &mut fatal, &cancelled);
+            }
+            Ok(Event::Ask {
+                who,
+                question,
+                allowance,
+                answer,
+            }) => {
+                let result = if invoking {
+                    questions::ask(session, &who, call, allowance, question)
+                } else {
+                    session
+                        .audit
+                        .event(
+                            Kind::Decision,
+                            Some(&who),
+                            Some(Scope::Tool),
+                            Some(false),
+                            json!({"call_id":call,"operation":"ask"}),
+                            "a question is refused outside invocation",
+                        )
+                        .map(|_| Err("a question is refused outside invocation".into()))
+                        .map_err(HostError::from)
+                };
                 respond(result, answer, &mut fatal, &cancelled);
             }
             Ok(Event::Mutate {

@@ -26,6 +26,7 @@ mod output;
 mod paths;
 mod plugins;
 mod provider;
+mod questions;
 mod search_transport;
 mod session;
 mod skills;
@@ -542,6 +543,12 @@ fn run_agent(
     }
     for note in &mcp_notes {
         eprintln!("saddle: an mcp server did not start — {note}");
+    }
+    // A question is asked on the terminal only where one is sitting at it: a piped run has no one to
+    // ask, and a JSON stream has a program at the other end, so both leave the tool unanswered
+    // rather than eating a line that was a prompt (D197).
+    if !args.json && io::stdin().is_terminal() {
+        session.questions = Some(Box::new(output::LineQuestions));
     }
     let mut out = if args.json {
         output::Output::Json(output::Json::stdout())

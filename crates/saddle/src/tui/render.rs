@@ -23,6 +23,7 @@ use super::app::{
     Activity, App, COPY_NOTE, Cached, CompactState, CompactionView, Confirm, Entry, NoteKind,
     Placed, Seen, Source,
 };
+use super::ask::{AskDialog, Stage as AskStage};
 use super::login::{Login, MODEL_ROWS, Purpose, Stage, matching};
 use super::permissions::{ADD_HELP, Draft, Kind, Permissions};
 use super::sessions::{ROWS as SESSION_ROWS, SessionPicker, age};
@@ -2287,6 +2288,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         app.open_url_at = link;
         surface = Some(seen);
     }
+    if let Some(dialog) = &app.ask {
+        // The question is what the turn is waiting on, so it is drawn over every other dialog, and
+        // a click on one of those links underneath is not a click at all (D86, D197).
+        app.open_url_at = None;
+        surface = Some(draw_ask(frame, dialog, area, &app.theme));
+    }
     let had_dialog = app.dialog_seen.is_some();
     let opened = !had_dialog && surface.is_some();
     app.dialog_seen = surface;
@@ -2344,6 +2351,114 @@ fn shade_dialog(frame: &mut Frame<'_>, app: &App) {
 ///
 /// One keystroke either way, and escape leaves the conversation where it is: the move is the
 /// person's decision already, and the summary is the only part of it that spends a request.
+/// A tool's question (D197): the choices, the preview of the one under the cursor, and the line the
+/// person writes their note or their own answer on.
+fn draw_ask(frame: &mut Frame<'_>, dialog: &AskDialog, area: Rect, theme: &Theme) -> Seen {
+    let width = area.width.saturating_sub(4).clamp(30, 84);
+    let inner = width.saturating_sub(2) as usize;
+    // Everything the box can hold; a preview that does not fit is cut rather than pushing the help
+    // line off the bottom, where nobody would find it.
+    let room = area.height.saturating_sub(2) as usize;
+    let accent = Style::new().fg(theme.accent);
+    let question = &dialog.asked.question;
+    let mut lines: Vec<Line> = Vec::new();
+    for line in wrap_columns(&question.question, inner.saturating_sub(2), 6) {
+        lines.push(Line::from(Span::styled(
+            line,
+            Style::new().add_modifier(Modifier::BOLD),
+        )));
+    }
+    if !question.choices.is_empty() {
+        lines.push(Line::default());
+    }
+    let rows = dialog.rows();
+    for (index, choice) in question.choices.iter().enumerate() {
+        let mut row = format!("{}. {}", index + 1, choice.label);
+        if !choice.description.is_empty() {
+            row.push_str("  ");
+            row.push_str(&choice.description);
+        }
+        lines.push(ask_row(
+            index == dialog.selected,
+            &clip(&row, inner.saturating_sub(2)),
+            &accent,
+        ));
+    }
+    if question.allow_other && rows > 0 {
+        lines.push(ask_row(
+            dialog.selected + 1 == rows,
+            &clip(
+                &format!("{}. Type something…", question.choices.len() + 1),
+                inner.saturating_sub(2),
+            ),
+            &accent,
+        ));
+    }
+    // The preview belongs to the choice under the cursor, and only to a choice.
+    let preview = dialog
+        .choice(dialog.selected)
+        .and_then(|index| question.choices.get(index))
+        .map(|choice| choice.preview.as_str())
+        .unwrap_or_default();
+    let editing = usize::from(!matches!(dialog.stage, AskStage::Choosing));
+    let error = usize::from(dialog.error.is_some());
+    // A blank line, the text line and the error if there is one, the help line, then the preview's
+    // own blank and label.
+    let fixed = lines.len() + 1 + editing + error + 1;
+    let left = room.saturating_sub(fixed + 2);
+    if !preview.is_empty() && left >= 1 {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled("preview", dim(theme))));
+        for line in wrap_columns(preview, inner, left) {
+            lines.push(Line::from(Span::styled(line, Style::new())));
+        }
+    }
+    lines.push(Line::default());
+    let mut cursor = None;
+    let (label, text) = match &dialog.stage {
+        AskStage::Choosing => ("", ""),
+        AskStage::Noting { text, .. } => ("note › ", text.as_str()),
+        AskStage::Typing { text } => ("answer › ", text.as_str()),
+    };
+    if !matches!(dialog.stage, AskStage::Choosing) {
+        let used = label.chars().count() + text.chars().count();
+        cursor = Some((lines.len(), used.min(inner.saturating_sub(1))));
+        lines.push(Line::from(vec![
+            Span::styled(label.to_owned(), accent),
+            Span::styled(
+                keep_tail(text, inner.saturating_sub(label.chars().count())),
+                Style::new().add_modifier(Modifier::UNDERLINED),
+            ),
+        ]));
+    }
+    if let Some(error) = &dialog.error {
+        lines.push(Line::from(Span::styled(
+            keep_tail(error, inner),
+            Style::new().fg(theme.error),
+        )));
+    }
+    let help = match dialog.stage {
+        AskStage::Choosing => "↑↓ choose · enter select · 1-9 pick · esc dismiss",
+        AskStage::Noting { .. } => "enter answer with this note · esc back · empty note for none",
+        AskStage::Typing { .. } => "enter send this answer · esc back",
+    };
+    lines.push(Line::from(Span::styled(help, dim(theme))));
+    modal(frame, area, width, " Question ", lines, cursor, theme).seen
+}
+
+/// One row of the list, marked with `›` while it is the one the cursor is on.
+fn ask_row(selected: bool, text: &str, accent: &Style) -> Line<'static> {
+    let style = if selected {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else {
+        Style::new()
+    };
+    Line::from(vec![
+        Span::styled(if selected { "› " } else { "  " }, *accent),
+        Span::styled(text.to_owned(), style),
+    ])
+}
+
 fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm, area: Rect, theme: &Theme) -> Seen {
     let width = area.width.saturating_sub(4).min(84);
     let inner = width.saturating_sub(2) as usize;
@@ -3338,6 +3453,54 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Word-wraps plain text to `width` columns and at most `max` lines, marking a cut with `…`.
+fn wrap_columns(text: &str, width: usize, max: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        let mut line = String::new();
+        for word in raw.split_whitespace() {
+            if !line.is_empty() && line.width() + 1 + word.width() > width {
+                out.push(mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        out.push(line);
+    }
+    if out.len() > max {
+        out.truncate(max);
+        if let Some(last) = out.last_mut() {
+            last.push('…');
+        }
+    }
+    out
+}
+
+/// The start of `s` in at most `max` columns, with `…` marking the cut.
+fn clip(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w + 1 > max {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
 fn keep_tail(s: &str, max: usize) -> String {
     if s.width() <= max {
         return s.to_owned();
@@ -3969,6 +4132,7 @@ mod tests {
     use crate::agent::End;
     use crate::provider::Image;
     use crate::provider::Usage;
+    use crate::questions::Asked;
     use crate::store::{Point, PointKind, Summary};
     use crate::team::{Beat, Render};
     use crate::tui::app::{Action, Cell, Selection};
@@ -3990,6 +4154,7 @@ mod tests {
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use ratatui::layout::Rect;
+    use saddle_wit::saddle::host::ask::{Choice as AskChoice, Question as AskedQuestion};
     use std::time::Duration;
     use std::time::SystemTime;
 
@@ -6703,6 +6868,60 @@ mod tests {
             "{all}"
         );
         assert!(all.contains("10m ago · 3 prompts"), "{all}");
+    }
+
+    #[test]
+    fn a_tools_question_draws_its_choices_preview_and_note_line_over_any_other_dialog() {
+        let mut app = bare_app();
+        let (asked, _answers) = Asked::pair(AskedQuestion {
+            question: "Which approach should the loader take?".into(),
+            choices: vec![
+                AskChoice {
+                    label: "rewrite it".into(),
+                    description: "cleaner boundary".into(),
+                    preview: "+ let host = prepare(component)?;\n- let host = legacy(component)?;"
+                        .into(),
+                },
+                AskChoice {
+                    label: "patch it".into(),
+                    description: String::new(),
+                    preview: String::new(),
+                },
+            ],
+            allow_other: true,
+            allow_note: true,
+        });
+        let mut dialog = AskDialog::new(asked);
+        dialog.selected = 0;
+        app.ask = Some(dialog);
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let all = screen(&terminal);
+        for want in [
+            "Question",
+            "Which approach should the loader take?",
+            "› 1. rewrite it  cleaner boundary",
+            "2. patch it",
+            "3. Type something…",
+            "preview",
+            "+ let host = prepare(component)?;",
+            "↑↓ choose · enter select · 1-9 pick · esc dismiss",
+        ] {
+            assert!(all.contains(want), "missing {want:?} in\n{all}");
+        }
+
+        // The note line belongs to the choice the person picked, and the cursor sits on it.
+        if let Some(dialog) = &mut app.ask {
+            dialog.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(matches!(dialog.stage, AskStage::Noting { .. }));
+        }
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let all = screen(&terminal);
+        assert!(all.contains("note ›"), "{all}");
+        assert!(
+            all.contains("enter answer with this note"),
+            "the help line says what enter does: {all}"
+        );
     }
 
     #[test]

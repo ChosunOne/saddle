@@ -348,11 +348,14 @@ read  = ["fs-read", "tool-read"]
 bash  = ["exec", "fs-read", "fs-write", "net"]
 tasks = ["exec"]          # a background task bash started: report, stop, wait (D182)
 config_help = []          # the configuration reference: nothing to delegate
+ask = []                  # a question to the person: nothing to delegate (D197)
 ```
 
 `config_help` holds no reach at all — it answers from the text compiled into it — so its entry lists
 no scopes and it answers a session whose grants allow nothing. It answers nothing if the entry is
-missing, with a denial naming the missing entry.
+missing, with a denial naming the missing entry. `ask` is the same shape: the question reaches the
+person at the session's own interface, who may dismiss it, and a run with nobody in front of it (a
+piped `saddle run`, `--json`, a worker, `saddle tool ask`) is told so instead of being answered.
 
 A config written before this table existed does not run the shipped tools until the entries are
 added (`saddle tools --config` prints what to add).
@@ -524,6 +527,8 @@ most often wants:
 | `network-seconds`, `http-redirects` | one HTTP request |
 | `query-rows`, `query-result-bytes` | one `session_query` answer |
 | `team-workers`, `team-steps` | live workers per session, and, when set, the model requests one worker turn may take; `0` (the default) means no limit, as the lead's own turn has none |
+| `ask-bytes`, `ask-options` | one question's words, and how many choices it may offer |
+| `ask-option-bytes`, `ask-preview-bytes`, `ask-reply-bytes` | one choice's label and description, its preview, and the note or typed answer a person may send |
 
 ## commands
 

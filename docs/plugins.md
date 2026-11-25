@@ -1,8 +1,9 @@
 # WASI tools and plugins
 
-Saddle's twelve ordinary tools run shipped WASI components (D146–D147), including `config_help`,
+Saddle's ordinary tools run shipped WASI components (D146–D147), including `config_help`,
 which returns the configuration reference compiled from `docs/settings.md` and imports only the
-budgets snapshot, so its profile delegates no scope (D171). There is no native fallback or
+budgets snapshot, so its profile delegates no scope (D171), and `ask`, which puts a question to the
+person in front of the session and delegates no scope either (D197). There is no native fallback or
 native/plugin implementation picker, and `tool_search` is the one name that remains a host MCP
 catalogue operation. Filesystem effects, path resolution, permissions, audit, sandbox execution,
 HTTP/credentials and branch-only transcript SQL remain privileged core services. Guests own schemas,
@@ -45,6 +46,7 @@ agent = ["transcript-read"]
 swarm = ["transcript-read"]
 session_query = ["transcript-read"]
 config_help = []                 # the reference: nothing to delegate
+ask = []                         # a question to the person: nothing to delegate (D197)
 ```
 
 Presence authorizes registration of that fixed shipped component only. Each listed operation scope
@@ -283,6 +285,16 @@ steer publication through a swapped symlink or multiply-linked inode outside its
   headers. Credentials stay in core and only reach the configured provider/fixed Exa endpoints.
   Search snapshots are principal-scoped, not shared with siblings; expansion rechecks current endpoint
   reach and reload evicts data above narrowed cache budgets.
+- **ask:** a question to the person, with numbered choices, an optional preview shown for the choice
+  under the cursor, an optional note attached to the choice they make, and a choice whose answer they
+  type themselves. The guest owns the schema, the bounds and the wording returned to the model; the
+  host owns the surface, the wait and the audit. Asking needs no grant beyond the `tool` registration
+  that runs the component: the person may always dismiss the question, and a dismissal is reported as
+  a failed result the model must not ask again. A session with nobody to reach — a piped `saddle run`,
+  a `--json` stream, a live worker, `saddle tool ask` — answers `unavailable` with the reason. The wait
+  is bounded by `host-wait-seconds`, not the guest's CPU ceiling, and a model-set `timeout_secs` still
+  bounds the whole call. The record keeps the question's and the answer's size and hash, never its
+  words (D197).
 - **session_query:** read-only SQL over one conversation's branch snapshot, including pre-compaction
   messages, request usage and prose reasoning, with a `sessions` view naming the conversations of this
   workspace. No saved-database handle, writes or arbitrary SQL functions. Parent and delegate both
@@ -683,6 +695,11 @@ plugin-input-bytes = 65536
 plugin-output-bytes = 65536
 host-wait-seconds = 300
 host-calls = 16
+ask-bytes = 4096
+ask-options = 8
+ask-option-bytes = 512
+ask-preview-bytes = 8192
+ask-reply-bytes = 4096
 metadata-bytes = 65536
 path-bytes = 4096
 directory-name-bytes = 1024

@@ -55,6 +55,7 @@ use crate::plugins::hooks::Queue as EventQueue;
 use crate::plugins::services::State as ExtensionState;
 use crate::plugins::{Entry as PluginEntry, HostFailure, Registry as PluginRegistry};
 use crate::provider::ToolDef;
+use crate::questions::Questioner;
 use crate::store::{Snapshot, Store};
 use crate::tasks::{self, Tasks};
 use crate::team::Manager;
@@ -684,6 +685,9 @@ pub struct Session {
     /// Set by whoever holds this session when a command it is running must stop: a worker's
     /// interrupt or stop, which reaches the child rather than waiting for it (D195).
     pub cancel: Arc<AtomicBool>,
+    /// How a tool asks the person a question, when this session has one in front of it (D197). A
+    /// worker, a piped run and `saddle tool` have none, and the tool is told so.
+    pub questions: Option<Box<dyn Questioner>>,
 }
 
 impl Session {
@@ -782,6 +786,7 @@ impl Session {
             team: Default::default(),
             team_label: "lead".into(),
             cancel: Arc::new(AtomicBool::new(false)),
+            questions: None,
         };
         // Managed directories are pinned separately from policy-addressable roots (D138).
         session.tool_roots = configured_tool_roots(&session.setup);
@@ -851,6 +856,9 @@ impl Session {
             team: self.team.child(),
             team_label: id.to_owned(),
             cancel: Arc::new(AtomicBool::new(false)),
+            // A worker has no interface of its own: it reports a question in its reply, which the
+            // lead reads and can act on (D195, D197).
+            questions: None,
         };
         session.tool_roots = configured_tool_roots(&session.setup);
         let mut plugins = mem::take(&mut session.plugins);

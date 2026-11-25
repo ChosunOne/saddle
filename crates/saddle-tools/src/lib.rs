@@ -1,5 +1,6 @@
 //! standard tool implementations; the core owns effects, guests own presentation (D131).
 
+pub mod ask;
 pub mod bash;
 pub mod config_help;
 mod diff;

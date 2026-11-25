@@ -83,6 +83,11 @@ pub mod context {
     }
 }
 
+/// a question put to the person, with choices, previews and a note of their own (D197).
+pub mod question {
+    pub use crate::saddle::host::ask::{Choice, Outcome, Question, Reply, Selection, ask};
+}
+
 /// bounded atomic private storage, not filesystem access (D156).
 pub mod persist {
     pub use crate::saddle::host::persist::{Change, Expectation, apply, get};

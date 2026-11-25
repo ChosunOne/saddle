@@ -73,6 +73,12 @@ budgets! {
     plugin_output_bytes: usize = 64 * 1024,
     host_wait_seconds: usize = 300,
     host_calls: usize = 16,
+    // D197: one question, its choices and the answer a person types.
+    ask_bytes: usize = 4096,
+    ask_options: usize = 8,
+    ask_option_bytes: usize = 512,
+    ask_preview_bytes: usize = 8 * 1024,
+    ask_reply_bytes: usize = 4 * 1024,
     metadata_bytes: usize = 64 * 1024,
     path_bytes: usize = 4096,
     directory_name_bytes: usize = 1024,

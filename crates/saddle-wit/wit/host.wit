@@ -16,6 +16,26 @@ interface web-search {
     last: func() -> result<option<snapshot>, string>;
 }
 
+// A question put to the person in the interface they are sitting at (D197). Asking grants no
+// resource: the tool proposes and the person answers, dismisses or says nobody is there. The
+// question's words reach the person, never the audit log, which keeps their length and hash.
+interface ask {
+    // One choice. `preview` is shown beside the list while this choice is the one selected, so a
+    // choice can carry a diff, a sketch or a paragraph without repeating it in every row.
+    record choice { label: string, description: string, preview: string }
+    // `allow-other` offers a choice whose answer is typed instead of picked; `allow-note` lets the
+    // person attach a note to the option they choose.
+    record question { question: string, choices: list<choice>, allow-other: bool, allow-note: bool }
+    // An index into `choices`, or words the person typed themselves.
+    variant selection { chosen(u32), typed(string) }
+    // `note` belongs to a chosen choice; it is empty for a typed answer.
+    record reply { selection: selection, note: string }
+    // `unavailable` says why this session has nobody to ask rather than inventing an answer; a
+    // refusal to ask at all is the error half, shaped the way every tool's denial is.
+    variant outcome { answered(reply), dismissed, unavailable(string) }
+    ask: func(question: question) -> result<outcome, string>;
+}
+
 interface exec {
     record command { argv: list<string>, timeout-secs: u64 }
     record reply {
