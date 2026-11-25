@@ -376,7 +376,7 @@ pub fn launch(
     };
     let spec = SandboxSpec {
         argv: [program.to_owned()].into_iter().chain(argv).collect(),
-        cwd: cwd.into(),
+        cwd,
         env: environment,
         // D190: the workspace is a read claim of the named launch only. The helper still
         // opens it without symlink traversal and checks for protected-path overlap.

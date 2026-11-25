@@ -1837,7 +1837,7 @@ fn a_live_worker_is_started_and_addressed_by_the_shipped_team_tool() {
     // conversations, and a worker request carrying the brief proves the second session exists.
     let (base, seen) = serve_dynamic(10, |_, body| {
         let text = body.to_string();
-        let answer = if text.contains("find the reload path") {
+        if text.contains("find the reload path") {
             // The worker's own first turn.
             sse_response(&openai_sse("worker finished", &[]))
         } else if text.contains("started runtime") {
@@ -1862,8 +1862,7 @@ fn a_live_worker_is_started_and_addressed_by_the_shipped_team_tool() {
                     }),
                 )],
             ))
-        };
-        answer
+        }
     });
     let env = Env::new(Api::Openai, &base);
     env.write_override(

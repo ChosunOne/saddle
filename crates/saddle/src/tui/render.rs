@@ -1267,8 +1267,10 @@ fn entry_render(
                 result.as_ref(),
                 diff.as_deref(),
                 &view,
-                elapsed.as_deref(),
-                *timeout,
+                Timing {
+                    elapsed: elapsed.as_deref(),
+                    limit: *timeout,
+                },
                 theme,
             );
             background_block(&mut rows, &mut bg, tasks, view.spinner, now, theme);
@@ -1515,16 +1517,40 @@ fn background_block(
 
 /// A tool call as a shaded block: the call, then its output. Collapsed, bash shows its last
 /// lines (where errors and test summaries are) and other tools their first.
+/// How long a call has been going, or took once it answered (D172), and the deadline it was given
+/// when the model set one (D152).
+#[derive(Clone, Copy, Default)]
+struct Timing<'a> {
+    elapsed: Option<&'a str>,
+    limit: Option<u64>,
+}
+
+impl Timing<'_> {
+    /// The words after the command: `· 5.0s`, `· 5.0s of 30s`, or `· 30s limit` where there is no
+    /// stopwatch to put the limit after.
+    fn words(&self) -> String {
+        let mut words = String::new();
+        if let Some(elapsed) = self.elapsed {
+            words.push_str(&format!(" · {elapsed}"));
+        }
+        if let Some(seconds) = self.limit {
+            if self.elapsed.is_some() {
+                words.push_str(&format!(" of {seconds}s"));
+            } else {
+                words.push_str(&format!(" · {seconds}s limit"));
+            }
+        }
+        words
+    }
+}
+
 fn tool_block(
     name: &str,
     detail: &str,
     result: Option<&(bool, String)>,
     diff: Option<&str>,
     view: &View,
-    // How long it has been running, or took once it answered (D172), and what the call is capped
-    // at when the model set a deadline (D152).
-    elapsed: Option<&str>,
-    timeout: Option<u64>,
+    timing: Timing<'_>,
     theme: &Theme,
 ) -> (Vec<Row>, Color) {
     let (expand, spinner) = (view.expand, view.spinner);
@@ -1553,21 +1579,10 @@ fn tool_block(
             header.push(Span::styled(first, bold));
         }
     }
-    // A stopwatch beside the call: running while it works, and the total once it has answered, so a
-    // command that took a minute says so afterwards (D172).
-    // A stopwatch, and the deadline the call set when it set one: `· 5.0s of 30s` while it runs,
-    // and `· 30s limit` when there is no stopwatch to put it after (D152).
-    let mut tail = String::new();
-    if let Some(elapsed) = elapsed {
-        tail.push_str(&format!(" · {elapsed}"));
-    }
-    if let Some(seconds) = timeout {
-        if elapsed.is_some() {
-            tail.push_str(&format!(" of {seconds}s"));
-        } else {
-            tail.push_str(&format!(" · {seconds}s limit"));
-        }
-    }
+    // A stopwatch beside the call — running while it works, the total once it has answered, so a
+    // command that took a minute says so afterwards (D172) — and the deadline the call set when it
+    // set one (D152).
+    let tail = timing.words();
     if !tail.is_empty() {
         header.push(Span::styled(tail, dim(theme)));
     }
@@ -4672,8 +4687,10 @@ mod tests {
                 Some(&(ok, content.into())),
                 None,
                 &view(expand),
-                None,
-                None,
+                Timing {
+                    elapsed: None,
+                    limit: None,
+                },
                 &Theme::default(),
             );
             let lines: Vec<String> = rows.iter().flat_map(|r| text(&wrap(r, 80))).collect();
@@ -4722,8 +4739,10 @@ mod tests {
             None,
             None,
             &view(false),
-            None,
-            None,
+            Timing {
+                elapsed: None,
+                limit: None,
+            },
             &Theme::default(),
         );
         let diff = "~\n-12 old line\n+12 new line, long enough to wrap around\n 13 next\n";
@@ -4733,8 +4752,10 @@ mod tests {
             Some(&(true, "edited src/x.rs at line 12".into())),
             Some(diff),
             &view(false),
-            None,
-            None,
+            Timing {
+                elapsed: None,
+                limit: None,
+            },
             &Theme::default(),
         );
         let shown: Vec<String> = edit_rows.iter().flat_map(|r| text(&wrap(r, 30))).collect();
@@ -4806,8 +4827,10 @@ mod tests {
             None,
             None,
             &view(false),
-            Some("5.0s"),
-            Some(30),
+            Timing {
+                elapsed: Some("5.0s"),
+                limit: Some(30),
+            },
             &Theme::default(),
         );
         assert_eq!(text(&wrap(&rows[0], 80)), ["⠋ $ sleep 9 · 5.0s of 30s"]);
@@ -4817,8 +4840,10 @@ mod tests {
             None,
             None,
             &view(false),
-            None,
-            Some(30),
+            Timing {
+                elapsed: None,
+                limit: Some(30),
+            },
             &Theme::default(),
         );
         assert_eq!(text(&wrap(&rows[0], 80)), ["⠋ read src/lib.rs · 30s limit"]);
@@ -4945,8 +4970,10 @@ mod tests {
             None,
             None,
             &view(false),
-            Some("5.0s"),
-            None,
+            Timing {
+                elapsed: Some("5.0s"),
+                limit: None,
+            },
             &Theme::default(),
         );
         assert_eq!(text(&wrap(&rows[0], 80)), ["⠋ $ sleep 9 · 5.0s"]);
@@ -4957,8 +4984,10 @@ mod tests {
             Some(&(true, "exit code 0".into())),
             None,
             &view(false),
-            Some("1m 05s"),
-            None,
+            Timing {
+                elapsed: Some("1m 05s"),
+                limit: None,
+            },
             &Theme::default(),
         );
         assert_eq!(text(&wrap(&rows[0], 80)), ["$ cargo test · 1m 05s"]);
@@ -4970,8 +4999,10 @@ mod tests {
             Some(&(true, "exit code 0".into())),
             None,
             &view(false),
-            None,
-            None,
+            Timing {
+                elapsed: None,
+                limit: None,
+            },
             &Theme::default(),
         );
         assert_eq!(text(&wrap(&rows[0], 80)), ["$ cargo test"]);
@@ -6804,8 +6835,10 @@ mod tests {
                 Some(&(true, "launch succeeded".into())),
                 None,
                 &view(false),
-                None,
-                None,
+                Timing {
+                    elapsed: None,
+                    limit: None,
+                },
                 &theme,
             );
             let now = Instant::now();
@@ -6847,6 +6880,26 @@ mod tests {
         assert_eq!(at.len(), 3, "one in a line, one block, one more in a line");
         assert!(
             lines.iter().all(|l| !plain(l).contains("\\top")),
+            "the source is not what is shown: {:?}",
+            lines.iter().map(plain).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_rate_bound_with_a_slanted_inequality_is_drawn_rather_than_shown_as_its_source() {
+        // Reported from a real terminal: `$k \epsilon^2 \gtrsim \log n$` came out as its source,
+        // because `\gtrsim` had no Typst name and one untranslated command refuses the whole
+        // formula (D165). The slanted inequality is a glyph Typst has, so the line is a picture.
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Kitty;
+        app.entries.push(Entry::Assistant(
+            "the gap is $k \\epsilon^2 \\gtrsim \\log n$ here".into(),
+        ));
+        app.cache.push(None);
+        let (lines, at) = transcript_with_images(&mut app, 80, false);
+        assert_eq!(at.len(), 1, "the formula is a picture in the line");
+        assert!(
+            lines.iter().all(|l| !plain(l).contains("gtrsim")),
             "the source is not what is shown: {:?}",
             lines.iter().map(plain).collect::<Vec<_>>()
         );

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
@@ -193,13 +193,8 @@ impl Bridge {
     /// Called from the loop that waits for the command, so it never blocks a decision for longer
     /// than one request.
     pub fn service(&mut self, session: &mut Session) -> Vec<String> {
-        loop {
-            match self.asks.try_recv() {
-                Ok(Ask::Decide { net, reply }) => {
-                    let _ = reply.send(decide(session, &net));
-                }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
+        while let Ok(Ask::Decide { net, reply }) = self.asks.try_recv() {
+            let _ = reply.send(decide(session, &net));
         }
         let denials: Vec<String> = self.denials.try_iter().collect();
         // A refusal that never reached the engine is still a refusal, and every one is recorded
@@ -235,29 +230,24 @@ impl Bridge {
         call: Option<&str>,
         ceiling: Option<(&[String], &[String])>,
     ) -> HostResult<Vec<String>> {
-        loop {
-            match self.asks.try_recv() {
-                Ok(Ask::Decide { net, reply }) => {
-                    let result = if ceiling
-                        .is_none_or(|(https, ssh)| within_launch_ceiling(&net, https, ssh))
-                    {
-                        decide_as(session, who, call, &net)
-                    } else {
-                        let why = "network target is outside the named launch host lists";
-                        session.audit.event(Kind::Decision, Some(who), Some(Scope::Net), Some(false), json!({"call_id":call, "via":"run-binary", "scheme":net.scheme,"host":net.host,"port":net.port}), why)?;
-                        Ok(Err(why.into()))
-                    };
-                    match result {
-                        Ok(result) => {
-                            let _ = reply.send(result);
-                        }
-                        Err(error) => {
-                            let _ = reply.send(Err("network host failure".into()));
-                            return Err(error);
-                        }
-                    }
+        while let Ok(Ask::Decide { net, reply }) = self.asks.try_recv() {
+            let result = if ceiling
+                .is_none_or(|(https, ssh)| within_launch_ceiling(&net, https, ssh))
+            {
+                decide_as(session, who, call, &net)
+            } else {
+                let why = "network target is outside the named launch host lists";
+                session.audit.event(Kind::Decision, Some(who), Some(Scope::Net), Some(false), json!({"call_id":call, "via":"run-binary", "scheme":net.scheme,"host":net.host,"port":net.port}), why)?;
+                Ok(Err(why.into()))
+            };
+            match result {
+                Ok(result) => {
+                    let _ = reply.send(result);
                 }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                Err(error) => {
+                    let _ = reply.send(Err("network host failure".into()));
+                    return Err(error);
+                }
             }
         }
         let denials: Vec<String> = self

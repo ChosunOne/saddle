@@ -1147,6 +1147,17 @@ fn symbol(name: &str) -> Option<&'static str> {
         "ll" => "lt.double",
         "gg" => "gt.double",
         "ne" | "neq" => "eq.not",
+        // The slanted and negated inequalities: `\gtrsim` in a rate bound is Typst's `gt.tilde`,
+        // and the crossed pair is `lt.gt`/`gt.lt`. Typst has no ≳-or-≈ or ≲-or-≈ glyph, so
+        // `\gtrapprox` and `\lessapprox` stay unknown rather than being drawn as something else.
+        "gtrsim" => "gt.tilde",
+        "lesssim" => "lt.tilde",
+        "gtrless" => "gt.lt",
+        "lessgtr" => "lt.gt",
+        "nless" => "lt.not",
+        "ngtr" => "gt.not",
+        "nleq" => "lt.eq.not",
+        "ngeq" => "gt.eq.not",
         "approx" => "approx",
         "equiv" => "equiv",
         "sim" => "tilde.op",
@@ -1283,6 +1294,22 @@ mod tests {
         assert_eq!(latex(r"\sqrt{x}").unwrap(), "sqrt(x)");
         assert_eq!(latex(r"\sqrt[3]{x+1}").unwrap(), "root(3, x+1)");
         assert_eq!(latex(r"\alpha \cdot \beta").unwrap(), "alpha dot beta");
+        // A rate bound: the epsilon is its own glyph, and the slanted inequalities are the
+        // relations Typst spells `gt.tilde` and `lt.tilde` rather than `gtrsim` and `lesssim`.
+        assert_eq!(
+            latex(r"k \epsilon^2 \gtrsim \log n").unwrap(),
+            "k epsilon^2 gt.tilde log n"
+        );
+        assert_eq!(
+            latex(r"a \lesssim b \gtrless c \lessgtr d").unwrap(),
+            "a lt.tilde b gt.lt c lt.gt d"
+        );
+        assert_eq!(
+            latex(r"x \nless y \nleq z \ngeq w \ngtr v").unwrap(),
+            "x lt.not y lt.eq.not z gt.eq.not w gt.not v"
+        );
+        // Typst has no ≳-or-≈ or ≲-or-≈ glyph, so a guess would draw a different relation.
+        assert_eq!(latex(r"a \gtrapprox b"), None);
         assert_eq!(latex(r"x^2 + y_i").unwrap(), "x^2 + y_i");
         assert_eq!(latex(r"\sin^2 x").unwrap(), "sin^2 x");
         // A thin space is a space, and `dx` is two letters written apart, as TeX sets them.
@@ -1396,6 +1423,11 @@ mod tests {
             scale: 1.0,
         };
         let formula = render_inline(r"a^2 + b^2", &room).expect("a formula renders");
+        // A rate bound in a sentence is drawn like any other inline formula (D165): the slanted
+        // inequality is a glyph Typst has, not a command it would refuse.
+        let bound = render_inline(r"k \epsilon^2 \gtrsim \log n", &room)
+            .expect("an inline formula renders");
+        assert_eq!(bound.cells.1, 1, "one row: {bound:?}");
         assert!(formula.inline, "it sits inside a line");
         assert_eq!(
             formula.cells.1, 1,
@@ -1564,6 +1596,7 @@ mod tests {
             r"\frac{\partial^2 u}{\partial t^2} = c^2 \nabla^2 u + \frac{1}{\rho} \int_{\Omega} f \, dV",
             r"\{ x \in \mathbb{R} : x > 0 \}",
             r"r^\top \delta > b-r^\top h_q",
+            r"k \epsilon^2 \gtrsim \log n",
         ] {
             assert!(
                 render(formula, &room()).is_some(),

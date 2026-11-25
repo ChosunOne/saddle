@@ -3979,7 +3979,10 @@ it, and one inside a line of text in cells of that line, on its baseline.
   separated, keeping a list of the names not to split. There is one compile now. An environment's
   name is read as written for the same reason — `matrix` is one word naming an environment, not
   `m a t r i x`. `\ll` and `\gg` are symbols like any other (`lt.double`, `gt.double`), because
-  that is how physics is written.
+  that is how physics is written, and so are the slanted and negated inequalities of a rate bound —
+  `\gtrsim` is `gt.tilde`, `\lesssim` is `lt.tilde`, `\gtrless`/`\lessgtr` are `gt.lt`/`lt.gt`,
+  `\nleq` is `lt.eq.not` — while a relation Typst has no glyph for (`\gtrapprox`, `\lessapprox`)
+  stays unknown and is drawn as its source rather than as a different relation.
 - **An environment is all or nothing.** A matrix or a `cases` with one cell this front end cannot
   translate refuses the whole environment rather than leaving that cell blank: a matrix with a hole
   in it is a formula drawn wrong, and the rule is that what cannot be drawn is drawn as its source.

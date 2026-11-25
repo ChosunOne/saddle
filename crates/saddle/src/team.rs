@@ -927,9 +927,9 @@ impl Manager {
         origin_principal: &str,
         name: &str,
         brief: &str,
-        provider: &str,
-        model: &str,
+        choice: Choice<'_>,
     ) -> Result<Result<String, String>> {
+        let Choice { provider, model } = choice;
         if origin_principal != "plugin.standard-agent"
             && origin_principal != "plugin.standard-swarm"
         {
@@ -1322,6 +1322,13 @@ fn first_line(text: &str) -> String {
 }
 
 /// One service call from the shipped team component. Every operation addresses only workers this
+/// The provider and model a worker runs on, as two separate names: an empty provider is the lead's
+/// own, an empty model is that provider's configured model, and neither is parsed out of the other.
+pub struct Choice<'a> {
+    pub provider: &'a str,
+    pub model: &'a str,
+}
+
 /// live session started; none takes a path, command or executable.
 pub fn manage(
     session: &mut Session,
@@ -1340,8 +1347,10 @@ pub fn manage(
                 &caller,
                 &brief.name,
                 &brief.brief,
-                &brief.provider,
-                &brief.model,
+                Choice {
+                    provider: &brief.provider,
+                    model: &brief.model,
+                },
             );
             session.team = team;
             result?
