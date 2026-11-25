@@ -476,8 +476,13 @@ impl Manager {
         }
     }
 
-    /// Whether a worker's completion is waiting for the lead's next turn (D195).
+    /// Whether a worker's completion is waiting for the lead's next turn (D195). Only the
+    /// conversation that owns the team reads them: a worker's own view shares the state so it can
+    /// record a rest, but it never receives the notices meant for the lead.
     pub fn pending(&self) -> bool {
+        if !self.owns {
+            return false;
+        }
         self.completions
             .lock()
             .map(|done| done.iter().any(|completion| !completion.announced))
@@ -499,6 +504,9 @@ impl Manager {
     /// What has not been told yet: the model's notices are marked announced so one turn carries
     /// them, the person's are shown in the transcript (D153's shape, for workers — D195).
     pub fn notices(&self, model: bool) -> Vec<String> {
+        if !self.owns {
+            return Vec::new();
+        }
         let Ok(mut done) = self.completions.lock() else {
             return Vec::new();
         };
@@ -1449,6 +1457,19 @@ mod tests {
         // The person's own transcript still shows the line, once.
         assert_eq!(team.notices(false).len(), 1);
         assert!(team.notices(false).is_empty());
+    }
+
+    #[test]
+    fn only_the_lead_reads_a_worker_completion() {
+        // D195: a worker's own session shares the team state so its rest can be recorded, but a
+        // peer's turn must not swallow the notice meant for the lead.
+        let lead = Manager::default();
+        let worker = lead.child();
+        worker.completed("runtime", "idle");
+        assert!(lead.pending());
+        assert!(!worker.pending());
+        assert!(worker.notices(true).is_empty());
+        assert_eq!(lead.notices(true).len(), 1);
     }
 
     #[test]
