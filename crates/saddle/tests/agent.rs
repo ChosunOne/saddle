@@ -1693,6 +1693,60 @@ fn a_worker_at_rest_wakes_the_lead_without_a_poll() {
     );
 }
 #[test]
+fn a_one_shot_run_waits_for_a_worker_that_is_still_mid_turn() {
+    // D195: a worker's thread is the session's, so a `saddle run` that left while it was mid-turn
+    // would close the session out from under it. The run waits for the worker, then acts on the
+    // completion it records — no polling by the lead, and no work lost.
+    let (base, seen) = serve_dynamic(12, |_, body| {
+        let text = body.to_string();
+        if text.contains("You are the worker `runtime`") {
+            if text.contains("\"role\":\"tool\"") {
+                sse_response(&openai_sse("the reload path is in session.rs", &[]))
+            } else {
+                // Keep the worker mid-turn after the lead's own turn has ended.
+                sse_response(&openai_sse(
+                    "",
+                    &[("s", "bash", serde_json::json!({"command":"sleep 1"}))],
+                ))
+            }
+        } else if text.contains("[saddle worker notification]") {
+            sse_response(&openai_sse("noted", &[]))
+        } else if text.contains("started runtime") {
+            sse_response(&openai_sse("done", &[]))
+        } else {
+            sse_response(&openai_sse(
+                "",
+                &[(
+                    "t",
+                    "agent",
+                    serde_json::json!({
+                        "action":"start","name":"runtime","brief":"find the reload path"
+                    }),
+                )],
+            ))
+        }
+    });
+    let env = Env::new(Api::Openai, &base);
+    env.write_override(
+        "[agent]\nmodel-invoke = { tokens-per-session = 100000, cost-per-session = 10.0 }\ntranscript-read = {}\n",
+    );
+    let started = Instant::now();
+    let out = env.saddle(&["run", "start a worker"]);
+    let elapsed = started.elapsed();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "the run left while the worker was still mid-turn: {elapsed:?}"
+    );
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.body.to_string().contains("[saddle worker notification]")),
+        "the worker's completion was acted on after it finished"
+    );
+}
+#[test]
 fn a_live_worker_is_started_and_addressed_by_the_shipped_team_tool() {
     // D195: the lead's tool starts a real session on its own thread. The mock answers both
     // conversations, and a worker request carrying the brief proves the second session exists.
