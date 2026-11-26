@@ -27,16 +27,20 @@ fn holder(who: &Principal) -> Principal {
     }
 }
 
+enum TaskOutput {
+    Live(Arc<Mutex<Capture>>),
+    Finished(Reply),
+}
+
 struct Task {
     id: String,
     ui_call: Option<String>,
     owner: Principal,
     call: String,
     stop: Arc<AtomicBool>,
-    capture: Arc<Mutex<Capture>>,
     worker: Option<JoinHandle<Result<Completed>>>,
     bridge: Option<Bridge>,
-    output: Option<Reply>,
+    output: TaskOutput,
     started: Instant,
     stopped: Option<Instant>,
     denials: Vec<String>,
@@ -46,6 +50,11 @@ struct Task {
 }
 
 impl Task {
+    fn complete(&mut self, output: Reply) {
+        self.output = TaskOutput::Finished(output);
+        self.stopped = Some(Instant::now());
+    }
+
     fn wakes(&self) -> bool {
         match self.wake {
             Wake::Armed => true,
@@ -155,20 +164,20 @@ impl Tasks {
                 started: task.started,
                 stopped: task.stopped,
                 state: match &task.output {
-                    None => State::Running,
-                    Some(output) if output.timed_out => State::TimedOut,
-                    Some(output) if output.cancelled => State::Cancelled,
-                    Some(output) if output.code == Some(0) => State::Succeeded,
-                    Some(_) => State::Failed,
+                    TaskOutput::Live(_) => State::Running,
+                    TaskOutput::Finished(output) if output.timed_out => State::TimedOut,
+                    TaskOutput::Finished(output) if output.cancelled => State::Cancelled,
+                    TaskOutput::Finished(output) if output.code == Some(0) => State::Succeeded,
+                    TaskOutput::Finished(_) => State::Failed,
                 },
             })
             .collect()
     }
 
     pub fn pending(&self) -> bool {
-        self.entries
-            .iter()
-            .any(|task| task.wakes() && task.output.is_some() && !task.announced)
+        self.entries.iter().any(|task| {
+            task.wakes() && matches!(task.output, TaskOutput::Finished(_)) && !task.announced
+        })
     }
 
     pub fn waiting(&self) -> bool {
@@ -192,23 +201,47 @@ impl Tasks {
     }
 }
 
-fn snapshot(task: &Task) -> Result<TaskReply> {
-    let output = if let Some(output) = &task.output {
-        output.clone()
-    } else {
-        let capture = task
-            .capture
-            .lock()
-            .map_err(|_| anyhow!("task capture lock poisoned"))?;
-        Reply {
-            code: None,
-            signal: None,
-            stdout: capture.stdout.clone(),
-            stderr: capture.stderr.clone(),
-            timed_out: false,
-            cancelled: false,
-            truncated: capture.truncated,
-            denials: task.denials.clone(),
+#[derive(Clone, Copy)]
+enum StreamDetail {
+    Include,
+    Omit,
+}
+
+impl StreamDetail {
+    fn copy(self, bytes: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Include => bytes.to_vec(),
+            Self::Omit => Vec::new(),
+        }
+    }
+}
+
+fn snapshot(task: &Task, streams: StreamDetail) -> Result<TaskReply> {
+    let output = match &task.output {
+        TaskOutput::Finished(output) => Reply {
+            code: output.code,
+            signal: output.signal,
+            stdout: streams.copy(&output.stdout),
+            stderr: streams.copy(&output.stderr),
+            timed_out: output.timed_out,
+            cancelled: output.cancelled,
+            truncated: output.truncated,
+            denials: output.denials.clone(),
+        },
+        TaskOutput::Live(capture) => {
+            let capture = capture
+                .lock()
+                .map_err(|_| anyhow!("task capture lock poisoned"))?;
+            Reply {
+                code: None,
+                signal: None,
+                stdout: streams.copy(&capture.stdout),
+                stderr: streams.copy(&capture.stderr),
+                timed_out: false,
+                cancelled: false,
+                truncated: capture.truncated,
+                denials: task.denials.clone(),
+            }
         }
     };
     Ok(TaskReply {
@@ -251,14 +284,14 @@ pub fn service(session: &mut Session) -> Result<()> {
                 if let Some(bridge) = task.bridge.take() {
                     bridge.finish();
                 }
-                task.output = Some(execution::finish(
+                let output = execution::finish(
                     session,
                     &task.owner,
                     &task.call,
                     completed,
                     mem::take(&mut task.denials),
-                )?);
-                task.stopped = Some(Instant::now());
+                )?;
+                task.complete(output);
             }
         }
         Ok(())
@@ -340,16 +373,15 @@ pub fn start(
         owner: who.clone(),
         call: call.into(),
         stop,
-        capture,
         worker: Some(worker),
         bridge,
-        output: None,
+        output: TaskOutput::Live(capture),
         denials: Vec::new(),
         announced: false,
         shown: false,
         wake: Wake::Unsaid,
     };
-    let reply = snapshot(&task)?;
+    let reply = snapshot(&task, StreamDetail::Include)?;
     session.tasks.entries.push(task);
     Ok(Ok(reply))
 }
@@ -407,6 +439,11 @@ pub fn access(
             thread::sleep(Duration::from_millis(5));
         }
     }
+    let streams = if id.is_some() {
+        StreamDetail::Include
+    } else {
+        StreamDetail::Omit
+    };
     let mut replies = Vec::new();
     for task in session
         .tasks
@@ -414,12 +451,7 @@ pub fn access(
         .iter()
         .filter(|task| holder(&task.owner) == caller && id.is_none_or(|id| task.id == id))
     {
-        let mut reply = snapshot(task)?;
-        if id.is_none() {
-            reply.output.stdout.clear();
-            reply.output.stderr.clear();
-        }
-        replies.push(reply);
+        replies.push(snapshot(task, streams)?);
     }
     if id.is_some() && replies.is_empty() {
         session.audit.event(
@@ -469,7 +501,7 @@ pub fn wake(
         )?;
         return Ok(Err("unknown task for this principal".into()));
     };
-    let reply = snapshot(task)?;
+    let reply = snapshot(task, StreamDetail::Include)?;
     Ok(Ok(vec![reply]))
 }
 
@@ -495,7 +527,7 @@ pub fn notices(session: &mut Session, model: bool) -> Result<Vec<String>> {
     service(session)?;
     let mut notices = Vec::new();
     for task in &mut session.tasks.entries {
-        if let Some(output) = &task.output
+        if let TaskOutput::Finished(output) = &task.output
             && !(if model { task.announced } else { task.shown })
         {
             if model {
@@ -578,8 +610,72 @@ pub fn human(session: &mut Session, argument: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use saddle_cap::PluginId;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use saddle_cap::{PluginId, Principal};
+    use saddle_sandbox::Capture;
+    use saddle_wit::saddle::host::exec::Reply;
+
+    use super::{
+        State, StreamDetail, Task, TaskOutput, View, Wake, elapsed_text, notice_line, snapshot,
+    };
+
+    #[test]
+    fn listing_omits_streams_and_completion_releases_live_capture() {
+        let capture = Arc::new(Mutex::new(Capture {
+            stdout: b"partial out".to_vec(),
+            stderr: b"partial err".to_vec(),
+            truncated: true,
+        }));
+        let live_capture = Arc::downgrade(&capture);
+        let mut task = Task {
+            id: "task-1".into(),
+            ui_call: None,
+            owner: Principal::Agent,
+            call: "call-1".into(),
+            stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            bridge: None,
+            output: TaskOutput::Live(capture),
+            started: Instant::now(),
+            stopped: None,
+            denials: Vec::new(),
+            announced: false,
+            shown: false,
+            wake: Wake::Quiet,
+        };
+        let partial = snapshot(&task, StreamDetail::Include).unwrap().output;
+        assert_eq!(partial.stdout, b"partial out");
+        assert_eq!(partial.stderr, b"partial err");
+        let listed = snapshot(&task, StreamDetail::Omit).unwrap().output;
+        assert_eq!(listed.stdout.capacity(), 0);
+        assert_eq!(listed.stderr.capacity(), 0);
+        assert!(listed.truncated);
+
+        task.complete(Reply {
+            code: Some(7),
+            signal: None,
+            stdout: b"final out".to_vec(),
+            stderr: b"final err".to_vec(),
+            timed_out: false,
+            cancelled: false,
+            truncated: true,
+            denials: vec!["denial".into()],
+        });
+        assert!(live_capture.upgrade().is_none());
+        let listed = snapshot(&task, StreamDetail::Omit).unwrap();
+        assert!(!listed.running);
+        assert_eq!(listed.output.stdout.capacity(), 0);
+        assert_eq!(listed.output.stderr.capacity(), 0);
+        assert_eq!(listed.output.code, Some(7));
+        assert!(listed.output.truncated);
+        assert_eq!(listed.output.denials, ["denial"]);
+        let saved = snapshot(&task, StreamDetail::Include).unwrap().output;
+        assert_eq!(saved.stdout, b"final out");
+        assert_eq!(saved.stderr, b"final err");
+    }
 
     #[test]
     fn a_completion_notice_says_where_to_read_it_and_whose_it_is() {
