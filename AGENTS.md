@@ -259,7 +259,7 @@ cargo nextest run -p saddle-cap              # one crate
 cargo nextest run -E 'test(/^tui::/)'        # by name, with nextest's filter expressions
 cargo fmt --all --check                      # must stay clean; no rustfmt.toml, so defaults apply
 cargo clippy --all-targets                   # must stay clean
-cargo dylint --all                           # source style lints; needs cargo-dylint and its nightly
+cargo dylint --all --workspace -- --all-targets  # source style lints; needs its pinned nightly
 ```
 
 `cargo dylint` is separate from Clippy: install
@@ -490,7 +490,7 @@ implementation is wrong.
   needed. New crates must set `[lints] workspace = true`.
 - Rust source has no comments, including Rustdoc (D198). Use clear names, explicit control flow,
   and tests for examples. Put API guidance in Markdown and design rationale in `docs/plan.md`.
-  `cargo dylint --all` denies Rust comment tokens; strings containing comment markers are unaffected.
+  The `no_source_comments` lint denies Rust comment tokens; strings containing comment markers are unaffected.
 - `anyhow` with `bail!`/`Context` in the `saddle` binary crate; typed `thiserror` errors in the
   library crates.
 - Messages are lowercase sentences. Host errors are prefixed `saddle:` by `main`; policy denials are

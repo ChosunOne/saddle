@@ -3419,8 +3419,9 @@ the raw components/digests and build-produced native Wasmtime artifacts. This re
 WIT, tool, limits and ignore sources; normal build/test produces current artifacts automatically.
 
 The pinned Wasmtime compiler uses an explicit baseline target ISA for package and runtime engines.
-Loading native artifacts is unsafe in general: the new embedded loader path accepts only immutable
-artifacts compiled by the trusted package build from those exact embedded component bytes. No
+Loading native artifacts is unsafe in general. The caller of `Loader::prepare_embedded` must
+provide immutable native bytes from the trusted package build, compiled by the pinned Wasmtime
+version from exactly the embedded component bytes passed to the same call. No
 runtime-writable serialized-code cache, native plugin library or downloaded artifact can use it.
 Ordinary third-party plugins still compile only digest-checked raw components. Both paths inspect
 actual types, check scope ceilings/delegation and pre-link against granted services before init.
@@ -4868,7 +4869,7 @@ choices.
 
 **D198.** Rust source has no comments, including line, block, and Rustdoc comments. Use code and
 focused tests to show what happens; put user guidance and design rationale in Markdown. Run
-`cargo dylint --all` with the other checks: `no_source_comments` is deny-by-default and uses the
+`cargo dylint --all --workspace -- --all-targets` with the other checks: `no_source_comments` is deny-by-default and uses the
 compiler's lexer on local Rust source loaded by the compiler, so comment syntax inside a literal is
 not a violation. This supersedes the inline documentation convention without changing D148's
 import rule.
