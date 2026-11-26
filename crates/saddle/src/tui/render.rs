@@ -2368,9 +2368,10 @@ fn shade_dialog(frame: &mut Frame<'_>, app: &App) {
 /// scrolls as ever, and the question is simply the end of the conversation rather than a lid over
 /// it. Returns the rows, and the cell the cursor belongs on counted from the block's first row.
 ///
-/// `room` is the viewport the block has to fit in. A preview is a preview: a diff long enough to
-/// push the question and its choices off the top of the screen while the person walks the choices
-/// taught that the preview gives way, not the question (D197).
+/// A choice's preview has a panel of its own beside the question when the screen is wide enough for
+/// both, and goes under the choices when it is not. Either way the block's height belongs to the
+/// question and its choices rather than to the choice under the cursor, so walking them moves
+/// nothing else on the screen.
 fn ask_rows(
     dialog: &AskDialog,
     width: usize,
@@ -2380,23 +2381,32 @@ fn ask_rows(
     let width = width.max(8);
     let accent = Style::new().fg(theme.accent);
     let question = &dialog.asked.question;
-    let mut rule = "── Question ".to_owned();
-    rule.push_str(&"─".repeat(width.saturating_sub(rule.width())));
-    let mut lines = vec![
-        Line::from(Span::styled(rule, Style::new().fg(theme.border_accent))),
-        Line::default(),
-    ];
-    for line in wrap_columns(&question.question, width.saturating_sub(2), 4) {
-        lines.push(Line::from(vec![
+    let has_preview = question
+        .choices
+        .iter()
+        .any(|choice| !choice.preview.trim().is_empty());
+    // The rule above the block spans the whole width; the question keeps the left of it and the
+    // preview takes a panel on the right, two cells for the rule between them (D197).
+    let panel = (has_preview && width >= PREVIEW_SIDE_MIN).then(|| (width * 2 / 5).clamp(20, 48));
+    let column_width = panel.map_or(width, |panel| width - panel - 2);
+    let preview = dialog
+        .choice(dialog.selected)
+        .and_then(|row| question.choices.get(row))
+        .map(|choice| choice.preview.as_str())
+        .unwrap_or_default();
+
+    let mut column: Vec<Line<'static>> = vec![Line::default()];
+    for line in wrap_columns(&question.question, column_width.saturating_sub(2), 4) {
+        column.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(line, Style::new().add_modifier(Modifier::BOLD)),
         ]));
     }
-    lines.push(Line::default());
+    column.push(Line::default());
     let rows = dialog.rows();
     for (index, choice) in question.choices.iter().enumerate() {
-        lines.extend(choice_rows(
-            width,
+        column.extend(choice_rows(
+            column_width,
             index + 1,
             &choice.label,
             &choice.description,
@@ -2406,8 +2416,8 @@ fn ask_rows(
         ));
     }
     if question.allow_other && rows > 0 {
-        lines.extend(choice_rows(
-            width,
+        column.extend(choice_rows(
+            column_width,
             question.choices.len() + 1,
             "Type something…",
             "an answer of your own",
@@ -2416,9 +2426,62 @@ fn ask_rows(
             theme,
         ));
     }
-    // The tail: the line being written, and why the last attempt was refused.
-    let mut tail = vec![Line::default()];
-    let mut note_col = None;
+    // A preview with no panel of its own goes under the choices, and gives way when the block
+    // would be taller than the viewport it lands in.
+    if panel.is_none() && has_preview {
+        let wrapped: Vec<Vec<String>> = question
+            .choices
+            .iter()
+            .map(|choice| {
+                if choice.preview.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    wrap_columns(&choice.preview, column_width.saturating_sub(4), usize::MAX)
+                }
+            })
+            .collect();
+        let tallest = wrapped.iter().map(Vec::len).max().unwrap_or(0);
+        // The blank, the word "preview" and the footer row are the region's own rows.
+        let cap = match room {
+            Some(room) => room.saturating_sub(column.len() + 4).min(MAX_PREVIEW_ROWS),
+            None => MAX_PREVIEW_ROWS,
+        };
+        let shown = tallest.min(cap);
+        if shown > 0 {
+            let selected = dialog
+                .choice(dialog.selected)
+                .and_then(|row| wrapped.get(row));
+            column.push(Line::default());
+            column.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled("preview", dim(theme)),
+            ]));
+            for index in 0..shown {
+                column.push(match selected.and_then(|lines| lines.get(index)) {
+                    Some(line) => Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(line.clone(), Style::new()),
+                    ]),
+                    None => Line::default(),
+                });
+            }
+            if tallest > shown {
+                let more = selected.map_or(0, |lines| lines.len().saturating_sub(shown));
+                let plural = if more == 1 { "" } else { "s" };
+                let footer = if more == 0 {
+                    String::new()
+                } else {
+                    format!("… {more} more line{plural}")
+                };
+                column.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(footer, dim(theme)),
+                ]));
+            }
+        }
+    }
+    column.push(Line::default());
+    let mut note = None;
     let (label, text) = match &dialog.stage {
         AskStage::Choosing => ("", ""),
         AskStage::Noting { text, .. } => ("note › ", text.as_str()),
@@ -2428,10 +2491,11 @@ fn ask_rows(
         // The cursor is where the next character goes, and a line too long to fit keeps its end —
         // which is the end being written. One column short of the edge: a cursor placed past it
         // wraps, and a wrap scrolls the screen out from under a block meant to stay put (D197).
-        let room = width.saturating_sub(2 + label.width());
+        let room = column_width.saturating_sub(2 + label.width());
         let used = text.width().min(room);
-        note_col = Some((2 + label.width() + used).min(width.saturating_sub(1)));
-        tail.push(Line::from(vec![
+        let col = (2 + label.width() + used).min(column_width.saturating_sub(1));
+        note = Some((column.len(), col));
+        column.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(label.to_owned(), accent),
             Span::styled(
@@ -2441,78 +2505,94 @@ fn ask_rows(
         ]));
     }
     if let Some(error) = &dialog.error {
-        tail.push(Line::from(vec![
+        column.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                clip(error, width.saturating_sub(2)),
+                clip(error, column_width.saturating_sub(2)),
                 Style::new().fg(theme.error),
             ),
         ]));
     }
-    // The preview belongs to the choice under the cursor, but the room it takes belongs to the
-    // question: the tallest preview decides how many rows are reserved, so walking the choices never
-    // changes the block's height and the screen never shifts under the person's eyes. The footer row
-    // is reserved too, and says how much of the selected preview was left out (D197).
-    let wrapped: Vec<Vec<String>> = question
-        .choices
-        .iter()
-        .map(|choice| {
-            if choice.preview.trim().is_empty() {
-                Vec::new()
-            } else {
-                wrap_columns(&choice.preview, width.saturating_sub(4), usize::MAX)
+
+    let mut rule = "── Question ".to_owned();
+    rule.push_str(&"─".repeat(width.saturating_sub(rule.width())));
+    let mut lines = vec![Line::from(Span::styled(
+        rule,
+        Style::new().fg(theme.border_accent),
+    ))];
+    // The cursor counts from the block's first row, and the rule is that row.
+    let cursor = note.map(|(row, col)| (row + 1, col));
+    match panel {
+        Some(panel_width) => {
+            let right = preview_panel(preview, panel_width, column.len(), theme);
+            for index in 0..column.len() {
+                lines.push(with_panel(
+                    column.get(index),
+                    right.get(index),
+                    column_width,
+                    theme,
+                ));
             }
-        })
-        .collect();
-    let tallest = wrapped.iter().map(Vec::len).max().unwrap_or(0);
-    // The blank, the word "preview" and the footer row are the region's own rows.
-    let cap = match room {
-        Some(room) => room
-            .saturating_sub(lines.len() + tail.len() + 3)
-            .min(MAX_PREVIEW_ROWS),
-        None => MAX_PREVIEW_ROWS,
-    };
-    let shown = tallest.min(cap);
-    if shown > 0 {
-        lines.push(Line::default());
-        lines.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled("preview", dim(theme)),
-        ]));
-        let selected = dialog
-            .choice(dialog.selected)
-            .and_then(|row| wrapped.get(row));
-        for index in 0..shown {
-            lines.push(match selected.and_then(|lines| lines.get(index)) {
-                Some(line) => Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(line.clone(), Style::new()),
-                ]),
-                None => Line::default(),
-            });
         }
-        if tallest > shown {
-            let more = selected.map_or(0, |lines| lines.len().saturating_sub(shown));
-            let plural = if more == 1 { "" } else { "s" };
-            let footer = if more == 0 {
-                String::new()
-            } else {
-                format!("… {more} more line{plural}")
-            };
-            lines.push(Line::from(vec![
-                Span::raw("    "),
-                Span::styled(footer, dim(theme)),
-            ]));
-        }
+        None => lines.extend(column),
     }
-    // The note line is the tail's second row, after the blank that separates it from the block.
-    let cursor = note_col.map(|col| (lines.len() + 1, col));
-    lines.extend(tail);
     (lines, cursor)
 }
 
-/// How many rows of a choice's preview are drawn at most, however tall the screen (D197).
+/// The preview's own panel: a title row, as much of the preview as the question's rows make room
+/// for, and the count of what was left out. Its height is the question's, never its own, so a long
+/// diff cannot make the block taller than the choices beside it (D197).
+fn preview_panel(preview: &str, width: usize, rows: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let mut panel = vec![Line::from(Span::styled("preview", dim(theme)))];
+    let wrapped = if preview.trim().is_empty() {
+        Vec::new()
+    } else {
+        wrap_columns(preview, width, usize::MAX)
+    };
+    let room = rows.saturating_sub(1);
+    let shown = if wrapped.len() > room {
+        room.saturating_sub(1)
+    } else {
+        wrapped.len()
+    };
+    for line in wrapped.iter().take(shown) {
+        panel.push(Line::from(Span::styled(line.clone(), Style::new())));
+    }
+    if wrapped.len() > shown {
+        let more = wrapped.len() - shown;
+        let plural = if more == 1 { "" } else { "s" };
+        panel.push(Line::from(Span::styled(
+            format!("… {more} more line{plural}"),
+            dim(theme),
+        )));
+    }
+    panel
+}
+
+/// One row of the question with the preview's panel beside it, and the rule between them.
+fn with_panel(
+    left: Option<&Line<'static>>,
+    right: Option<&Line<'static>>,
+    column_width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = left.map(|line| line.spans.clone()).unwrap_or_default();
+    let used: usize = spans.iter().map(|span| span.content.width()).sum();
+    spans.push(Span::raw(" ".repeat(column_width.saturating_sub(used))));
+    spans.push(Span::styled("│ ", dim(theme)));
+    if let Some(right) = right {
+        spans.extend(right.spans.clone());
+    }
+    Line::from(spans)
+}
+
+/// How many rows of a choice's preview are drawn under the choices at most, however tall the screen
+/// (D197).
 const MAX_PREVIEW_ROWS: usize = 10;
+
+/// How wide the screen must be before a choice's preview gets a panel of its own beside the
+/// question rather than under it (D197).
+const PREVIEW_SIDE_MIN: usize = 64;
 
 /// One choice: its number and label, the recommended marker on the one the asker advises, and the
 /// description as subtext under it in a quieter colour than the label (D197).
@@ -7034,7 +7114,7 @@ mod tests {
             "the transcript was covered:\n{all}"
         );
         assert!(
-            all.contains("↑↓ choose · enter select · 1-9 pick · esc dismiss"),
+            all.contains("↑↓ choose · enter answer · 1-9 pick · n note · esc dismiss"),
             "the keys are on the frame's own line:\n{all}"
         );
         for want in [
@@ -7048,7 +7128,7 @@ mod tests {
             "an answer of your own",
             "preview",
             "+ let host = prepare(component)?;",
-            "↑↓ choose · enter select · 1-9 pick · esc dismiss",
+            "↑↓ choose · enter answer · 1-9 pick · n note · esc dismiss",
         ] {
             assert!(all.contains(want), "missing {want:?} in\n{all}");
         }
@@ -7080,9 +7160,9 @@ mod tests {
             "the subtext is drawn in the quiet colour"
         );
 
-        // The chosen row asks for its note in the same band, and the cursor sits on that line.
+        // `n` opens a note on the choice under the cursor, and the cursor sits on that line.
         if let Some(dialog) = &mut app.ask {
-            dialog.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            dialog.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
             assert!(matches!(dialog.stage, AskStage::Noting { .. }));
         }
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -7164,9 +7244,9 @@ mod tests {
             app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
 
-        // Picking a choice opens its note, and the frame names the choice the note belongs to, so
-        // the answer is never sent by a keystroke that meant to add to it (D197).
-        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // `n` opens the note of the choice under the cursor, and the frame names the choice it
+        // belongs to, so an answer is never sent by a keystroke that meant to add to it (D197).
+        app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let all = screen(&terminal);
         assert!(
@@ -7235,13 +7315,14 @@ mod tests {
         let (lines, cursor) = ask_rows(&dialog, 80, Some(24), &theme);
         let (row, col) = cursor.expect("a note has a cursor");
         let text = plain(&lines[row]);
+        let written = "  note › half";
         assert!(
-            text.contains("note › half"),
+            text.starts_with(written),
             "the cursor is on the note line: {text:?}"
         );
         assert_eq!(
             col,
-            text.width(),
+            written.width(),
             "the cursor follows the words, never past the edge"
         );
         assert!(col < 80);

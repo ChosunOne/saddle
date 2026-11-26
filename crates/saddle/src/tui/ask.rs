@@ -66,7 +66,12 @@ impl AskDialog {
     pub fn help(&self) -> String {
         match &self.stage {
             Stage::Choosing => {
-                "↑↓ choose · enter select · 1-9 pick · esc dismiss · pgup/pgdn scroll".into()
+                let note = if self.asked.question.allow_note {
+                    " · n note"
+                } else {
+                    ""
+                };
+                format!("↑↓ choose · enter answer · 1-9 pick{note} · esc dismiss")
             }
             Stage::Noting { choice, .. } => {
                 let label = self
@@ -185,7 +190,8 @@ impl AskDialog {
                 self.selected = (self.selected + 1) % rows;
                 Answer::Stay
             }
-            // A digit is the shortest way to a choice whose preview the person does not need.
+            // A digit is the shortest way to a choice whose preview the person does not need, so it
+            // answers rather than only moving the highlight.
             KeyCode::Char(digit @ '1'..='9') => {
                 let row = digit.to_digit(10).unwrap_or(1) as usize - 1;
                 if row < rows {
@@ -196,20 +202,16 @@ impl AskDialog {
                 }
             }
             KeyCode::Enter => self.choose(),
+            // A note is an extra, never a step between picking a choice and answering it: `n`
+            // opens the line, and enter there sends the answer with it (D197).
+            KeyCode::Char('n') => self.note(),
             _ => Answer::Stay,
         }
     }
 
-    /// Enter on the highlighted row: a note first when one is offered, else the answer itself.
+    /// Enter (or a digit) on the highlighted row: that is the answer, now.
     fn choose(&mut self) -> Answer {
         match self.choice(self.selected) {
-            Some(choice) if self.asked.question.allow_note => {
-                self.stage = Stage::Noting {
-                    choice,
-                    text: String::new(),
-                };
-                Answer::Stay
-            }
             Some(choice) => Answer::Given(Outcome::Answered(Reply {
                 selection: Selection::Chosen(choice as u32),
                 note: String::new(),
@@ -221,6 +223,20 @@ impl AskDialog {
                 Answer::Stay
             }
         }
+    }
+
+    /// `n`: write the note that goes with the choice under the cursor. A question that offers no
+    /// note, or the row whose answer is typed, has nothing to write one about.
+    fn note(&mut self) -> Answer {
+        if let Some(choice) = self.choice(self.selected)
+            && self.asked.question.allow_note
+        {
+            self.stage = Stage::Noting {
+                choice,
+                text: String::new(),
+            };
+        }
+        Answer::Stay
     }
 }
 
@@ -294,7 +310,7 @@ mod tests {
         assert_eq!(dialog.selected, 0, "handing the key back chose nothing");
         // The same holds while a note is being written: end still means the end of the
         // conversation, and the note is where the cursor already is.
-        dialog.key(key(KeyCode::Enter));
+        dialog.key(key(KeyCode::Char('n')));
         assert!(matches!(dialog.stage, Stage::Noting { .. }));
         assert!(matches!(dialog.key(key(KeyCode::End)), Answer::Pass));
         assert!(matches!(dialog.key(key(KeyCode::Char('n'))), Answer::Stay));
@@ -303,10 +319,10 @@ mod tests {
     #[test]
     fn a_choice_takes_a_note_and_the_note_is_the_answer() {
         let (mut dialog, _answers) = dialog();
-        // Down to the second choice, enter to choose it.
+        // Down to the second choice, `n` for the note, then the words and enter.
         assert!(matches!(dialog.key(key(KeyCode::Down)), Answer::Stay));
         assert_eq!(dialog.selected, 1);
-        assert!(matches!(dialog.key(key(KeyCode::Enter)), Answer::Stay));
+        assert!(matches!(dialog.key(key(KeyCode::Char('n'))), Answer::Stay));
         assert_eq!(
             dialog.stage,
             Stage::Noting {
@@ -325,19 +341,53 @@ mod tests {
     }
 
     #[test]
-    fn a_digit_picks_that_choice_and_escape_dismisses_the_question() {
+    fn a_digit_answers_with_that_choice_at_once() {
         let (mut dialog, _answers) = dialog();
-        assert!(
-            matches!(dialog.key(key(KeyCode::Char('1'))), Answer::Stay),
-            "a choice with a note offered asks for the note first"
-        );
+        // A digit answers: a note is `n`, never a step on the way (D197).
+        let Answer::Given(Outcome::Answered(reply)) = dialog.key(key(KeyCode::Char('2'))) else {
+            panic!("a digit answers with its choice");
+        };
+        assert!(matches!(reply.selection, Selection::Chosen(1)));
+        assert_eq!(reply.note, "");
+    }
+
+    #[test]
+    fn enter_answers_and_escape_dismisses() {
+        let (mut dismissing, _answers) = dialog();
+        assert!(matches!(
+            dismissing.key(key(KeyCode::Esc)),
+            Answer::Given(Outcome::Dismissed)
+        ));
+        let (mut answering, _answers) = dialog();
+        let Answer::Given(Outcome::Answered(reply)) = answering.key(key(KeyCode::Enter)) else {
+            panic!("enter answers with the highlighted choice");
+        };
+        assert!(matches!(reply.selection, Selection::Chosen(0)));
+    }
+
+    #[test]
+    fn n_writes_a_note_and_escape_goes_back_to_the_choices() {
+        let (mut dialog, _answers) = dialog();
+        assert!(matches!(dialog.key(key(KeyCode::Char('n'))), Answer::Stay));
+        assert!(matches!(dialog.stage, Stage::Noting { .. }));
         // The note stage is where escape goes back, not away.
         assert!(matches!(dialog.key(key(KeyCode::Esc)), Answer::Stay));
         assert_eq!(dialog.stage, Stage::Choosing);
-        assert!(matches!(
-            dialog.key(key(KeyCode::Esc)),
-            Answer::Given(Outcome::Dismissed)
-        ));
+        // And a question that offers no note has none to open.
+        let (asked, _answers) = Asked::pair(Question {
+            question: "confirm?".into(),
+            choices: vec![Choice {
+                label: "yes".into(),
+                description: String::new(),
+                preview: String::new(),
+                recommended: false,
+            }],
+            allow_other: false,
+            allow_note: false,
+        });
+        let mut dialog = AskDialog::new(asked);
+        assert!(matches!(dialog.key(key(KeyCode::Char('n'))), Answer::Stay));
+        assert_eq!(dialog.stage, Stage::Choosing);
     }
 
     #[test]
@@ -389,7 +439,7 @@ mod tests {
         let (mut dialog, _answers) = dialog();
         dialog.paste("not while choosing");
         assert_eq!(dialog.stage, Stage::Choosing);
-        dialog.key(key(KeyCode::Enter));
+        dialog.key(key(KeyCode::Char('n')));
         dialog.paste("a pasted note \u{1b}[2J");
         assert_eq!(
             dialog.stage,

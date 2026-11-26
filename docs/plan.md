@@ -4832,15 +4832,17 @@ explanation is not interrupted mid-sentence by a box landing on the words they w
 question is simply what comes next, and `end` puts it back in view. The keys the question owns are on
 the frame's activity line, so they are readable even when the question has been scrolled away; the
 line says where the question is instead, once it is out of view. The block is laid out to fit the
-viewport it lands in: a choice's preview is what gives way when room runs short — cut to at most ten
-rows with the number it left out — because a diff nobody asked to read must never push the question
-and its choices off the top of the screen while the person walks them. The preview's rows belong to
-the question rather than to the choice under the cursor: the tallest preview decides how many rows are
-reserved, a choice with none leaves them blank, and the footer row is reserved whether or not it has
-something to say. So walking the choices never changes the block's height, and nothing moves on the
-screen while every choice is already visible. Picking a choice opens the
-note as a second step, and the activity line names the choice it will be attached to, so an answer is
-never sent by the keystroke that meant to add to it. The shipped `ask` tool is the guest — it owns the schema, the bounds and how the
+viewport it lands in, and its rows belong to the question and its choices rather than to the choice
+under the cursor, so walking them moves nothing else on the screen. A choice's preview is a panel of
+its own on the right when the screen is wide enough for both — the two columns separated by a rule,
+the panel titled and given exactly the rows the question beside it needs — and goes under the choices
+when it is not, where it gives way to them: cut to at most ten rows with the number it left out,
+because a diff nobody asked to read must never push the question and its choices off the top of the
+screen. What the person does is answering, not writing: `enter` or a digit answers with the choice it
+names, a digit answering at once rather than only moving the highlight, and `n` opens a note on the
+choice under the cursor as an extra — never a step between picking and answering. The activity line
+names the choice a note will be attached to, so an answer is never sent by the keystroke that meant to
+add to it. The shipped `ask` tool is the guest — it owns the schema, the bounds and how the
 answer is put to the model — and the host owns the surface, the wait and the record. Asking is
 available to any component registered as a tool (`tool` scope), because a question grants no resource
 and the person may always dismiss it; the dialog belongs to the tool that asked, and a dismissal is

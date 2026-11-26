@@ -287,10 +287,11 @@ steer publication through a swapped symlink or multiply-linked inode outside its
   reach and reload evicts data above narrowed cache budgets.
 - **ask:** a question to the person, drawn as the end of the transcript so it covers nothing the
   conversation said: numbered choices, each with a line of subtext in a quieter colour, an optional
-  preview shown for the choice under the cursor, and at most one choice marked `recommended`. The
-  person may attach a note to the choice they make, or type an answer of their own, and they have as
-  long as they like: the wait ends on the answer, a dismissal, or a cancelled turn, and
-  `ask-wait-seconds` is the one bound a person can put on it. The guest owns the schema, the bounds
+  preview for the choice under the cursor — a panel of its own beside the question on a wide screen,
+  under the choices otherwise — and at most one choice marked `recommended`. Enter or a digit answers
+  at once; `n` opens a note on the choice under the cursor, and the person may type an answer of
+  their own. They have as long as they like: the wait ends on the answer, a dismissal, or a
+  cancelled turn, and `ask-wait-seconds` is the one bound a person can put on it. The guest owns the schema, the bounds
   and the wording returned to the model; the host owns the surface, the wait and the audit. Asking
   needs no grant beyond the `tool` registration that runs the component: the person may always
   dismiss the question, and a dismissal is reported as
