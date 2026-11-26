@@ -197,8 +197,17 @@ fn record(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use saddle_wit::saddle::host::ask::Choice;
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
+    use std::{env, fs, thread};
+
+    use saddle_cap::{PluginId, Principal};
+    use saddle_wit::saddle::host::ask::{Choice, Question};
+
+    use super::{Asked, Outcome, Questioner, Reply, Selection, ask, wait};
+    use crate::cancel;
+    use crate::config::Overrides;
+    use crate::session::Session;
 
     fn question() -> Question {
         Question {
@@ -250,9 +259,6 @@ mod tests {
 
     #[test]
     fn without_an_allowance_the_person_has_as_long_as_they_like() {
-        use std::thread;
-        use std::time::Duration;
-
         let (asked, answers) = Asked::pair(question());
         assert!(asked.open(), "the question is open while it waits");
         let later = asked.clone();
@@ -272,12 +278,6 @@ mod tests {
 
     #[test]
     fn a_session_records_the_question_and_returns_the_answer_its_person_gave() {
-        use crate::config::Overrides;
-        use crate::session::Session;
-        use saddle_cap::PluginId;
-        use std::env;
-        use std::fs;
-
         struct Answering;
         impl Questioner for Answering {
             fn ask(&mut self, asked: Arc<Asked>, _until: Option<Instant>) {
