@@ -1138,7 +1138,9 @@ fn glob(pattern: &str) -> Result<Glob, globset::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{HostPattern, PluginId, Policy, Principal, Sessions, check_base, document, merge};
+    use crate::roots::{RelPath, RootName, Roots};
+    use crate::scope::Scope;
 
     fn roots() -> (tempfile::TempDir, Roots) {
         let dir = tempfile::tempdir().unwrap();
@@ -1345,8 +1347,8 @@ mcp = ["-exa"]
             toml::from_str("version = 1\n[agent]\nnet = [\"-api.example.com\"]\n").unwrap();
         let two: toml::Value =
             toml::from_str("version = 1\n[agent]\nnet = [\"-*.example.net\"]\n").unwrap();
-        let twice = super::merge(super::merge(base, one).unwrap(), two).unwrap();
-        let twice = Policy::parse(&super::document(&twice).unwrap(), &roots).unwrap();
+        let twice = merge(merge(base, one).unwrap(), two).unwrap();
+        let twice = Policy::parse(&document(&twice).unwrap(), &roots).unwrap();
         assert!(
             twice.grants(&Principal::Agent).unwrap().net.is_empty(),
             "what the base granted, a profile removed, and a project removed again"
@@ -1380,7 +1382,7 @@ mcp = ["-exa"]
 
         let base = "version = 1\n[agent]\nnet = [\"-api.example.com\"]\n";
         let value: toml::Value = toml::from_str(base).unwrap();
-        let e = super::check_base(&value).unwrap_err().to_string();
+        let e = check_base(&value).unwrap_err().to_string();
         assert!(e.contains("there is no inherited list here"), "{e}");
         assert!(e.contains("agent.net"), "it names where: {e}");
         let e = Policy::layer(base, "", &roots).unwrap_err().to_string();
