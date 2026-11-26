@@ -285,17 +285,20 @@ steer publication through a swapped symlink or multiply-linked inode outside its
   headers. Credentials stay in core and only reach the configured provider/fixed Exa endpoints.
   Search snapshots are principal-scoped, not shared with siblings; expansion rechecks current endpoint
   reach and reload evicts data above narrowed cache budgets.
-- **ask:** a question to the person, drawn in a band above the input box so the transcript stays
-  visible: numbered choices, each with a line of subtext in a quieter colour, an optional preview
-  shown for the choice under the cursor, and at most one choice marked `recommended`. The person may
-  attach a note to the choice they make, or type an answer of their own. The guest owns the schema, the bounds and the wording returned to the model; the
-  host owns the surface, the wait and the audit. Asking needs no grant beyond the `tool` registration
-  that runs the component: the person may always dismiss the question, and a dismissal is reported as
+- **ask:** a question to the person, drawn as the end of the transcript so it covers nothing the
+  conversation said: numbered choices, each with a line of subtext in a quieter colour, an optional
+  preview shown for the choice under the cursor, and at most one choice marked `recommended`. The
+  person may attach a note to the choice they make, or type an answer of their own, and they have as
+  long as they like: the wait ends on the answer, a dismissal, or a cancelled turn, and
+  `ask-wait-seconds` is the one bound a person can put on it. The guest owns the schema, the bounds
+  and the wording returned to the model; the host owns the surface, the wait and the audit. Asking
+  needs no grant beyond the `tool` registration that runs the component: the person may always
+  dismiss the question, and a dismissal is reported as
   a failed result the model must not ask again. A session with nobody to reach — a piped `saddle run`,
   a `--json` stream, a live worker, `saddle tool ask` — answers `unavailable` with the reason. The wait
-  is bounded by `host-wait-seconds`, not the guest's CPU ceiling, and a model-set `timeout_secs` still
-  bounds the whole call. The record keeps the question's and the answer's size and hash, never its
-  words (D197).
+  is the person's, bounded by nothing unless `ask-wait-seconds` says so, and a model-set `timeout_secs`
+  still bounds the whole call. The record keeps the question's and the answer's size and hash, never
+  its words (D197).
 - **session_query:** read-only SQL over one conversation's branch snapshot, including pre-compaction
   messages, request usage and prose reasoning, with a `sessions` view naming the conversations of this
   workspace. No saved-database handle, writes or arbitrary SQL functions. Parent and delegate both
@@ -701,6 +704,7 @@ ask-options = 8
 ask-option-bytes = 512
 ask-preview-bytes = 8192
 ask-reply-bytes = 4096
+ask-wait-seconds = 0
 metadata-bytes = 65536
 path-bytes = 4096
 directory-name-bytes = 1024

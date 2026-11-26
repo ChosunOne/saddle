@@ -153,7 +153,7 @@ enum Event {
     Ask {
         who: Principal,
         question: Question,
-        allowance: Duration,
+        allowance: Option<Duration>,
         answer: SyncSender<HostReply<AskOutcome, String>>,
     },
     Mutate {
@@ -430,7 +430,7 @@ impl HostServices for Host {
         &mut self,
         call: &Invocation,
         question: Question,
-        allowance: Duration,
+        allowance: Option<Duration>,
     ) -> Result<Result<AskOutcome, String>> {
         let (answer, result) = mpsc::sync_channel(1);
         self.events
@@ -441,10 +441,15 @@ impl HostServices for Host {
                 answer,
             })
             .map_err(|_| anyhow!("plugin session ended"))?;
-        // A person answers in their own time; the caller bounded the wait already, and this side
-        // only has to outlive it by a poll so the answer is never dropped on a rounding edge (D197).
-        result
-            .recv_timeout(allowance + Duration::from_millis(500))
+        // A person answers in their own time: with no allowance this waits for the answer itself,
+        // which the session sends when the question is answered, dismissed or the turn is cancelled
+        // (D197). An allowance is only outlived by a poll, so an answer is never dropped on a
+        // rounding edge.
+        let received = match allowance {
+            Some(allowance) => result.recv_timeout(allowance + Duration::from_millis(500)),
+            None => result.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        received
             .map_err(|_| anyhow!("question answer timed out"))?
             .map_err(|why| anyhow!(why))
     }

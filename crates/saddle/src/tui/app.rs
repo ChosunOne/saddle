@@ -1055,6 +1055,11 @@ impl App {
     pub fn tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
         self.now = Instant::now();
+        // A question nobody is waiting for any more — the turn was cancelled, or a deadline the
+        // person set ran out — comes off the screen with the answer it can no longer take (D197).
+        if self.ask.as_ref().is_some_and(|dialog| !dialog.asked.open()) {
+            self.ask = None;
+        }
     }
 
     /// Commands matching what is typed, while the editor holds only a command name: those that
@@ -1252,6 +1257,9 @@ impl App {
         if let Some(dialog) = &mut self.ask {
             return match dialog.key(key) {
                 AskAnswer::Stay => None,
+                // A question is the end of the transcript, so scrolling stays the transcript's: the
+                // person reads what led to it with the same keys as ever (D197).
+                AskAnswer::Pass => self.transcript_key(key),
                 AskAnswer::Given(outcome) => {
                     if let Some(dialog) = self.ask.take() {
                         dialog.asked.answer(outcome);
@@ -1961,6 +1969,33 @@ impl App {
 
     fn page(&self) -> usize {
         (self.view_height / 2).max(1)
+    }
+
+    /// The keys a question hands back to the transcript: the ones that walk it, and nothing that
+    /// edits or sends, since the question still owns the prompt underneath (D197).
+    fn transcript_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let page = self.page() as isize;
+        if self.worker.is_some() {
+            let page = self.worker_height.saturating_sub(1).max(1);
+            match key.code {
+                KeyCode::PageUp => {
+                    self.worker_scroll = (self.worker_scroll + page).min(self.worker_total)
+                }
+                KeyCode::PageDown => self.worker_scroll = self.worker_scroll.saturating_sub(page),
+                KeyCode::Home => self.worker_scroll = self.worker_total,
+                KeyCode::End => self.worker_scroll = 0,
+                _ => {}
+            }
+            return None;
+        }
+        match key.code {
+            KeyCode::PageUp => self.scroll_by(page),
+            KeyCode::PageDown => self.scroll_by(-page),
+            KeyCode::Home => self.scroll = usize::MAX,
+            KeyCode::End => self.scroll = 0,
+            _ => {}
+        }
+        None
     }
 
     fn scroll_by(&mut self, delta: isize) {

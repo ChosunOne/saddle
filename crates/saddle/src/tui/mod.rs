@@ -877,7 +877,7 @@ struct ChannelQuestions {
 }
 
 impl Questioner for ChannelQuestions {
-    fn ask(&mut self, asked: Arc<Asked>, _until: Instant) {
+    fn ask(&mut self, asked: Arc<Asked>, _until: Option<Instant>) {
         if self.events.send(AgentEvent::Ask(asked.clone())).is_err() {
             asked.answer(QuestionOutcome::Unavailable("the interface closed".into()));
         }

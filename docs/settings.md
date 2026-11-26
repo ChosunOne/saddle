@@ -529,6 +529,7 @@ most often wants:
 | `team-workers`, `team-steps` | live workers per session, and, when set, the model requests one worker turn may take; `0` (the default) means no limit, as the lead's own turn has none |
 | `ask-bytes`, `ask-options` | one question's words, and how many choices it may offer |
 | `ask-option-bytes`, `ask-preview-bytes`, `ask-reply-bytes` | one choice's label and description, its preview, and the note or typed answer a person may send |
+| `ask-wait-seconds` | how long a question waits for its answer; `0` (the default) waits for the person, however long they take (D197) |
 
 ## commands
 

@@ -5,6 +5,10 @@
 //! label. Escape dismisses the question — an answer of its own, not an error — while ctrl+c cancels
 //! the turn the question belongs to. Nothing here decides anything: the answer travels back to the
 //! waiting tool through the question it arrived with.
+//!
+//! The question is drawn as the end of the transcript rather than over it, so the keys that walk the
+//! transcript are handed back to it: a person reading what led to the question scrolls without
+//! answering first (D197).
 
 use crate::questions::{Asked, Outcome, Reply, Selection};
 use saddle_limits as budgets;
@@ -32,6 +36,8 @@ pub enum Answer {
     Given(Outcome),
     /// The person cancelled the turn the question belongs to.
     Cancel,
+    /// The key is the transcript's, not the question's: scrolling, while it is being answered.
+    Pass,
 }
 
 pub struct AskDialog {
@@ -53,6 +59,18 @@ impl AskDialog {
         }
     }
 
+    /// The keys the stage answers to, drawn on the frame's activity line so they are on the screen
+    /// even when the question itself has been scrolled out of view (D197).
+    pub fn help(&self) -> &'static str {
+        match self.stage {
+            Stage::Choosing => {
+                "↑↓ choose · enter select · 1-9 pick · esc dismiss · pgup/pgdn scroll"
+            }
+            Stage::Noting { .. } => "enter answer with this note · esc back",
+            Stage::Typing { .. } => "enter send this answer · esc back",
+        }
+    }
+
     /// How many rows the list has: the choices, and the typed answer when the question offers one.
     pub fn rows(&self) -> usize {
         self.asked.question.choices.len() + usize::from(self.asked.question.allow_other)
@@ -69,6 +87,15 @@ impl AskDialog {
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Answer::Cancel;
+        }
+        // Walking the transcript stays the transcript's: the question is its last rows, not a lid
+        // over them (D197). Home and End included — they mean "the start" and "the end" of the
+        // conversation, and the line being written has no cursor movement of its own to lose.
+        if matches!(
+            key.code,
+            KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
+        ) {
+            return Answer::Pass;
         }
         self.error = None;
         match self.stage.clone() {
@@ -237,6 +264,30 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn the_keys_that_walk_the_transcript_are_the_transcript_s_while_a_question_is_asked() {
+        let (mut dialog, _answers) = dialog();
+        // The question is the transcript's last rows, so scrolling is still scrolling (D197).
+        for code in [
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            assert!(
+                matches!(dialog.key(key(code)), Answer::Pass),
+                "{code:?} belongs to the transcript"
+            );
+        }
+        assert_eq!(dialog.selected, 0, "handing the key back chose nothing");
+        // The same holds while a note is being written: end still means the end of the
+        // conversation, and the note is where the cursor already is.
+        dialog.key(key(KeyCode::Enter));
+        assert!(matches!(dialog.stage, Stage::Noting { .. }));
+        assert!(matches!(dialog.key(key(KeyCode::End)), Answer::Pass));
+        assert!(matches!(dialog.key(key(KeyCode::Char('n'))), Answer::Stay));
     }
 
     #[test]

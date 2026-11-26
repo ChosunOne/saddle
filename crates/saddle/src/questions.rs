@@ -5,9 +5,11 @@
 //! rather than being handed an answer that nobody gave. A session with nobody in front of it — a
 //! piped run, a JSON stream, a worker, `saddle tool` — answers `unavailable` with the reason.
 //!
-//! The wait is bounded by the host-wait allowance rather than the guest's own CPU ceiling, because
-//! reading four choices takes a person longer than two seconds. The turn's cancellation flag ends
-//! the wait too: escape or ctrl+c on a running turn must not leave a dialog owning the keyboard.
+//! The wait is the person's: reading four choices takes longer than the guest's own two-second CPU
+//! ceiling and longer than any budget the harness would spend on a machine's work, so nothing bounds
+//! it unless the person set `ask-wait-seconds` or the caller set a deadline of its own. The turn's
+//! cancellation flag ends the wait too: escape or ctrl+c on a running turn must not leave a dialog
+//! owning the keyboard.
 
 use crate::cancel;
 use crate::session::Session;
@@ -17,6 +19,7 @@ use saddle_policy::Kind;
 use saddle_policy::Request;
 use saddle_policy::audit::sha256_hex;
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,6 +35,9 @@ const POLL: Duration = Duration::from_millis(50);
 pub struct Asked {
     pub question: Question,
     reply: Mutex<Option<SyncSender<Outcome>>>,
+    /// Whether the wait is still running, so an interface drawing a question it can no longer answer
+    /// can take it down: the turn was cancelled, or a deadline the person set ran out (D197).
+    open: AtomicBool,
 }
 
 impl Asked {
@@ -42,9 +48,20 @@ impl Asked {
             Arc::new(Self {
                 question,
                 reply: Mutex::new(Some(reply)),
+                open: AtomicBool::new(true),
             }),
             answers,
         )
+    }
+
+    /// Whether the question is still waiting: false once nobody is listening for an answer.
+    pub fn open(&self) -> bool {
+        self.open.load(Ordering::Relaxed)
+    }
+
+    /// The wait is over, answered or not, so an interface still showing the question drops it.
+    pub fn close(&self) {
+        self.open.store(false, Ordering::Relaxed);
     }
 
     /// The person's answer. A second call does nothing: the first answer is the answer.
@@ -80,18 +97,20 @@ impl Eq for Asked {}
 pub trait Questioner: Send {
     /// Put this question to the person. The answer, or `Outcome::Unavailable` when this interface
     /// cannot ask, travels through `asked`; this call returns once it has been shown or refused.
-    /// `until` is the whole wait, for an interface that reads on this thread and can only notice a
-    /// deadline or a cancelled turn after the line it is waiting for arrives.
-    fn ask(&mut self, asked: Arc<Asked>, until: Instant);
+    /// `until` is the whole wait when there is one, for an interface that reads on this thread and
+    /// can only notice a deadline or a cancelled turn after the line it is waiting for arrives
+    /// (D197).
+    fn ask(&mut self, asked: Arc<Asked>, until: Option<Instant>);
 }
 
 /// Put a question to this session's person, decide it under the tool's registration, and record it
-/// without its words. `allowance` is the whole wait, so the caller's deadline is the waiter's.
+/// without its words. `allowance` is the whole wait when the person set one or the caller carries a
+/// deadline of its own; `None` waits for the person (D197).
 pub fn ask(
     session: &mut Session,
     who: &Principal,
     call: &str,
-    allowance: Duration,
+    allowance: Option<Duration>,
     question: Question,
 ) -> Result<Result<Outcome, String>> {
     // Registration already decided that this principal may run its tool; the question is recorded
@@ -110,7 +129,7 @@ pub fn ask(
             "choices": question.choices.len(),
             "allow_other": question.allow_other,
             "allow_note": question.allow_note,
-            "deadline_secs": allowance.as_secs(),
+            "deadline_secs": allowance.map(|allowance| allowance.as_secs()),
         }),
     )?;
     if !decision.allow {
@@ -126,22 +145,25 @@ pub fn ask(
         );
     };
     let (asked, answers) = Asked::pair(question.clone());
-    let until = Instant::now() + allowance;
-    questioner.ask(asked, until);
+    let until = allowance.map(|allowance| Instant::now() + allowance);
+    questioner.ask(asked.clone(), until);
     let outcome = wait(answers, until);
+    asked.close();
     record(session, who, call, &question, &outcome)?;
     Ok(Ok(outcome))
 }
 
 /// The wait itself: one answer, a dismissal when the turn is cancelled, and an explanation when the
-/// interface or the allowance goes away first.
-fn wait(answers: Receiver<Outcome>, until: Instant) -> Outcome {
+/// interface or the allowance goes away first. With no `until` the person has as long as they like.
+fn wait(answers: Receiver<Outcome>, until: Option<Instant>) -> Outcome {
     loop {
         match answers.recv_timeout(POLL) {
             Ok(outcome) => return outcome,
             // A turn the person cancelled has no question left to answer (D183).
             Err(RecvTimeoutError::Timeout) if cancel::requested() => return Outcome::Dismissed,
-            Err(RecvTimeoutError::Timeout) if Instant::now() >= until => {
+            Err(RecvTimeoutError::Timeout)
+                if until.is_some_and(|until| Instant::now() >= until) =>
+            {
                 return Outcome::Unavailable("the person did not answer in time".into());
             }
             Err(RecvTimeoutError::Timeout) => continue,
@@ -247,7 +269,7 @@ mod tests {
         let (asked, answers) = Asked::pair(question());
         asked.answer(Outcome::Dismissed);
         assert!(matches!(
-            wait(answers, Instant::now() + Duration::from_secs(1)),
+            wait(answers, Some(Instant::now() + Duration::from_secs(1))),
             Outcome::Dismissed
         ));
 
@@ -255,7 +277,7 @@ mod tests {
         let (asked, answers) = Asked::pair(question());
         drop(asked);
         assert!(matches!(
-            wait(answers, Instant::now() + Duration::from_secs(1)),
+            wait(answers, Some(Instant::now() + Duration::from_secs(1))),
             Outcome::Unavailable(ref why) if why.contains("closed")
         ));
 
@@ -263,10 +285,34 @@ mod tests {
         let (_asked, answers) = Asked::pair(question());
         cancel::request();
         let started = Instant::now();
-        let outcome = wait(answers, Instant::now() + Duration::from_secs(30));
+        let outcome = wait(answers, Some(Instant::now() + Duration::from_secs(30)));
         cancel::reset();
         assert!(matches!(outcome, Outcome::Dismissed));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn without_an_allowance_the_person_has_as_long_as_they_like() {
+        use std::thread;
+        use std::time::Duration;
+
+        let (asked, answers) = Asked::pair(question());
+        assert!(asked.open(), "the question is open while it waits");
+        // Longer than any poll or allowance, and shorter than a person reading four choices.
+        let later = asked.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            later.answer(Outcome::Dismissed);
+        });
+        let started = Instant::now();
+        assert!(matches!(wait(answers, None), Outcome::Dismissed));
+        // Dismissed only because it was answered, never because the clock ran out.
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        asked.close();
+        assert!(
+            !asked.open(),
+            "a closed question is one no interface should keep drawing"
+        );
     }
 
     /// The whole host side of D197, against a real session: the standard component's principal is
@@ -282,7 +328,7 @@ mod tests {
 
         struct Answering;
         impl Questioner for Answering {
-            fn ask(&mut self, asked: Arc<Asked>, _until: Instant) {
+            fn ask(&mut self, asked: Arc<Asked>, _until: Option<Instant>) {
                 assert_eq!(asked.question.choices.len(), 2, "the question as written");
                 asked.answer(Outcome::Answered(Reply {
                     selection: Selection::Chosen(1),
@@ -328,15 +374,9 @@ mod tests {
             allow_other: true,
             allow_note: true,
         };
-        let outcome = ask(
-            &mut session,
-            &who,
-            "call-1",
-            Duration::from_secs(5),
-            question,
-        )
-        .unwrap()
-        .unwrap();
+        let outcome = ask(&mut session, &who, "call-1", None, question)
+            .unwrap()
+            .unwrap();
         match outcome {
             Outcome::Answered(reply) => {
                 assert!(matches!(reply.selection, Selection::Chosen(1)));

@@ -2088,21 +2088,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .map(|panel| panel.rows.len() + 2)
         .sum::<usize>()
         .min(area.height as usize / 3);
-    // A question takes a band of its own just above the input box, so it never covers the
-    // transcript and the person can see what was said before it (D197).
-    let ask_rows = app.ask.as_ref().map_or(0, |dialog| {
-        ask_height(
-            dialog,
-            area.width as usize,
-            area.height as usize,
-            &app.theme,
-        )
-    });
     let [
         transcript_area,
         panels_area,
         queue_area,
-        ask_area,
         activity_area,
         editor_area,
         status_area,
@@ -2110,7 +2099,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Constraint::Min(1),
         Constraint::Length(panel_rows as u16),
         Constraint::Length(queue_rows as u16),
-        Constraint::Length(ask_rows as u16),
         Constraint::Length(1),
         Constraint::Length(editor_rows as u16 + 2),
         Constraint::Length(1),
@@ -2149,50 +2137,64 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     );
     frame.render_widget(Paragraph::new(queued), queue_area);
 
-    let activity = match (&app.busy, &app.stopped) {
-        (Some(activity), _) => {
-            let spin = SPINNER[app.spinner % SPINNER.len()];
-            let what = if app.cancelling {
-                "cancelling…".to_owned()
-            } else {
-                match activity {
-                    Activity::Waiting => format!("waiting for {}", app.header.model),
-                    Activity::Thinking => "thinking".to_owned(),
-                    Activity::Compacting => "compacting the conversation".to_owned(),
-                    Activity::Writing => "writing".to_owned(),
-                    Activity::Tool(name) => format!("running {name}"),
-                }
-            };
-            Line::from(vec![
-                Span::styled(format!("{spin} "), Style::new().fg(app.theme.warning)),
-                Span::raw(what),
-                Span::styled("  esc to cancel", dim(&app.theme)),
-            ])
-        }
-        (None, Some(reason)) => Line::from(Span::styled(
-            format!("session stopped: {reason}"),
-            Style::new().fg(app.theme.error),
-        )),
-        (None, None) => match app.copied.filter(|at| at.elapsed() < COPY_NOTE) {
-            Some(_) => {
-                let mut spans = vec![Span::styled(
-                    format!("copied {}", app.copied_what),
-                    Style::new().fg(app.theme.success),
-                )];
-                // Only the transcript's own selection needs the hint; a dialog's text was never
-                // the terminal's to select (D86).
-                if app.copied_what == "the selection" {
-                    spans.push(Span::styled(
-                        "  (shift+drag still selects in the terminal)",
-                        dim(&app.theme),
-                    ));
-                }
-                Line::from(spans)
+    // A question is answered where it is drawn, at the end of the transcript, so the line that is
+    // always visible carries its keys and says when it has been scrolled out of sight (D197).
+    let activity = match &app.ask {
+        Some(dialog) => {
+            let mut spans = vec![
+                Span::styled("question ", Style::new().fg(app.theme.accent)),
+                Span::styled(dialog.help(), dim(&app.theme)),
+            ];
+            if app.scroll > 0 {
+                spans.push(Span::styled("  · end to see it", dim(&app.theme)));
             }
-            None => Line::from(Span::styled(
-                "enter send · shift+enter newline · /help",
-                dim(&app.theme),
+            Line::from(spans)
+        }
+        None => match (&app.busy, &app.stopped) {
+            (Some(activity), _) => {
+                let spin = SPINNER[app.spinner % SPINNER.len()];
+                let what = if app.cancelling {
+                    "cancelling…".to_owned()
+                } else {
+                    match activity {
+                        Activity::Waiting => format!("waiting for {}", app.header.model),
+                        Activity::Thinking => "thinking".to_owned(),
+                        Activity::Compacting => "compacting the conversation".to_owned(),
+                        Activity::Writing => "writing".to_owned(),
+                        Activity::Tool(name) => format!("running {name}"),
+                    }
+                };
+                Line::from(vec![
+                    Span::styled(format!("{spin} "), Style::new().fg(app.theme.warning)),
+                    Span::raw(what),
+                    Span::styled("  esc to cancel", dim(&app.theme)),
+                ])
+            }
+            (None, Some(reason)) => Line::from(Span::styled(
+                format!("session stopped: {reason}"),
+                Style::new().fg(app.theme.error),
             )),
+            (None, None) => match app.copied.filter(|at| at.elapsed() < COPY_NOTE) {
+                Some(_) => {
+                    let mut spans = vec![Span::styled(
+                        format!("copied {}", app.copied_what),
+                        Style::new().fg(app.theme.success),
+                    )];
+                    // Only the transcript's own selection needs the hint; a dialog's text was never
+                    // the terminal's to select (D86).
+                    if app.copied_what == "the selection" {
+                        spans.push(Span::styled(
+                            "  (shift+drag still selects in the terminal)",
+                            dim(&app.theme),
+                        ));
+                    }
+                    Line::from(spans)
+                }
+                None => Line::from(Span::styled(
+                    "enter send · shift+enter newline · /help",
+                    dim(&app.theme),
+                )),
+            },
         },
     };
     frame.render_widget(Paragraph::new(activity), activity_area);
@@ -2220,10 +2222,14 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             .border_style(Style::new().fg(border)),
     );
     frame.render_widget(editor, editor_area);
-    frame.set_cursor_position(Position::new(
-        editor_area.x + 1 + cursor_col as u16,
-        editor_area.y + 1 + (cursor_row - top) as u16,
-    ));
+    // While a question is open the prompt keeps its text but not the cursor: what is typed goes to
+    // the note or the answer, which draws its own (D197).
+    if app.ask.is_none() {
+        frame.set_cursor_position(Position::new(
+            editor_area.x + 1 + cursor_col as u16,
+            editor_area.y + 1 + (cursor_row - top) as u16,
+        ));
+    }
 
     // The line is whatever `[ui] status` says, filled from the session (D36).
     let right = app.header.status.render(&StatusData {
@@ -2300,15 +2306,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         app.open_url_at = link;
         surface = Some(seen);
     }
-    // The other dialogs are modals drawn over everything; the question is a band with its own rows.
-    let modal = surface.is_some();
-    let mut band = None;
-    if let Some(dialog) = &app.ask {
-        // A click on a link of a dialog underneath is not a click at all (D86).
-        app.open_url_at = None;
-        band = Some(ask_area);
-        surface = Some(draw_ask(frame, dialog, ask_area, &app.theme));
-    }
     let had_dialog = app.dialog_seen.is_some();
     let opened = !had_dialog && surface.is_some();
     app.dialog_seen = surface;
@@ -2318,10 +2315,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         app.selection = None;
     }
     if app.dialog_seen.is_some() {
-        // A modal owns the screen, so no picture is drawn while it is open; the question owns only
-        // its own band, and the transcript's pictures stay where they are (D161, D197).
-        let covered = if modal { area } else { band.unwrap_or(area) };
-        app.covered.push(covered);
+        // A modal owns the screen, so no picture is drawn while it is open (D161). A question is
+        // the transcript's own last rows, so the pictures above it stay where they are (D197).
+        app.covered.push(area);
     }
     shade_dialog(frame, app);
 }
@@ -2368,72 +2364,34 @@ fn shade_dialog(frame: &mut Frame<'_>, app: &App) {
 ///
 /// One keystroke either way, and escape leaves the conversation where it is: the move is the
 /// person's decision already, and the summary is the only part of it that spends a request.
-/// The rows a question needs, capped so the transcript keeps most of the screen (D197).
-fn ask_height(dialog: &AskDialog, width: usize, screen: usize, theme: &Theme) -> usize {
-    let inner = width.saturating_sub(2);
-    let natural = ask_body(dialog, inner, usize::MAX, theme).0.len() + 2;
-    natural.min(screen.saturating_sub(6).max(4))
-}
-
-/// A tool's question (D197): the choices with their subtext, the preview of the one under the
-/// cursor, and the line the person writes their note or their own answer on. Laid out as a band of
-/// its own, so the transcript above it is never covered.
-fn draw_ask(frame: &mut Frame<'_>, dialog: &AskDialog, area: Rect, theme: &Theme) -> Seen {
-    let inner = area.width.saturating_sub(2) as usize;
-    let (lines, cursor) = ask_body(dialog, inner, area.height.saturating_sub(2) as usize, theme);
-    // What each row says, cut to the cells it occupies: a drag copies the text that was drawn (D87).
-    let text: Vec<String> = lines
-        .iter()
-        .map(|line| plain(line).chars().take(inner).collect())
-        .collect();
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().fg(theme.border_accent))
-                .title(" Question "),
-        ),
-        area,
-    );
-    if let Some((row, col)) = cursor {
-        frame.set_cursor_position(Position::new(
-            area.x + 1 + col as u16,
-            area.y + 1 + row as u16,
-        ));
-    }
-    Seen {
-        area: Rect::new(
-            area.x.saturating_add(1),
-            area.y.saturating_add(1),
-            area.width.saturating_sub(2),
-            area.height.saturating_sub(2),
-        ),
-        top: 0,
-        lines: text,
-        pictures: Vec::new(),
-    }
-}
-
-/// The question's rows, at most `room` of them, and the cell inside the box the cursor belongs on.
-fn ask_body(
+/// A tool's question as the last rows of the transcript (D197): the person reads what led to it and
+/// scrolls as ever, and the question is simply the end of the conversation rather than a lid over
+/// it. Returns the rows, and the cell the cursor belongs on counted from the block's first row.
+fn ask_rows(
     dialog: &AskDialog,
-    inner: usize,
-    room: usize,
+    width: usize,
     theme: &Theme,
 ) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+    let width = width.max(8);
     let accent = Style::new().fg(theme.accent);
     let question = &dialog.asked.question;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for line in wrap_columns(&question.question, inner, 3) {
-        lines.push(Line::from(Span::styled(
-            line,
-            Style::new().add_modifier(Modifier::BOLD),
-        )));
+    let mut rule = "── Question ".to_owned();
+    rule.push_str(&"─".repeat(width.saturating_sub(rule.width())));
+    let mut lines = vec![
+        Line::from(Span::styled(rule, Style::new().fg(theme.border_accent))),
+        Line::default(),
+    ];
+    for line in wrap_columns(&question.question, width.saturating_sub(2), 4) {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(line, Style::new().add_modifier(Modifier::BOLD)),
+        ]));
     }
+    lines.push(Line::default());
     let rows = dialog.rows();
     for (index, choice) in question.choices.iter().enumerate() {
         lines.extend(choice_rows(
-            inner,
+            width,
             index + 1,
             &choice.label,
             &choice.description,
@@ -2444,7 +2402,7 @@ fn ask_body(
     }
     if question.allow_other && rows > 0 {
         lines.extend(choice_rows(
-            inner,
+            width,
             question.choices.len() + 1,
             "Type something…",
             "an answer of your own",
@@ -2459,19 +2417,17 @@ fn ask_body(
         .and_then(|index| question.choices.get(index))
         .map(|choice| choice.preview.as_str())
         .unwrap_or_default();
-    let editing = usize::from(!matches!(dialog.stage, AskStage::Choosing));
-    let error = usize::from(dialog.error.is_some());
-    // A blank, the line being written if there is one, the error if there is one, the help line.
-    let reserved = 1 + editing + error + 1;
-    if lines.len().saturating_add(reserved) > room {
-        lines.truncate(room.saturating_sub(reserved));
-    }
-    let left = room.saturating_sub(lines.len().saturating_add(reserved));
-    if !preview.is_empty() && left >= 3 {
+    if !preview.is_empty() {
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled("preview", dim(theme))));
-        for line in wrap_columns(preview, inner, left - 2) {
-            lines.push(Line::from(Span::styled(line, Style::new())));
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled("preview", dim(theme)),
+        ]));
+        for line in wrap_columns(preview, width.saturating_sub(4), 8) {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(line, Style::new()),
+            ]));
         }
     }
     lines.push(Line::default());
@@ -2482,35 +2438,36 @@ fn ask_body(
         AskStage::Typing { text } => ("answer › ", text.as_str()),
     };
     if !matches!(dialog.stage, AskStage::Choosing) {
-        let used = label.chars().count() + text.chars().count();
-        cursor = Some((lines.len(), used.min(inner.saturating_sub(1))));
+        // The cursor is where the next character goes, and a line too long to fit keeps its end —
+        // which is the end being written (D197).
+        let room = width.saturating_sub(2 + label.width());
+        let used = text.width().min(room);
+        cursor = Some((lines.len(), 2 + label.width() + used));
         lines.push(Line::from(vec![
+            Span::raw("  "),
             Span::styled(label.to_owned(), accent),
             Span::styled(
-                keep_tail(text, inner.saturating_sub(label.chars().count())),
+                keep_tail(text, room),
                 Style::new().add_modifier(Modifier::UNDERLINED),
             ),
         ]));
     }
     if let Some(error) = &dialog.error {
-        lines.push(Line::from(Span::styled(
-            keep_tail(error, inner),
-            Style::new().fg(theme.error),
-        )));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                clip(error, width.saturating_sub(2)),
+                Style::new().fg(theme.error),
+            ),
+        ]));
     }
-    let help = match dialog.stage {
-        AskStage::Choosing => "↑↓ choose · enter select · 1-9 pick · esc dismiss",
-        AskStage::Noting { .. } => "enter answer with this note · esc back · empty note for none",
-        AskStage::Typing { .. } => "enter send this answer · esc back",
-    };
-    lines.push(Line::from(Span::styled(help, dim(theme))));
     (lines, cursor)
 }
 
 /// One choice: its number and label, the recommended marker on the one the asker advises, and the
 /// description as subtext under it in a quieter colour than the label (D197).
 fn choice_rows(
-    inner: usize,
+    width: usize,
     number: usize,
     label: &str,
     description: &str,
@@ -2525,21 +2482,21 @@ fn choice_rows(
         Style::new()
     };
     let marker = if recommended { "  (recommended)" } else { "" };
-    let budget = inner.saturating_sub(2 + marker.chars().count()).max(4);
+    let budget = width.saturating_sub(4 + marker.width()).max(4);
     let mut spans = vec![
-        Span::styled(if selected { "› " } else { "  " }, accent),
+        Span::styled(if selected { "  › " } else { "    " }, accent),
         Span::styled(format!("{number}. {}", clip(label, budget)), style),
     ];
     if recommended {
         spans.push(Span::styled(marker, Style::new().fg(theme.success)));
     }
     let mut lines = vec![Line::from(spans)];
-    for line in wrap_columns(description, inner.saturating_sub(4), 2) {
+    for line in wrap_columns(description, width.saturating_sub(6), 3) {
         if line.is_empty() {
             continue;
         }
         lines.push(Line::from(vec![
-            Span::raw("    "),
+            Span::raw("      "),
             Span::styled(line, dim(theme)),
         ]));
     }
@@ -4087,6 +4044,18 @@ fn worker_entries(worker: &Render) -> Vec<Entry> {
 
 fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect, activity: bool) {
     let (mut lines, at) = transcript_with_images(app, area.width.max(1), activity);
+    // A question a tool is waiting on is the end of the transcript, not a lid over it (D197): the
+    // rows go after everything said, the transcript's own scrolling reaches them, and a person
+    // reading what led to the question scrolls exactly as ever.
+    let question = app
+        .ask
+        .as_ref()
+        .map(|dialog| ask_rows(dialog, area.width as usize, &app.theme));
+    let cursor = question.as_ref().and_then(|(_, cursor)| *cursor);
+    let asked = question.as_ref().map_or(0, |(rows, _)| rows.len());
+    if let Some((rows, _)) = question {
+        lines.extend(rows);
+    }
     let mut placed: Vec<Placed> = Vec::new();
     let height = area.height as usize;
     let total = lines.len();
@@ -4172,6 +4141,17 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect, activity: b
     }
     let visible: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
     frame.render_widget(Paragraph::new(visible), area);
+    // The cursor of the line being written sits in the block, unless the person has scrolled it
+    // off the screen, in which case nothing on this screen has the cursor (D197).
+    if let Some((row, col)) = cursor {
+        let line = total.saturating_sub(asked) + row;
+        if line >= top && line < top + height {
+            frame.set_cursor_position(Position::new(
+                area.x + col as u16,
+                area.y + (line - top) as u16,
+            ));
+        }
+    }
     app.images = placed;
     app.seen = Some(Seen {
         area,
@@ -6958,7 +6938,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tools_question_takes_a_band_of_its_own_with_subtext_and_a_recommendation() {
+    fn a_tools_question_is_the_end_of_the_transcript_with_subtext_and_a_recommendation() {
         let mut app = bare_app();
         let (asked, _answers) = Asked::pair(AskedQuestion {
             question: "Which approach should the loader take?".into(),
@@ -6981,6 +6961,11 @@ mod tests {
             allow_note: true,
         });
         app.ask = Some(AskDialog::new(asked));
+        // A conversation long enough to scroll, with the line that must stay visible just above
+        // the question at its end.
+        for line in 0..30 {
+            app.note(NoteKind::Info, &format!("line {line} of what was said"));
+        }
         app.note(
             NoteKind::Info,
             "a line of the conversation that must stay visible",
@@ -6988,10 +6973,15 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let all = screen(&terminal);
-        // The question owns a band of its own: what was said above it is still on the screen.
+        // The question is the transcript's last rows: what was said above it is still there, and
+        // the frame carries its keys because the question itself can be scrolled away (D197).
         assert!(
             all.contains("a line of the conversation that must stay visible"),
             "the transcript was covered:\n{all}"
+        );
+        assert!(
+            all.contains("↑↓ choose · enter select · 1-9 pick · esc dismiss"),
+            "the keys are on the frame's own line:\n{all}"
         );
         for want in [
             "Question",
@@ -7021,9 +7011,10 @@ mod tests {
         };
         let subtext = row_of("cleaner boundary").expect("the subtext row");
         let below = row_of("Which approach").expect("the question row");
+        let said = row_of("a line of the conversation").expect("the transcript line");
         assert!(
-            subtext > below,
-            "the question sits at the bottom, under the transcript and above the input box"
+            below > said && subtext > below,
+            "the question is below the conversation, and its subtext below its label"
         );
         let buf = terminal.backend().buffer();
         let col = (0..buf.area.width)
@@ -7045,12 +7036,32 @@ mod tests {
         assert!(all.contains("note ›"), "{all}");
         assert!(
             all.contains("enter answer with this note"),
-            "the help line says what enter does: {all}"
+            "the frame's line says what enter does: {all}"
         );
         assert!(
             all.contains("a line of the conversation that must stay visible"),
             "the note line did not cover the transcript either:\n{all}"
         );
+
+        // Scrolling walks the transcript, and the question walks off the bottom with it: reading
+        // what led to a question is the same gesture as ever (D197).
+        for _ in 0..4 {
+            app.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        }
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let all = screen(&terminal);
+        assert!(app.scroll > 0, "the transcript scrolled under the question");
+        assert!(
+            !all.contains("Which approach should the loader take?"),
+            "the question scrolled out of view rather than staying pinned:\n{all}"
+        );
+        assert!(
+            all.contains("end to see it"),
+            "and the frame says where it is:\n{all}"
+        );
+        app.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("Which approach should the loader take?"));
     }
 
     #[test]

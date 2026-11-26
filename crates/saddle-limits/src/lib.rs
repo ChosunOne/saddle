@@ -18,7 +18,7 @@ macro_rules! budgets {
         impl Budgets {
             /// reject zero/unrepresentable budgets instead of wrapping at the guest ABI.
             pub fn validate(&self) -> Result<(), String> {
-                $(if (self.$name == 0 && !matches!(stringify!($name), "http_redirects" | "exec_report_paths" | "exec_report_denials" | "web_quotes" | "image_count" | "team_steps")) || (stringify!($ty) == "usize" && self.$name as u64 > u64::from(u32::MAX)) {
+                $(if (self.$name == 0 && !matches!(stringify!($name), "http_redirects" | "exec_report_paths" | "exec_report_denials" | "web_quotes" | "image_count" | "team_steps" | "ask_wait_seconds")) || (stringify!($ty) == "usize" && self.$name as u64 > u64::from(u32::MAX)) {
                     return Err(format!("tool-limits.{} must be positive (except disabled report/redirect/image counts) and fit its ABI representation", stringify!($name).replace('_', "-")));
                 })*
                 Ok(())
@@ -79,6 +79,9 @@ budgets! {
     ask_option_bytes: usize = 512,
     ask_preview_bytes: usize = 8 * 1024,
     ask_reply_bytes: usize = 4 * 1024,
+    // D197: how long a question waits, 0 meaning it waits for the person and nothing else. A turn
+    // the person cancels still ends it, and a model's own `timeout_secs` still bounds the call.
+    ask_wait_seconds: usize = 0,
     metadata_bytes: usize = 64 * 1024,
     path_bytes: usize = 4096,
     directory_name_bytes: usize = 1024,

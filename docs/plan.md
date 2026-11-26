@@ -4824,8 +4824,13 @@ longer counts as a member that may enqueue, claim or finish.
 `saddle:host/ask`: a question; its choices, each with a label, a line of subtext under it drawn in the
 theme's muted colour, an optional preview shown while that choice is selected, and at most one marked
 as the one the asker recommends; the person may attach a note to the choice they make, or type an
-answer of their own. The question is a band of its own above the input box, so it never covers the
-transcript: a decision is easier with what led to it still on the screen. The shipped `ask` tool is the guest — it owns the schema, the bounds and how the
+answer of their own. The question is drawn as the **end of the transcript**, not as a modal or a band
+over it: its rows follow the last thing said, the transcript's own scrolling reaches them, and the
+keys that walk the transcript — `pgup`/`pgdn`, `home`/`end`, the wheel and a drag past the edge — stay
+the transcript's while it is being answered. Nothing is ever covered, so a person reading an
+explanation is not interrupted mid-sentence by a box landing on the words they were reading; the
+question is simply what comes next, and `end` puts it back in view. The keys the question owns are on
+the frame's activity line, so they are readable even when the question has been scrolled away. The shipped `ask` tool is the guest — it owns the schema, the bounds and how the
 answer is put to the model — and the host owns the surface, the wait and the record. Asking is
 available to any component registered as a tool (`tool` scope), because a question grants no resource
 and the person may always dismiss it; the dialog belongs to the tool that asked, and a dismissal is
@@ -4833,14 +4838,20 @@ not consent: the guest reports it as a failed result and says not to ask again. 
 in front of it answers `unavailable` with the reason — a piped `saddle run`, a `--json` stream, a live
 worker and `saddle tool` all have no one to reach, and a worker puts its question in its reply, where
 the lead reads it. In the interface, escape dismisses the question and ctrl+c cancels the turn it
-belongs to, which also ends the wait. The wait is bounded by `host-wait-seconds` rather than
-`plugin-timeout-ms`, because reading a few choices takes longer than a guest's CPU ceiling allows:
-the host extends the invocation's deadline across the question and restores it afterwards, while a
-`timeout_secs` the model itself set still bounds the whole call (D152). The audit records the
+belongs to, which also ends the wait. **The wait is the person's**: no `host-wait-seconds` and no
+guest CPU ceiling bounds it, and the host extends the invocation's deadline across the question and
+gives the elapsed time back afterwards rather than resuming into a deadline the wait had passed. A
+question therefore stays up until it is answered or dismissed, the turn is cancelled, or the session
+closes. The one bound a person can set is `ask-wait-seconds` in `[tool-limits]` (`0`, the default,
+means no bound); it is in the protected user config, so a model cannot set it, and a `timeout_secs`
+the model itself put on the call still bounds its own call (D152). An interface showing a question
+nobody is waiting for any more — the turn was cancelled, or a configured wait ran out — takes it down
+at its next frame, because the question says whether it is still open. The audit records the
 question by size and hash and the answer by choice index and by the note's or typed answer's size and
 hash, never either's words (D10, D24). The bounds are `[tool-limits]` (`ask-bytes`, `ask-options`,
-`ask-option-bytes`, `ask-preview-bytes`, `ask-reply-bytes`); the guest refuses a question the
-interface could not draw before it reaches the person, including one that recommends two choices.
+`ask-option-bytes`, `ask-preview-bytes`, `ask-reply-bytes`, `ask-wait-seconds`); the guest refuses a
+question the interface could not draw before it reaches the person, including one that recommends two
+choices.
 
 ## 4. Scope enumeration
 

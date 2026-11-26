@@ -165,8 +165,10 @@ impl Tool for Ask {
                           paragraph, so it can be judged rather than only a label), and \
                           `recommended: true` on the one you advise. The person may attach a note to \
                           the choice they make, or type an answer of their own. The result is their \
-                          answer. This is not a permission prompt: a grant decides what you may do. \
-                          A dismissed question is not consent, so do not ask it again."
+                          answer. The call waits for them: they answer or dismiss it in their own \
+                          time, so do not put a `timeout_secs` on it. This is not a permission \
+                          prompt: a grant decides what you may do. A dismissed question is not \
+                          consent, so do not ask it again."
                 .into(),
             input_schema: json!({
                 "type": "object",

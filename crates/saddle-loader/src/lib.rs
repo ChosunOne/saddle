@@ -283,13 +283,15 @@ pub trait HostServices: Send + 'static {
     ) -> anyhow::Result<Result<(), String>> {
         Ok(Err("host does not implement diff presentation".into()))
     }
-    /// Ask the person this session is attached to; `allowance` bounds the wait, not the guest's CPU
-    /// ceiling, and a session with nobody in front of it answers `unavailable` (D197).
+    /// Ask the person this session is attached to. `allowance` bounds the wait only when the person
+    /// configured one or the caller set a deadline of its own; `None` waits for them however long
+    /// they take. A cancelled turn always ends it, and a session with nobody in front of it answers
+    /// `unavailable` (D197).
     fn ask(
         &mut self,
         _call: &Invocation,
         _question: Question,
-        _allowance: Duration,
+        _allowance: Option<Duration>,
     ) -> anyhow::Result<Result<AskOutcome, String>> {
         Ok(Err("host does not implement questions".into()))
     }
@@ -446,6 +448,50 @@ impl<H: HostServices> State<H> {
 }
 
 impl<H: HostServices> State<H> {
+    /// A host call that waits for a person rather than for a machine (D197): the guards are
+    /// `host_wait`'s, but the wait spends neither the guest's deadline nor the host-wait budget,
+    /// because nothing the guest or the host does is happening while a person reads.
+    fn host_question<T>(
+        &mut self,
+        operation: impl FnOnce(&mut H, &Invocation, Option<Duration>) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        if self.call.cancelled()
+            || Instant::now() >= self.call.deadline
+            || self.host_calls >= budgets::host_calls()
+        {
+            return Err(anyhow!(
+                "plugin call cancelled, timed out or exceeds configured host call limit"
+            ));
+        }
+        let allowance = match budgets::ask_wait_seconds() {
+            0 => None,
+            seconds => Some(Duration::from_secs(seconds as u64)),
+        };
+        let allowance = match self.call.hard_deadline {
+            Some(end) => {
+                let left = end.saturating_duration_since(Instant::now());
+                Some(allowance.map_or(left, |allowance| allowance.min(left)))
+            }
+            None => allowance,
+        };
+        if allowance.is_some_and(|allowance| allowance.is_zero()) {
+            return Err(anyhow!("plugin host wait budget exhausted"));
+        }
+        self.host_calls += 1;
+        let old = self.call.deadline;
+        let start = Instant::now();
+        let result = operation(&mut self.host, &self.call, allowance);
+        // The guest was not running while the person read, so it gets that time back rather than
+        // resuming into a deadline the wait had already passed.
+        self.call.deadline = old
+            .checked_add(start.elapsed())
+            .ok_or_else(|| anyhow!("plugin deadline overflow"))?;
+        if let Some(end) = self.call.hard_deadline {
+            self.call.deadline = self.call.deadline.min(end);
+        }
+        result
+    }
+
     fn service(&mut self, service: Service) -> anyhow::Result<Result<ServiceReply, String>> {
         self.host_wait(
             Duration::from_secs(budgets::host_wait_seconds() as u64),
@@ -530,12 +576,10 @@ impl<H: HostServices> AskHost for State<H> {
                 "question or its choices exceed the configured limits".into()
             ));
         }
-        // D197: the person may take longer than the guest's own CPU ceiling allows, so the wait is
-        // bounded by the host-wait budget instead, and the guest gets its ceiling back after.
-        self.host_wait(
-            Duration::from_secs(budgets::host_wait_seconds() as u64),
-            |host, call, allowance| host.ask(call, question, allowance),
-        )
+        // D197: a question waits for the person, so its wait is not the host-wait budget and not the
+        // guest's CPU ceiling either. What bounds it is `ask-wait-seconds` when the person set one,
+        // a deadline the caller itself set, or a cancelled turn.
+        self.host_question(|host, call, allowance| host.ask(call, question, allowance))
     }
 }
 

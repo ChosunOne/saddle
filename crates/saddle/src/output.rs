@@ -309,14 +309,14 @@ impl Ui for Output {
 pub struct LineQuestions;
 
 impl Questioner for LineQuestions {
-    fn ask(&mut self, asked: Arc<Asked>, until: Instant) {
+    fn ask(&mut self, asked: Arc<Asked>, until: Option<Instant>) {
         asked.answer(at_terminal(&asked.question, until));
     }
 }
 
 /// Asks one question in the plainest way a terminal allows: number the choices, print the previews,
 /// and read a line. An empty line dismisses the question, which is an answer rather than an error.
-fn at_terminal(question: &Question, until: Instant) -> Outcome {
+fn at_terminal(question: &Question, until: Option<Instant>) -> Outcome {
     if !io::stdin().is_terminal() {
         return Outcome::Unavailable("stdin is not a terminal".into());
     }
@@ -328,9 +328,14 @@ fn at_terminal(question: &Question, until: Instant) -> Outcome {
         } else {
             format!("  ({})", term::clean(&choice.description))
         };
+        let recommended = if choice.recommended {
+            "  (recommended)"
+        } else {
+            ""
+        };
         let _ = writeln!(
             err,
-            "  {}. {}{description}",
+            "  {}. {}{description}{recommended}",
             index + 1,
             term::clean(&choice.label)
         );
@@ -360,7 +365,7 @@ fn at_terminal(question: &Question, until: Instant) -> Outcome {
         if cancel::requested() {
             return Outcome::Dismissed;
         }
-        if Instant::now() >= until {
+        if until.is_some_and(|until| Instant::now() >= until) {
             return Outcome::Unavailable("the person did not answer in time".into());
         }
         let typed = line.trim();
