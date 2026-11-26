@@ -396,11 +396,17 @@ impl Store {
         Ok(())
     }
 
-    fn node(&self, id: i64) -> Result<Node> {
-        Ok(self.conn.query_row(
-            "SELECT id, parent, kind, body, created FROM nodes WHERE id = ?1",
-            params![id],
-            |r| {
+    fn branch_to(&self, leaf: Option<i64>) -> Result<Vec<Node>> {
+        let mut out = Vec::new();
+        if leaf.is_none() {
+            return Ok(out);
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, parent, kind, body, created FROM nodes WHERE id = ?1")?;
+        let mut at = leaf;
+        while let Some(id) = at {
+            let node = stmt.query_row(params![id], |r| {
                 Ok(Node {
                     id: r.get(0)?,
                     parent: r.get(1)?,
@@ -408,15 +414,7 @@ impl Store {
                     body: r.get(3)?,
                     created: r.get(4)?,
                 })
-            },
-        )?)
-    }
-
-    fn branch_to(&self, leaf: Option<i64>) -> Result<Vec<Node>> {
-        let mut out = Vec::new();
-        let mut at = leaf;
-        while let Some(id) = at {
-            let node = self.node(id)?;
+            })?;
             at = node.parent;
             out.push(node);
         }
@@ -756,17 +754,7 @@ impl Store {
     pub fn fork(&self, session: &str, at: Option<i64>) -> Result<String> {
         let chain = match at {
             None => self.branch(session)?,
-            Some(id) => {
-                let mut out = Vec::new();
-                let mut at = Some(id);
-                while let Some(id) = at {
-                    let node = self.node(id)?;
-                    at = node.parent;
-                    out.push(node);
-                }
-                out.reverse();
-                out
-            }
+            Some(id) => self.branch_to(Some(id))?,
         };
         let from_node = chain.last().map(|n| n.id);
         let id = session_id();

@@ -68,38 +68,17 @@ pub fn execute(
     } else {
         None
     };
-    let Some(snapshot) = snapshot.or(match target.as_deref() {
-        Some(id) => Some(session.transcript_store()?.snapshot(id)?),
-        None => None,
-    }) else {
-        return Ok(Err("no saved conversation is active".into()));
+    let snapshot = match (snapshot, target.as_deref()) {
+        (Some(snapshot), _) => snapshot,
+        (None, Some(id)) => session.transcript_store()?.snapshot(id)?,
+        (None, None) => return Ok(Err("no saved conversation is active".into())),
     };
-    let allowed: Vec<SessionRow> = match mode {
-        Some(Sessions::Workspace) => listed.iter().map(row).collect(),
-        _ => listed
-            .iter()
-            .filter(|s| Some(&s.id) == active.as_ref())
-            .map(row)
-            .collect(),
+    let allowed = match mode {
+        Some(Sessions::Workspace) => listed.as_slice(),
+        _ => &[],
     };
-    Ok(query_bounded(&snapshot, &allowed, sql, deadline)
+    Ok(query_bounded(&snapshot, allowed, sql, deadline)
         .map_err(|error| format!("session query failed: {error}")))
-}
-
-fn row(summary: &Summary) -> SessionRow {
-    SessionRow {
-        id: summary.id.clone(),
-        name: summary.name.clone().unwrap_or_default(),
-        title: summary.title.clone(),
-        model: summary.model.clone(),
-        updated: summary
-            .updated
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64),
-        messages: summary.messages as i64,
-        forked_from: summary.forked_from.clone().unwrap_or_default(),
-        worker: i64::from(summary.worker),
-    }
 }
 
 fn resolve<'a>(selector: &str, listed: &'a [Summary]) -> Result<&'a str, String> {
@@ -159,20 +138,9 @@ fn check_deadline(deadline: Option<Instant>) -> Result<()> {
     Ok(())
 }
 
-struct SessionRow {
-    id: String,
-    name: String,
-    title: String,
-    model: String,
-    updated: i64,
-    messages: i64,
-    forked_from: String,
-    worker: i64,
-}
-
 fn query_bounded(
     snapshot: &Snapshot,
-    sessions: &[SessionRow],
+    sessions: &[Summary],
     sql: &str,
     deadline: Option<Instant>,
 ) -> Result<Value> {
@@ -261,18 +229,24 @@ fn query_bounded(
         }
     }
     {
-        let mut insert =
-            conn.prepare("INSERT INTO session_snapshot VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?;
+        let mut insert = conn.prepare(
+            "INSERT INTO session_snapshot (id, name, title, model, updated, messages, forked_from, worker)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
         for row in sessions {
+            let updated = row
+                .updated
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
             insert.execute(params![
                 row.id,
-                row.name,
+                row.name.as_deref().unwrap_or_default(),
                 row.title,
                 row.model,
-                row.updated,
-                row.messages,
-                row.worker,
-                row.forked_from
+                updated,
+                row.messages as i64,
+                row.forked_from.as_deref().unwrap_or_default(),
+                i64::from(row.worker)
             ])?;
         }
     }
@@ -432,24 +406,48 @@ mod tests {
 
     #[test]
     fn the_sessions_view_names_the_conversations_and_nothing_else_is_readable() {
-        let rows = [SessionRow {
-            id: "abcdefghij".into(),
-            name: String::new(),
-            title: "remember teal".into(),
-            model: "glm".into(),
-            updated: 1_700_000_000,
-            messages: 4,
-            forked_from: String::new(),
-            worker: 0,
-        }];
+        let rows = [
+            summary("abcdefghij", "remember teal"),
+            Summary {
+                name: Some("my fork".into()),
+                forked_from: Some("abcdefghij".into()),
+                worker: true,
+                ..summary("klmnopqrst", "my fork")
+            },
+        ];
         let out = query_bounded(
             &messages(),
             &rows,
-            "SELECT id, title, messages FROM sessions",
+            "SELECT id, name, title, model, updated, messages, forked_from, worker
+             FROM sessions ORDER BY id",
             None,
         )
         .unwrap();
-        assert_eq!(out["rows"], json!([["abcdefghij", "remember teal", 4]]));
+        assert_eq!(
+            out["rows"],
+            json!([
+                [
+                    "abcdefghij",
+                    "",
+                    "remember teal",
+                    "glm",
+                    1_700_000_000,
+                    2,
+                    "",
+                    0
+                ],
+                [
+                    "klmnopqrst",
+                    "my fork",
+                    "my fork",
+                    "glm",
+                    1_700_000_000,
+                    2,
+                    "abcdefghij",
+                    1
+                ]
+            ])
+        );
         let error = query_bounded(&messages(), &rows, "SELECT * FROM sessions", None)
             .and_then(|_| {
                 query_bounded(
