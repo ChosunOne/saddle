@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Display;
 use std::sync::{Arc, Mutex};
 
 use crate::audit::sha256_hex;
@@ -205,14 +206,24 @@ pub fn net_decision(reach: &[NetGrant], req: &Request<'_>, who: &str) -> Decisio
     match req {
         Request::Net {
             scheme, host, port, ..
-        } => match net_allows(reach, scheme, host, *port) {
-            Some(grant) => Decision::allow(Scope::Net, &grant.rule, &grant.why),
-            None => Decision::deny(
-                Scope::Net,
-                format!("{who} has no net grant covering {scheme}://{host}:{port}"),
-            ),
-        },
+        } => decide_net(reach, who, scheme, host, *port),
         _ => Decision::deny(Scope::Net, format!("{req:?} is not a network request")),
+    }
+}
+
+fn decide_net(
+    reach: &[NetGrant],
+    who: impl Display,
+    scheme: &str,
+    host: &str,
+    port: u16,
+) -> Decision {
+    match net_allows(reach, scheme, host, port) {
+        Some(grant) => Decision::allow(Scope::Net, &grant.rule, &grant.why),
+        None => Decision::deny(
+            Scope::Net,
+            format!("{who} has no net grant covering {scheme}://{host}:{port}"),
+        ),
     }
 }
 
@@ -372,13 +383,7 @@ impl Engine {
             },
             Request::Net {
                 scheme, host, port, ..
-            } => match grants.net.iter().find(|g| g.allows(scheme, host, *port)) {
-                Some(g) => Decision::allow(scope, &g.rule, &g.why),
-                None => Decision::deny(
-                    scope,
-                    format!("{who} has no net grant covering {scheme}://{host}:{port}"),
-                ),
-            },
+            } => decide_net(&grants.net, who, scheme, host, *port),
             Request::ModelReserve { tokens, cost } => self.reserve_model(who, *tokens, *cost),
             Request::ModelInvoke { tokens } => {
                 let Some(g) = &grants.model_invoke else {
@@ -444,6 +449,106 @@ fn fs_decision(who: &Principal, scope: Scope, grants: &[FsGrant], loc: &Location
 mod tests {
     use super::*;
     use saddle_cap::{PluginId, RelPath, RootName, Roots};
+
+    fn net_request<'a>(scheme: &'a str, host: &'a str, port: u16) -> Request<'a> {
+        Request::Net {
+            method: "GET",
+            scheme,
+            host,
+            port,
+            path: "/",
+            headers: &[],
+        }
+    }
+
+    #[test]
+    fn principal_and_mcp_net_decisions_match_for_the_same_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = Roots::resolve([(RootName::workspace(), dir.path().into())], &[]).unwrap();
+        let policy = Policy::parse(
+            r#"
+version = 1
+[agent]
+net = [
+    { host = "api.example.com", why = "exact" },
+    { host = "*.example.com", why = "suffix" },
+    { host = "api.example.com", scheme = "http", port = 8080 },
+]
+"#,
+            &roots,
+        )
+        .unwrap();
+        let engine = Engine::new(policy);
+        let reach = &engine.policy().grants(&Principal::Agent).unwrap().net;
+        for (scheme, host, port, expected) in [
+            ("https", "api.example.com", 443, Some((0, ": exact"))),
+            ("https", "other.example.com", 443, Some((1, ": suffix"))),
+            ("http", "api.example.com", 8080, Some((2, ""))),
+            ("https", "example.com", 443, None),
+            ("https", "api.example.com", 8080, None),
+            ("http", "api.example.com", 80, None),
+        ] {
+            let req = net_request(scheme, host, port);
+            let principal = engine.decide(&Principal::Agent, &req);
+            assert_eq!(principal, net_decision(reach, &req, "agent"));
+            assert_eq!(principal.scope, Scope::Net);
+            if let Some((index, reason)) = expected {
+                assert!(principal.allow);
+                assert_eq!(principal.rule.as_ref(), Some(&reach[index].rule));
+                assert_eq!(principal.explanation, format!("agent.net[{index}]{reason}"));
+            } else {
+                assert!(!principal.allow);
+                assert_eq!(principal.rule, None);
+                assert_eq!(
+                    principal.explanation,
+                    format!("agent has no net grant covering {scheme}://{host}:{port}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_net_decisions_use_only_the_supplied_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = Roots::resolve([(RootName::workspace(), dir.path().into())], &[]).unwrap();
+        let policy = Policy::parse(
+            r#"
+version = 1
+[agent]
+net = [{ host = "api.search.example" }, { host = "other.search.example" }]
+"#,
+            &roots,
+        )
+        .unwrap();
+        let engine = Engine::new(policy);
+        let agent = Principal::Agent;
+        let reach = &engine.policy().grants(&agent).unwrap().net[..1];
+        let req = net_request("https", "api.search.example", 443);
+        assert!(engine.decide(&agent, &req).allow);
+        assert!(net_decision(reach, &req, "`search`").allow);
+        assert!(!net_decision(&[], &req, "`search`").allow);
+        let unknown = Principal::Plugin(PluginId::new("unknown").unwrap());
+        assert_eq!(
+            engine.decide(&unknown, &req),
+            Decision::deny(
+                Scope::Net,
+                "plugin.unknown has no grants in the policy".into()
+            )
+        );
+        let other = net_request("https", "other.search.example", 443);
+        assert!(engine.decide(&agent, &other).allow);
+        assert_eq!(
+            net_decision(reach, &other, "`search`"),
+            Decision::deny(
+                Scope::Net,
+                "`search` has no net grant covering https://other.search.example:443".into()
+            )
+        );
+        assert_eq!(
+            net_decision(reach, &Request::Plain(Scope::Tool), "`search`"),
+            Decision::deny(Scope::Net, "Plain(Tool) is not a network request".into())
+        );
+    }
 
     #[test]
     fn tool_paths_intersect_host_supplied_entry_roles_and_the_calling_principal() {
