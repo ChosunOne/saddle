@@ -2418,7 +2418,7 @@ fn ask_rows(
     }
     // The tail: the line being written, and why the last attempt was refused.
     let mut tail = vec![Line::default()];
-    let mut cursor = None;
+    let mut note_col = None;
     let (label, text) = match &dialog.stage {
         AskStage::Choosing => ("", ""),
         AskStage::Noting { text, .. } => ("note › ", text.as_str()),
@@ -2426,15 +2426,11 @@ fn ask_rows(
     };
     if !matches!(dialog.stage, AskStage::Choosing) {
         // The cursor is where the next character goes, and a line too long to fit keeps its end —
-        // which is the end being written.
+        // which is the end being written. One column short of the edge: a cursor placed past it
+        // wraps, and a wrap scrolls the screen out from under a block meant to stay put (D197).
         let room = width.saturating_sub(2 + label.width());
         let used = text.width().min(room);
-        // One column short of the edge: a cursor placed past it wraps, and a wrap scrolls the
-        // screen out from under a block that is supposed to stay put (D197).
-        cursor = Some((
-            lines.len() + tail.len(),
-            (2 + label.width() + used).min(width.saturating_sub(1)),
-        ));
+        note_col = Some((2 + label.width() + used).min(width.saturating_sub(1)));
         tail.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(label.to_owned(), accent),
@@ -2453,46 +2449,64 @@ fn ask_rows(
             ),
         ]));
     }
-    // The preview belongs to the choice under the cursor, and only to a choice.
-    let preview = dialog
-        .choice(dialog.selected)
-        .and_then(|index| question.choices.get(index))
-        .map(|choice| choice.preview.as_str())
-        .unwrap_or_default();
-    if !preview.is_empty() {
-        let wrapped = wrap_columns(preview, width.saturating_sub(4), usize::MAX);
-        // The blank, the word "preview" and at least two rows of it, or nothing at all.
-        let left = room.map_or(wrapped.len(), |room| {
-            room.saturating_sub(lines.len() + tail.len() + 2)
-                .min(MAX_PREVIEW_ROWS)
-        });
-        if left >= 2 && wrapped.len() >= 2 {
-            lines.push(Line::default());
-            lines.push(Line::from(vec![
-                Span::raw("    "),
-                Span::styled("preview", dim(theme)),
-            ]));
-            let shown = if wrapped.len() > left {
-                left - 1
+    // The preview belongs to the choice under the cursor, but the room it takes belongs to the
+    // question: the tallest preview decides how many rows are reserved, so walking the choices never
+    // changes the block's height and the screen never shifts under the person's eyes. The footer row
+    // is reserved too, and says how much of the selected preview was left out (D197).
+    let wrapped: Vec<Vec<String>> = question
+        .choices
+        .iter()
+        .map(|choice| {
+            if choice.preview.trim().is_empty() {
+                Vec::new()
             } else {
-                wrapped.len()
-            };
-            for line in wrapped.iter().take(shown) {
-                lines.push(Line::from(vec![
+                wrap_columns(&choice.preview, width.saturating_sub(4), usize::MAX)
+            }
+        })
+        .collect();
+    let tallest = wrapped.iter().map(Vec::len).max().unwrap_or(0);
+    // The blank, the word "preview" and the footer row are the region's own rows.
+    let cap = match room {
+        Some(room) => room
+            .saturating_sub(lines.len() + tail.len() + 3)
+            .min(MAX_PREVIEW_ROWS),
+        None => MAX_PREVIEW_ROWS,
+    };
+    let shown = tallest.min(cap);
+    if shown > 0 {
+        lines.push(Line::default());
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled("preview", dim(theme)),
+        ]));
+        let selected = dialog
+            .choice(dialog.selected)
+            .and_then(|row| wrapped.get(row));
+        for index in 0..shown {
+            lines.push(match selected.and_then(|lines| lines.get(index)) {
+                Some(line) => Line::from(vec![
                     Span::raw("    "),
                     Span::styled(line.clone(), Style::new()),
-                ]));
-            }
-            if wrapped.len() > shown {
-                let more = wrapped.len() - shown;
-                let plural = if more == 1 { "" } else { "s" };
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(format!("… {more} more line{plural}"), dim(theme)),
-                ]));
-            }
+                ]),
+                None => Line::default(),
+            });
+        }
+        if tallest > shown {
+            let more = selected.map_or(0, |lines| lines.len().saturating_sub(shown));
+            let plural = if more == 1 { "" } else { "s" };
+            let footer = if more == 0 {
+                String::new()
+            } else {
+                format!("… {more} more line{plural}")
+            };
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(footer, dim(theme)),
+            ]));
         }
     }
+    // The note line is the tail's second row, after the blank that separates it from the block.
+    let cursor = note_col.map(|col| (lines.len() + 1, col));
     lines.extend(tail);
     (lines, cursor)
 }
@@ -7168,6 +7182,69 @@ mod tests {
             all.contains("Where should the words you type go?"),
             "the question is still readable while its note is written:\n{all}"
         );
+    }
+
+    #[test]
+    fn a_questions_block_keeps_one_height_and_puts_the_cursor_where_the_note_is() {
+        let theme = Theme::default();
+        let (asked, _answers) = Asked::pair(AskedQuestion {
+            question: "which one?".into(),
+            choices: vec![
+                AskChoice {
+                    label: "short".into(),
+                    description: "a line".into(),
+                    preview: "one line".into(),
+                    recommended: false,
+                },
+                AskChoice {
+                    label: "long".into(),
+                    description: String::new(),
+                    preview: (0..12)
+                        .map(|n| format!("line {n}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    recommended: true,
+                },
+                AskChoice {
+                    label: "none".into(),
+                    description: String::new(),
+                    preview: String::new(),
+                    recommended: false,
+                },
+            ],
+            allow_other: true,
+            allow_note: true,
+        });
+        let mut dialog = AskDialog::new(asked);
+        // The room the preview takes belongs to the question, not to the choice under the cursor:
+        // walking the choices must not change the block's height and shift the screen (D197).
+        let mut heights = Vec::new();
+        for row in 0..dialog.rows() {
+            dialog.selected = row;
+            heights.push(ask_rows(&dialog, 80, Some(24), &theme).0.len());
+        }
+        assert!(
+            heights.windows(2).all(|pair| pair[0] == pair[1]),
+            "the block changed height while the choices were walked: {heights:?}"
+        );
+        // Including the rows the note and the error add, and the same with no room to spare.
+        dialog.stage = AskStage::Noting {
+            choice: 0,
+            text: "half".into(),
+        };
+        let (lines, cursor) = ask_rows(&dialog, 80, Some(24), &theme);
+        let (row, col) = cursor.expect("a note has a cursor");
+        let text = plain(&lines[row]);
+        assert!(
+            text.contains("note › half"),
+            "the cursor is on the note line: {text:?}"
+        );
+        assert_eq!(
+            col,
+            text.width(),
+            "the cursor follows the words, never past the edge"
+        );
+        assert!(col < 80);
     }
 
     #[test]

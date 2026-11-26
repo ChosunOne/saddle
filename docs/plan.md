@@ -4834,7 +4834,11 @@ the frame's activity line, so they are readable even when the question has been 
 line says where the question is instead, once it is out of view. The block is laid out to fit the
 viewport it lands in: a choice's preview is what gives way when room runs short — cut to at most ten
 rows with the number it left out — because a diff nobody asked to read must never push the question
-and its choices off the top of the screen while the person walks them. Picking a choice opens the
+and its choices off the top of the screen while the person walks them. The preview's rows belong to
+the question rather than to the choice under the cursor: the tallest preview decides how many rows are
+reserved, a choice with none leaves them blank, and the footer row is reserved whether or not it has
+something to say. So walking the choices never changes the block's height, and nothing moves on the
+screen while every choice is already visible. Picking a choice opens the
 note as a second step, and the activity line names the choice it will be attached to, so an answer is
 never sent by the keystroke that meant to add to it. The shipped `ask` tool is the guest — it owns the schema, the bounds and how the
 answer is put to the model — and the host owns the surface, the wait and the record. Asking is
