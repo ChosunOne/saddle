@@ -1815,7 +1815,20 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let inner_width = area.width.saturating_sub(2) as usize;
     let layout = app.editor.layout(inner_width.max(1));
     let editor_rows = layout.rows.len().clamp(1, MAX_EDITOR_ROWS);
-    let queue_rows = (app.steering.len() + app.jobs.len()).min(3);
+    let queued: Vec<Line> = app
+        .steering
+        .iter()
+        .map(|text| ("steering › ", text))
+        .chain(app.queue.iter().map(|text| ("queued › ", text)))
+        .take(3)
+        .map(|(label, text)| {
+            let first = text.lines().next().unwrap_or_default();
+            Line::from(vec![
+                Span::styled(label, dim(&app.theme)),
+                Span::raw(first.to_owned()),
+            ])
+        })
+        .collect();
     let panel_rows = app
         .plugin_panels
         .iter()
@@ -1832,7 +1845,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     ] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(panel_rows as u16),
-        Constraint::Length(queue_rows as u16),
+        Constraint::Length(queued.len() as u16),
         Constraint::Length(1),
         Constraint::Length(editor_rows as u16 + 2),
         Constraint::Length(1),
@@ -1848,25 +1861,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     draw_panels(frame, &app.plugin_panels, panels_area, &app.theme);
 
-    let pending = |label: &'static str, text: &String| {
-        let first = text.lines().next().unwrap_or_default();
-        Line::from(vec![
-            Span::styled(label, dim(&app.theme)),
-            Span::raw(first.to_owned()),
-        ])
-    };
-    let mut queued: Vec<Line> = app
-        .steering
-        .iter()
-        .take(queue_rows)
-        .map(|q| pending("steering › ", q))
-        .collect();
-    queued.extend(
-        app.queue
-            .iter()
-            .take(queue_rows - queued.len())
-            .map(|q| pending("queued › ", q)),
-    );
     frame.render_widget(Paragraph::new(queued), queue_area);
 
     let activity = match &app.ask {
@@ -3890,7 +3884,7 @@ mod tests {
     use crate::provider::Usage;
     use crate::questions::Asked;
     use crate::store::{Point, PointKind, Summary};
-    use crate::team::{Beat, Render};
+    use crate::team::{Beat, BusMessage, QueueItem, QueueState, Render};
     use crate::tui::app::{Action, Cell, Selection};
     use crate::tui::app::{AgentEvent, Header, Spent};
     use crate::tui::keys::Keys;
@@ -5735,9 +5729,66 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_queued_during_a_turn_appears_in_the_pending_strip() {
+        let mut app = bare_app();
+        app.busy = Some(Activity::Waiting);
+        app.editor.set("follow up\nsecond line".into());
+        assert!(
+            app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
+                .is_none()
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("queued › follow up"), "{shown}");
+        assert!(!shown.contains("second line"), "{shown}");
+    }
+
+    #[test]
+    fn a_team_job_does_not_take_up_space_in_the_pending_strip() {
+        let mut app = bare_app();
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let initial_height = app.view_height;
+
+        app.agent(AgentEvent::Queue(vec![QueueItem {
+            id: 1,
+            command: "echo team job".into(),
+            why: String::new(),
+            owner: "lead".into(),
+            state: QueueState::Pending,
+        }]));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.view_height, initial_height);
+        assert!(!screen(&terminal).contains("echo team job"));
+    }
+
+    #[test]
+    fn the_pending_strip_shows_steering_before_queued_prompts_in_at_most_three_rows() {
+        let mut app = bare_app();
+        app.steering = ["first steer".into(), "second steer".into()].into();
+        app.queue = ["first queued".into(), "second queued".into()].into();
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        let pending: Vec<_> = shown
+            .lines()
+            .filter(|line| line.starts_with("steering › ") || line.starts_with("queued › "))
+            .collect();
+        assert_eq!(
+            pending,
+            [
+                "steering › first steer",
+                "steering › second steer",
+                "queued › first queued",
+            ]
+        );
+    }
+
+    #[test]
     fn the_overview_page_lists_the_team_and_shares_the_bus_and_queue() {
-        use crate::team::{Beat, BusMessage, QueueItem, QueueState, Render};
-        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         fn runtime() -> Render {
             Render {
                 name: "runtime".into(),
@@ -5874,7 +5925,6 @@ mod tests {
 
     #[test]
     fn a_board_stays_selected_when_the_team_has_no_workers() {
-        use ratatui::crossterm::event::{KeyCode, KeyEvent};
         let mut app = bare_app();
         app.overview = Some(0);
         app.agent(AgentEvent::Workers(Vec::new()));
@@ -5891,8 +5941,6 @@ mod tests {
 
     #[test]
     fn the_page_scrolls_a_sessions_history_and_a_boards_full_text() {
-        use crate::team::{Beat, BusMessage, QueueItem, QueueState, Render};
-        use ratatui::crossterm::event::{KeyCode, KeyEvent};
         let mut app = bare_app();
         app.show_thinking = true;
         let mut many = Render {
