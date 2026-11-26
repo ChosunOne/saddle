@@ -7114,7 +7114,7 @@ mod tests {
             "the transcript was covered:\n{all}"
         );
         assert!(
-            all.contains("↑↓ choose · enter answer · 1-9 pick · n note · esc dismiss"),
+            all.contains("↑↓ choose · 1-9 jump · enter answer · n note · esc dismiss"),
             "the keys are on the frame's own line:\n{all}"
         );
         for want in [
@@ -7128,7 +7128,7 @@ mod tests {
             "an answer of your own",
             "preview",
             "+ let host = prepare(component)?;",
-            "↑↓ choose · enter answer · 1-9 pick · n note · esc dismiss",
+            "↑↓ choose · 1-9 jump · enter answer · n note · esc dismiss",
         ] {
             assert!(all.contains(want), "missing {want:?} in\n{all}");
         }

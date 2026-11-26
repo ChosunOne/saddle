@@ -80,7 +80,8 @@ budgets snapshot, so its entry delegates no scope: `config_help = []` (D171). `a
 `ask = []`: its guest owns the schema and the wording, while the person is reached through
 `saddle:host/ask` and may always dismiss the question. That question is drawn as the end of the
 transcript — nothing is ever covered, `pgup`/`pgdn` and the wheel still scroll while it waits, `enter`
-or a digit answers at once and `n` opens a note — and it waits for the person with no deadline unless
+answers, a digit only moves the highlight and `n` opens a note — and it waits for the person with no
+deadline unless
 the protected `ask-wait-seconds` sets one, since a model may not decide how long a person has to
 think (D197). The one name that is
 the host's rather than a component's is `tool_search`, which is MCP discovery and decides nothing

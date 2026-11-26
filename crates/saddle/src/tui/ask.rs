@@ -71,7 +71,7 @@ impl AskDialog {
                 } else {
                     ""
                 };
-                format!("↑↓ choose · enter answer · 1-9 pick{note} · esc dismiss")
+                format!("↑↓ choose · 1-9 jump · enter answer{note} · esc dismiss")
             }
             Stage::Noting { choice, .. } => {
                 let label = self
@@ -190,16 +190,14 @@ impl AskDialog {
                 self.selected = (self.selected + 1) % rows;
                 Answer::Stay
             }
-            // A digit is the shortest way to a choice whose preview the person does not need, so it
-            // answers rather than only moving the highlight.
+            // A digit moves the highlight to that choice, and nothing else: answering is enter's
+            // job, so a number can never send an answer the person meant to look at (D197).
             KeyCode::Char(digit @ '1'..='9') => {
                 let row = digit.to_digit(10).unwrap_or(1) as usize - 1;
                 if row < rows {
                     self.selected = row;
-                    self.choose()
-                } else {
-                    Answer::Stay
                 }
+                Answer::Stay
             }
             KeyCode::Enter => self.choose(),
             // A note is an extra, never a step between picking a choice and answering it: `n`
@@ -341,14 +339,21 @@ mod tests {
     }
 
     #[test]
-    fn a_digit_answers_with_that_choice_at_once() {
-        let (mut dialog, _answers) = dialog();
-        // A digit answers: a note is `n`, never a step on the way (D197).
-        let Answer::Given(Outcome::Answered(reply)) = dialog.key(key(KeyCode::Char('2'))) else {
-            panic!("a digit answers with its choice");
+    fn a_digit_only_moves_the_highlight() {
+        let (mut moving, _answers) = dialog();
+        // A digit moves the highlight, so it can never send an answer the person meant to look at
+        // (D197); enter is what answers.
+        assert!(matches!(moving.key(key(KeyCode::Char('2'))), Answer::Stay));
+        assert_eq!(moving.selected, 1);
+        let Answer::Given(Outcome::Answered(reply)) = moving.key(key(KeyCode::Enter)) else {
+            panic!("enter answers with the highlighted choice");
         };
         assert!(matches!(reply.selection, Selection::Chosen(1)));
         assert_eq!(reply.note, "");
+        // A digit past the last row moves nothing.
+        let (mut fresh, _answers) = dialog();
+        assert!(matches!(fresh.key(key(KeyCode::Char('9'))), Answer::Stay));
+        assert_eq!(fresh.selected, 0);
     }
 
     #[test]

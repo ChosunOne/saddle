@@ -4838,9 +4838,10 @@ its own on the right when the screen is wide enough for both — the two columns
 the panel titled and given exactly the rows the question beside it needs — and goes under the choices
 when it is not, where it gives way to them: cut to at most ten rows with the number it left out,
 because a diff nobody asked to read must never push the question and its choices off the top of the
-screen. What the person does is answering, not writing: `enter` or a digit answers with the choice it
-names, a digit answering at once rather than only moving the highlight, and `n` opens a note on the
-choice under the cursor as an extra — never a step between picking and answering. The activity line
+screen. What the person does is answering, not writing: `enter` answers with the highlighted choice, a digit
+only moves the highlight to the choice it names — so a number can never send an answer the person
+meant to look at — and `n` opens a note on the choice under the cursor as an extra, never a step
+between picking and answering. The activity line
 names the choice a note will be attached to, so an answer is never sent by the keystroke that meant to
 add to it. The shipped `ask` tool is the guest — it owns the schema, the bounds and how the
 answer is put to the model — and the host owns the surface, the wait and the record. Asking is
