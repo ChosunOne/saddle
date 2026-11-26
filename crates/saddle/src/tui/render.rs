@@ -2140,16 +2140,16 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // A question is answered where it is drawn, at the end of the transcript, so the line that is
     // always visible carries its keys and says when it has been scrolled out of sight (D197).
     let activity = match &app.ask {
-        Some(dialog) => {
-            let mut spans = vec![
-                Span::styled("question ", Style::new().fg(app.theme.accent)),
-                Span::styled(dialog.help(), dim(&app.theme)),
-            ];
-            if app.scroll > 0 {
-                spans.push(Span::styled("  · end to see it", dim(&app.theme)));
-            }
-            Line::from(spans)
-        }
+        // The question is the transcript's last rows, so it can be scrolled away: then the line
+        // says where it is rather than listing keys for a block that is not on the screen (D197).
+        Some(dialog) if app.scroll > 0 => Line::from(vec![
+            Span::styled("question below ", Style::new().fg(app.theme.accent)),
+            Span::styled("· end to see it", dim(&app.theme)),
+        ]),
+        Some(dialog) => Line::from(vec![
+            Span::styled("question ", Style::new().fg(app.theme.accent)),
+            Span::styled(dialog.help(), dim(&app.theme)),
+        ]),
         None => match (&app.busy, &app.stopped) {
             (Some(activity), _) => {
                 let spin = SPINNER[app.spinner % SPINNER.len()];
@@ -2367,9 +2367,14 @@ fn shade_dialog(frame: &mut Frame<'_>, app: &App) {
 /// A tool's question as the last rows of the transcript (D197): the person reads what led to it and
 /// scrolls as ever, and the question is simply the end of the conversation rather than a lid over
 /// it. Returns the rows, and the cell the cursor belongs on counted from the block's first row.
+///
+/// `room` is the viewport the block has to fit in. A preview is a preview: a diff long enough to
+/// push the question and its choices off the top of the screen while the person walks the choices
+/// taught that the preview gives way, not the question (D197).
 fn ask_rows(
     dialog: &AskDialog,
     width: usize,
+    room: Option<usize>,
     theme: &Theme,
 ) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
     let width = width.max(8);
@@ -2411,26 +2416,8 @@ fn ask_rows(
             theme,
         ));
     }
-    // The preview belongs to the choice under the cursor, and only to a choice.
-    let preview = dialog
-        .choice(dialog.selected)
-        .and_then(|index| question.choices.get(index))
-        .map(|choice| choice.preview.as_str())
-        .unwrap_or_default();
-    if !preview.is_empty() {
-        lines.push(Line::default());
-        lines.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled("preview", dim(theme)),
-        ]));
-        for line in wrap_columns(preview, width.saturating_sub(4), 8) {
-            lines.push(Line::from(vec![
-                Span::raw("    "),
-                Span::styled(line, Style::new()),
-            ]));
-        }
-    }
-    lines.push(Line::default());
+    // The tail: the line being written, and why the last attempt was refused.
+    let mut tail = vec![Line::default()];
     let mut cursor = None;
     let (label, text) = match &dialog.stage {
         AskStage::Choosing => ("", ""),
@@ -2439,11 +2426,16 @@ fn ask_rows(
     };
     if !matches!(dialog.stage, AskStage::Choosing) {
         // The cursor is where the next character goes, and a line too long to fit keeps its end —
-        // which is the end being written (D197).
+        // which is the end being written.
         let room = width.saturating_sub(2 + label.width());
         let used = text.width().min(room);
-        cursor = Some((lines.len(), 2 + label.width() + used));
-        lines.push(Line::from(vec![
+        // One column short of the edge: a cursor placed past it wraps, and a wrap scrolls the
+        // screen out from under a block that is supposed to stay put (D197).
+        cursor = Some((
+            lines.len() + tail.len(),
+            (2 + label.width() + used).min(width.saturating_sub(1)),
+        ));
+        tail.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(label.to_owned(), accent),
             Span::styled(
@@ -2453,7 +2445,7 @@ fn ask_rows(
         ]));
     }
     if let Some(error) = &dialog.error {
-        lines.push(Line::from(vec![
+        tail.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
                 clip(error, width.saturating_sub(2)),
@@ -2461,8 +2453,52 @@ fn ask_rows(
             ),
         ]));
     }
+    // The preview belongs to the choice under the cursor, and only to a choice.
+    let preview = dialog
+        .choice(dialog.selected)
+        .and_then(|index| question.choices.get(index))
+        .map(|choice| choice.preview.as_str())
+        .unwrap_or_default();
+    if !preview.is_empty() {
+        let wrapped = wrap_columns(preview, width.saturating_sub(4), usize::MAX);
+        // The blank, the word "preview" and at least two rows of it, or nothing at all.
+        let left = room.map_or(wrapped.len(), |room| {
+            room.saturating_sub(lines.len() + tail.len() + 2)
+                .min(MAX_PREVIEW_ROWS)
+        });
+        if left >= 2 && wrapped.len() >= 2 {
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled("preview", dim(theme)),
+            ]));
+            let shown = if wrapped.len() > left {
+                left - 1
+            } else {
+                wrapped.len()
+            };
+            for line in wrapped.iter().take(shown) {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(line.clone(), Style::new()),
+                ]));
+            }
+            if wrapped.len() > shown {
+                let more = wrapped.len() - shown;
+                let plural = if more == 1 { "" } else { "s" };
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(format!("… {more} more line{plural}"), dim(theme)),
+                ]));
+            }
+        }
+    }
+    lines.extend(tail);
     (lines, cursor)
 }
+
+/// How many rows of a choice's preview are drawn at most, however tall the screen (D197).
+const MAX_PREVIEW_ROWS: usize = 10;
 
 /// One choice: its number and label, the recommended marker on the one the asker advises, and the
 /// description as subtext under it in a quieter colour than the label (D197).
@@ -4047,10 +4083,14 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect, activity: b
     // A question a tool is waiting on is the end of the transcript, not a lid over it (D197): the
     // rows go after everything said, the transcript's own scrolling reaches them, and a person
     // reading what led to the question scrolls exactly as ever.
-    let question = app
-        .ask
-        .as_ref()
-        .map(|dialog| ask_rows(dialog, area.width as usize, &app.theme));
+    let question = app.ask.as_ref().map(|dialog| {
+        ask_rows(
+            dialog,
+            area.width as usize,
+            Some(area.height as usize),
+            &app.theme,
+        )
+    });
     let cursor = question.as_ref().and_then(|(_, cursor)| *cursor);
     let asked = question.as_ref().map_or(0, |(rows, _)| rows.len());
     if let Some((rows, _)) = question {
@@ -4147,7 +4187,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect, activity: b
         let line = total.saturating_sub(asked) + row;
         if line >= top && line < top + height {
             frame.set_cursor_position(Position::new(
-                area.x + col as u16,
+                area.x + (col as u16).min(area.width.saturating_sub(1)),
                 area.y + (line - top) as u16,
             ));
         }
@@ -7035,8 +7075,8 @@ mod tests {
         let all = screen(&terminal);
         assert!(all.contains("note ›"), "{all}");
         assert!(
-            all.contains("enter answer with this note"),
-            "the frame's line says what enter does: {all}"
+            all.contains("note on \"rewrite it\" · enter send"),
+            "the frame's line names the choice the note belongs to and what enter does: {all}"
         );
         assert!(
             all.contains("a line of the conversation that must stay visible"),
@@ -7062,6 +7102,72 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         assert!(screen(&terminal).contains("Which approach should the loader take?"));
+    }
+
+    #[test]
+    fn moving_through_a_questions_choices_keeps_its_question_and_choices_on_the_screen() {
+        let mut app = bare_app();
+        // The shape that got this wrong: three choices whose previews are long enough that the
+        // block is taller than the screen, walked with the keys the question uses (D197).
+        let (asked, _answers) = Asked::pair(AskedQuestion {
+            question: "Where should the words you type go?".into(),
+            choices: (1..=3)
+                .map(|n| AskChoice {
+                    label: format!("choice {n}"),
+                    description: "a line about it".into(),
+                    preview: (0..14)
+                        .map(|line| format!("preview line {line} of choice {n}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    recommended: n == 1,
+                })
+                .collect(),
+            allow_other: true,
+            allow_note: true,
+        });
+        app.ask = Some(AskDialog::new(asked));
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        for turn in 0..8 {
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            let all = screen(&terminal);
+            assert!(
+                all.contains("Where should the words you type go?"),
+                "turn {turn} lost the question itself:\n{all}"
+            );
+            assert!(
+                all.contains("1. choice 1") && all.contains("3. choice 3"),
+                "turn {turn} lost the choices:\n{all}"
+            );
+            assert_eq!(app.scroll, 0, "turn {turn} scrolled the transcript");
+            if turn == 0 {
+                // The preview gives way rather than the question: it is cut, and says how much it
+                // left out.
+                assert!(
+                    all.contains("more line"),
+                    "the preview was cut short:\n{all}"
+                );
+            }
+            app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+
+        // Picking a choice opens its note, and the frame names the choice the note belongs to, so
+        // the answer is never sent by a keystroke that meant to add to it (D197).
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let all = screen(&terminal);
+        assert!(
+            all.contains("note ›"),
+            "the note line is on the screen:\n{all}"
+        );
+        assert!(
+            all.contains("note on \"choice"),
+            "and the frame says which choice it is for:\n{all}"
+        );
+        assert!(all.contains("empty note is none"), "{all}");
+        assert!(
+            all.contains("Where should the words you type go?"),
+            "the question is still readable while its note is written:\n{all}"
+        );
     }
 
     #[test]

@@ -60,14 +60,24 @@ impl AskDialog {
     }
 
     /// The keys the stage answers to, drawn on the frame's activity line so they are on the screen
-    /// even when the question itself has been scrolled out of view (D197).
-    pub fn help(&self) -> &'static str {
-        match self.stage {
+    /// even when the question itself has been scrolled out of view. A note names the choice it will
+    /// be attached to, because the person has already picked one and the block can be far away
+    /// (D197).
+    pub fn help(&self) -> String {
+        match &self.stage {
             Stage::Choosing => {
-                "↑↓ choose · enter select · 1-9 pick · esc dismiss · pgup/pgdn scroll"
+                "↑↓ choose · enter select · 1-9 pick · esc dismiss · pgup/pgdn scroll".into()
             }
-            Stage::Noting { .. } => "enter answer with this note · esc back",
-            Stage::Typing { .. } => "enter send this answer · esc back",
+            Stage::Noting { choice, .. } => {
+                let label = self
+                    .asked
+                    .question
+                    .choices
+                    .get(*choice)
+                    .map_or("this choice", |choice| choice.label.as_str());
+                format!("note on \"{label}\" · enter send · esc back · empty note is none")
+            }
+            Stage::Typing { .. } => "an answer of your own · enter send · esc back".into(),
         }
     }
 

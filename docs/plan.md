@@ -4830,7 +4830,13 @@ keys that walk the transcript — `pgup`/`pgdn`, `home`/`end`, the wheel and a d
 the transcript's while it is being answered. Nothing is ever covered, so a person reading an
 explanation is not interrupted mid-sentence by a box landing on the words they were reading; the
 question is simply what comes next, and `end` puts it back in view. The keys the question owns are on
-the frame's activity line, so they are readable even when the question has been scrolled away. The shipped `ask` tool is the guest — it owns the schema, the bounds and how the
+the frame's activity line, so they are readable even when the question has been scrolled away; the
+line says where the question is instead, once it is out of view. The block is laid out to fit the
+viewport it lands in: a choice's preview is what gives way when room runs short — cut to at most ten
+rows with the number it left out — because a diff nobody asked to read must never push the question
+and its choices off the top of the screen while the person walks them. Picking a choice opens the
+note as a second step, and the activity line names the choice it will be attached to, so an answer is
+never sent by the keystroke that meant to add to it. The shipped `ask` tool is the guest — it owns the schema, the bounds and how the
 answer is put to the model — and the host owns the surface, the wait and the record. Asking is
 available to any component registered as a tool (`tool` scope), because a question grants no resource
 and the person may always dismiss it; the dialog belongs to the tool that asked, and a dismissal is
