@@ -4874,6 +4874,14 @@ compiler's lexer on local Rust source loaded by the compiler, so comment syntax 
 not a violation. This supersedes the inline documentation convention without changing D148's
 import rule.
 
+**D199.** A settled transcript entry caches its wrapped styled rows, shared copy text, and
+entry-relative formula positions together. A frame computes scrolling, question rows, selection
+shading and picture clipping from the current viewport. It copies styled rows and image payloads
+only for what can be painted; its selection snapshot shares the copy text for the entire history,
+including the entries and formulas outside the viewport. Content mutations and layout changes
+invalidate the relevant rows; running entries still render against the current clock. The worker
+view still builds from the current worker snapshot rather than using a second persistent cache.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

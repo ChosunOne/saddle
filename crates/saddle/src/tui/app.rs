@@ -16,7 +16,6 @@ use crate::tui::image::Fit;
 use crate::tui::image::Protocol;
 use crate::tui::keys::Keys;
 use crate::tui::math;
-use crate::tui::math::Formula;
 use crate::tui::notify::Notify;
 use crate::tui::permissions::Change as PermissionsChange;
 use crate::tui::permissions::Permissions;
@@ -27,6 +26,7 @@ use crate::tui::tree::Tree;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::mem;
+use std::ops::Index;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,12 +36,11 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Position, Rect};
-use ratatui::text::Line;
 use unicode_width::UnicodeWidthChar;
 
 use super::editor::Editor;
 use super::login::{Draft, Listed, Login, LoginRequest, Outcome, Pick};
-use super::render::home_relative;
+use super::render::{Cached, home_relative};
 use super::sessions::{PickOutcome, SessionPicker};
 use super::settings::{Change, SettingsDialog, SettingsOutcome};
 use crate::agent::call_detail;
@@ -196,8 +195,76 @@ impl Selection {
 pub struct Seen {
     pub area: Rect,
     pub top: usize,
-    pub lines: Vec<String>,
+    pub lines: CopyLines,
     pub pictures: Vec<Source>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CopyLines {
+    len: usize,
+    chunks: Vec<CopyChunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopyChunk {
+    start: usize,
+    rows: Arc<[String]>,
+}
+
+impl CopyLines {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn blank(&mut self) {
+        self.len += 1;
+    }
+
+    pub fn append(&mut self, rows: Arc<[String]>) {
+        if !rows.is_empty() {
+            let start = self.len;
+            self.len += rows.len();
+            self.chunks.push(CopyChunk { start, rows });
+        }
+    }
+
+    pub fn get(&self, row: usize) -> Option<&str> {
+        if row >= self.len {
+            return None;
+        }
+        let after = self.chunks.partition_point(|chunk| chunk.start <= row);
+        let text = after.checked_sub(1).and_then(|index| {
+            let chunk = &self.chunks[index];
+            chunk.rows.get(row - chunk.start)
+        });
+        Some(text.map_or("", String::as_str))
+    }
+
+    #[cfg(test)]
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        (0..self.len).map(|row| &self[row])
+    }
+}
+
+impl From<Vec<String>> for CopyLines {
+    fn from(rows: Vec<String>) -> Self {
+        let mut lines = Self::default();
+        lines.append(rows.into());
+        lines
+    }
+}
+
+impl Index<usize> for CopyLines {
+    type Output = str;
+
+    fn index(&self, index: usize) -> &str {
+        assert!(index < self.len, "copy row {index} is out of bounds");
+        self.get(index).unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,7 +275,7 @@ pub struct Source {
     pub cols: u16,
     pub inline: bool,
     pub typst: bool,
-    pub tex: String,
+    pub tex: Arc<str>,
 }
 
 #[derive(Debug, Clone)]
@@ -355,14 +422,6 @@ pub struct Header {
     pub keys: Keys,
 }
 
-pub struct Cached {
-    pub width: u16,
-    pub expand: bool,
-    pub thinking: bool,
-    pub lines: Vec<Line<'static>>,
-    pub pictures: Vec<Formula>,
-}
-
 #[derive(Clone)]
 pub struct Menu {
     pub name: String,
@@ -490,6 +549,7 @@ pub struct App {
     pub entries: Vec<Entry>,
     pub plugin_panels: Vec<PanelView>,
     pub cache: Vec<Option<Cached>>,
+    pub cache_theme: Option<Theme>,
     pub editor: Editor,
     pub queue: VecDeque<String>,
     pub steering: VecDeque<String>,
@@ -587,13 +647,6 @@ pub fn help() -> String {
 }
 
 impl App {
-    pub fn cached_image(&self, i: usize) -> Option<Image> {
-        match self.entries.get(i) {
-            Some(Entry::Image(image)) => Some(image.clone()),
-            _ => None,
-        }
-    }
-
     pub fn new(header: Header) -> Self {
         let (show_reasoning, expand_tools, max_steps) =
             (header.show_reasoning, header.expand_tools, header.max_steps);
@@ -603,6 +656,7 @@ impl App {
             entries: Vec::new(),
             plugin_panels: Vec::new(),
             cache: Vec::new(),
+            cache_theme: None,
             editor: Editor::default(),
             queue: VecDeque::new(),
             steering: VecDeque::new(),
@@ -1577,9 +1631,8 @@ impl App {
             parts.push(delimited(picture));
             parts.push(String::new());
         }
-        let rows = seen.lines.get(first.line..=last_line).unwrap_or_default();
-        for (offset, text) in rows.iter().enumerate() {
-            let line = first.line + offset;
+        for line in first.line..=last_line {
+            let text = &seen.lines[line];
             let mut chars: Vec<char> = text.chars().collect();
             let width = chars.len().max(cells_end(line, &seen.pictures));
             chars.resize(width, ' ');
@@ -3256,7 +3309,8 @@ mod tests {
                 String::new(),
                 "so it holds".into(),
                 format!("if {} then", " ".repeat(6)),
-            ],
+            ]
+            .into(),
             pictures: vec![
                 Source {
                     line: 2,
@@ -3458,7 +3512,7 @@ mod tests {
         a.seen = Some(Seen {
             area: Rect::new(0, 0, 20, 5),
             top: 0,
-            lines: vec!["› hello world".into(), "  second line".into()],
+            lines: vec!["› hello world".into(), "  second line".into()].into(),
             pictures: Vec::new(),
         });
         let ev = |kind, column, row| MouseEvent {
@@ -3496,7 +3550,7 @@ mod tests {
         a.seen = Some(Seen {
             area: Rect::new(0, 0, 20, 5),
             top: 0,
-            lines: vec!["one two three".into()],
+            lines: vec!["one two three".into()].into(),
             pictures: Vec::new(),
         });
         let ev = |kind, column, row| MouseEvent {
@@ -3516,7 +3570,7 @@ mod tests {
         a.seen = Some(Seen {
             area: Rect::new(0, 0, 20, 5),
             top: 0,
-            lines: vec!["some text".into()],
+            lines: vec!["some text".into()].into(),
             pictures: Vec::new(),
         });
         let ev = |kind| MouseEvent {
@@ -3540,7 +3594,10 @@ mod tests {
         a.seen = Some(Seen {
             area: Rect::new(0, 4, 20, 5),
             top: 10,
-            lines: (0..20).map(|i| format!("line {i}")).collect(),
+            lines: (0..20)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .into(),
             pictures: Vec::new(),
         });
         let ev = |kind, column, row| MouseEvent {
@@ -3580,7 +3637,7 @@ mod tests {
         a.seen = Some(Seen {
             area: Rect::new(0, 0, 20, 5),
             top: 0,
-            lines: vec!["some text".into()],
+            lines: vec!["some text".into()].into(),
             pictures: Vec::new(),
         });
         a.resume = Some(SessionPicker::new(Vec::new()));

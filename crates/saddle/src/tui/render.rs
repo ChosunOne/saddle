@@ -13,12 +13,14 @@ use std::borrow::Cow;
 use std::env;
 use std::iter;
 use std::mem;
+use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
-    Activity, App, COPY_NOTE, Cached, CompactState, CompactionView, Confirm, Entry, NoteKind,
+    Activity, App, COPY_NOTE, CompactState, CompactionView, Confirm, CopyLines, Entry, NoteKind,
     Placed, Seen, Source,
 };
 use super::ask::{AskDialog, Stage as AskStage};
@@ -1531,121 +1533,280 @@ fn shaded(rows: &[Row], bg: Color, width: usize) -> Vec<Line<'static>> {
     out
 }
 
+#[cfg_attr(test, derive(Clone))]
 struct At {
     line: usize,
     column: Option<u16>,
     picture: Picture,
-    tex: String,
-    inline: bool,
-    typst: bool,
+    source: Option<FormulaText>,
     id: u32,
 }
 
+#[cfg_attr(test, derive(Clone))]
 struct Picture {
     image: Image,
     cells: image::Fit,
 }
 
+#[cfg_attr(test, derive(Clone))]
+struct FormulaText {
+    tex: Arc<str>,
+    inline: bool,
+    typst: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LayoutKey {
+    width: u16,
+    expand: bool,
+    thinking: bool,
+    images: bool,
+    scale: u32,
+    cell: (u32, u32),
+}
+
+pub struct Cached {
+    key: LayoutKey,
+    lines: Vec<Line<'static>>,
+    text: Arc<[String]>,
+    pictures: Vec<At>,
+    attachment: Option<image::Fit>,
+}
+
+fn refresh_transcript(app: &mut App, width: u16, activity: bool) {
+    if app.cache_theme.as_ref() != Some(&app.theme) {
+        app.cache.iter_mut().for_each(|entry| *entry = None);
+        app.cache_theme = Some(app.theme.clone());
+    }
+    let view = View {
+        expand: app.expand_tools,
+        thinking: app.show_thinking,
+        spinner: app.spinner,
+        activity,
+        room: (width, image::MAX_ROWS),
+        images: app.protocol != image::Protocol::Text,
+        scale: app.header.math_scale,
+    };
+    let key = LayoutKey {
+        width,
+        expand: view.expand,
+        thinking: view.thinking,
+        images: view.images,
+        scale: view.scale.to_bits(),
+        cell: image::cell_px(),
+    };
+    for (index, (entry, cached)) in app.entries.iter().zip(&mut app.cache).enumerate() {
+        let running = match entry {
+            Entry::Tool { result, tasks, .. } => {
+                result.is_none() || tasks.iter().any(|task| task.state == TaskState::Running)
+            }
+            Entry::Compaction(view) => view.state == CompactState::Running,
+            _ => false,
+        };
+        if !running && cached.as_ref().is_some_and(|cached| cached.key == key) {
+            continue;
+        }
+        let (mut lines, formulas) = entry_render(entry, view, &app.theme, app.now);
+        let pictures = resolve_formulas(index, &mut lines, formulas);
+        let attachment = match entry {
+            Entry::Image(image) => Some(image::fit((image.width, image.height), view.room)),
+            _ => None,
+        };
+        let text = lines.iter().map(plain).collect();
+        *cached = Some(Cached {
+            key,
+            lines,
+            text,
+            pictures,
+            attachment,
+        });
+    }
+}
+
+fn resolve_formulas(entry: usize, lines: &mut [Line<'static>], formulas: Vec<Formula>) -> Vec<At> {
+    let mut pictures = Vec::with_capacity(formulas.len());
+    let mut row = 0;
+    for (index, formula) in formulas.into_iter().enumerate() {
+        while let Some(line) = lines.get_mut(row) {
+            let Some(column) = unmark(line) else {
+                row += 1;
+                continue;
+            };
+            let (line, column) = if formula.inline {
+                (row, Some(column as u16))
+            } else {
+                *line = Line::default();
+                row += 1;
+                (row, None)
+            };
+            pictures.push(At {
+                line,
+                column,
+                picture: Picture {
+                    cells: image::Fit {
+                        cols: formula.cells.0.max(1),
+                        rows: formula.cells.1.max(1),
+                        scaled: true,
+                    },
+                    image: formula.image,
+                },
+                source: Some(FormulaText {
+                    tex: formula.source.into(),
+                    inline: formula.inline,
+                    typst: formula.notation == math::Notation::Typst,
+                }),
+                id: picture_id(entry, index + 1),
+            });
+            break;
+        }
+    }
+    pictures
+}
+
+fn transcript_len(cache: &[Option<Cached>]) -> usize {
+    let rows: usize = cache.iter().flatten().map(|entry| entry.lines.len()).sum();
+    rows + cache.len().saturating_sub(1)
+}
+
+fn transcript_entries(cache: &[Option<Cached>]) -> impl Iterator<Item = (usize, usize, &Cached)> {
+    let mut start = 0;
+    cache.iter().enumerate().filter_map(move |(index, entry)| {
+        if index > 0 {
+            start += 1;
+        }
+        let entry = entry.as_ref()?;
+        let first = start;
+        start += entry.lines.len();
+        Some((index, first, entry))
+    })
+}
+
+struct TranscriptRows {
+    visible: Vec<Line<'static>>,
+    text: CopyLines,
+    sources: Vec<Source>,
+    placed: Vec<Placed>,
+}
+
+fn transcript_rows(
+    app: &App,
+    question: Vec<Line<'static>>,
+    viewport: Range<usize>,
+) -> TranscriptRows {
+    let mut rows = TranscriptRows {
+        visible: Vec::with_capacity(viewport.len()),
+        text: CopyLines::default(),
+        sources: Vec::new(),
+        placed: Vec::new(),
+    };
+    for (index, start, entry) in transcript_entries(&app.cache) {
+        rows.add_gap(start, &viewport);
+        rows.add_visible(start, &entry.lines, &viewport);
+        rows.text.append(Arc::clone(&entry.text));
+        if let (Some(cells), Entry::Image(image)) = (entry.attachment, &app.entries[index]) {
+            rows.place(start + 1, 0, picture_id(index, 0), cells, image, &viewport);
+        }
+        for at in &entry.pictures {
+            rows.add_picture(start, at, &viewport);
+        }
+    }
+    let start = rows.text.len();
+    if !question.is_empty() {
+        let text = question.iter().map(plain).collect();
+        rows.add_visible(start, &question, &viewport);
+        rows.text.append(text);
+    }
+    rows
+}
+
+impl TranscriptRows {
+    fn add_gap(&mut self, end: usize, viewport: &Range<usize>) {
+        while self.text.len() < end {
+            if viewport.contains(&self.text.len()) {
+                self.visible.push(Line::default());
+            }
+            self.text.blank();
+        }
+    }
+
+    fn add_visible(&mut self, start: usize, lines: &[Line<'static>], viewport: &Range<usize>) {
+        let first = viewport.start.saturating_sub(start);
+        let end = viewport.end.saturating_sub(start).min(lines.len());
+        if first < end {
+            self.visible.extend_from_slice(&lines[first..end]);
+        }
+    }
+
+    fn add_picture(&mut self, start: usize, at: &At, viewport: &Range<usize>) {
+        let line = start + at.line;
+        let column = at.column.unwrap_or(0);
+        let Picture { image, cells } = &at.picture;
+        if let Some(source) = &at.source
+            && !source.tex.is_empty()
+        {
+            self.sources.push(Source {
+                line,
+                column,
+                rows: cells.rows,
+                cols: cells.cols,
+                inline: source.inline,
+                typst: source.typst,
+                tex: Arc::clone(&source.tex),
+            });
+        }
+        self.place(line, column, at.id, *cells, image, viewport);
+    }
+
+    fn place(
+        &mut self,
+        line: usize,
+        column: u16,
+        id: u32,
+        cells: image::Fit,
+        image: &Image,
+        viewport: &Range<usize>,
+    ) {
+        if image::band(line, cells.rows, viewport.start, viewport.len()).is_some() {
+            self.placed.push(Placed {
+                line,
+                column,
+                id,
+                box_: cells,
+                pixels: (image.width, image.height),
+                data: image.data.clone(),
+            });
+        }
+    }
+}
+
+#[cfg(test)]
 fn transcript_with_images(
     app: &mut App,
     width: u16,
     activity: bool,
 ) -> (Vec<Line<'static>>, Vec<At>) {
-    let mut images: Vec<At> = Vec::new();
-    let mut lines = Vec::new();
-    for i in 0..app.entries.len() {
-        let running = match &app.entries[i] {
-            Entry::Tool { result, tasks, .. } => {
-                result.is_none() || tasks.iter().any(|task| task.state == TaskState::Running)
-            }
-            Entry::Compaction(v) => v.state == CompactState::Running,
-            _ => false,
-        };
-        let fresh = app.cache[i].as_ref().is_some_and(|c| {
-            c.width == width && c.expand == app.expand_tools && c.thinking == app.show_thinking
-        });
-        if !fresh || running {
-            let view = View {
-                expand: app.expand_tools,
-                thinking: app.show_thinking,
-                spinner: app.spinner,
-                activity,
-                room: (width, image::MAX_ROWS),
-                images: app.protocol != image::Protocol::Text,
-                scale: app.header.math_scale,
-            };
-            let (rendered, formulas) = entry_render(&app.entries[i], view, &app.theme, app.now);
-            app.cache[i] = Some(Cached {
-                width,
-                expand: app.expand_tools,
-                thinking: app.show_thinking,
-                lines: rendered,
-                pictures: formulas,
-            });
-        }
-        if i > 0 {
-            lines.push(Line::default());
-        }
-        if let Some(image) = app.cached_image(i) {
-            let cells = image::fit((image.width, image.height), (width, image::MAX_ROWS));
-            images.push(At {
-                line: lines.len() + 1,
+    refresh_transcript(app, width, activity);
+    let rows = transcript_rows(app, Vec::new(), 0..transcript_len(&app.cache));
+    let mut pictures = Vec::new();
+    for (index, start, entry) in transcript_entries(&app.cache) {
+        if let (Some(cells), Entry::Image(image)) = (entry.attachment, &app.entries[index]) {
+            pictures.push(At {
+                line: start + 1,
                 column: None,
-                picture: Picture { image, cells },
-                tex: String::new(),
-                inline: false,
-                typst: false,
-                id: picture_id(i, 0),
-            });
-        }
-        let start = lines.len();
-        lines.extend(
-            app.cache[i]
-                .as_ref()
-                .map(|c| c.lines.iter().cloned())
-                .into_iter()
-                .flatten(),
-        );
-        let pictures = app
-            .cache
-            .get(i)
-            .map(|c| c.as_ref().map(|c| c.pictures.clone()).unwrap_or_default())
-            .unwrap_or_default();
-        for (k, image) in pictures.into_iter().enumerate() {
-            let Some(at) = lines[start..]
-                .iter()
-                .position(|line| plain(line).contains(FORMULA))
-            else {
-                continue;
-            };
-            let (line, column) = if image.inline {
-                let Some(column) = unmark(&mut lines[start + at]) else {
-                    continue;
-                };
-                (start + at, Some(column as u16))
-            } else {
-                lines[start + at] = Line::default();
-                (start + at + 1, None)
-            };
-            images.push(At {
-                line,
-                column,
-                tex: image.source.clone(),
-                inline: image.inline,
-                typst: image.notation == math::Notation::Typst,
                 picture: Picture {
-                    cells: image::Fit {
-                        cols: image.cells.0.max(1),
-                        rows: image.cells.1.max(1),
-                        scaled: true,
-                    },
-                    image: image.image,
+                    image: image.clone(),
+                    cells,
                 },
-                id: picture_id(i, k + 1),
+                source: None,
+                id: picture_id(index, 0),
             });
         }
+        pictures.extend(entry.pictures.iter().cloned().map(|mut picture| {
+            picture.line += start;
+            picture
+        }));
     }
-    (lines, images)
+    (rows.visible, pictures)
 }
 
 fn picture_id(entry: usize, within: usize) -> u32 {
@@ -2739,7 +2900,7 @@ fn modal(
                 rect.height.saturating_sub(2),
             ),
             top: 0,
-            lines: text,
+            lines: text.into(),
             pictures: Vec::new(),
         },
         rect,
@@ -2845,7 +3006,7 @@ fn draw_tree(frame: &mut Frame<'_>, tree: &mut Tree, area: Rect, theme: &Theme) 
     Seen {
         area,
         top: 0,
-        lines: text,
+        lines: text.into(),
         pictures: Vec::new(),
     }
 }
@@ -3393,7 +3554,7 @@ fn draw_overview(frame: &mut Frame<'_>, app: &mut App, selected: usize, area: Re
             draw_board(frame, app, lines, empty, detail_inner);
         }
     }
-    let lines = (0..inner.height)
+    let lines: Vec<String> = (0..inner.height)
         .map(|y| {
             (0..inner.width)
                 .map(|x| {
@@ -3409,7 +3570,7 @@ fn draw_overview(frame: &mut Frame<'_>, app: &mut App, selected: usize, area: Re
     Seen {
         area: inner,
         top: 0,
-        lines,
+        lines: lines.into(),
         pictures: Vec::new(),
     }
 }
@@ -3669,6 +3830,7 @@ fn draw_worker_transcript(frame: &mut Frame<'_>, worker: &Render, app: &mut App,
     let entries = worker_entries(worker);
     let fresh = iter::repeat_with(|| None).take(entries.len()).collect();
     let lead_cache = mem::replace(&mut app.cache, fresh);
+    let lead_cache_theme = app.cache_theme.take();
     let lead_entries = mem::replace(&mut app.entries, entries);
     let (lead_scroll, lead_total) = (app.scroll, app.total_lines);
     app.scroll = app.worker_scroll;
@@ -3680,6 +3842,7 @@ fn draw_worker_transcript(frame: &mut Frame<'_>, worker: &Render, app: &mut App,
     app.total_lines = lead_total;
     app.entries = lead_entries;
     app.cache = lead_cache;
+    app.cache_theme = lead_cache_theme;
 }
 
 fn worker_entries(worker: &Render) -> Vec<Entry> {
@@ -3743,23 +3906,14 @@ fn worker_entries(worker: &Render) -> Vec<Entry> {
 }
 
 fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect, activity: bool) {
-    let (mut lines, at) = transcript_with_images(app, area.width.max(1), activity);
-    let question = app.ask.as_ref().map(|dialog| {
-        ask_rows(
-            dialog,
-            area.width as usize,
-            Some(area.height as usize),
-            &app.theme,
-        )
-    });
-    let cursor = question.as_ref().and_then(|(_, cursor)| *cursor);
-    let asked = question.as_ref().map_or(0, |(rows, _)| rows.len());
-    if let Some((rows, _)) = question {
-        lines.extend(rows);
-    }
-    let mut placed: Vec<Placed> = Vec::new();
-    let height = area.height as usize;
-    let total = lines.len();
+    refresh_transcript(app, area.width.max(1), activity);
+    let height = usize::from(area.height);
+    let (question, cursor) = app.ask.as_ref().map_or_else(
+        || (Vec::new(), None),
+        |dialog| ask_rows(dialog, usize::from(area.width), Some(height), &app.theme),
+    );
+    let question_start = transcript_len(&app.cache);
+    let total = question_start + question.len();
     if app.scroll > 0 && total > app.total_lines {
         app.scroll += total - app.total_lines;
     }
@@ -3767,7 +3921,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect, activity: b
     app.total_lines = total;
     app.view_height = height;
     let top = total.saturating_sub(height + app.scroll);
-    let text: Vec<String> = lines.iter().map(plain).collect();
+    let mut rows = transcript_rows(app, question, top..top + height);
     let dialog_open = app.resume.is_some()
         || app.tree.is_some()
         || app.confirm.is_some()
@@ -3781,53 +3935,23 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect, activity: b
         && !dialog_open
     {
         let (first, last) = sel.ends();
-        for (i, line) in lines.iter_mut().enumerate().skip(top).take(height) {
-            if i < first.line || i > last.line {
+        for (offset, line) in rows.visible.iter_mut().enumerate() {
+            let index = top + offset;
+            if index < first.line || index > last.line {
                 continue;
             }
-            let from = if i == first.line { first.ch } else { 0 };
-            let to = if i == last.line { last.ch } else { usize::MAX };
+            let from = if index == first.line { first.ch } else { 0 };
+            let to = if index == last.line {
+                last.ch
+            } else {
+                usize::MAX
+            };
             shade(line, from, to, &app.theme);
         }
     }
-    let sources: Vec<Source> = at
-        .iter()
-        .filter(|at| !at.tex.is_empty())
-        .map(|at| Source {
-            line: at.line,
-            column: at.column.unwrap_or(0),
-            rows: at.picture.cells.rows.max(1),
-            cols: at.picture.cells.cols.max(1),
-            inline: at.inline,
-            typst: at.typst,
-            tex: at.tex.clone(),
-        })
-        .collect();
-    for At {
-        line,
-        column,
-        picture,
-        id,
-        ..
-    } in at
-    {
-        let Picture { image, cells: box_ } = picture;
-        if image::band(line, box_.rows, top, height).is_none() {
-            continue;
-        }
-        placed.push(Placed {
-            line,
-            column: column.unwrap_or(0),
-            id,
-            box_,
-            pixels: (image.width, image.height),
-            data: image.data,
-        });
-    }
-    let visible: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
-    frame.render_widget(Paragraph::new(visible), area);
+    frame.render_widget(Paragraph::new(rows.visible), area);
     if let Some((row, col)) = cursor {
-        let line = total.saturating_sub(asked) + row;
+        let line = question_start + row;
         if line >= top && line < top + height {
             frame.set_cursor_position(Position::new(
                 area.x + (col as u16).min(area.width.saturating_sub(1)),
@@ -3835,12 +3959,12 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect, activity: b
             ));
         }
     }
-    app.images = placed;
+    app.images = rows.placed;
     app.seen = Some(Seen {
         area,
         top,
-        lines: text,
-        pictures: sources,
+        lines: rows.text,
+        pictures: rows.sources,
     });
     app.jump_badge = None;
     if app.scroll > 0 {
@@ -3940,6 +4064,156 @@ mod tests {
         app.agent(AgentEvent::Panels(Vec::new()));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert!(!screen(&terminal).contains("plugin.features"));
+    }
+
+    #[test]
+    #[ignore = "manual warm redraw benchmark"]
+    fn warm_transcript_redraw_benchmark() {
+        for entries in [20, 400] {
+            let mut app = bare_app();
+            let paragraph = "A line of transcript text with **bold**, *italics*, and `code`.\n\n";
+            for index in 0..entries {
+                app.entries.push(Entry::Assistant(format!(
+                    "Entry {index}\n\n{}",
+                    paragraph.repeat(20)
+                )));
+                app.cache.push(None);
+            }
+            let mut terminal = Terminal::new(TestBackend::new(90, 32)).unwrap();
+            for _ in 0..5 {
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            }
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let start = Instant::now();
+                for _ in 0..40 {
+                    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                }
+                samples.push(start.elapsed() / 40);
+            }
+            samples.sort_unstable();
+            println!(
+                "{entries} entries, {} rows: {:?}/frame (median)",
+                app.total_lines, samples[2]
+            );
+        }
+    }
+
+    #[test]
+    fn warm_redraw_shares_offscreen_rows_and_copies_both_formula_notations() {
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Kitty;
+        app.entries.extend([
+            Entry::Assistant("first $x$ and $y$\n\n$$\\frac{a}{b}$$".into()),
+            Entry::Assistant("```typst-math\nfrac(c, d)\n```".into()),
+            Entry::Assistant(format!("{}final row", "middle\n\n".repeat(40))),
+        ]);
+        app.cache.resize_with(app.entries.len(), || None);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let first = app.seen.clone().unwrap();
+        assert!(first.top > first.pictures.last().unwrap().line);
+        assert!(app.images.is_empty());
+        assert_eq!(first.pictures.len(), 4);
+        assert_eq!(first.pictures[0].line, first.pictures[1].line);
+        assert!(first.pictures[0].column < first.pictures[1].column);
+        let cached_text = Arc::clone(&app.cache[0].as_ref().unwrap().text);
+        let end = first.lines.len() - 1;
+        app.selection = Some(Selection {
+            anchor: Cell { line: 0, ch: 0 },
+            focus: Cell {
+                line: end,
+                ch: usize::MAX,
+            },
+            dragging: true,
+        });
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.seen.as_ref().unwrap(), &first);
+        assert!(Arc::ptr_eq(
+            &cached_text,
+            &app.cache[0].as_ref().unwrap().text
+        ));
+        let copy = app.selected_text().unwrap();
+        assert!(copy.contains(r"first \(x\) and \(y\)"), "{copy}");
+        assert!(copy.contains(r"\[\frac{a}{b}\]"), "{copy}");
+        assert!(copy.contains("```typst-math\nfrac(c, d)\n```"), "{copy}");
+        assert!(copy.ends_with("final row"), "{copy}");
+    }
+
+    #[test]
+    fn layout_changes_refresh_styled_rows_and_formula_positions() {
+        let mut app = bare_app();
+        app.protocol = image::Protocol::Kitty;
+        app.agent(AgentEvent::Call {
+            id: "call".into(),
+            name: "bash".into(),
+            detail: "show".into(),
+            timeout: None,
+        });
+        app.agent(AgentEvent::Result {
+            ok: true,
+            content: (0..30).map(|i| format!("result {i}\n")).collect(),
+            diff: None,
+            images: Vec::new(),
+        });
+        app.entries.push(Entry::Assistant(
+            "before the formula and after those words $x^2$ end".into(),
+        ));
+        app.cache.push(None);
+        let mut wide = Terminal::new(TestBackend::new(90, 25)).unwrap();
+        wide.draw(|frame| draw(frame, &mut app)).unwrap();
+        let original = app.seen.as_ref().unwrap().pictures[0].clone();
+        app.expand_tools = true;
+        wide.draw(|frame| draw(frame, &mut app)).unwrap();
+        let expanded = app.seen.as_ref().unwrap().pictures[0].clone();
+        assert!(expanded.line > original.line);
+        assert_eq!(expanded.column, original.column);
+
+        let mut narrow = Terminal::new(TestBackend::new(32, 25)).unwrap();
+        narrow.draw(|frame| draw(frame, &mut app)).unwrap();
+        let resized = app.seen.as_ref().unwrap().pictures[0].clone();
+        assert_ne!(resized.column, expanded.column);
+        let preview = Color::Rgb(19, 40, 71);
+        app.theme.text = preview;
+        narrow.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.seen.as_ref().unwrap().pictures[0], resized);
+        let warm = narrow.backend().buffer().clone();
+        let warm_text = app.seen.clone();
+        app.cache.iter_mut().for_each(|entry| *entry = None);
+        narrow.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(narrow.backend().buffer(), &warm);
+        assert_eq!(app.seen, warm_text);
+
+        app.protocol = image::Protocol::Text;
+        narrow.draw(|frame| draw(frame, &mut app)).unwrap();
+        let seen = app.seen.as_ref().unwrap();
+        assert!(seen.pictures.is_empty());
+        assert!(seen.lines.iter().any(|row| row.contains("$x^2$")));
+    }
+
+    #[test]
+    fn drawing_a_worker_does_not_validate_the_lead_cache_for_a_new_theme() {
+        let mut app = bare_app();
+        app.entries.push(Entry::Assistant("lead text".into()));
+        app.cache.push(None);
+        let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let previous = Arc::clone(&app.cache[0].as_ref().unwrap().text);
+        let worker = Render {
+            beats: vec![Beat::Text("worker text".into())],
+            ..Render::default()
+        };
+        app.theme.text = Color::Rgb(19, 40, 71);
+        let area = app.seen.as_ref().unwrap().area;
+        terminal
+            .draw(|frame| draw_worker_transcript(frame, &worker, &mut app, area))
+            .unwrap();
+        assert!(Arc::ptr_eq(&previous, &app.cache[0].as_ref().unwrap().text));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!Arc::ptr_eq(
+            &previous,
+            &app.cache[0].as_ref().unwrap().text
+        ));
     }
 
     #[test]
@@ -5008,7 +5282,6 @@ mod tests {
             .lines
             .iter()
             .find(|l| l.contains("provider"))
-            .cloned()
             .unwrap_or_else(|| panic!("no provider row in {:?}", seen.lines));
         let row = seen
             .lines
@@ -6378,7 +6651,7 @@ mod tests {
             "the keyboard's row is not the last row of the list: {:?}",
             seen.lines
         );
-        assert!(seen.lines[16].starts_with('›'), "{:?}", seen.lines[16]);
+        assert!(seen.lines[16].starts_with('›'), "{:?}", &seen.lines[16]);
         assert!(seen.lines[17].contains("40 messages"), "{:?}", seen.lines);
         assert!(seen.lines[19].contains("esc closes"), "{:?}", seen.lines);
         assert!(
