@@ -137,8 +137,7 @@ impl Steering {
         if let Ok(map) = self.shared.lock()
             && let Some(peer) = map.get(name)
         {
-            peer.handle.steer.push(text);
-            let _ = peer.jobs.send(Job::Wake);
+            peer.deliver(text);
         }
     }
 
@@ -295,6 +294,28 @@ impl Peer {
             .map(|r| r.state == "running")
             .unwrap_or(false)
     }
+
+    fn working(&self) -> bool {
+        self.render
+            .lock()
+            .map(|r| matches!(r.state.as_str(), "starting" | "running"))
+            .unwrap_or(false)
+    }
+
+    fn deliver(&self, text: String) -> bool {
+        if !self.live() {
+            return false;
+        }
+        self.handle
+            .deliver(text, || self.jobs.send(Job::Wake).is_ok())
+    }
+}
+
+impl Handle {
+    fn deliver(&self, text: String, wake: impl FnOnce() -> bool) -> bool {
+        self.steer.push(text);
+        wake()
+    }
 }
 
 pub struct Manager {
@@ -363,7 +384,18 @@ impl Manager {
         self.shared.lock().ok()?.get(name).cloned()
     }
 
-    pub fn completed(&self, name: &str, state: &str) {
+    fn publish_rest(&self, render: &mut Render, state: String, failure: Option<&str>, stop: bool) {
+        if !stop {
+            self.completed(&render.name, &state);
+        }
+        render.state = state;
+        if let Some(text) = failure {
+            render.error = Some(text.to_owned());
+            render.push(Beat::Note(format!("error: {text}")));
+        }
+    }
+
+    fn completed(&self, name: &str, state: &str) {
         let Ok(mut done) = self.completions.lock() else {
             return;
         };
@@ -409,10 +441,7 @@ impl Manager {
 
     pub fn working(&self) -> bool {
         match self.shared.lock() {
-            Ok(map) => map.values().any(|peer| {
-                let state = peer.render().state;
-                state == "starting" || state == "running"
-            }),
+            Ok(map) => map.values().any(Peer::working),
             Err(_) => false,
         }
     }
@@ -521,15 +550,9 @@ impl Manager {
         if text.trim().is_empty() {
             return Err("empty message".into());
         }
-        if peer.render().finished {
+        if !peer.deliver(format!("[message from {from}]\n{text}")) {
             return Err(format!("{to} has finished; start a new worker"));
         }
-        peer.jobs
-            .send(Job::Wake)
-            .map_err(|_| format!("{to} has finished; start a new worker"))?;
-        peer.handle
-            .steer
-            .push(format!("[message from {from}]\n{text}"));
         if let Ok(mut bus) = self.bus.lock() {
             bus.push_back(BusMessage {
                 from: from.to_owned(),
@@ -956,6 +979,30 @@ impl Manager {
     }
 }
 
+fn next_prompt(
+    jobs: &Receiver<Job>,
+    steer: &Steer,
+    stop: &AtomicBool,
+    first: bool,
+) -> Option<String> {
+    while !stop.load(Ordering::SeqCst) {
+        if !first {
+            let pending = steer.take();
+            if !pending.is_empty() {
+                return Some(pending.join("\n\n"));
+            }
+        }
+        let job = jobs.recv().ok()?;
+        if stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        if let Job::Start(brief) = job {
+            return Some(brief);
+        }
+    }
+    None
+}
+
 fn run(
     mut agent: Agent,
     mut session: Session,
@@ -970,55 +1017,14 @@ fn run(
         cancel,
     } = handle;
     session.cancel = cancel.clone();
-    let name = view
-        .lock()
-        .map(|render| render.name.clone())
-        .unwrap_or_default();
     let mut ui = WorkerUi {
         view: view.clone(),
         interrupt: interrupt.clone(),
         stop: stop.clone(),
     };
     let mut first = true;
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
-        let prompt = if first {
-            first = false;
-            match jobs.recv() {
-                Ok(Job::Start(brief)) => brief,
-                Ok(Job::Wake) => continue,
-                Err(_) => break,
-            }
-        } else {
-            let mut text = None;
-            loop {
-                if stop.load(Ordering::SeqCst) {
-                    break;
-                }
-                match jobs.recv() {
-                    Ok(Job::Start(brief)) => {
-                        text = Some(brief);
-                        break;
-                    }
-                    Ok(Job::Wake) => {}
-                    Err(_) => {
-                        finish(agent, session, &view);
-                        return;
-                    }
-                }
-                let pending = steer.take();
-                if !pending.is_empty() {
-                    text = Some(pending.join("\n\n"));
-                    break;
-                }
-            }
-            match text {
-                Some(text) => text,
-                None => break,
-            }
-        };
+    while let Some(prompt) = next_prompt(&jobs, &steer, &stop, first) {
+        first = false;
         set(&view, |render| {
             render.state = "running".into();
             render.turns += 1;
@@ -1035,15 +1041,13 @@ fn run(
             }
         };
         set(&view, |render| {
-            render.state = state.clone();
-            if let Some(text) = &failure {
-                render.error = Some(text.clone());
-                render.push(Beat::Note(format!("error: {text}")));
-            }
+            session.team.publish_rest(
+                render,
+                state,
+                failure.as_deref(),
+                stop.load(Ordering::SeqCst),
+            );
         });
-        if !stop.load(Ordering::SeqCst) {
-            session.team.completed(&name, &state);
-        }
         if failure.is_some() {
             break;
         }
@@ -1325,7 +1329,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use saddle_wit::saddle::host::workers::{Job, Message};
+    use saddle_wit::saddle::host::workers::{Job as QueueJob, Message};
     use std::sync::Mutex;
 
     #[test]
@@ -1488,6 +1492,62 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_rest_is_queued_before_releasing_the_worker_state() {
+        let team = with_peers(vec![("runtime", "running", false)]);
+        let peer = team.lookup("runtime").unwrap();
+        assert!(team.working());
+        assert!(!team.pending());
+
+        let mut render = peer.render.lock().unwrap();
+        render.name = "runtime".into();
+        team.child()
+            .publish_rest(&mut render, "idle".into(), None, false);
+        assert!(team.pending());
+        drop(render);
+
+        assert!(!team.working());
+        let notices = team.notices(true);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("worker runtime"));
+        assert!(!team.pending());
+        assert!(team.notices(true).is_empty());
+    }
+
+    #[test]
+    fn the_receiver_can_take_the_message_at_the_instant_it_is_woken() {
+        let peer = peer("idle", false);
+        assert!(peer.handle.deliver("one message".into(), || {
+            assert_eq!(peer.handle.steer.take(), ["one message"]);
+            true
+        }));
+        assert!(peer.handle.steer.take().is_empty());
+    }
+
+    #[test]
+    fn a_wake_before_start_does_not_displace_the_brief_or_lose_the_message() {
+        let team = with_peers(vec![("runtime", "starting", false)]);
+        let (jobs, receive) = mpsc::channel();
+        let peer = {
+            let mut peers = team.shared.lock().unwrap();
+            let peer = peers.get_mut("runtime").unwrap();
+            peer.jobs = jobs;
+            peer.clone()
+        };
+        team.say("lead", "runtime", "early message").unwrap();
+        peer.jobs.send(Job::Start("the brief".into())).unwrap();
+        let Peer { handle, jobs, .. } = peer;
+        drop(jobs);
+        drop(team);
+        let next = |first| next_prompt(&receive, &handle.steer, &handle.stop, first);
+        assert_eq!(next(true).as_deref(), Some("the brief"));
+        assert_eq!(
+            next(false).as_deref(),
+            Some("[message from lead]\nearly message")
+        );
+        assert!(next(false).is_none());
+    }
+
+    #[test]
     fn a_worker_cannot_address_the_lead_and_is_told_where_its_answer_goes() {
         let team = with_peers(vec![("a", "idle", false)]);
         let refused = team.say("a", "lead", "a finding").unwrap_err();
@@ -1608,7 +1668,7 @@ mod tests {
         assert_eq!(bus[0].to, "runtime");
         assert!(bus[0].text.starts_with("check the loader"));
         assert!(team.bus_text().contains("lead → runtime"));
-        let op = Operation::Enqueue(Job {
+        let op = Operation::Enqueue(QueueJob {
             command: "rm -rf secret".into(),
             why: "test".into(),
         });
