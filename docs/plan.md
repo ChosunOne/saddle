@@ -2991,7 +2991,7 @@ and model arguments. The loader does not depend on the binary's session: a narro
 trait receives the host-assigned plugin and invocation identity. Implementations must decide and
 audit each operation against that identity; neither guest arguments nor tool names select it.
 
-Wasmtime and WASI are pinned to `36.0.20` (Rust 1.86 minimum, within our 1.88 MSRV); the future
+Wasmtime and WASI are pinned to `36.0.23` (Rust 1.86 minimum, within our 1.88 MSRV); the future
 WASI-HTTP adapter must use that same exact version. WASI remains 0.2, and guest bindings use
 `wit-bindgen` 0.45.0. Each invocation has a fresh store and
 instance, bounded linear memories, tables, fuel and argument/result sizes, plus an epoch wall-clock
@@ -4882,6 +4882,24 @@ including the entries and formulas outside the viewport. Content mutations and l
 invalidate the relevant rows; running entries still render against the current clock. The worker
 view still builds from the current worker snapshot rather than using a second persistent cache.
 
+**D200.** The dependency graph is part of what this project claims, so it is decided by a written
+policy rather than by whatever a `cargo add` resolves. `deny.toml` at the workspace root is the
+gate and `cargo deny check` runs it: advisories (vulnerable, unsound, unmaintained and yanked are
+all errors, for every crate in the graph and not only the ones a manifest names), a closed
+allow-list of licences, bans on the crates that would bring a second TLS or git implementation, and
+crates.io as the only source — a git dependency is a moving target no `Cargo.lock` digest holds.
+`.cargo/audit.toml` repeats the advisory part of that policy for `cargo audit`, so the same lockfile
+is read against RustSec's database by two tools that agree on the exceptions; an advisory ignored in
+one and not the other fails the run they disagree in. The workspace crates are `publish = false`,
+which is what makes a wildcard requirement an error: their own path dependencies are exempt from
+what crates.io requires of a published crate, and a registry wildcard is still refused. Duplicate
+versions are reported and not forbidden, because the pinned wasmtime line (D14) and the pinned typst
+line (D165) carry their own; a duplicate outside them is a signal to read rather than a gate. An
+advisory no version requirement here can move is ignored by name with a reason that says which
+pinned line holds it and why it is not reachable, and the rest is fixed: setting the gate up found
+four wasmtime advisories and one in `url`, and the pinned line moved to `36.0.23` and `2.5.9` rather
+than being ignored.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |
@@ -5007,6 +5025,13 @@ read bindings under a write capability must never let that principal read a file
   grant has already decided.
 - `saddle mcp tools <server>` and a name-level filter over a run's tools: the grant decides what may
   be called, so both are presentation conveniences.
+- Replacing `humantime`, which is unmaintained rather than vulnerable (RUSTSEC-2026-0542, ignored in
+  `deny.toml` under D200). It formats and parses RFC3339 in the audit log, the session store and the
+  status line, so the swap is a source change with tests of its own, not a dependency bump.
+- Moving the typst line (D165) to a hayagriva and citationberg that accept `quick-xml >= 0.41`, which
+  is the fix for RUSTSEC-2026-0194 and RUSTSEC-2026-0195. The two advisories are about parsing
+  untrusted XML, which nothing here does — the harness compiles math markup, never a bibliography —
+  so they are ignored by name until that line moves.
 
 ## 9. Known risks
 

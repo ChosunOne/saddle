@@ -37,6 +37,10 @@ because it is followed.
 `lints/qualified-paths` is outside the workspace: a Dylint library holding the source style lints
 (D148, D198), with its own nightly toolchain and UI tests. `cargo build` never compiles it.
 
+`deny.toml` is the dependency policy and `.cargo/audit.toml` its advisory part alone (D200); the
+Commands section below says how both are run. Neither reaches `lints/qualified-paths`, which is
+outside the workspace and has a lockfile of its own.
+
 Inside `crates/saddle/src`:
 
 | module | owns |
@@ -260,7 +264,26 @@ cargo nextest run -E 'test(/^tui::/)'        # by name, with nextest's filter ex
 cargo fmt --all --check                      # must stay clean; no rustfmt.toml, so defaults apply
 cargo clippy --all-targets                   # must stay clean
 cargo dylint --all --workspace -- --all-targets  # source style lints; needs its pinned nightly
+cargo deny check                             # dependency policy: advisories, licences, bans, sources
+cargo audit                                  # the same lockfile against RustSec alone
 ```
+
+`cargo deny` and `cargo audit` are separate installs — `cargo install cargo-deny cargo-audit
+--locked` — and neither is a dependency of the build. They decide what the workspace will accept
+from the registry (D200): `deny.toml` at the root is the gate, `.cargo/audit.toml` repeats only its
+advisory part so both tools read RustSec's database with the same exceptions. Advisories —
+vulnerable, unsound, unmaintained and yanked alike — are errors, as is a crate from a git repository
+or a second TLS or git implementation. The allow-list of licences is closed: a new licence fails the
+check, and the answer is a decision in `docs/plan.md`, not a line in `deny.toml`.
+
+Both fetch RustSec's advisory database on every run, so each wants the network. Nothing in the tree
+runs them for you: a person runs them before a release and after a dependency changes. The
+workspace crates are `publish = false`, which is what lets `wildcards = "deny"` mean a registry
+requirement: their own path dependencies are exempt. An advisory that cannot be fixed from this
+repository is ignored by name with its reason in `deny.toml`, and the same id goes into
+`.cargo/audit.toml` — the two lists are kept in step, and a warning that an entry is unused says it
+is time to remove both. Duplicate versions are warnings, not failures: the pinned wasmtime (D14)
+and typst (D165) lines carry their own, and a duplicate outside them is meant to be read.
 
 `cargo dylint` is separate from Clippy: install
 `cargo-dylint` and `dylint-link` once, and the pinned `lints/qualified-paths/rust-toolchain.toml` is

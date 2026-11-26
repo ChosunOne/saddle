@@ -1,0 +1,41 @@
+# What `cargo audit` decides, for the lockfile as a whole. `deny.toml` is the gate — `cargo deny
+# check` decides advisories, licences, bans and sources together — and this file repeats only the
+# RustSec part, so both tools read the same database with the same exceptions.
+#
+# Keep the two ignore lists in step. Each advisory is written with its reason in `deny.toml`; the
+# list here names the same ids because cargo-audit has nowhere to record why. An advisory ignored
+# in one file and not the other fails the run they disagree in.
+
+[advisories]
+ignore = [
+    # the typst line's quick-xml 0.38, which no version requirement of ours can move
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # humantime: unmaintained, not vulnerable, and replaced by a source change of its own
+    "RUSTSEC-2026-0542",
+    # unmaintained crates inside the pinned syntect (D80) and typst (D165) lines
+    "RUSTSEC-2024-0320",
+    "RUSTSEC-2024-0449",
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2025-0141",
+    "RUSTSEC-2026-0192",
+    "RUSTSEC-2026-0206",
+]
+# The same categories that fail `cargo deny check`: a crate nobody maintains and a crate whose
+# version was withdrawn are both facts about the tree, not advice about it.
+informational_warnings = ["unmaintained", "unsound"]
+
+[database]
+url = "https://github.com/RustSec/advisory-db.git"
+fetch = true
+stale = false
+
+[output]
+format = "terminal"
+deny = ["unmaintained", "unsound", "yanked"]
+quiet = false
+show_tree = true
+
+[yanked]
+enabled = true
+update_index = true

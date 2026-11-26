@@ -7,6 +7,7 @@ version = "0.0.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.88"
+publish = false
 
 [workspace.lints.rust]
 # An item nothing reaches is either a bug or a fossil. The compiler decides which, not a later
@@ -38,8 +39,8 @@ saddle-ignore = { path = "crates/saddle-ignore" }
 
 # D14, D127: one deliberately pinned runtime line; 36 supports the workspace's Rust 1.88 MSRV.
 # The future wasmtime-wasi-http adapter must use the same exact version.
-wasmtime = { version = "=36.0.20", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
-wasmtime-wasi = { version = "=36.0.20", default-features = false }
+wasmtime = { version = "=36.0.23", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime-wasi = { version = "=36.0.23", default-features = false }
 wit-bindgen = { version = "=0.45.0", default-features = false, features = ["macros", "realloc", "std"] }
 wat = "=1.236.1"
 wit-component = "=0.238.1"
