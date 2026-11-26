@@ -1,14 +1,3 @@
-//! live teams of ordinary agent sessions, requested by the shipped team component and owned by the
-//! session that started them (D195), with the team's message bus and its serially claimed command
-//! queue (D196).
-//!
-//! A worker is not a second implementation of a session: it is [`Agent`] and [`Session`] on a
-//! thread, with the same policy, roots and audit rules. It inherits only the caller's delegated
-//! reach by deriving its policy from the same setup, and its model calls are its own principal's,
-//! so one worker cannot spend or reach for another. Every worker's full transcript is retained as
-//! an attributed branch item on its own conversation, while the model that started it gets one
-//! bounded result.
-
 use crate::agent::{self, Agent, End, Steer, Ui};
 use crate::cancel;
 use crate::compact;
@@ -35,13 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// How much of a worker's transcript is kept for a person to read on screen.
-/// How many beats a worker's view keeps. Early ones fall off rather than growing without bound;
-/// the conversation itself is in the worker's own saved transcript.
 const RENDER_BEATS: usize = 2000;
 
-/// One delivery on the team's live message bus, kept for the page's bus view (D195). The words are
-/// held in memory only: the audit records who spoke to whom, never what was said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BusMessage {
     pub from: String,
@@ -49,8 +33,6 @@ pub struct BusMessage {
     pub text: String,
 }
 
-/// What a queued command is doing: waiting its turn, claimed by one member (so the queue runs one
-/// command at a time), finished, or lost when a claim's lease ran out (D195).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueState {
     Pending,
@@ -59,7 +41,6 @@ pub enum QueueState {
     Lost,
 }
 
-/// One item of the team's shared command queue (D195).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueItem {
     pub id: u64,
@@ -70,7 +51,6 @@ pub struct QueueItem {
 }
 
 impl Queue {
-    /// The commands the queue is holding or has finished, oldest first (D195).
     fn view(&self) -> Vec<QueueItem> {
         self.items
             .iter()
@@ -91,7 +71,6 @@ impl Queue {
             .count()
     }
 
-    /// Keeps the finished history bounded; waiting commands are the team's and are never dropped.
     fn trim(&mut self) {
         let done = self
             .items
@@ -114,8 +93,6 @@ impl Queue {
     }
 }
 
-/// One queued command as the host holds it, with when it was claimed, so a dead member's claim
-/// does not stop the queue for good.
 struct Queued {
     id: u64,
     command: String,
@@ -131,39 +108,23 @@ struct Queue {
     next: u64,
 }
 
-/// How many bus deliveries are kept for the page.
 const BUS_MESSAGES: usize = 200;
-/// How much of one message the bus keeps: the full finding in practice, bounded so a team cannot
-/// grow the bus without limit.
 const BUS_CHARS: usize = 8000;
 
-/// How much of the bus `agent bus` hands a model: the newest messages that fit, so a tool result
-/// has a ceiling of its own (D196).
 const BUS_TEXT_MESSAGES: usize = 20;
 const BUS_TEXT_CHARS: usize = 16_000;
-/// How many commands may wait at once.
 const QUEUE_ITEMS: usize = 64;
-/// How many finished commands the queue keeps for its view.
 const QUEUE_DONE: usize = 16;
-/// How long a claim holds the queue before another member may take it: a worker that dies mid-build
-/// must not stop the team for good.
 const QUEUE_LEASE: Duration = Duration::from_secs(600);
 
-/// A live handle the interface can use without the agent thread: steering a worker, or asking it to
-/// stop, never needs the session that owns it.
 #[derive(Clone)]
 pub struct Handle {
     steer: Steer,
-    /// Ends the turn in flight; the worker stays live and takes the next message.
     interrupt: Arc<AtomicBool>,
-    /// Ends the worker for good after the turn in flight.
     stop: Arc<AtomicBool>,
-    /// Reaches a command the turn is waiting on, so an interrupt does not wait for it (D195).
     cancel: Arc<AtomicBool>,
 }
 
-/// The handles the interface keeps, so a message or an interrupt reaches a worker while the agent
-/// that started it is busy (D195).
 #[derive(Clone, Default)]
 pub struct Steering {
     shared: Arc<Mutex<BTreeMap<String, Peer>>>,
@@ -177,7 +138,6 @@ impl Steering {
             && let Some(peer) = map.get(name)
         {
             peer.handle.steer.push(text);
-            // An idle worker waits on its channel, so the message itself is what wakes it (D195).
             let _ = peer.jobs.send(Job::Wake);
         }
     }
@@ -192,8 +152,6 @@ impl Steering {
         }
     }
 
-    /// Ends a worker for good, as the list's `x` does. The interface holds the lead's map, so it
-    /// is the conversation that owns the team doing it (D195).
     pub fn stop(&self, name: &str) {
         if let Ok(map) = self.shared.lock()
             && let Some(peer) = map.get(name)
@@ -206,8 +164,6 @@ impl Steering {
         }
     }
 
-    /// What the interface draws, read straight from the shared handles so a worker streams while
-    /// the lead's thread is busy (D195).
     pub fn views(&self) -> Vec<Render> {
         match self.shared.lock() {
             Ok(map) => map.values().map(Peer::render).collect(),
@@ -215,7 +171,6 @@ impl Steering {
         }
     }
 
-    /// The team's message bus, for the page's bus view (D195).
     pub fn bus(&self) -> Vec<BusMessage> {
         self.bus
             .lock()
@@ -223,7 +178,6 @@ impl Steering {
             .unwrap_or_default()
     }
 
-    /// The shared command queue, for the page's queue view (D195).
     pub fn queue(&self) -> Vec<QueueItem> {
         self.queue
             .lock()
@@ -232,30 +186,23 @@ impl Steering {
     }
 }
 
-/// One piece of a worker's conversation, kept structured rather than as finished lines: the
-/// interface draws it with the same renderer as the lead's transcript — markdown, code, tool
-/// blocks and collapsed output — instead of a plain tail (D195).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Beat {
-    /// A prompt the worker was given: its brief, or a message from a person or a peer.
     Prompt(String),
     Text(String),
     Thinking(String),
     Call {
         name: String,
         detail: String,
-        /// The deadline the call set, in seconds, for the worker's view to show (D152).
         timeout: Option<u64>,
     },
     Result {
         ok: bool,
         content: String,
         diff: Option<String>,
-        /// Pictures the call returned, drawn where the terminal can (D58).
         images: Vec<Image>,
     },
     Note(String),
-    /// What one reply used, as the status line of the lead's transcript states it.
     Spend {
         input: u64,
         output: u64,
@@ -263,12 +210,10 @@ pub enum Beat {
     },
 }
 
-/// What a person sees of one worker: its live transcript and what it is doing.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Render {
     pub name: String,
     pub brief: String,
-    /// The provider and model this worker runs on, as `provider/model` (D195).
     pub model: String,
     pub state: String,
     pub turns: usize,
@@ -278,8 +223,6 @@ pub struct Render {
 }
 
 impl Render {
-    /// Adds one piece, joining the streamed text and reasoning onto the block already at the end
-    /// so a token does not become a beat of its own.
     fn push(&mut self, beat: Beat) {
         match (&mut self.beats.last_mut(), &beat) {
             (Some(Beat::Text(held)), Beat::Text(more)) => held.push_str(more),
@@ -292,8 +235,6 @@ impl Render {
         }
     }
 
-    /// The conversation as plain lines, for `agent status`: the whole transcript is in the
-    /// interface, and a line-mode reader needs the words rather than the rendering.
     fn plain(&self) -> Vec<String> {
         let mut out = Vec::new();
         for beat in &self.beats {
@@ -322,29 +263,20 @@ impl Render {
     }
 }
 
-/// How many peers still hold a thread. A finished worker is kept for inspection but not counted
-/// against `tool-limits.team-workers` (D195).
 fn live_count(map: &BTreeMap<String, Peer>) -> usize {
     map.values().filter(|peer| peer.live()).count()
 }
 
-/// What runs on a worker's thread. The brief is the conversation's first prompt; a message arrives
-/// as an ordinary turn with whose words it is stated first.
 enum Job {
     Start(String),
-    /// A message is waiting on the worker's steering handle; look for it (D195).
     Wake,
 }
 
-/// One live worker as the team shares it: a worker's own session sees its peers through the same
-/// map, which is what lets two workers message each other without a lead relay (D195).
 #[derive(Clone)]
 struct Peer {
     conversation: String,
     handle: Handle,
     render: Arc<Mutex<Render>>,
-    /// Kept so the worker's thread stays alive between turns: dropping it would end the worker
-    /// after its first turn, before a peer or the interface could address it (D195).
     jobs: Sender<Job>,
 }
 
@@ -353,14 +285,10 @@ impl Peer {
         self.render.lock().map(|r| r.clone()).unwrap_or_default()
     }
 
-    /// Whether this worker still has a thread to reach. A finished one is kept so its conversation
-    /// can still be inspected, but it is not a live worker: it does not use a team slot and its
-    /// name can be used again (D195).
     fn live(&self) -> bool {
         self.render.lock().map(|r| !r.finished).unwrap_or(false)
     }
 
-    /// Whether a turn is in flight, which is the only thing an interrupt can end.
     fn running(&self) -> bool {
         self.render
             .lock()
@@ -369,39 +297,23 @@ impl Peer {
     }
 }
 
-/// The live team of one session. Held on the session's thread, so starting a worker is a session
-/// effect and never a guest operation on its own. A worker's session holds a view of the same map
-/// with `owns` false: it can address peers but not start or stop the team.
 pub struct Manager {
     shared: Arc<Mutex<BTreeMap<String, Peer>>>,
-    /// What the team has said to itself, newest last, for the page's bus view (D195).
     bus: Arc<Mutex<VecDeque<BusMessage>>>,
-    /// Commands the team wants run one at a time, whoever gets to them (D195).
     queue: Arc<Mutex<Queue>>,
-    /// What the workers have finished since the lead last read it, oldest first, so the lead is
-    /// woken by an event rather than by asking (D195).
     completions: Arc<Mutex<VecDeque<Completion>>>,
-    /// Rests that did not fit the queue and were never announced, said in the next notice rather
-    /// than lost silently (D195).
     dropped: Arc<Mutex<usize>>,
     owns: bool,
 }
 
-/// One thing a worker did that its lead has not been told yet: it came to rest after a turn, or it
-/// failed. The notice names the worker and its state, never its words; the lead reads those with
-/// `status` or `inspect` and answers with `send` (D195).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Completion {
     name: String,
     state: String,
-    /// Whether the lead's model has been shown it.
     announced: bool,
-    /// Whether the person's transcript has shown it.
     shown: bool,
 }
 
-/// How many completions are kept: past this the oldest one the lead's model has already read is
-/// dropped, and an unread one that has to go is counted and said in the next notice.
 const COMPLETIONS: usize = 32;
 
 impl Default for Manager {
@@ -418,7 +330,6 @@ impl Default for Manager {
 }
 
 impl Manager {
-    /// The view of the team a worker's own session gets (D195).
     pub(crate) fn child(&self) -> Self {
         Self {
             shared: self.shared.clone(),
@@ -429,8 +340,6 @@ impl Manager {
             owns: false,
         }
     }
-    /// A handle map the interface can use without the agent thread. It reads the peers' handles
-    /// each time, so a worker started after the interface was built is still reachable.
     pub fn steering(&self) -> Steering {
         Steering {
             shared: self.shared.clone(),
@@ -446,7 +355,6 @@ impl Manager {
         }
     }
 
-    /// The saved conversation a worker writes, for the interface to open it (D195).
     pub fn conversation(&self, name: &str) -> Option<String> {
         self.lookup(name).map(|peer| peer.conversation)
     }
@@ -455,12 +363,6 @@ impl Manager {
         self.shared.lock().ok()?.get(name).cloned()
     }
 
-    /// Records that a worker came to rest, so the lead's next turn carries it: an event, never
-    /// something the lead has to poll for (D195).
-    ///
-    /// One worker resting in the same state is one wakeup until the lead has read it, however many
-    /// times the person's transcript has shown it and whatever other workers did in between: the
-    /// reader that ends the coalescing is the lead's next turn, not the next idle tick.
     pub fn completed(&self, name: &str, state: &str) {
         let Ok(mut done) = self.completions.lock() else {
             return;
@@ -478,16 +380,11 @@ impl Manager {
             shown: false,
         });
         while done.len() > COMPLETIONS {
-            // Bound the record by dropping the oldest the model has already read. A notice nobody
-            // has read yet is kept unless every entry is unread, which takes a team far past the
-            // worker limit and a lead that has not taken a turn in between.
             match done.iter().position(|completion| completion.announced) {
                 Some(index) => {
                     done.remove(index);
                 }
                 None => {
-                    // Every entry is unread: the oldest is lost, so the count is said in the next
-                    // notice instead of the rest vanishing (D195).
                     done.pop_front();
                     if let Ok(mut dropped) = self.dropped.lock() {
                         *dropped += 1;
@@ -497,9 +394,6 @@ impl Manager {
         }
     }
 
-    /// Whether a worker's completion is waiting for the lead's next turn (D195). Only the
-    /// conversation that owns the team reads them: a worker's own view shares the state so it can
-    /// record a rest, but it never receives the notices meant for the lead.
     pub fn pending(&self) -> bool {
         if !self.owns {
             return false;
@@ -513,8 +407,6 @@ impl Manager {
             .unwrap_or(false)
     }
 
-    /// Whether a worker is still starting or mid-turn, so a one-shot run waits for it instead of
-    /// closing the session out from under it (D174's rule, for a team — D195).
     pub fn working(&self) -> bool {
         match self.shared.lock() {
             Ok(map) => map.values().any(|peer| {
@@ -525,8 +417,6 @@ impl Manager {
         }
     }
 
-    /// What has not been told yet: the model's notices are marked announced so one turn carries
-    /// them, the person's are shown in the transcript (D153's shape, for workers — D195).
     pub fn notices(&self, model: bool) -> Vec<String> {
         if !self.owns {
             return Vec::new();
@@ -564,8 +454,6 @@ impl Manager {
         out
     }
 
-    /// Stops everything and says how many were stopped; used before a policy replacement and at
-    /// session close, when the grants a worker was built on no longer exist (D47, D153).
     pub fn stop_all(&mut self) -> usize {
         if !self.owns {
             return 0;
@@ -592,8 +480,6 @@ impl Manager {
         if !peer.live() {
             return Ok(format!("{name} has finished"));
         }
-        // An interrupt at rest would be waiting for the next message and cancel that turn instead:
-        // it ends a turn in flight or it is nothing (D195).
         if !peer.running() {
             return Ok(format!("{name} is idle; nothing to interrupt"));
         }
@@ -638,17 +524,12 @@ impl Manager {
         if peer.render().finished {
             return Err(format!("{to} has finished; start a new worker"));
         }
-        // A running worker takes it at its next request boundary; an idle one is woken by this,
-        // and the handle is shared with its thread so a peer or the interface can do it while the
-        // agent that started the team is busy (D195).
         peer.jobs
             .send(Job::Wake)
             .map_err(|_| format!("{to} has finished; start a new worker"))?;
         peer.handle
             .steer
             .push(format!("[message from {from}]\n{text}"));
-        // The bus keeps who spoke to whom and the words, for the page and for peers that ask; the
-        // conversation itself holds the full text (D195).
         if let Ok(mut bus) = self.bus.lock() {
             bus.push_back(BusMessage {
                 from: from.to_owned(),
@@ -674,8 +555,6 @@ impl Manager {
         if let Some(error) = &render.error {
             out.push_str(&format!("error: {error}\n"));
         }
-        // What the lead is supposed to do about it, so a notice and a status answer the same
-        // question the same way (D195).
         if render.state.starts_with("idle") {
             out.push_str(&format!(
                 "waiting for you: reply with agent send to {name}\n"
@@ -712,8 +591,6 @@ impl Manager {
         out
     }
 
-    /// Adds a command to the team's shared queue. Whoever gets to it runs it through their own
-    /// `bash`; the queue only decides the order (D195).
     pub fn enqueue(&self, from: &str, command: &str, why: &str) -> Result<String, String> {
         self.member(from)?;
         let command = command.trim();
@@ -746,8 +623,6 @@ impl Manager {
         Ok(format!("queued #{id} for the team: {command}"))
     }
 
-    /// Claims the next command, which holds the queue until it is finished or the lease runs out,
-    /// so two workers never run the queue's commands at the same time (D195).
     pub fn claim(&self, from: &str) -> Result<String, String> {
         self.member(from)?;
         let mut queue = self
@@ -797,7 +672,6 @@ impl Manager {
         ))
     }
 
-    /// Marks a claimed command finished, which lets the next one be claimed (D195).
     pub fn finish(&self, from: &str, id: u64, ok: bool) -> Result<String, String> {
         self.member(from)?;
         let mut queue = self
@@ -820,8 +694,6 @@ impl Manager {
         Ok(format!("#{id} {}", if ok { "done" } else { "failed" }))
     }
 
-    /// The queue as the model reads it: what is waiting, what is running, what has finished
-    /// (D195).
     pub fn queue_text(&self) -> String {
         let Ok(queue) = self.queue.lock() else {
             return "the command queue is unavailable".into();
@@ -850,7 +722,6 @@ impl Manager {
         out
     }
 
-    /// The bus as the model reads it: the last messages, oldest first, attributed (D195).
     pub fn bus_text(&self) -> String {
         let Ok(bus) = self.bus.lock() else {
             return "the message bus is unavailable".into();
@@ -858,8 +729,6 @@ impl Manager {
         if bus.is_empty() {
             return "no messages on the team bus yet".into();
         }
-        // A tool result is bounded too: the newest messages that fit in the budget, with the count
-        // said when older ones are left out rather than a silent cut (D196).
         let mut chosen = Vec::new();
         let mut used = 0;
         for message in bus.iter().rev() {
@@ -890,8 +759,6 @@ impl Manager {
         out
     }
 
-    /// Whether a name is the lead or a live worker, so a finished worker's old tool call cannot
-    /// claim or finish in the team's queue (D195).
     fn member(&self, name: &str) -> Result<(), String> {
         if name == "lead" {
             return Ok(());
@@ -902,8 +769,6 @@ impl Manager {
         }
     }
 
-    /// Whether this conversation is the one that started the team. A worker sees its peers and can
-    /// message them, but cannot create a team of its own or stop one (D195).
     fn owner(&self) -> Result<(), String> {
         if self.owns {
             Ok(())
@@ -915,11 +780,6 @@ impl Manager {
         }
     }
 
-    /// Starts a worker. The brief is written inside the session's temporary root and read back
-    /// through the read gate, so the exact text the worker was given is a branch item attributable
-    /// to a real file rather than an unrecorded argument (D195). `provider` and `model` are separate
-    /// choices: empty provider is the lead's own, empty model is that provider's own, and both empty
-    /// keeps the lead's provider and model. Neither name is parsed out of the other.
     pub fn start(
         &mut self,
         session: &mut Session,
@@ -948,8 +808,6 @@ impl Manager {
             return Ok(Err("a worker needs a brief".into()));
         }
         let team_workers = session.setup.tool_limits.team_workers;
-        // A worker turn has no request limit unless `tool-limits.team-steps` sets one, as the
-        // lead's turn has none unless `[agent] max-steps` does (D37).
         let team_steps = match session.setup.tool_limits.team_steps {
             0 => None,
             steps => Some(steps),
@@ -977,9 +835,6 @@ impl Manager {
                 decision.explanation
             )));
         }
-        // The host writes and reads the brief itself, in this session's private 0700 temporary
-        // directory: no root is involved, so no grant is needed to read what the harness chose,
-        // and the exact text is still recorded by hash rather than by argument (D195).
         let dir = session.tmp_dir().join("team").join(name);
         if let Err(error) = fs::create_dir_all(&dir) {
             return Ok(Err(format!(
@@ -995,10 +850,6 @@ impl Manager {
             Err(error) => return Ok(Err(format!("could not read the worker's brief: {error}"))),
         };
         let brief_label = brief_path.display().to_string();
-        // Which provider and model the worker runs on: both may be named, separately (D195). Empty
-        // provider is this conversation's own; empty model is that provider's configured model; both
-        // empty keeps the lead's provider and model, twin and all, so a refreshed credential is not
-        // re-read from disk.
         let provider = if provider.trim().is_empty() && model.trim().is_empty() {
             match session.provider_twin() {
                 Some(provider) => provider,
@@ -1039,11 +890,8 @@ impl Manager {
             "live worker started from a delegated brief",
         )?;
         let id = session_id();
-        // `session.team` is this manager, temporarily taken out of the session, so the child's
-        // view is taken from here rather than from the session it is derived from (D195).
         let mut child = session.derive(&id)?;
         child.team = self.child();
-        // Peers address each other by name; the random id names the audit log, not a mailbox.
         child.team_label = name.to_owned();
         let store = Store::open(
             &child.setup.paths.session_db(),
@@ -1108,7 +956,6 @@ impl Manager {
     }
 }
 
-/// The thread a worker lives on: one turn per job, and a session closed with its audit log.
 fn run(
     mut agent: Agent,
     mut session: Session,
@@ -1137,8 +984,6 @@ fn run(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        // A message from the interface or a peer arrives through the same handle a person's
-        // steering does; with no turn running it starts one (D149, D195).
         let prompt = if first {
             first = false;
             match jobs.recv() {
@@ -1152,8 +997,6 @@ fn run(
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
-                // The thread sleeps on its channel rather than polling the steering handle: every
-                // message, interrupt and stop sends a job to wake it (D195).
                 match jobs.recv() {
                     Ok(Job::Start(brief)) => {
                         text = Some(brief);
@@ -1198,9 +1041,6 @@ fn run(
                 render.push(Beat::Note(format!("error: {text}")));
             }
         });
-        // A worker that comes to rest is an event for the lead's next turn, which may be idle now:
-        // this is what replaces the lead having to ask. A stop the lead asked for is not announced
-        // (D195).
         if !stop.load(Ordering::SeqCst) {
             session.team.completed(&name, &state);
         }
@@ -1210,7 +1050,6 @@ fn run(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        // An interrupt ends the turn, not the worker: it takes its next message.
         interrupt.store(false, Ordering::SeqCst);
         cancel.store(false, Ordering::SeqCst);
     }
@@ -1238,9 +1077,6 @@ fn set(view: &Arc<Mutex<Render>>, change: impl FnOnce(&mut Render)) {
     }
 }
 
-/// What one notice says: which worker, what it is now, and how the lead reads it and answers. A
-/// worker's own words stay in its conversation, as a task's output stays in its record (D153), so
-/// the notice carries host-owned state only (D195).
 fn notice_line(name: &str, state: &str) -> String {
     let what = match state {
         "idle" => "finished its turn and is waiting",
@@ -1262,9 +1098,6 @@ fn notice_line(name: &str, state: &str) -> String {
     }
 }
 
-/// The provider and model an `agent start` asks for (D195). An empty provider is this
-/// conversation's own, and an empty model is that provider's configured one; the two are separate
-/// arguments, so a model whose name carries a slash is simply a model name.
 fn worker_provider(
     session: &Session,
     provider: &str,
@@ -1289,8 +1122,6 @@ fn worker_provider(
 }
 
 fn valid_name(name: &str) -> Result<(), String> {
-    // "lead" is what a peer message from the conversation in hand is called, so a worker with that
-    // name would make whose words they are ambiguous (D195).
     if name == "lead" {
         return Err(
             "`lead` names the conversation that started the team; pick another name".into(),
@@ -1321,15 +1152,11 @@ fn first_line(text: &str) -> String {
     out
 }
 
-/// One service call from the shipped team component. Every operation addresses only workers this
-/// The provider and model a worker runs on, as two separate names: an empty provider is the lead's
-/// own, an empty model is that provider's configured model, and neither is parsed out of the other.
 pub struct Choice<'a> {
     pub provider: &'a str,
     pub model: &'a str,
 }
 
-/// live session started; none takes a path, command or executable.
 pub fn manage(
     session: &mut Session,
     who: &Principal,
@@ -1389,7 +1216,6 @@ pub fn manage(
     Ok(result)
 }
 
-/// What the audit records: who it addresses and how much it says, never the words themselves.
 pub fn arguments(op: &Operation) -> serde_json::Value {
     match op {
         Operation::Start(brief) => json!({
@@ -1417,8 +1243,6 @@ pub fn arguments(op: &Operation) -> serde_json::Value {
     }
 }
 
-/// A worker's interface: full streaming and reasoning into its own view, bounded by the same
-/// limits as any other transcript.
 struct WorkerUi {
     view: Arc<Mutex<Render>>,
     interrupt: Arc<AtomicBool>,
@@ -1489,8 +1313,6 @@ impl Ui for WorkerUi {
     fn contribution(&mut self, _: &Contribution) {}
 }
 
-/// The provider twin a worker starts from. Kept as a method so the whole path from the active
-/// provider to a worker is visible in one place.
 impl Session {
     pub(crate) fn provider_twin(&self) -> Option<provider::Provider> {
         self.extensions
@@ -1522,7 +1344,6 @@ mod tests {
 
     fn peer(state: &str, finished: bool) -> Peer {
         let (jobs, receive) = mpsc::channel();
-        // The test keeps no thread to receive: hold the receiver open so a delivery is a delivery.
         mem::forget(receive);
         let flag = || Arc::new(AtomicBool::new(false));
         Peer {
@@ -1559,7 +1380,6 @@ mod tests {
 
     #[test]
     fn a_long_bus_is_bounded_and_says_what_it_left_out() {
-        // D196: the newest messages that fit, and a count when older ones are not sent.
         let team = with_peers(vec![("b", "idle", false)]);
         for index in 0..25 {
             team.say("a", "b", &format!("m{index}")).unwrap();
@@ -1569,7 +1389,6 @@ mod tests {
         assert!(!text.contains("m0\n"), "{text}");
         assert!(text.contains("(the last 20 of 25 messages)"), "{text}");
 
-        // The character budget bounds it too: twenty long messages do not all reach the model.
         let team = with_peers(vec![("b", "idle", false)]);
         for index in 0..20 {
             team.say("a", "b", &format!("{index} {}", "y".repeat(1000)))
@@ -1587,8 +1406,6 @@ mod tests {
 
     #[test]
     fn a_worker_at_rest_is_one_notice_each_reader_sees_once() {
-        // D195: the lead is woken by an event, not by asking, and a repeated rest is not a second
-        // wakeup while the first is still unread.
         let team = Manager::default();
         assert!(!team.pending());
         team.completed("runtime", "idle");
@@ -1602,15 +1419,12 @@ mod tests {
         assert!(model[0].contains("action send"), "{model:?}");
         assert!(!team.pending());
         assert!(team.notices(true).is_empty(), "one turn carries it");
-        // The person's own transcript still shows the line, once.
         assert_eq!(team.notices(false).len(), 1);
         assert!(team.notices(false).is_empty());
     }
 
     #[test]
     fn a_rest_that_does_not_fit_is_counted_rather_than_lost_silently() {
-        // D195: the notice list is bounded, and a drop must not leave the lead believing it has
-        // heard from everyone.
         let team = Manager::default();
         for index in 0..COMPLETIONS {
             team.completed(&format!("w{index}"), "idle");
@@ -1630,8 +1444,6 @@ mod tests {
 
     #[test]
     fn only_the_lead_reads_a_worker_completion() {
-        // D195: a worker's own session shares the team state so its rest can be recorded, but a
-        // peer's turn must not swallow the notice meant for the lead.
         let lead = Manager::default();
         let worker = lead.child();
         worker.completed("runtime", "idle");
@@ -1643,8 +1455,6 @@ mod tests {
 
     #[test]
     fn one_unread_rest_is_one_wakeup_whatever_the_transcript_showed() {
-        // D195: the person's transcript showing the line does not mean the lead has answered it,
-        // so the next rest in the same state adds nothing to read. D195's reader is the turn.
         let team = Manager::default();
         team.completed("a", "idle");
         assert_eq!(team.notices(false).len(), 1, "the transcript shows it once");
@@ -1653,8 +1463,6 @@ mod tests {
         let model = team.notices(true);
         assert_eq!(model.len(), 1, "one wakeup, not two: {model:?}");
         assert!(!team.pending());
-        // A rest after the read is a new event; one in a different state is its own event; and a
-        // repeat of an unread rest stays one, even with another worker in between.
         team.completed("a", "idle");
         team.completed("b", "idle");
         team.completed("a", "idle");
@@ -1690,8 +1498,6 @@ mod tests {
 
     #[test]
     fn an_interrupt_only_ends_a_turn_that_is_running() {
-        // At rest there is no turn to end, and marking one would cancel the message that comes
-        // next instead (D195).
         let idle = with_peers(vec![("idle", "idle", false)]);
         assert_eq!(
             idle.interrupt("idle").unwrap(),
@@ -1711,7 +1517,6 @@ mod tests {
             ("busy", "running", false),
         ]);
         assert_eq!(live_count(&team.shared.lock().unwrap()), 2);
-        // A message to a finished worker is refused rather than delivered to no thread.
         let refused = team.say("lead", "done", "hello").unwrap_err();
         assert_eq!(refused, "done has finished; start a new worker");
     }
@@ -1743,8 +1548,6 @@ mod tests {
 
     #[test]
     fn the_shared_queue_runs_one_claim_at_a_time() {
-        // Two workers share one queue: a claim holds it until the command is finished, so the
-        // commands that must not overlap are run serially (D195).
         let team = with_peers(vec![("runtime", "idle", false), ("tests", "idle", false)]);
         assert_eq!(
             team.enqueue("lead", "cargo test -p saddle-cap", "not two at once")
@@ -1770,7 +1573,6 @@ mod tests {
             team.steering().queue()[1].state,
             QueueState::Done { ok: false }
         );
-        // Only a live member may queue or claim; a finished worker's late call is refused.
         let gone = with_peers(vec![("done", "finished", true)]);
         assert!(gone.enqueue("done", "true", "").is_err());
         assert!(gone.claim("done").is_err());
@@ -1778,8 +1580,6 @@ mod tests {
 
     #[test]
     fn a_claim_whose_lease_ran_out_frees_the_queue() {
-        // A worker that dies mid-command must not hold the queue for ever: after the lease another
-        // member may take the next command, and the abandoned one is marked lost (D196).
         let team = with_peers(vec![("runtime", "idle", false), ("tests", "idle", false)]);
         team.enqueue("lead", "cargo test -p saddle-cap", "")
             .unwrap();
@@ -1808,7 +1608,6 @@ mod tests {
         assert_eq!(bus[0].to, "runtime");
         assert!(bus[0].text.starts_with("check the loader"));
         assert!(team.bus_text().contains("lead → runtime"));
-        // A queue entry's audit names the length and hash, never the command.
         let op = Operation::Enqueue(Job {
             command: "rm -rf secret".into(),
             why: "test".into(),

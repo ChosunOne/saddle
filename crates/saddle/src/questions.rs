@@ -1,16 +1,3 @@
-//! A question a tool puts to the person, and the answer they give it (D197).
-//!
-//! The tool owns the words and the choices; this module owns the wait, the record and one answer
-//! per question. A question is not authority: the person may dismiss it, and the guest is told so
-//! rather than being handed an answer that nobody gave. A session with nobody in front of it — a
-//! piped run, a JSON stream, a worker, `saddle tool` — answers `unavailable` with the reason.
-//!
-//! The wait is the person's: reading four choices takes longer than the guest's own two-second CPU
-//! ceiling and longer than any budget the harness would spend on a machine's work, so nothing bounds
-//! it unless the person set `ask-wait-seconds` or the caller set a deadline of its own. The turn's
-//! cancellation flag ends the wait too: escape or ctrl+c on a running turn must not leave a dialog
-//! owning the keyboard.
-
 use crate::cancel;
 use crate::session::Session;
 use anyhow::Result;
@@ -26,22 +13,16 @@ use std::time::{Duration, Instant};
 
 pub use saddle_wit::saddle::host::ask::{Outcome, Question, Reply, Selection};
 
-/// How long one poll of the answer channel waits before the cancellation flag is read again.
 const POLL: Duration = Duration::from_millis(50);
 
-/// One question waiting for its answer in the person's own interface. The interface takes the
-/// answer exactly once; dropping the question unanswered is what a closed interface looks like.
 #[derive(Debug)]
 pub struct Asked {
     pub question: Question,
     reply: Mutex<Option<SyncSender<Outcome>>>,
-    /// Whether the wait is still running, so an interface drawing a question it can no longer answer
-    /// can take it down: the turn was cancelled, or a deadline the person set ran out (D197).
     open: AtomicBool,
 }
 
 impl Asked {
-    /// The question, and the end of a channel that carries the person's one answer.
     pub fn pair(question: Question) -> (Arc<Self>, Receiver<Outcome>) {
         let (reply, answers) = mpsc::sync_channel(1);
         (
@@ -54,17 +35,14 @@ impl Asked {
         )
     }
 
-    /// Whether the question is still waiting: false once nobody is listening for an answer.
     pub fn open(&self) -> bool {
         self.open.load(Ordering::Relaxed)
     }
 
-    /// The wait is over, answered or not, so an interface still showing the question drops it.
     pub fn close(&self) {
         self.open.store(false, Ordering::Relaxed);
     }
 
-    /// The person's answer. A second call does nothing: the first answer is the answer.
     pub fn answer(&self, outcome: Outcome) {
         let Ok(mut slot) = self.reply.lock() else {
             return;
@@ -75,8 +53,6 @@ impl Asked {
     }
 }
 
-/// Two questions are the same when they would draw the same dialog. The ABI's records carry no
-/// comparison of their own, so this is written out here rather than derived (D197).
 impl PartialEq for Asked {
     fn eq(&self, other: &Self) -> bool {
         let a = &self.question;
@@ -93,19 +69,10 @@ impl PartialEq for Asked {
 
 impl Eq for Asked {}
 
-/// The interface a session asks on: the TUI's dialog, or the terminal in line mode.
 pub trait Questioner: Send {
-    /// Put this question to the person. The answer, or `Outcome::Unavailable` when this interface
-    /// cannot ask, travels through `asked`; this call returns once it has been shown or refused.
-    /// `until` is the whole wait when there is one, for an interface that reads on this thread and
-    /// can only notice a deadline or a cancelled turn after the line it is waiting for arrives
-    /// (D197).
     fn ask(&mut self, asked: Arc<Asked>, until: Option<Instant>);
 }
 
-/// Put a question to this session's person, decide it under the tool's registration, and record it
-/// without its words. `allowance` is the whole wait when the person set one or the caller carries a
-/// deadline of its own; `None` waits for the person (D197).
 pub fn ask(
     session: &mut Session,
     who: &Principal,
@@ -113,8 +80,6 @@ pub fn ask(
     allowance: Option<Duration>,
     question: Question,
 ) -> Result<Result<Outcome, String>> {
-    // Registration already decided that this principal may run its tool; the question is recorded
-    // under that decision like any other host operation, with the words hashed rather than kept.
     let request = Request::Plain(Scope::Tool);
     let decision = session.engine.decide(who, &request);
     session.audit.decision_for_call_details(
@@ -153,13 +118,10 @@ pub fn ask(
     Ok(Ok(outcome))
 }
 
-/// The wait itself: one answer, a dismissal when the turn is cancelled, and an explanation when the
-/// interface or the allowance goes away first. With no `until` the person has as long as they like.
 fn wait(answers: Receiver<Outcome>, until: Option<Instant>) -> Outcome {
     loop {
         match answers.recv_timeout(POLL) {
             Ok(outcome) => return outcome,
-            // A turn the person cancelled has no question left to answer (D183).
             Err(RecvTimeoutError::Timeout) if cancel::requested() => return Outcome::Dismissed,
             Err(RecvTimeoutError::Timeout)
                 if until.is_some_and(|until| Instant::now() >= until) =>
@@ -186,8 +148,6 @@ fn unavailable(
     Ok(Ok(outcome))
 }
 
-/// What a person answered, never the words they typed: a note and an answer of their own are their
-/// own text, so the record keeps their size and hash (D197).
 fn record(
     session: &mut Session,
     who: &Principal,
@@ -259,7 +219,6 @@ mod tests {
         let (asked, answers) = Asked::pair(question());
         asked.answer(Outcome::Dismissed);
         asked.answer(Outcome::Unavailable("second".into()));
-        // The second answer is dropped: one question has one answer.
         assert!(matches!(answers.try_recv(), Ok(Outcome::Dismissed)));
         assert!(answers.try_recv().is_err());
     }
@@ -273,7 +232,6 @@ mod tests {
             Outcome::Dismissed
         ));
 
-        // Nobody answers before the allowance runs out.
         let (asked, answers) = Asked::pair(question());
         drop(asked);
         assert!(matches!(
@@ -281,7 +239,6 @@ mod tests {
             Outcome::Unavailable(ref why) if why.contains("closed")
         ));
 
-        // A cancelled turn ends the wait at the next poll rather than at the allowance.
         let (_asked, answers) = Asked::pair(question());
         cancel::request();
         let started = Instant::now();
@@ -298,7 +255,6 @@ mod tests {
 
         let (asked, answers) = Asked::pair(question());
         assert!(asked.open(), "the question is open while it waits");
-        // Longer than any poll or allowance, and shorter than a person reading four choices.
         let later = asked.clone();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(300));
@@ -306,7 +262,6 @@ mod tests {
         });
         let started = Instant::now();
         assert!(matches!(wait(answers, None), Outcome::Dismissed));
-        // Dismissed only because it was answered, never because the clock ran out.
         assert!(started.elapsed() >= Duration::from_millis(250));
         asked.close();
         assert!(
@@ -315,9 +270,6 @@ mod tests {
         );
     }
 
-    /// The whole host side of D197, against a real session: the standard component's principal is
-    /// decided by the engine, the question reaches the interface, the person's answer comes back, and
-    /// the audit keeps the words' size and hash rather than the words.
     #[test]
     fn a_session_records_the_question_and_returns_the_answer_its_person_gave() {
         use crate::config::Overrides;
@@ -346,7 +298,6 @@ mod tests {
             "[standard-tools]\nask = []\n",
         )
         .unwrap();
-        // SAFETY: one process per test (nextest), and nothing else reads these.
         unsafe {
             env::set_var("XDG_CONFIG_HOME", &config);
             env::set_var("XDG_STATE_HOME", xdg.path().join("state"));

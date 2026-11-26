@@ -1,6 +1,3 @@
-//! The one capability representation (plan §5). Everything else lowers from here: the component
-//! import check, per-call policy decisions, and the exec sandbox spec.
-
 pub mod component;
 pub mod delegate;
 pub mod manifest;

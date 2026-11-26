@@ -1,32 +1,23 @@
-//! JSON-RPC 2.0 as MCP frames it on a stdio transport: one JSON object per line, requests carrying
-//! an id, notifications carrying none (D107). Nothing here knows what a tool is.
-
 use serde_json::{Value, json};
 
-/// A reply to a request we sent, carrying the id it answers.
 #[derive(Debug, PartialEq)]
 pub struct Reply {
     pub id: u64,
     pub result: Result<Value, String>,
 }
 
-/// A request, as one line without the newline.
 pub fn request(id: u64, method: &str, params: Value) -> String {
     json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string()
 }
 
-/// A notification, which by definition has no id and gets no reply.
 pub fn notification(method: &str, params: Value) -> String {
     json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string()
 }
 
-/// Reads one line, keeping the id so a reply can be matched to its request. A line with no whole
-/// number for an id is a notification rather than a reply, and not this function's business.
 pub fn reply(text: &str) -> Option<Reply> {
     let value: Value = serde_json::from_str(text).ok()?;
     let id = value.get("id").and_then(Value::as_u64)?;
     let outcome = match (value.get("error"), value.get("result")) {
-        // A reply carries exactly one of the two; an error is a failure, not a host error.
         (Some(error), _) => Err(error
             .get("message")
             .and_then(Value::as_str)
@@ -51,7 +42,6 @@ mod tests {
             request(7, "tools/list", json!({})),
             r#"{"id":7,"jsonrpc":"2.0","method":"tools/list","params":{}}"#
         );
-        // No id: the server must not answer a notification.
         assert_eq!(
             notification("notifications/initialized", json!({})),
             r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#
@@ -74,7 +64,6 @@ mod tests {
                 result: Err("no such method".to_owned())
             })
         );
-        // A notification from the server is not a reply, and a line that is not JSON is nothing.
         assert_eq!(
             reply(r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#),
             None
@@ -83,8 +72,6 @@ mod tests {
     }
 }
 
-/// Everything a server may send: a reply to us, a request of its own (D114), or a notification,
-/// which by definition wants no answer.
 #[derive(Debug, PartialEq)]
 pub enum Message {
     Reply(Reply),
@@ -98,8 +85,6 @@ pub enum Message {
     },
 }
 
-/// Classifies one framed message. `None` for a line that is not JSON-RPC at all, which a server
-/// writing to its own stdout may well produce.
 pub fn message(text: &str) -> Option<Message> {
     let value: Value = serde_json::from_str(text).ok()?;
     let method = value.get("method").and_then(Value::as_str);
@@ -117,7 +102,6 @@ pub fn message(text: &str) -> Option<Message> {
     })
 }
 
-/// One answer to a request of the server's, framed for the wire.
 pub fn response(id: u64, result: Result<Value, String>) -> String {
     match result {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),

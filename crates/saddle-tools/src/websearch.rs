@@ -1,5 +1,3 @@
-//! web search workflows, response parsing, excerpt/full-page presentation in the guest (D143).
-
 use saddle_limits as budgets;
 use saddle_sdk::SearchSnapshot;
 #[cfg(target_arch = "wasm32")]
@@ -172,17 +170,13 @@ pub struct Hit {
     pub url: String,
     pub published: Option<String>,
     pub author: Option<String>,
-    /// The passages the backend chose, in its order: Exa's `highlights`, which are excerpts.
     pub highlights: Vec<String>,
-    /// The result's own text — `/v2/search` documents this field and it is often the whole page,
-    /// so it is the fallback excerpt when a backend sends no highlights (D82).
     pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastSearch {
     pub query: String,
-    /// Which backend answered, named as the audit names it.
     pub via: &'static str,
     pub hits: Vec<Hit>,
 }
@@ -190,19 +184,11 @@ pub struct LastSearch {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Plan {
-    /// The session already holds the search that numbered this result: read from it.
     FromCache,
-    /// A query was given that the session has not searched, so search it now.
     Fresh,
-    /// Nothing to read and nothing to search: the call is incomplete.
     Nothing,
 }
 
-/// Decides whether an expansion reads what was shown or has to search first.
-///
-/// A query that matches what was remembered is reused, because re-asking could answer with
-/// different pages under the same numbers — a silent substitution for the page the model was
-/// shown. A query that differs is searched, and the answer says which search it came from.
 #[cfg(test)]
 fn plan(last: Option<&LastSearch>, query: &str) -> Plan {
     match (last, query.is_empty()) {
@@ -291,8 +277,6 @@ fn hit(result: &Value) -> Hit {
     Hit {
         title: text("title").unwrap_or_default(),
         url: text("url").unwrap_or_default(),
-        // `/v2/search` documents `published`; Exa's REST search calls the same thing
-        // `publishedDate`, so one parser reads both rather than one backend losing its dates.
         published: text("published").or_else(|| text("publishedDate")),
         author: text("author"),
         highlights: result
@@ -310,7 +294,6 @@ fn hit(result: &Value) -> Hit {
     }
 }
 
-/// The results as the model reads them: one numbered entry each, then what Exa quoted from it.
 pub fn format_hits(hits: &[Hit]) -> String {
     if hits.is_empty() {
         return "no results".to_owned();
@@ -332,15 +315,10 @@ pub fn format_hits(hits: &[Hit]) -> String {
             out.push_str(&format!("   > {}\n", passage_for_model(passage)));
         }
     }
-    // The second step, said where the model is looking rather than only in the tool's description.
     out.push_str("\n(full text of one result: call websearch with {\"result\": N})");
     cut(out.trim_end())
 }
 
-/// One quoted passage as a single line, cut to [`budgets::web_quote_chars()`] characters.
-///
-/// Cuts on a character boundary and says so, because half a word at the end of an excerpt reads as
-/// a typo rather than as an excerpt.
 fn passage_for_model(text: &str) -> String {
     let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.chars().count() <= budgets::web_quote_chars() {
@@ -351,10 +329,6 @@ fn passage_for_model(text: &str) -> String {
 }
 
 impl Hit {
-    /// What to quote from this result: the passages the backend chose, or the result's own text.
-    ///
-    /// Empty strings are dropped rather than quoted, so a result with `"highlights": [""]` still
-    /// shows its text instead of a blank line.
     fn excerpts(&self) -> Vec<&str> {
         let chosen: Vec<&str> = self
             .highlights
@@ -373,7 +347,6 @@ impl Hit {
     }
 }
 
-/// An ISO timestamp as the date it states, since that is the part a reader can use.
 fn date_of(stamp: &str) -> &str {
     let bytes = stamp.as_bytes();
     let iso = bytes.len() >= 10
@@ -392,7 +365,6 @@ fn title_of(hit: &Hit) -> &str {
     }
 }
 
-/// A reply cut to what a tool result may carry, saying so rather than ending mid-word.
 fn cut(text: &str) -> String {
     if text.len() <= budgets::presentation_bytes() {
         return text.to_owned();
@@ -408,8 +380,6 @@ fn cut(text: &str) -> String {
     )
 }
 
-/// `x-request-id`, `costDollars` and `searchTime`, when the answer says: enough for a record to be
-/// reconciled against a bill without the model having to care.
 fn describe(body: &str) -> String {
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return "no request id".to_owned();
@@ -426,7 +396,6 @@ fn describe(body: &str) -> String {
     format!("request {id}, {cost}")
 }
 
-/// What the status and body mean, in a sentence the model can act on.
 fn explain(status: u16, body: &str) -> String {
     let detail = serde_json::from_str::<Value>(body)
         .ok()
@@ -456,7 +425,6 @@ fn explain(status: u16, body: &str) -> String {
     }
 }
 
-/// The session id from an MCP answer's headers, which arrive here as part of the body's framing.
 #[cfg(test)]
 fn mcp_session(body: &str) -> Option<String> {
     body.lines().find_map(|line| {
@@ -468,8 +436,6 @@ fn mcp_session(body: &str) -> Option<String> {
     })
 }
 
-/// The JSON-RPC answer inside an MCP reply, which is either a JSON body or a server-sent event
-/// stream whose `data:` lines each carry one message.
 fn parse_mcp(body: &str) -> Option<Value> {
     if let Ok(value) = serde_json::from_str::<Value>(body)
         && value.get("result").is_some()
@@ -496,7 +462,6 @@ mod tests {
 
     #[test]
     fn a_rest_answer_becomes_numbered_results() {
-        // The shape is Exa's own, trimmed to the fields this tool reads.
         let body = r#"{
             "requestId": "abc",
             "costDollars": {"total": 0.005},
@@ -522,16 +487,12 @@ mod tests {
             text.contains("> Rust library for syntax highlighting"),
             "{text}"
         );
-        // A result with no title is named by its address, so it is still distinguishable.
         assert!(text.contains("2. https://docs.rs/syntect"), "{text}");
         assert!(describe(body).contains("request abc") && describe(body).contains("$0.0050"));
     }
 
     #[test]
     fn the_documented_search_shape_is_read() {
-        // D82: `POST /v2/search` documents `url`, `title`, `text` and `published` — no highlights,
-        // no author. A parser that only read Exa's `highlights` would show titles with no content,
-        // so this is the shape that matters most and the one the fallback must not depend on.
         let body = r#"{
             "results": [{
                 "url": "https://curl.se/docs/projdocs.html",
@@ -553,19 +514,16 @@ mod tests {
             text.contains("> Project Documentation. The curl project is ..."),
             "the text is the excerpt: {text}"
         );
-        // A timestamp is shown as its date, and anything that is not one is shown as it came.
         assert!(text.contains("published 2025-11-05\n"), "{text}");
         assert!(!text.contains("2025-11-05T00:00"), "{text}");
         assert_eq!(date_of("not a date"), "not a date");
         assert_eq!(date_of("2025-11-05"), "2025-11-05");
-        // A result with neither highlights nor text is a link rather than a blank quote.
         let bare = Hit {
             title: "t".into(),
             url: "https://t/".into(),
             ..Hit::default()
         };
         assert!(!format_hits(&[bare]).contains("> "), "quoted nothing");
-        // An empty highlight falls back to the text rather than quoting a blank line.
         let empty = Hit {
             title: "t".into(),
             url: "https://t/".into(),
@@ -586,9 +544,6 @@ mod tests {
 
     #[test]
     fn a_result_can_be_read_in_full_from_the_search_already_made() {
-        // D82: the excerpts are the first step; `{"result": n}` is the second, and it reads the page
-        // the model was already shown rather than asking for a search that could answer with
-        // different pages under the same numbers.
         let hit = Hit {
             title: "Atomics".into(),
             url: "https://doc.rust-lang.org/nomicon/atomics.html".into(),
@@ -603,7 +558,6 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("published 2025-06-26"), "{text}");
-        // The whole body, untouched by the excerpt ceiling.
         assert!(text.contains("the whole page, not an excerpt"), "{text}");
         assert!(
             text.contains(
@@ -611,7 +565,6 @@ mod tests {
             ),
             "{text}"
         );
-        // A result that came without text points at the page rather than pretending it is empty.
         let bare = Hit {
             title: "t".into(),
             url: "https://t/".into(),
@@ -625,7 +578,6 @@ mod tests {
 
     #[test]
     fn a_long_page_is_cut_at_what_a_tool_result_carries() {
-        // The ceiling is the agent's own result limit, so nothing is cut twice on the way in.
         let page = "word ".repeat(60_000);
         let text = whole_text(&page, "https://example.test/");
         assert!(text.len() < page.len(), "not cut");
@@ -642,18 +594,13 @@ mod tests {
             "{} bytes",
             text.len()
         );
-        // Short text is passed through.
         assert_eq!(whole_text("short", "https://x/"), "short");
-        // A cut never splits a character.
         let multibyte = "é".repeat(budgets::presentation_bytes());
         assert!(str::from_utf8(whole_text(&multibyte, "https://x/").as_bytes()).is_ok());
     }
 
     #[test]
     fn an_expansion_reads_the_search_it_names_or_searches_once_more() {
-        // D82: the numbers in a result belong to the search that produced them, so a matching query
-        // must read the held results rather than ask again — a second search could return
-        // different pages under the same numbers.
         let held = last_search(vec![]);
         assert_eq!(
             plan(Some(&held), ""),
@@ -662,14 +609,12 @@ mod tests {
         );
         assert_eq!(plan(Some(&held), "rust atomics"), Plan::FromCache);
         assert_eq!(plan(Some(&held), "something else"), Plan::Fresh);
-        // Nothing held: a query makes the call work on its own, no query cannot.
         assert_eq!(plan(None, "rust atomics"), Plan::Fresh);
         assert_eq!(plan(None, ""), Plan::Nothing);
     }
 
     #[test]
     fn the_results_say_how_to_read_one_in_full() {
-        // The affordance has to be visible in the answer, not only in the tool's description.
         let hit = Hit {
             title: "t".into(),
             url: "https://t/".into(),
@@ -678,7 +623,6 @@ mod tests {
         };
         let text = format_hits(&[hit]);
         assert!(text.contains("result\": N"), "{text}");
-        // No results, no hint: there is nothing to expand.
         assert_eq!(format_hits(&[]), "no results");
     }
 
@@ -686,7 +630,6 @@ mod tests {
     fn an_answer_with_no_results_says_so() {
         assert_eq!(format_hits(&[]), "no results");
         assert_eq!(parse_exa(r#"{"results": []}"#).unwrap(), []);
-        // A body that is not what Exa sends is an error rather than an empty success.
         assert!(parse_exa("not json").is_err());
         assert!(parse_exa(r#"{"nope": 1}"#).is_err());
     }
@@ -706,8 +649,6 @@ mod tests {
 
     #[test]
     fn an_mcp_answer_is_found_in_a_stream_or_a_body() {
-        // The transport is one POST and a line filter: the server may answer either way, and both
-        // are the same JSON-RPC message.
         let streamed = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Title: x\"}]}}\n\n";
         assert_eq!(
             parse_mcp(streamed)
@@ -718,7 +659,6 @@ mod tests {
         );
         let plain = r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"y"}]}}"#;
         assert!(parse_mcp(plain).is_some());
-        // An error message is a result to report, not a parse failure.
         let failed =
             "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"bad\"}}";
         assert_eq!(
@@ -742,7 +682,6 @@ mod tests {
 
     #[test]
     fn the_denial_for_a_key_explains_what_to_do() {
-        // The two cases people hit: a key that is wrong, and a key whose team is out of credit.
         let text = explain(
             401,
             r#"{"error":"Invalid API key","tag":"INVALID_API_KEY"}"#,
@@ -757,13 +696,11 @@ mod tests {
         assert!(text.contains("unset EXA_API_KEY"), "{text}");
         let text = explain(429, r#"{"error":"slow down"}"#);
         assert!(text.contains("rate limiting"), "{text}");
-        // A body that is not JSON is reported rather than dropped.
         assert!(explain(500, "<html>oops</html>").contains("<html>oops</html>"));
     }
 
     #[test]
     fn a_passage_is_one_line_of_bounded_length() {
-        // Synthetic returns whole pages under `highlights`; a model gets an excerpt (D82).
         let page = "word ".repeat(5000);
         let quoted = passage_for_model(&page);
         assert_eq!(
@@ -772,9 +709,7 @@ mod tests {
             "kept or ellipsis wrong"
         );
         assert!(quoted.ends_with('…'), "{quoted:.20}");
-        // A short passage is untouched apart from its line breaks.
         assert_eq!(passage_for_model("one\n two\n\nthree"), "one two three");
-        // No more than a few passages per result, whatever the server sends.
         let hit = Hit {
             title: "a".into(),
             url: "https://a/".into(),
@@ -787,7 +722,6 @@ mod tests {
             budgets::web_quotes(),
             "{text}"
         );
-        // Five whole pages still fit in one answer.
         let hits: Vec<Hit> = (0..5)
             .map(|i| Hit {
                 title: format!("t{i}"),
@@ -811,9 +745,7 @@ mod tests {
             "not cut"
         );
         assert!(shortened.ends_with("bytes)"), "{shortened:?}");
-        // Short text is untouched.
         assert_eq!(cut("short"), "short");
-        // A cut never splits a character.
         let multibyte = "é".repeat(budgets::presentation_bytes());
         assert!(str::from_utf8(cut(&multibyte).as_bytes()).is_ok());
     }

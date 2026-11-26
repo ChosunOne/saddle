@@ -1,9 +1,3 @@
-//! D108: the tools the model can see. A server's tools are not declared to the model until it asks
-//! for them: `tool_search` matches a query against what the granted servers offer and declares the
-//! matches, which stay declared for the session. Nothing here decides authority — the grant does
-//! (D103), so a tool the grant does not name is never declared and never callable, however loudly
-//! the server advertises it.
-
 use crate::mcp::Exposure;
 use crate::mcp::Transport;
 use crate::mcp::host;
@@ -25,9 +19,6 @@ use crate::provider::ToolDef;
 use crate::session::Session;
 use crate::tools::{ToolOutput, timeout};
 
-/// What a call carried, for the audit log: how much and what, never what it said. A tool's
-/// arguments may hold a secret the way a `fetch` query string may, so both are recorded the same
-/// way — a length and a hash (D24, D112).
 pub fn arguments_record(input: &Value) -> Value {
     let text = input.to_string();
     json!({
@@ -36,9 +27,6 @@ pub fn arguments_record(input: &Value) -> Value {
     })
 }
 
-/// One MCP tool call, allowed or refused, recorded against the server it was for (D112). One
-/// function, because the model's call and a person's `saddle mcp call` are the same decision and
-/// two record shapes would be two answers to what the audit log means.
 pub fn record_call(
     session: &mut Session,
     server: &str,
@@ -67,47 +55,33 @@ pub fn record_call(
     Ok(())
 }
 
-/// The prefix that keeps a server's tool from ever shadowing a built-in one.
 pub const PREFIX: &str = "mcp__";
 
-/// How many matches one search declares, so a broad query cannot fill the context.
 const MATCHES: usize = 8;
 
-/// The server and tool a declared name stands for. A name that does not split is not a tool of
-/// ours; one that splits wrongly can only ever be refused, because the grant lookup that follows
-/// is exact — so a server whose own name holds `__` loses its declarations rather than widening.
 fn parse(key: &str) -> Option<(&str, &str)> {
     let (server, tool) = key.strip_prefix(PREFIX)?.split_once("__")?;
     (!server.is_empty() && !tool.is_empty()).then_some((server, tool))
 }
 
-/// How one running server is spoken to: a child's pipes, or the host's own requests (D107, D110).
 pub enum Connection {
     Stdio(Client),
     Http(HttpClient),
 }
 
-/// One running server and its relay.
 pub struct Running {
     conn: Connection,
     bridge: Option<Bridge>,
 }
 
-/// What one session knows about the servers its policy grants.
 #[derive(Default)]
 pub struct Registry {
-    /// The servers a grant names (D103), and the tables that declare them (D104).
     grants: Vec<saddle_cap::McpGrant>,
     entries: BTreeMap<String, McpEntry>,
-    /// What each running server offers, keyed `mcp__<server>__<tool>`.
     catalogue: BTreeMap<String, (String, Tool)>,
     loaded: BTreeSet<String>,
     servers: BTreeMap<String, Running>,
-    /// Servers a person turned off for this session only: not a config change, and forgotten when
-    /// the session ends (D123).
     suspended: BTreeSet<String>,
-    /// Servers that could not be started, and why: remembered, so a search does not retry one that
-    /// is broken or repeat the same failure.
     failures: BTreeMap<String, String>,
     host_env: Vec<(String, String)>,
     tmp: Option<PathBuf>,
@@ -131,13 +105,10 @@ impl Registry {
         }
     }
 
-    /// The name the model sees for one tool of one server.
     pub fn name(server: &str, tool: &str) -> String {
         format!("{PREFIX}{server}__{tool}")
     }
 
-    /// Starts every granted server that is not running, and records what each offers. Failures are
-    /// returned as notes for the model, once.
     pub fn discover(&mut self, session: &mut Session) -> Vec<String> {
         let mut notes = Vec::new();
         let pending: Vec<String> = self
@@ -157,8 +128,6 @@ impl Registry {
                 self.failures.insert(name, why);
             }
         }
-        // A server that said its catalogue changed is read again before this search scores
-        // anything, so the model is never offered a tool the server has since withdrawn (D114).
         let running: Vec<String> = self.servers.keys().cloned().collect();
         for name in running {
             if timeout::expired() {
@@ -171,8 +140,6 @@ impl Registry {
         notes
     }
 
-    /// Re-reads one server's catalogue if it said it changed. A failure here is not a failure of
-    /// the session: the old catalogue is still what the grant decides over.
     fn refresh(&mut self, server: &str, session: &mut Session) -> Result<()> {
         let Some(Running { conn, bridge }) = self.servers.get_mut(server) else {
             return Ok(());
@@ -198,9 +165,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Starts one server and records the tools it offers. The grant is consulted when a tool is
-    /// declared or called, not here: what a server offers and what the model may use are different
-    /// questions, and only the second is authority.
     fn connect(&mut self, server: &str, session: &mut Session) -> Result<()> {
         let grant = self
             .grants
@@ -242,8 +206,6 @@ impl Registry {
                 );
             }
             Transport::Http { url } => {
-                // A server with no child still has a reach: its net grants, narrowed from the
-                // agent's, are what every request of its own is decided against (D105, D110).
                 let reach = lower::net_reach(session, &grant)?;
                 let mut client = HttpClient::start(server, url, reach, entry.timeout())?;
                 client.initialize(session)?;
@@ -261,7 +223,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Files what a server offers under namespaced keys (D108).
     fn record(&mut self, server: &str, tools: Vec<Tool>) {
         for tool in tools {
             let key = Self::name(server, &tool.name);
@@ -269,21 +230,16 @@ impl Registry {
         }
     }
 
-    /// What one tool's exposure is, from its table: the tool's own word, the server's, or `hidden`
-    /// when there is no table to ask (D117, D122).
     fn exposure(&self, server: &str, tool: &str) -> Exposure {
         self.entries
             .get(server)
             .map_or(Exposure::Deferred, |entry| entry.exposure_of(tool))
     }
 
-    /// Whether a server is off: `hidden` in its table, or turned off for this session (D117, D123).
     fn is_off(&self, server: &str) -> bool {
         self.is_hidden(server) || self.suspended.contains(server)
     }
 
-    /// Turns one server off for this session, without touching the config a person would have to
-    /// keep in step (D123). Dropping the client kills its child, so off means off.
     pub fn suspend(&mut self, server: &str) -> Result<String> {
         if !self.entries.contains_key(server) {
             bail!("`{server}` has no [mcp.{server}] table in config.toml");
@@ -294,7 +250,6 @@ impl Registry {
         Ok(note)
     }
 
-    /// Turns it back on. Not started again: it starts on demand, or on `/mcp restart`.
     pub fn resume(&mut self, server: &str) -> Result<String> {
         if !self.suspended.remove(server) {
             bail!("`{server}` is not off in this session");
@@ -305,15 +260,12 @@ impl Registry {
         ))
     }
 
-    /// Whether a server's table says `hidden`, in which case it is not started at all (D117).
     fn is_hidden(&self, server: &str) -> bool {
         self.entries
             .get(server)
             .is_some_and(|entry| entry.exposure() == Exposure::Hidden)
     }
 
-    /// The servers whose table says `direct`, which are started when the session opens because
-    /// their schemas are needed before the model's first request (D117).
     pub fn direct(&self) -> Vec<String> {
         self.entries
             .iter()
@@ -325,8 +277,6 @@ impl Registry {
             .collect()
     }
 
-    /// Starts the `direct` servers. Called where the model loop is set up rather than from a
-    /// search, because there is nothing to search for: the table already said what to declare.
     pub fn start_direct(&mut self, session: &mut Session) -> Vec<String> {
         let mut notes = Vec::new();
         for name in self.direct() {
@@ -342,10 +292,6 @@ impl Registry {
         notes
     }
 
-    /// The `mcp_servers` section of the prompt: one line per granted server, saying how its tools
-    /// are reached and what the person wrote about it (D120). Only the person's own words appear —
-    /// a server's instructions and tool descriptions are its text, and the prompt is not the place
-    /// for prose a server controls (D104).
     pub fn prompt_lines(&self) -> Vec<String> {
         let mut out = Vec::new();
         for grant in &self.grants {
@@ -379,8 +325,6 @@ impl Registry {
         out
     }
 
-    /// What `/mcp` shows: one line per granted server, its exposure, whether it is running, how
-    /// much of what it offers is granted, and what went wrong if anything did (D118).
     pub fn report(&self) -> Vec<String> {
         let mut out = Vec::new();
         for grant in &self.grants {
@@ -431,9 +375,6 @@ impl Registry {
         out
     }
 
-    /// Forgets a server and starts it again, which is what a person does when a server has been
-    /// upgraded or its credentials have changed underneath a running session (D118). Dropping the
-    /// client kills the child, so nothing of the old one survives into the new.
     pub fn restart(&mut self, server: &str, session: &mut Session) -> Result<String> {
         if !self.grants.iter().any(|g| g.server == server) {
             bail!("`{server}` is not granted");
@@ -454,16 +395,10 @@ impl Registry {
         Ok(format!("{server} restarted, offering {tools} tool(s)"))
     }
 
-    /// Starts one server by name, so `saddle mcp call` reaches the one it was given rather than
-    /// every granted server. The discovery path starts them all at once; this is the same
-    /// `connect`, reached by name (D111).
     pub fn start(&mut self, server: &str, session: &mut Session) -> Result<()> {
         self.connect(server, session)
     }
 
-    /// Declares every tool of one server the grant names, without a search (D111). A by-hand call
-    /// has no conversation to declare into, so this is the model's "search for everything" with
-    /// nothing recorded: the session it belongs to is about to end.
     pub fn declare_server(&mut self, server: &str) {
         for (key, (owner, tool)) in &self.catalogue {
             if owner == server && self.granted(server, &tool.name) {
@@ -472,16 +407,11 @@ impl Registry {
         }
     }
 
-    /// Declares what matches `query`. An empty query declares everything the granted servers offer,
-    /// which is what a model with no idea what is available should ask for.
     pub fn search(&mut self, query: &str) -> Vec<String> {
         let wanted = query.trim().to_lowercase();
         let words: Vec<&str> = wanted.split_whitespace().collect();
         let mut scored: Vec<(usize, String)> = Vec::new();
         for (key, (server, tool)) in &self.catalogue {
-            // A hidden server or tool is not searched, called or started: the switch is in the
-            // table, and a catalogue that somehow holds the tool must not be a way past it
-            // (D117, D122).
             if self.is_off(server)
                 || self.exposure(server, &tool.name) == Exposure::Hidden
                 || !self.granted(server, &tool.name)
@@ -520,10 +450,6 @@ impl Registry {
             .is_some_and(|g| g.allows(tool))
     }
 
-    /// The definitions to add to the tool list: what this session has declared by searching, plus
-    /// every granted tool whose exposure is `direct` — whether the server said so or the tool's own
-    /// entry did (D117, D122). A hidden server or tool contributes nothing, which is what makes the
-    /// word a switch rather than a second grant.
     pub fn declared(&self) -> Vec<ToolDef> {
         let mut keys: BTreeSet<String> = self.loaded.clone();
         for (key, (server, tool)) in &self.catalogue {
@@ -554,14 +480,10 @@ impl Registry {
             .collect()
     }
 
-    /// What this session has declared, in name order, for the store to record (D109).
     pub fn loaded(&self) -> Vec<String> {
         self.loaded.iter().cloned().collect()
     }
 
-    /// Puts back the declarations a branch was saved with, keeping only those the grant in force
-    /// still names (D109). A branch recorded under a wider policy therefore confers nothing under
-    /// a narrower one, which is why this is a filter and not an assignment.
     pub fn restore(&mut self, names: &[String]) {
         let kept: BTreeSet<String> = names
             .iter()
@@ -574,18 +496,12 @@ impl Registry {
         self.loaded = kept;
     }
 
-    /// Calls one declared tool. A granted tool that was never declared is a host error rather than
-    /// a denial: the model named something it cannot see, which is a protocol mistake, not a
-    /// permission one.
     pub fn call(&mut self, key: &str, input: &Value, session: &mut Session) -> Result<ToolOutput> {
         let (server, tool) = self
             .catalogue
             .get(key)
             .cloned()
             .ok_or_else(|| anyhow!("unknown tool `{key}`"))?;
-        // D112: a call is a decision wherever it is answered, so a refusal is recorded here and a
-        // grant is recorded below — the same shape every other tool's allow carries, with the
-        // arguments hashed rather than quoted (D24).
         let arguments = arguments_record(input);
         let refusal = if self.suspended.contains(&server) {
             Some(format!(
@@ -665,7 +581,6 @@ impl Registry {
         let mut out = match outcome {
             Ok(out) => out,
             Err(why) if why.is::<timeout::TimedOut>() => {
-                // Closing a local server kills its process group; remote work cannot be guaranteed stopped.
                 if matches!(conn, Connection::Stdio(_)) {
                     self.servers.remove(&server);
                     self.failures.insert(
@@ -683,13 +598,10 @@ impl Registry {
         Ok(out)
     }
 
-    /// Stops every server, so a session leaves none behind.
     pub fn close(&mut self) {
         self.servers.clear();
     }
 
-    /// The tools the servers were seen offering that no grant names: what a server grew overnight
-    /// is visible without being callable (D103).
     pub fn ungranted(&self) -> Vec<String> {
         self.catalogue
             .iter()
@@ -721,8 +633,6 @@ mod tests {
 
     #[test]
     fn a_server_can_be_turned_off_for_this_session_without_editing_the_config() {
-        // D123: pi's `/mcp` toggle, made session-scoped. Off means off for search, declaration and
-        // calls, and the report says which kind of off it is — the table's or this session's.
         let mut entries = BTreeMap::new();
         entries.insert(
             "scout".to_owned(),
@@ -761,9 +671,6 @@ mod tests {
 
     #[test]
     fn one_tool_can_be_declared_or_hidden_beside_its_server() {
-        // D122: exposure per tool, on top of the server's own word. A `direct` tool of a deferred
-        // server is in the prompt, a `hidden` tool of the same server is not reachable at all, and
-        // neither can widen what the grant allows.
         let mut entries = BTreeMap::new();
         entries.insert(
             "scout".to_owned(),
@@ -804,8 +711,6 @@ mod tests {
 
     #[test]
     fn the_report_says_what_each_server_is_doing() {
-        // D118: `/mcp` is one line per granted server — exposure, state, how much of what it
-        // offers is granted — so a server that never started is visible before it is needed.
         let mut entries = BTreeMap::new();
         entries.insert(
             "front".to_owned(),
@@ -860,9 +765,6 @@ mod tests {
 
     #[test]
     fn a_direct_server_is_declared_without_a_search_and_a_hidden_one_never_is() {
-        // D117: exposure is presentation, so it decides what reaches the prompt and nothing about
-        // what may be called. `direct` declares the granted tools up front; `hidden` declares none
-        // however loudly the server advertises them.
         let tool = |name: &str| Tool {
             name: name.to_owned(),
             description: format!("{name} does things"),
@@ -912,7 +814,6 @@ mod tests {
         );
         assert!(registry.loaded().is_empty(), "and nothing was searched for");
 
-        // The server that was told to stay off does not even answer a search for everything.
         let declared = registry.search("");
         assert!(
             !declared.iter().any(|key| key.starts_with("mcp__off")),
@@ -922,8 +823,6 @@ mod tests {
 
     #[test]
     fn a_restored_declaration_is_checked_against_the_grant_again() {
-        // D109: a branch carries names, not authority. Restoring them under a narrower policy —
-        // or under a name that is not a tool of ours at all — keeps only what is still granted.
         let mut registry = Registry::new(
             vec![granted("fake", &["search"])],
             BTreeMap::new(),

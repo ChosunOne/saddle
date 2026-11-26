@@ -1,5 +1,3 @@
-//! The third lowering (plan §5): a principal's grants to the sandbox a child process runs in (D19).
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use crate::policy::Grants;
 use crate::roots::{Location, RootName, Roots};
 
-/// Read and execute for every child, whatever the grants.
 pub const SYSTEM_READ: &[&str] = &[
     "/usr",
     "/bin",
@@ -22,112 +19,64 @@ pub const SYSTEM_READ: &[&str] = &[
     "/dev/urandom",
     "/dev/random",
 ];
-/// Writable device nodes for every child.
 pub const SYSTEM_WRITE: &[&str] = &["/dev/null", "/dev/zero", "/dev/full"];
-/// Environment variables passed through by default. `LC_*` is matched by prefix.
 pub const BASE_ENV: &[&str] = &[
     "PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "TERM", "TZ",
 ];
 
-/// The port the guest's loopback listens on for the proxy protocol, and the port the proxy
-/// variables point at. One number, so the relay and the environment cannot disagree (D79).
 pub const PROXY_PORT: u16 = 3128;
 
-/// How a command reaches the network: its own namespace, and this one door back to the proxy
-/// (D79). `None` means the command gets no network at all, which is what every command had before
-/// D79 and what it falls back to when a namespace cannot be made.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetBridge {
-    /// The unix socket the relay in the namespace connects back to, in this process.
     pub socket: PathBuf,
-    /// Where the guest's loopback accepts the proxy protocol.
     pub proxy_port: u16,
 }
 
-/// Everything the helper needs to confine itself and exec the target. Serialised to the helper's
-/// stdin (D18).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxSpec {
     pub argv: Vec<String>,
     pub cwd: PathBuf,
-    /// The complete child environment.
     pub env: Vec<(String, String)>,
-    /// Paths the child may read and execute beneath.
     pub read: Vec<PathBuf>,
-    /// Paths the child may read, write, create and delete beneath.
     pub write: Vec<PathBuf>,
-    /// The network the child reaches, if any (D79).
     #[serde(default)]
     pub net: Option<NetBridge>,
-    /// select the stricter named-profile helper path (D184).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub named_launch: Option<NamedLaunch>,
 }
 
-/// paths no named launch may grant, even through system-runtime claims (D184).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamedLaunch {
     pub protected: Vec<PathBuf>,
     pub agent_write: Vec<PathBuf>,
     #[serde(default)]
     pub executable_sha256: Option<[u8; 32]>,
-    /// exact helper paths and session-pinned digests; empty keeps initial-exec-only mode.
     #[serde(default)]
     pub helpers: Vec<(PathBuf, Option<[u8; 32]>)>,
 }
 
-/// User-level additions from `config.toml` (`[sandbox] read = [...]`, `write = [...]`), for
-/// toolchains that live outside the workspace.
 #[derive(Debug, Clone, Default)]
 pub struct SandboxExtras {
-    /// Resolved paths, not root names: a toolchain directory must not be nameable by a policy
-    /// (D62).
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
-    /// Directories worked out at startup from an `[[sandbox.include]]` rule, already enumerated
-    /// (D62).
     pub include: Vec<PathBuf>,
 }
 
-/// One `[[sandbox.include]]` rule: walk `base`, keep the directories that do not match `except`,
-/// and hand landlock the list (D62).
 #[derive(Debug, Clone)]
 pub struct Include {
     pub base: PathBuf,
-    /// How deep below `base` to walk. A landlock rule is recursive, so a rule for a directory
-    /// grants everything beneath it; this only decides how far saddle looks for exclusions.
     pub depth: usize,
-    /// Matched against the path relative to `base`, as slashes.
     pub except: Vec<regex::Regex>,
 }
 
-/// What an `Include` rule grants: the directories to add to the child's rules (D62).
-///
-/// A pattern is only an input. The authority is this list, which is what `check` prints and the
-/// audit record names, because a rule that says "everything under home except these" means
-/// nothing a person can review until it is resolved.
-///
-/// The rule that makes it safe: a landlock rule covers everything below its directory, so a
-/// directory that **contains** an exclusion must not be granted — granting `~/.config` would grant
-/// `~/.config/saddle` however the pattern reads. Such a directory is therefore expanded instead:
-/// its children are considered in its place. `protected` is excluded whatever the pattern says,
-/// because the state and config directories may never be in a root (D16).
 pub fn enumerate(include: &Include, protected: &[PathBuf]) -> Vec<PathBuf> {
     let base = include.base.canonicalize().unwrap_or(include.base.clone());
     let protected: Vec<PathBuf> = protected
         .iter()
         .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
         .collect();
-    // Every entry worth deciding about, parents before children.
     let mut found: Vec<Entry> = Vec::new();
     walk(&base, &base, include.depth, &mut found);
-    // Two passes, because a directory must not be granted when *anything* below it is withheld,
-    // and that is not known until the whole walk has been read.
-    //
-    // First: what is withheld. Everything withheld counts, but only a withheld *directory* takes
-    // its descendants with it — a withheld file has none. Both lists are needed: `~/.cargo` must be
-    // expanded because `~/.cargo/credentials.toml` is withheld, and `.ssh` must take `id_rsa` with
-    // it.
     let mut withheld: Vec<String> = Vec::new();
     let mut withheld_dirs: Vec<String> = Vec::new();
     for entry in &found {
@@ -141,8 +90,6 @@ pub fn enumerate(include: &Include, protected: &[PathBuf]) -> Vec<PathBuf> {
             }
         }
     }
-    // Second: the rules. A directory above anything withheld is expanded rather than granted, and a
-    // directory already covered by a kept rule adds nothing, because landlock rules are recursive.
     let mut kept: Vec<PathBuf> = Vec::new();
     let mut kept_rel: Vec<String> = Vec::new();
     for entry in &found {
@@ -166,7 +113,6 @@ pub fn enumerate(include: &Include, protected: &[PathBuf]) -> Vec<PathBuf> {
     kept
 }
 
-/// A directory or file found while walking, with its path relative to the base.
 struct Entry {
     path: PathBuf,
     rel: String,
@@ -182,19 +128,12 @@ impl Entry {
     }
 }
 
-/// Whether `child` is strictly below `parent`, comparing path strings as slashes.
 fn is_below(child: &str, parent: &str) -> bool {
     child.len() > parent.len()
         && child.starts_with(parent)
         && child.as_bytes()[parent.len()] == b'/'
 }
 
-/// Fills `out` with every entry below `dir`, down to `depth` (0 means none), parents first.
-///
-/// Files are collected as well as directories. A directory that contains an exclusion is expanded
-/// rather than granted (D62), and without file entries its regular files would become unreadable
-/// too — `~/.gitconfig` would stop working the moment anything else in home is excluded. Landlock
-/// accepts a rule on a regular file, so the expansion can be exact.
 fn walk(dir: &Path, base: &Path, depth: usize, out: &mut Vec<Entry>) {
     let rel = dir
         .strip_prefix(base)
@@ -220,7 +159,6 @@ fn walk(dir: &Path, base: &Path, depth: usize, out: &mut Vec<Entry>) {
     }
     dirs.sort();
     files.sort();
-    // Files first, so a file's own rule is never shadowed by a directory rule decided later.
     for path in files {
         let rel = path
             .strip_prefix(base)
@@ -253,7 +191,6 @@ pub enum LowerError {
 pub struct ExecRequest<'a> {
     pub argv: Vec<String>,
     pub cwd: &'a Location,
-    /// The host's environment, filtered here through the allowlist.
     pub host_env: &'a [(String, String)],
 }
 
@@ -285,8 +222,6 @@ pub fn lower_exec(
         read.push(path(name)?);
     }
     read.extend(extras.read.iter().cloned());
-    // Enumerated by an `[[sandbox.include]]` rule at startup; already a list of directories, so
-    // nothing here has to know what a toolchain is (D62).
     read.extend(extras.include.iter().cloned());
     let mut write: Vec<PathBuf> = SYSTEM_WRITE.iter().map(PathBuf::from).collect();
     for name in grants.fs_write.iter().map(|g| &g.root) {
@@ -307,8 +242,6 @@ pub fn lower_exec(
         })
         .cloned()
         .collect();
-    // Programs disagree about the case of the proxy variables, so both are set. The guest's own
-    // loopback is reached directly: it is the guest's, and it cannot leave (D79).
     let proxy = format!("http://127.0.0.1:{PROXY_PORT}");
     for name in [
         "http_proxy",
@@ -337,8 +270,6 @@ pub fn lower_exec(
             env,
             read,
             write,
-            // The caller fills this in once it has a socket to offer: the bridge is plumbing, not
-            // a grant, and the authority it reaches is decided per request (D79).
             net: None,
             named_launch: None,
         },
@@ -385,19 +316,13 @@ mod tests {
 
     #[test]
     fn an_include_grants_the_directories_that_are_not_excluded() {
-        // D62: the pattern is an input; this list is the authority.
         let dir = tree(&["cargo/bin", "rustup/toolchains", "jj"]);
         let got = rel(dir.path(), &enumerate(&rule(dir.path(), 2, &[]), &[]));
-        // The base is never a rule, and a directory with nothing excluded beneath it is one
-        // recursive rule rather than one per child. Files get a rule of their own, because they
-        // are not covered by any directory rule the base does not have.
         assert_eq!(got, ["README", "cargo", "jj", "rustup"], "{got:?}");
     }
 
     #[test]
     fn a_directory_containing_an_exclusion_is_expanded_not_granted() {
-        // The rule that makes this safe: a landlock rule covers everything below its directory, so
-        // granting ~/.config would grant ~/.config/saddle however the pattern reads (D16, D20).
         let dir = tree(&[".config/saddle", ".config/git", ".config/other", ".ssh"]);
         let got = rel(
             dir.path(),
@@ -415,15 +340,11 @@ mod tests {
             "{got:?}"
         );
         assert!(!got.iter().any(|p| p == ".ssh"), "{got:?}");
-        // Its siblings still are, so the tool configs that live there keep working.
         assert_eq!(got, [".config/git", ".config/other", "README"], "{got:?}");
     }
 
     #[test]
     fn a_withheld_file_expands_its_directory_too() {
-        // The bug: only withheld *directories* forced their parent to expand, so withholding a
-        // file inside a granted directory was silently undone — a crates.io token in ~/.cargo,
-        // which is granted for the toolchain, stayed readable (D62).
         let dir = tree(&["cargo/registry"]);
         fs::write(dir.path().join("cargo/credentials.toml"), "token\n").unwrap();
         fs::write(dir.path().join("cargo/config.toml"), "[net]\n").unwrap();
@@ -431,17 +352,14 @@ mod tests {
             dir.path(),
             &enumerate(&rule(dir.path(), 2, &[r"^cargo/credentials\.toml$"]), &[]),
         );
-        // The directory is not a rule, so the token cannot be reached through it.
         assert!(!got.iter().any(|p| p == "cargo"), "{got:?}");
         assert!(!got.iter().any(|p| p.contains("credentials")), "{got:?}");
-        // Everything else in it still is, which is why the toolchain keeps working.
         assert!(got.iter().any(|p| p == "cargo/config.toml"), "{got:?}");
         assert!(got.iter().any(|p| p == "cargo/registry"), "{got:?}");
     }
 
     #[test]
     fn the_state_and_config_directories_are_excluded_whatever_the_pattern_says() {
-        // A pattern cannot open what D16 keeps out of every root.
         let dir = tree(&["state/saddle", "config", "cargo"]);
         let state = dir.path().join("state/saddle");
         let got = rel(
@@ -453,7 +371,6 @@ mod tests {
 
     #[test]
     fn a_depth_limit_decides_how_far_saddle_looks_for_exclusions() {
-        // Depth bounds only the search: a granted directory covers its children anyway.
         let dir = tree(&["a/b/c"]);
         assert_eq!(
             rel(dir.path(), &enumerate(&rule(dir.path(), 1, &[]), &[])),
@@ -463,7 +380,6 @@ mod tests {
             rel(dir.path(), &enumerate(&rule(dir.path(), 3, &[]), &[])),
             ["README", "a"]
         );
-        // An exclusion two levels down forces the expansion down to it.
         let dir = tree(&["a/b/secret", "a/b/keep"]);
         let got = rel(
             dir.path(),
@@ -474,8 +390,6 @@ mod tests {
 
     #[test]
     fn a_pattern_that_matches_a_directory_by_prefix_does_not_leak_its_siblings() {
-        // Unanchored patterns are allowed, which is how a person writes ".ssh" rather than the
-        // full relative path; the point of the test is that matching is still per directory.
         let dir = tree(&["cache/ssh-agent", "cache/other"]);
         let got = rel(
             dir.path(),
@@ -538,8 +452,6 @@ exec = { why = "x", env = ["CARGO_TERM_COLOR"] }
         .unwrap();
         let spec = lowered.spec;
         let names: Vec<&str> = spec.env.iter().map(|(k, _)| k.as_str()).collect();
-        // The proxy variables are set here rather than by the caller, so they cannot disagree with
-        // the port the relay listens on (D79). Both cases, because programs disagree about it.
         assert_eq!(
             names,
             [
@@ -564,7 +476,6 @@ exec = { why = "x", env = ["CARGO_TERM_COLOR"] }
                 "{name} does not reach the proxy"
             );
         }
-        // The command's own loopback is reached directly: it is its own, and cannot leave.
         assert!(
             spec.env
                 .contains(&("no_proxy".to_owned(), "localhost,127.0.0.1,::1".to_owned()))

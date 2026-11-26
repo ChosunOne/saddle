@@ -1,5 +1,3 @@
-//! isolated provider requests, shared parent quotas and reported-usage accounting (D156).
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};

@@ -1,34 +1,19 @@
-//! D105: an MCP server is a delegate of the agent, so its reach is the intersection of what its
-//! grant asks for with what the agent holds. It is never a widening, and a grant asking for more
-//! than the agent has is an error rather than a silent trim: a narrowing that quietly halved a
-//! server's reach would look like a server that mysteriously cannot see a file, which is a much
-//! worse thing to debug than a policy that will not load.
-
 use std::collections::BTreeSet;
 
 use crate::policy::{FsGrant, Grants, HostPattern, McpReach, NetGrant, RuleId};
 use crate::roots::RootName;
 
-/// The grants one server runs under: the agent's own, narrowed by what its grant asks for.
-///
-/// `what` names the grant in the error, so a policy with several servers says which one asked for
-/// too much.
 pub fn narrow(agent: &Grants, reach: &McpReach, what: &str) -> Result<Grants, String> {
     let mut out = Grants {
-        // A server is a command: it needs the agent's `exec`, and its timeout, to run at all.
         exec: agent.exec.clone(),
         ..Grants::default()
     };
     out.fs_read = narrow_fs(&agent.fs_read, &reach.fs_read, what, "read")?;
     out.fs_write = narrow_fs(&agent.fs_write, &reach.fs_write, what, "write")?;
     out.net = narrow_net(&agent.net, &reach.net, what)?;
-    // Nothing else crosses: a server is not a plugin principal, so it holds no plain scope, no
-    // model budget and no roots of its own.
     Ok(out)
 }
 
-/// Filesystem entries: one per root the server asked for, with the exclusions of both grants, so
-/// the result is never wider than either.
 fn narrow_fs(
     agent: &[FsGrant],
     asked: &[FsGrant],
@@ -56,16 +41,12 @@ fn narrow_fs(
             }
         }
         let mut narrowed = want.with_exclusions(exclude)?;
-        // The rule names the grant that asked, so a denial in the audit points at a line in the
-        // policy rather than at the agent's own grant.
         narrowed.rule = want.rule.clone();
         out.push(narrowed);
     }
     Ok(out)
 }
 
-/// Network entries: each must be covered by an agent grant. An exact host is kept as it was
-/// written; a wildcard is kept only where the agent already holds one at least as wide.
 fn narrow_net(agent: &[NetGrant], asked: &[NetGrant], what: &str) -> Result<Vec<NetGrant>, String> {
     if asked.is_empty() {
         return Ok(agent.to_vec());
@@ -84,7 +65,6 @@ fn narrow_net(agent: &[NetGrant], asked: &[NetGrant], what: &str) -> Result<Vec<
     Ok(out)
 }
 
-/// Whether `outer` allows everything `inner` does, on the same scheme and port.
 pub(crate) fn covers(outer: &NetGrant, inner: &NetGrant) -> bool {
     outer.scheme == inner.scheme
         && outer.port.unwrap_or(outer.scheme.default_port())
@@ -97,17 +77,12 @@ fn covers_host(outer: &HostPattern, inner: &HostPattern) -> bool {
         (HostPattern::Any, _) => true,
         (HostPattern::Exact(a), HostPattern::Exact(b)) => a.eq_ignore_ascii_case(b),
         (HostPattern::Exact(_), _) => false,
-        // A suffix covers itself and anything below it: `*.example.com` covers
-        // `*.api.example.com` and `api.example.com`.
         (HostPattern::Suffix(suffix), HostPattern::Suffix(inner)) => {
             suffix.eq_ignore_ascii_case(inner) || inner.ends_with(&format!(".{suffix}"))
         }
-        // A suffix covers strict subdomains only, as `matches` does: `*.example.com` says nothing
-        // about `example.com` itself.
         (HostPattern::Suffix(suffix), HostPattern::Exact(host)) => {
             host.ends_with(&format!(".{suffix}"))
         }
-        // A suffix never covers a wildcard: `*.example.com` says nothing about every host.
         (HostPattern::Suffix(_), HostPattern::Any) => false,
     }
 }
@@ -121,7 +96,6 @@ fn describe_net(grant: &NetGrant) -> String {
     )
 }
 
-/// The roots a narrowed grant reaches, for a caller that wants to say so.
 pub fn roots_of(grants: &Grants) -> BTreeSet<RootName> {
     grants
         .fs_read
@@ -131,7 +105,6 @@ pub fn roots_of(grants: &Grants) -> BTreeSet<RootName> {
         .collect()
 }
 
-/// The rules a narrowed grant was resolved from, so `check` and the audit can name them.
 pub fn rules_of(grants: &Grants) -> Vec<&RuleId> {
     let files = grants
         .fs_read
@@ -230,7 +203,6 @@ net      = [{ host = "*.example.com" }, { host = "api.other.test" }]
             "agent.mcp[0].fs-read[0]",
             "the audit names the line the server's grant was written on"
         );
-        // It asked for nothing writable, so it inherits the agent's writes.
         assert_eq!(narrowed.fs_write.len(), agent.fs_write.len());
     }
 
@@ -276,7 +248,6 @@ net      = [{ host = "*.example.com" }, { host = "api.other.test" }]
         let grant = &agent.mcp[0];
         let narrowed = narrow(agent, &grant.reach, grant.rule.as_str()).unwrap();
         assert_eq!(narrowed.net.len(), 2);
-        // A host just outside the suffix is refused, which no wildcard may paper over.
         let text = format!(
             "{BASE}\nmcp = [{{ server = \"s\", tools = [\"t\"], net = [{{ host = \"badexample.com\" }}] }}]\n"
         );

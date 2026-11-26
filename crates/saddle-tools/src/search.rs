@@ -1,5 +1,3 @@
-//! guest-side traversal, globs and regex matching; host services supply only scoped data (D133).
-
 use globset::{GlobBuilder, GlobMatcher};
 use regex::RegexBuilder;
 use saddle_ignore::{FILES, Rules};
@@ -22,7 +20,6 @@ use serde_json::{Value, json};
 pub struct Find;
 pub struct Grep;
 
-/// the guest has no native filesystem; tests provide in-memory data through the same contract.
 pub trait Filesystem {
     fn directory(&mut self, root: &str, path: &str, after: &str) -> Result<DirectoryPage, String>;
     fn file(&mut self, root: &str, path: &str, maximum: usize) -> Result<FileRead, String>;
@@ -369,7 +366,6 @@ fn notes(text: &mut String, walked: &Walk) {
     }
 }
 
-/// finds names using only metadata and ignore-file bytes from the supplied service.
 pub fn find_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, String> {
     let args: FindArguments =
         serde_json::from_str(arguments).map_err(|error| format!("invalid arguments: {error}"))?;
@@ -405,7 +401,6 @@ pub fn find_with(arguments: &str, fs: &mut impl Filesystem) -> Result<String, St
     Ok(text)
 }
 
-/// searches bounded UTF-8 file contents; regular expressions and line formatting remain in guest code.
 pub fn grep_with<F: Filesystem>(arguments: &str, fs: &mut F) -> Result<String, String> {
     let args: GrepArguments =
         serde_json::from_str(arguments).map_err(|error| format!("invalid arguments: {error}"))?;

@@ -1,22 +1,3 @@
-//! The proxy a guest's network traffic reaches, and the only thing that decides it (D79).
-//!
-//! This module is the engine: given the bytes a guest sends and a way to ask the policy and open a
-//! connection, it decides the request and then carries the connection. It owns no sockets and
-//! borrows every decision, so the whole decision surface — what is allowed, what is refused, what
-//! the guest is told — is tested against in-memory pipes. The socket half is a thin adapter.
-//!
-//! Three dialects arrive, and each is decided on the name it carries:
-//!
-//! - a TLS handshake reaching loopback `:443`, whose name is in the server name extension;
-//! - a plaintext request on loopback `:80`, whose name is in the `Host` header;
-//! - the proxy protocol on its own port, whose name is in a `CONNECT` line or an absolute URL.
-//!
-//! A connection that reaches none of them names nothing, and is refused: a grant names a host, so
-//! an address on its own is not something a grant can match (D28, D40).
-//!
-//! A `CONNECT` tunnel is decided once, on its own line, and then carried unchanged. The handshake
-//! inside it is not read a second time, because it can only reach the host that was allowed.
-
 use crate::net;
 use std::io::{self, Read, Write};
 use std::thread;
@@ -27,46 +8,32 @@ use crate::net::client::Target;
 use crate::net::head::{self, Route};
 use crate::net::hello::{self, Peek};
 
-/// Bytes buffered while waiting for a request's first decision.
 const MAX_HEAD: usize = head::MAX_HEAD;
 
-/// Which dialect the relay says the guest is speaking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// A TLS connection to loopback `:443`, decided on its server name.
     Tls,
-    /// A plaintext request to loopback `:80`, decided on its `Host` header.
     Http,
-    /// The proxy protocol: `CONNECT`, an absolute URL, or origin form.
     Proxy,
-    /// named-launch proxy: CONNECT requests to port 22 use the SSH grant (D192).
     NamedProxy,
 }
 
-/// The other end of a connection the proxy opened on the guest's behalf.
 pub struct Upstream {
     pub reader: Box<dyn Read + Send>,
     pub writer: Box<dyn Write + Send>,
 }
 
-/// What the proxy needs from the rest of the program: a decision, and a connection.
 pub trait Peer {
-    /// Asks the policy about one request. `Err` carries the sentence to show, and the
-    /// implementation audits the decision, so a refusal here is recorded where the others are
-    /// (D10).
     fn decide(&mut self, req: &Request<'_>) -> Result<(), String>;
 
-    /// Opens a connection to the host and port the decision was made about.
     fn dial(&mut self, host: &str, port: u16) -> io::Result<Upstream>;
 }
 
-/// What was refused, for the tool result to report to the model.
 #[derive(Debug, Default)]
 pub struct Outcome {
     pub denials: Vec<String>,
 }
 
-/// Serves one guest connection until both directions close.
 pub fn serve(
     guest_read: &mut (impl Read + Send),
     guest_write: &mut (impl Write + Send),
@@ -89,8 +56,6 @@ pub fn serve(
         writer.write_all(&plan.first)?;
         writer.flush()?;
     }
-    // The two directions are independent, so each is copied in its own thread. The scope keeps
-    // them borrowed, so nothing has to outlive this call.
     thread::scope(|s| {
         s.spawn(|| copy(guest_read, &mut *writer));
         s.spawn(|| copy(&mut *reader, guest_write));
@@ -100,9 +65,7 @@ pub fn serve(
 
 struct Plan {
     upstream: Upstream,
-    /// Bytes already read from the guest, which belong upstream before anything else.
     first: Vec<u8>,
-    /// What the guest is told before the connection is carried, such as a `CONNECT` reply.
     reply: Option<Vec<u8>>,
 }
 
@@ -112,8 +75,6 @@ enum Step {
     Go(Plan),
 }
 
-/// Reads until the request can be decided, then decides it. `Ok(None)` means the guest was refused
-/// or went away, and there is nothing to carry.
 fn negotiate(
     guest_read: &mut (impl Read + Send),
     guest_write: &mut (impl Write + Send),
@@ -121,8 +82,6 @@ fn negotiate(
     peer: &mut dyn Peer,
     outcome: &mut Outcome,
 ) -> io::Result<Option<Plan>> {
-    // A TLS record's length field is 16 bits, so a handshake may legitimately need 64 KiB before
-    // its first decision; a request head may not.
     let cap = if mode == Mode::Tls {
         usize::from(u16::MAX) + 5
     } else {
@@ -163,7 +122,6 @@ fn negotiate(
     }
 }
 
-/// A TLS connection to loopback: its name is the server name extension, and nothing else.
 fn decide_tls(buf: &[u8], peer: &mut dyn Peer) -> io::Result<Step> {
     match hello::peek(buf) {
         Peek::Incomplete => Ok(Step::More),
@@ -176,7 +134,6 @@ fn decide_tls(buf: &[u8], peer: &mut dyn Peer) -> io::Result<Step> {
             };
             permit("tunnel", &target, &[], buf.to_vec(), peer)
         }
-        // The cover name in an Encrypted Client Hello proves nothing about the real one.
         Peek::Encrypted => Ok(Step::Refuse(
             "the TLS handshake hid its server name (Encrypted Client Hello), so no grant can be \
              checked against it"
@@ -193,7 +150,6 @@ fn decide_tls(buf: &[u8], peer: &mut dyn Peer) -> io::Result<Step> {
     }
 }
 
-/// A plaintext request: a `CONNECT` line, an absolute URL, or an origin-form `Host` header.
 fn decide_http(buf: &[u8], mode: Mode, peer: &mut dyn Peer) -> io::Result<Step> {
     match head::route(buf) {
         Route::Incomplete => Ok(Step::More),
@@ -227,7 +183,6 @@ fn decide_http(buf: &[u8], mode: Mode, peer: &mut dyn Peer) -> io::Result<Step> 
     }
 }
 
-/// Asks the policy, then opens the connection the request named.
 fn permit(
     method: &str,
     target: &Target,
@@ -259,8 +214,6 @@ fn permit(
     }
 }
 
-/// Tells the guest what happened, where the dialect allows saying it. A TLS guest cannot be told
-/// anything without a certificate, so it is simply closed.
 fn refuse(mode: Mode, guest_write: &mut (impl Write + Send), why: &str) -> io::Result<()> {
     if mode == Mode::Tls {
         return Ok(());
@@ -274,7 +227,6 @@ fn refuse(mode: Mode, guest_write: &mut (impl Write + Send), why: &str) -> io::R
     guest_write.flush()
 }
 
-/// The method at the start of the request line, as the audit record spells it.
 fn method_of(buf: &[u8]) -> String {
     let end = buf
         .iter()
@@ -298,7 +250,6 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    /// An in-memory connection: bytes waiting to be read, and bytes the other side wrote.
     #[derive(Clone, Default)]
     struct Wire {
         inbound: Arc<Mutex<(Vec<u8>, usize)>>,
@@ -353,9 +304,7 @@ mod tests {
         allowed: Result<(), String>,
         decided: Vec<String>,
         dialled: Vec<String>,
-        /// What the far end says once the connection opens.
         reply: &'static [u8],
-        /// The guest's side of every connection that was opened, for checking what went out.
         opened: Vec<Wire>,
     }
 
@@ -401,8 +350,6 @@ mod tests {
     }
 
     fn client_hello(name: Option<&str>, ech: bool) -> Vec<u8> {
-        // Built here rather than by a helper shared with the parser: a test that reuses the
-        // parser's own idea of the format would pass even if both were wrong.
         let mut exts = Vec::new();
         if let Some(name) = name {
             let mut list = vec![0u8];
@@ -435,7 +382,6 @@ mod tests {
         record
     }
 
-    /// Serves `guest` bytes through the proxy and reports what the guest was told.
     fn run(mode: Mode, guest: &[u8], peer: &mut Fake) -> (Outcome, String) {
         let wire = Wire::with(guest);
         let mut read = wire.read_half();
@@ -512,7 +458,6 @@ mod tests {
     fn a_hello_split_across_reads_is_still_read() {
         let hello = client_hello(Some("crates.io"), false);
         let mut peer = Fake::allowing();
-        // One byte at a time is the worst case the buffer has to survive.
         let wire = Wire::with(&hello);
         let mut read = Split(Reader(wire.clone()), 1);
         let mut write = wire.write_half();

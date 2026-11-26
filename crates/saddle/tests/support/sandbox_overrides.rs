@@ -1,5 +1,3 @@
-//! real command confinement and workspace isolation for sandbox list operators (D157).
-
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::process::{Command, Output};
@@ -85,7 +83,6 @@ fn sandbox_lists_share_workspace_overrides_without_changing_root_grants() {
             &json!({"command":format!("printf x > '{}/other'",one.display())}).to_string(),
         ]);
         assert!(!other.status.success());
-        // The same global configuration and session id do not lend another workspace this claim.
         let other_workspace = tempfile::tempdir().unwrap();
         let isolated = Command::new(env!("CARGO_BIN_EXE_saddle"))
             .arg("-C")
@@ -100,7 +97,6 @@ fn sandbox_lists_share_workspace_overrides_without_changing_root_grants() {
         assert!(!isolated.status.success());
         assert!(!extra.join("isolated").exists());
     }
-    // A bare command path does not become a file-tool root or lend a D66 tool role.
     let read = env.saddle(&[
         "--session",
         "chosen",

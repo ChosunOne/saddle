@@ -1,6 +1,3 @@
-//! Runs probes inside the real sandbox. The probe is this test binary itself, re-run with
-//! `PROBE` set, so the tests depend on nothing but the kernel.
-
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
@@ -25,15 +22,12 @@ const PROBE: &str = "SADDLE_SANDBOX_PROBE";
 const MARK: &str = "probe-result:";
 static NEVER: AtomicBool = AtomicBool::new(false);
 
-/// The probe side. Does nothing unless started by one of the tests below.
 #[test]
 fn probe() {
     let Ok(action) = env::var(PROBE) else {
         return;
     };
     let (verb, arg) = action.split_once(':').unwrap_or((action.as_str(), ""));
-    // A command the host holds a conversation with answers every line it is given, which is what
-    // proves a spawned child kept its own stdin and stdout (D106).
     if verb == "chat" {
         let mut out = io::stdout();
         for line in io::stdin().lines() {
@@ -137,8 +131,6 @@ impl Fixture {
 
 #[test]
 fn a_spawned_command_keeps_its_own_stdin_and_stdout() {
-    // D106: the spec rides on fd 3 so fd 0 and fd 1 belong to the command, which is what lets
-    // saddle speak a protocol to it instead of only running it to completion.
     if !sandbox_available() {
         return;
     }
@@ -151,8 +143,6 @@ fn a_spawned_command_keeps_its_own_stdin_and_stdout() {
     for word in ["one", "two"] {
         writeln!(stdin, "{word}").unwrap();
         stdin.flush().unwrap();
-        // The test binary says a few lines of its own first, so the answer is the line carrying
-        // the marker rather than the next one.
         let mut answer = None;
         for line in lines.by_ref() {
             if let Some((_, said)) = line.unwrap().split_once(MARK) {
@@ -213,7 +203,6 @@ fn writes_only_writable_paths() {
         f.probe(&format!("write:{}", f.granted.path().join("new").display())),
         EACCES
     );
-    // ABI 3: truncation of a read-only file is refused as well.
     assert_eq!(
         f.probe(&format!(
             "truncate:{}",
@@ -231,8 +220,6 @@ fn no_network_of_any_family() {
     }
     let f = Fixture::new();
     let sock = f.writable.path().join("agent.sock");
-    // Inside another saddle sandbox (the agent running this suite) the fixture itself cannot
-    // create a Unix socket; the TCP probes still run.
     let listener = match UnixListener::bind(&sock) {
         Ok(l) => Some(l),
         Err(e) if e.raw_os_error() == Some(libc::EPERM) => None,
@@ -250,7 +237,6 @@ fn environment_is_exactly_the_spec() {
     if !sandbox_available() {
         return;
     }
-    // SAFETY: tests in this binary do not read this variable concurrently.
     unsafe { env::set_var("SADDLE_TEST_SECRET", "hunter2") };
     let f = Fixture::new();
     let mut names: Vec<String> = f
@@ -260,7 +246,6 @@ fn environment_is_exactly_the_spec() {
         .map(str::to_owned)
         .collect();
     names.sort();
-    // libtest may add RUST_* variables of its own; nothing from the host may appear.
     names.retain(|n| !n.starts_with("RUST_"));
     assert_eq!(names, ["PATH", PROBE]);
 }

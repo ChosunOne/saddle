@@ -1,5 +1,3 @@
-//! real hook-only SDK components through the session policy and both disjoint channels (D155).
-
 use std::fs;
 use std::io::Write;
 use std::process::{Output, Stdio};
@@ -188,7 +186,6 @@ fn same_hook_artifact_gains_and_loses_external_access_across_reload() {
         "sandbox".into(),
         TomlValue::try_from(json!({"read":[{"path":external.path(),"tools":["read"]}]})).unwrap(),
     );
-    // The external declaration exists, but no tool role is delegated initially.
     initial["plugin"]["hooks"]
         .as_table_mut()
         .unwrap()
@@ -369,7 +366,6 @@ fn workspace_sandbox_overrides_enable_revoke_and_keep_invalid_reloads_atomic() {
         "tool-read".into(),
         TomlValue::try_from(json!({"tools":["read"]})).unwrap(),
     );
-    // Keep the parent read role available without declaring the external directory yet.
     table.insert(
         "sandbox".into(),
         TomlValue::try_from(json!({"read":[{"path":env.ws.path(),"tools":["read"]}]})).unwrap(),

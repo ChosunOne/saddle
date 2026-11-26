@@ -1,9 +1,5 @@
-//! The /settings dialog. Each row shows a setting's current value; enter changes it, and the
-//! controller saves the change to config.toml and applies it to the running session.
-
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-/// Reasoning effort levels, in the order enter cycles through them. `None` sends nothing.
 pub const EFFORTS: [Option<&str>; 4] = [None, Some("low"), Some("medium"), Some("high")];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,21 +21,15 @@ pub enum Setting {
     Permissions,
 }
 
-/// Current values, gathered by the controller each time the dialog opens or changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Values {
-    /// Empty when no provider is chosen.
     pub provider: String,
     pub model: String,
     pub effort: Option<String>,
     pub max_tokens: Option<u32>,
-    /// `None` uses the window the provider, the cache or the table says this model takes (D34).
     pub context_window: Option<u64>,
-    /// The window in force while `context_window` is unset, for the dialog to show.
     pub window: u64,
-    /// The status line as set, or the default (D36).
     pub status: String,
-    /// `None` is no limit (D37).
     pub max_steps: Option<usize>,
     pub auto_compact: bool,
     pub idle_compact: bool,
@@ -57,9 +47,7 @@ pub enum Change {
     Effort(Option<String>),
     MaxTokens(Option<u32>),
     ContextWindow(Option<u32>),
-    /// The status line template; `None` returns to the default (D36).
     StatusLine(Option<String>),
-    /// `None` returns to the default.
     MaxSteps(Option<usize>),
     AutoCompact(bool),
     IdleCompact(bool),
@@ -68,7 +56,6 @@ pub enum Change {
     ExpandTools(bool),
     EditConfig,
     EditPolicy,
-    /// Opens the permissions editor for this project (D45).
     OpenPermissions,
 }
 
@@ -82,7 +69,6 @@ pub enum SettingsOutcome {
 pub struct SettingsDialog {
     pub values: Values,
     pub selected: usize,
-    /// The text being typed into a number setting.
     pub editing: Option<String>,
     pub error: Option<String>,
 }
@@ -126,7 +112,6 @@ impl Setting {
         }
     }
 
-    /// What enter does, shown under the list for the selected row.
     pub fn help(self) -> &'static str {
         match self {
             Setting::Provider => "enter opens /login to choose a provider or add a key",
@@ -208,8 +193,6 @@ impl SettingsDialog {
             Setting::BackgroundCompact => on_off(v.background_compact),
             Setting::ShowReasoning => on_off(v.show_reasoning),
             Setting::ExpandTools => on_off(v.expand_tools),
-            // The value column says what the row does, since the grants themselves are a screen
-            // of their own.
             Setting::Permissions => "open the editor".into(),
             Setting::EditConfig => v.config_path.clone(),
             Setting::EditPolicy => v.policy_path.clone(),
@@ -221,7 +204,6 @@ impl SettingsDialog {
             return SettingsOutcome::Stay;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        // The status line is the one setting edited as text; the others take digits only.
         let text_mode = self.current() == Setting::StatusLine;
         if let Some(text) = &mut self.editing {
             match key.code {
@@ -302,7 +284,6 @@ impl SettingsDialog {
 
     fn finish_edit(&mut self) -> SettingsOutcome {
         let text = self.editing.take().unwrap_or_default();
-        // The status line is text, not a number: it is checked when it is saved.
         if self.current() == Setting::StatusLine {
             let text = text.trim().to_owned();
             return SettingsOutcome::Apply(Change::StatusLine((!text.is_empty()).then_some(text)));
@@ -376,7 +357,6 @@ mod tests {
             press(&mut d, KeyCode::Enter),
             SettingsOutcome::Apply(Change::MaxSteps(Some(12)))
         );
-        // Emptying it asks for no limit again.
         go_to(&mut d, Setting::MaxSteps);
         press(&mut d, KeyCode::Enter);
         for _ in 0..2 {
@@ -408,7 +388,6 @@ mod tests {
             press(&mut d, KeyCode::Enter),
             SettingsOutcome::Apply(Change::StatusLine(Some("{percent} of {window}".into())))
         );
-        // An empty prompt asks for the default rather than for an empty line.
         go_to(&mut d, Setting::StatusLine);
         press(&mut d, KeyCode::Enter);
         for _ in 0..d.editing.clone().unwrap().chars().count() {
@@ -459,7 +438,6 @@ mod tests {
 
     #[test]
     fn the_compaction_toggles_are_reachable_from_the_dialog() {
-        // D77 and D78 are config keys a person should not have to know about to find.
         for (setting, want) in [
             (Setting::AutoCompact, Change::AutoCompact(false)),
             (Setting::IdleCompact, Change::IdleCompact(false)),
@@ -470,7 +448,6 @@ mod tests {
             assert_eq!(d.value(setting), "on", "on by default");
             assert_eq!(press(&mut d, KeyCode::Enter), SettingsOutcome::Apply(want));
         }
-        // And each says what it does, rather than only its name.
         assert!(Setting::IdleCompact.help().contains("half full"));
         assert!(Setting::BackgroundCompact.help().contains("three quarters"));
     }

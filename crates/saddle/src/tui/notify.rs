@@ -1,39 +1,24 @@
-//! D164: the end of a turn the person is not watching is announced, with the terminal's bell or a
-//! desktop notification the terminal draws itself.
-//!
-//! Whether the person is watching is the terminal's focus, which it reports once mode 1004 is on.
-//! A terminal that has not reported it is treated as unfocused: one that never reports would
-//! otherwise never announce anything, and an extra bell is the cheaper mistake.
-
 use crate::agent::End;
 use serde::Deserialize;
 
-/// `[ui] notify`: how the end of a turn is announced.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Notify {
     Off,
-    /// BEL. Every terminal accepts it; most mark the tab or window, and some play a sound.
     #[default]
     Bell,
-    /// OSC 9, a desktop notification in iTerm2, WezTerm, Ghostty and kitty.
     Osc9,
-    /// OSC 777, a desktop notification in foot and Ghostty.
     Osc777,
 }
 
-/// What the event loop knows about the terminal's focus.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Focus {
-    /// The terminal has not said, which may mean it never will.
     #[default]
     Unknown,
     In,
     Out,
 }
 
-/// What to say when a turn ends this way, or `None` when nothing should be said: a cancelled turn
-/// was cancelled by the person, who is therefore watching.
 pub fn ended(end: End) -> Option<&'static str> {
     match end {
         End::Cancelled => None,
@@ -46,9 +31,6 @@ pub fn ended(end: End) -> Option<&'static str> {
     }
 }
 
-/// The bytes that announce `message` under `title`, or `None` when the setting is off or the
-/// terminal is focused. Under tmux an OSC goes through tmux's passthrough; the bell needs none,
-/// because tmux passes a pane's bell on by itself.
 pub fn sequence(
     how: Notify,
     focus: Focus,
@@ -59,7 +41,6 @@ pub fn sequence(
     if focus == Focus::In {
         return None;
     }
-    // OSC 777 separates the title from the body with `;`, so the title cannot carry one.
     let title = clean(title).replace(';', ",");
     let message = clean(message);
     match how {
@@ -73,8 +54,6 @@ pub fn sequence(
     }
 }
 
-/// tmux forwards an escape sequence to the outer terminal only inside one of its own, with every
-/// ESC inside doubled.
 pub fn passthrough(sequence: &str, tmux: bool) -> String {
     if tmux {
         format!("\x1bPtmux;{}\x1b\\", sequence.replace('\x1b', "\x1b\x1b"))
@@ -83,8 +62,6 @@ pub fn passthrough(sequence: &str, tmux: bool) -> String {
     }
 }
 
-/// The text without control characters, so a workspace name cannot end the sequence early or
-/// start another one.
 fn clean(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).collect()
 }

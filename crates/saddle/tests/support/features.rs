@@ -1,5 +1,3 @@
-//! typed extension services through a real, digest-pinned SDK component (D156).
-
 use std::fs;
 use std::io::{Read, Write};
 use std::mem;

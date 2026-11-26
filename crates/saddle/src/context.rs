@@ -1,11 +1,3 @@
-//! Instruction files (D32). The global AGENTS.md comes first, then each directory from the
-//! workspace root down to the start directory: its AGENTS.md (or CLAUDE.md where there is no
-//! AGENTS.md), then its AGENTS.local.md. More specific files come later, so they have the last
-//! word. Nothing above the workspace is read: it is outside every root the policy grants.
-//!
-//! Project files are read through the policy as the agent, like the read tool, so a file the
-//! agent may not read (or a symlink leading out of the workspace) never reaches the prompt.
-
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,12 +13,10 @@ use crate::file_read::read_text;
 use crate::paths::Paths;
 use crate::session::Session;
 
-/// Bytes of one file that go into the prompt; the rest is cut with a note.
 pub const MAX_FILE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextFile {
-    /// Shown to the user and the model: workspace-relative, or `~/`-relative for the global file.
     pub label: String,
     pub text: String,
 }
@@ -64,8 +54,6 @@ pub(crate) fn cap(mut text: String) -> String {
     text
 }
 
-/// The global file to use: the configured or default AGENTS.md, or `~/.claude/CLAUDE.md` when that
-/// does not exist and the fallback is on.
 pub fn global_file(cfg: &ContextConfig, paths: &Paths) -> Option<PathBuf> {
     let agents = match cfg.global.as_deref() {
         Some("") => return None,
@@ -79,7 +67,6 @@ pub fn global_file(cfg: &ContextConfig, paths: &Paths) -> Option<PathBuf> {
     (cfg.claude_fallback.unwrap_or(true) && claude.is_file()).then_some(claude)
 }
 
-/// The workspace-relative directories from the root down to `start`.
 pub(crate) fn directories(workspace: &Path, start: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![PathBuf::new()];
     if let Ok(rel) = start.strip_prefix(workspace) {
@@ -92,8 +79,6 @@ pub(crate) fn directories(workspace: &Path, start: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Loads the files, records them in the audit log, and returns them with notes for the user
-/// about any that were refused.
 pub fn load(
     session: &mut Session,
     cfg: &ContextConfig,

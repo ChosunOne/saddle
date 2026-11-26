@@ -1,21 +1,12 @@
-//! The `/theme` list: every theme by name, drawn in the theme it offers (D74).
-//!
-//! A theme is chosen by looking at it, so the list is a picker rather than a printed set of names:
-//! the highlighted entry is applied to the whole screen as the selection moves, and escape puts back
-//! what was there. Enter is what makes the choice stick, by writing it to `config.toml`.
-
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::tui::theme::{Appearance, Theme, ThemeTables, build, builtin_names};
 
-/// How many entries are on screen at once; the rest scroll, as the message tree does.
 pub const ROWS: usize = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// A theme that ships with this build.
     Builtin,
-    /// A `[themes.<name>]` table in `config.toml`.
     Config,
 }
 
@@ -32,13 +23,10 @@ impl Source {
 pub struct Entry {
     pub name: String,
     pub source: Source,
-    /// The theme as it builds, or why it does not: a broken palette stays in the list, so the
-    /// mistake is visible where it was made instead of only at startup.
     pub theme: Result<Theme, String>,
 }
 
 impl Entry {
-    /// What the list says about the entry beyond its name.
     pub fn note(&self) -> String {
         match &self.theme {
             Ok(theme) => match theme.appearance {
@@ -53,21 +41,17 @@ impl Entry {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Stay,
-    /// Escape: put back the theme that was in force when the list opened.
     Cancel,
-    /// Enter: keep the highlighted theme and save it.
     Choose(String),
 }
 
 pub struct ThemePicker {
     pub entries: Vec<Entry>,
     pub selected: usize,
-    /// The theme in force before the list opened, by name, so escape can name it in a note.
     pub original: String,
 }
 
 impl ThemePicker {
-    /// Every theme this build can show, the one in force first so the list opens on it (D74).
     pub fn collect(tables: &ThemeTables, current: &str) -> Self {
         let mut names: Vec<(String, Source)> = builtin_names()
             .into_iter()
@@ -75,8 +59,6 @@ impl ThemePicker {
             .collect();
         for name in tables.keys() {
             match names.iter_mut().find(|(n, _)| n == name) {
-                // A `[themes.mono]` table overrides the built-in rather than duplicating it, and the
-                // list must say so: `config.toml` is where that theme is now edited.
                 Some((_, source)) => *source = Source::Config,
                 None => names.push((name.clone(), Source::Config)),
             }
@@ -92,8 +74,6 @@ impl ThemePicker {
                 }
             })
             .collect();
-        // Open on the theme in force, so the first thing seen is where you are. A pair
-        // (`light/dark`) has no entry of its own: the half in force is the one to stand on.
         let selected = entries
             .iter()
             .position(|e| e.name == current)
@@ -110,12 +90,10 @@ impl ThemePicker {
         &self.entries[self.selected]
     }
 
-    /// The theme to draw with while this entry is highlighted, if it builds.
     pub fn preview(&self) -> Option<&Theme> {
         self.current().theme.as_ref().ok()
     }
 
-    /// The first entry drawn, kept so the selection is always on screen.
     pub fn offset(&self) -> usize {
         let last = self.entries.len().saturating_sub(1);
         if self.selected < ROWS {
@@ -141,7 +119,6 @@ impl ThemePicker {
             KeyCode::Home => self.selected = 0,
             KeyCode::End => self.selected = last,
             KeyCode::Enter | KeyCode::Char(' ') => {
-                // A theme that does not build cannot be chosen; the reason is already on screen.
                 return match &self.current().theme {
                     Ok(_) => Outcome::Choose(self.current().name.clone()),
                     Err(_) => Outcome::Stay,
@@ -158,7 +135,6 @@ mod tests {
     use super::*;
     use crate::tui::catppuccin;
 
-    /// `ThemeTables` is the contents of `[themes]`, so these are the tables inside it.
     fn tables(text: &str) -> ThemeTables {
         toml::from_str(text).unwrap()
     }
@@ -176,7 +152,6 @@ mod tests {
         }
         assert!(names.contains(&"mine"), "{names:?}");
         assert!(names.contains(&"other"), "{names:?}");
-        // No name twice, even when a table shadows a built-in.
         let mut sorted = names.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -195,8 +170,6 @@ mod tests {
     fn the_list_opens_on_the_theme_in_force() {
         let p = ThemePicker::collect(&tables(""), "light");
         assert_eq!(p.current().name, "light");
-        // A name that is not in the list (a pair, or a theme since deleted) opens on the first
-        // entry that can be drawn rather than on nothing.
         let p = ThemePicker::collect(&tables(""), "light/dark");
         assert!(p.preview().is_some(), "opened on a theme that builds");
     }
@@ -211,7 +184,6 @@ mod tests {
         let chosen = p.current().name.clone();
         assert_eq!(press(&mut p, KeyCode::Enter), Outcome::Choose(chosen));
         assert_eq!(press(&mut p, KeyCode::Esc), Outcome::Cancel);
-        // The ends are ends, not wrap-arounds: a list you can overshoot by holding a key is worse.
         press(&mut p, KeyCode::Up);
         press(&mut p, KeyCode::Up);
         press(&mut p, KeyCode::Up);
@@ -224,7 +196,6 @@ mod tests {
 
     #[test]
     fn a_theme_that_does_not_build_stays_in_the_list_and_cannot_be_chosen() {
-        // A broken palette is a mistake to be shown, not hidden: it is where the person made it.
         let mut p =
             ThemePicker::collect(&tables("[broken]\naccent = \"not-a-colour\"\n"), "default");
         let at = p.entries.iter().position(|e| e.name == "broken").unwrap();
@@ -261,8 +232,6 @@ mod tests {
 
     #[test]
     fn the_catppuccin_flavours_are_offered_and_say_which_terminal_they_want() {
-        // A flavour is picked by looking at it, so it has to be in the list, and the note has to
-        // say which kind of terminal it belongs on — Latte on a dark terminal is unreadable (D76).
         let p = ThemePicker::collect(&tables(""), "default");
         for name in catppuccin::NAMES {
             let entry = p

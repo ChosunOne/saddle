@@ -1,14 +1,9 @@
-//! OpenAI's published standard API prices and ChatGPT plan windows (D93).
-
 use std::time::{Duration, UNIX_EPOCH};
 
 use serde_json::Value;
 
 use super::{Auth, Price, ProviderConfig, Quota, QuotaWindow};
 
-/// Published API rates, never subscription charges or a guess for a compatible server.
-/// Source: https://developers.openai.com/api/docs/pricing.md, checked 2026-11-13.
-/// Tiered long-context models are omitted until accounting can select their price per request.
 pub fn price(config: &ProviderConfig) -> Option<Price> {
     if config.auth != Auth::ApiKey
         || config.base_url.trim_end_matches('/') != "https://api.openai.com/v1"
@@ -55,11 +50,9 @@ pub fn price(config: &ProviderConfig) -> Option<Price> {
 
 fn stamp(seconds: u64) -> Option<String> {
     let at = UNIX_EPOCH.checked_add(Duration::from_secs(seconds))?;
-    // Avoid a timestamp outside the range the display's RFC3339 parser accepts.
     (seconds < 253_402_300_800).then(|| humantime::format_rfc3339_seconds(at).to_string())
 }
 
-/// The WHAM usage response: used_percent is not the remaining allowance.
 pub fn quota(page: &Value) -> Option<Quota> {
     let limits = page.get("rate_limit")?;
     let mut windows = Vec::new();

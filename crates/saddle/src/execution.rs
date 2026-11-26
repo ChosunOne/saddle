@@ -1,5 +1,3 @@
-//! attributed subprocess effects and shared execution limits (D142, D152, D153, D185).
-
 use saddle_limits as budgets;
 use std::env::{self, join_paths};
 use std::io;
@@ -26,7 +24,6 @@ use crate::{cancel, tasks};
 
 pub const HELPER_ARG: &str = "__sandbox";
 
-/// holds the lowered sandbox and resource bounds for one launch.
 pub struct Prepared {
     pub spec: SandboxSpec,
     deadline: Instant,
@@ -37,7 +34,6 @@ pub struct Completed {
     output: io::Result<Output>,
 }
 
-/// one lowering for foreground and background execution; no second policy or sandbox source.
 pub fn prepare(
     session: &mut Session,
     who: &Principal,
@@ -103,7 +99,6 @@ pub fn prepare(
 }
 
 impl Prepared {
-    /// process cleanup runs on the monitor, even while the model is busy.
     pub fn run(
         self,
         cancel: &AtomicBool,
@@ -185,8 +180,6 @@ pub fn execute(
     if let Some(bridge) = &bridge {
         prepared.spec.net = Some(bridge.spec());
     }
-    // A command ends for either reason: the person cancelled the turn in this process, or the
-    // session running it was told to stop (a worker's interrupt or stop, D195).
     let stop = AtomicBool::new(cancel::FLAG.load(Ordering::Relaxed));
     let session_cancel = session.cancel.clone();
     let mut denials = Vec::new();
@@ -232,7 +225,6 @@ pub fn execute(
     Ok(Ok(reply))
 }
 
-/// authorizes and runs one protected profile, without borrowing ordinary shell authority (D184).
 pub fn launch(
     session: &mut Session,
     who: &Principal,
@@ -286,8 +278,6 @@ pub fn launch(
     {
         return Ok(Err("named launch exceeds argument bounds".into()));
     }
-    // Bound trusted executable and runtime claims against ordinary user-configured write reach.
-    // All writable roots are included, even if this profile or caller doesn't hold fs-write.
     let claim_paths = |paths: Vec<PathBuf>| {
         paths
             .into_iter()
@@ -326,7 +316,6 @@ pub fn launch(
     } else {
         Vec::new()
     };
-    // The lookup path is only a convenience. Landlock grants execute on exact pinned files.
     let path = if helpers.is_empty() {
         String::new()
     } else {
@@ -365,10 +354,6 @@ pub fn launch(
     } else {
         None
     };
-    // D184: a launch starts where its relative paths belong. For a profile that claims the
-    // workspace — the default, read (D190) or write (D193) — that is the checkout itself, so a
-    // repository tool finds its repository without being told a path. A profile that claims
-    // neither starts in the private launch directory instead, rather than in a tree it cannot open.
     let cwd = if profile.read_workspace || profile.write_workspace {
         session.setup.workspace.clone()
     } else {
@@ -378,16 +363,12 @@ pub fn launch(
         argv: [program.to_owned()].into_iter().chain(argv).collect(),
         cwd,
         env: environment,
-        // D190: the workspace is a read claim of the named launch only. The helper still
-        // opens it without symlink traversal and checks for protected-path overlap.
         read: profile
             .read
             .iter()
             .chain(profile.read_workspace.then_some(&session.setup.workspace))
             .cloned()
             .collect(),
-        // D193: the workspace is writable by default. Landlock cannot carve a path out of a
-        // granted root, so file-tool exclusions do not narrow this claim.
         write: profile
             .write_workspace
             .then(|| session.setup.workspace.clone())
@@ -402,8 +383,6 @@ pub fn launch(
         }),
     };
     let helper = env::current_exe().context("locating the saddle binary")?;
-    // A command ends for either reason: the person cancelled the turn in this process, or the
-    // session running it was told to stop (a worker's interrupt or stop, D195).
     let stop = AtomicBool::new(cancel::FLAG.load(Ordering::Relaxed));
     let session_cancel = session.cancel.clone();
     let mut denials = Vec::new();

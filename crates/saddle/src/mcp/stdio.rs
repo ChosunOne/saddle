@@ -1,8 +1,3 @@
-//! D107: the stdio transport. A declared command is started under the same sandbox a `bash`
-//! command gets (D106), and spoken to with JSON-RPC over its stdin and stdout. The command's stderr
-//! is drained into a bounded tail, never mixed into the protocol, and quoted only when something
-//! failed: "exited with status 1" without the reason is the message that costs an hour.
-
 use crate::mcp::host;
 use crate::tools;
 use crate::tools::timeout;
@@ -25,18 +20,12 @@ use serde_json::{Value, json};
 
 use crate::mcp::protocol::{self, Message, Reply};
 
-/// How long one reply may take before the server is treated as broken. A handshake that silently
-/// never arrives is a stall rather than an error (D106), so this is not optional.
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How often a waiting caller is asked to service the network relay, so a server that opens a
-/// connection while it starts is answered rather than left hanging.
 const POLL: Duration = Duration::from_millis(20);
 
-/// How much of the server's stderr is kept for the error message.
 const STDERR_TAIL: usize = 4096;
 
-/// One tool a server offers, as it describes itself.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tool {
     pub name: String,
@@ -44,7 +33,6 @@ pub struct Tool {
     pub schema: Value,
 }
 
-/// One running server.
 pub struct Client {
     name: String,
     child: Child,
@@ -54,14 +42,11 @@ pub struct Client {
     stderr: Arc<Mutex<Vec<u8>>>,
     next: u64,
     timeout: Duration,
-    /// What `roots/list` is answered with, handed in because this client has no session (D114).
     roots: Vec<Value>,
-    /// The server said its tool list changed, so the catalogue it gave earlier is not the truth.
     stale: bool,
 }
 
 impl Client {
-    /// Starts a server under the sandbox spec its grant was lowered to (D105, D106).
     pub fn start(
         name: &str,
         helper: &Path,
@@ -69,8 +54,6 @@ impl Client {
         timeout: Duration,
         roots: Vec<Value>,
     ) -> Result<Self> {
-        // The helper is this binary, re-executed: without its argument it would run the CLI
-        // instead of applying the sandbox.
         let child = saddle_sandbox::spawn(helper, &[tools::HELPER_ARG], spec)
             .with_context(|| format!("starting the `{name}` server"))?;
         let mut client = Self::from_child(name, child)?;
@@ -79,13 +62,9 @@ impl Client {
         Ok(client)
     }
 
-    /// A client over any child with piped stdio, sandboxed or not. The tests use this so the
-    /// protocol is checked without needing landlock.
     pub fn from_child(name: &str, mut child: Child) -> Result<Self> {
         let stdin = child.stdin.take().context("the server has no stdin")?;
-        // Pipe writes must not bypass a deadline when a server stops reading (D152).
         let fd = stdin.as_raw_fd();
-        // SAFETY: fd is a live pipe owned by stdin; fcntl changes only its status flags.
         let nonblocking = unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
@@ -99,14 +78,9 @@ impl Client {
         let stdout = child.stdout.take().context("the server has no stdout")?;
         let stderr = child.stderr.take().context("the server has no stderr")?;
         let (tx, messages) = channel();
-        // The pipes are read on their own thread so the caller can service the relay while it
-        // waits, and so a server that writes a lot of stderr cannot fill a pipe and deadlock.
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
-                // Everything the server says goes to the waiter, including the requests it makes
-                // of us: a request answered only by someone who happened to be reading would be
-                // answered by nobody (D114).
                 if let Some(parsed) = protocol::message(&line)
                     && tx.send(parsed).is_err()
                 {
@@ -148,18 +122,14 @@ impl Client {
         })
     }
 
-    /// Whether the server has said its catalogue changed since it was read (D114).
     pub fn stale(&self) -> bool {
         self.stale
     }
 
-    /// Forgets a stale catalogue once it has been read again.
     pub fn refreshed(&mut self) {
         self.stale = false;
     }
 
-    /// The handshake, and the notification that says this client is ready. `service` runs whenever
-    /// the caller is waiting, which is when the server may be asking the relay for a connection.
     pub fn initialize(&mut self, service: &mut dyn FnMut()) -> Result<Value> {
         let result = self.request(
             "initialize",
@@ -177,8 +147,6 @@ impl Client {
         Ok(result)
     }
 
-    /// What the server says it offers. Nothing here decides what the model may call: that is the
-    /// grant (D103).
     pub fn tools(&mut self, service: &mut dyn FnMut()) -> Result<Vec<Tool>> {
         let result = self.request("tools/list", json!({}), service)?;
         let list = result
@@ -202,8 +170,6 @@ impl Client {
             .collect())
     }
 
-    /// Calls one tool. `Ok(false, _)` means the call failed on the server's own terms (`isError`),
-    /// which is the model's problem rather than the host's.
     pub fn call(
         &mut self,
         tool: &str,
@@ -258,7 +224,6 @@ impl Client {
         let id = self.next;
         self.send_until(&protocol::request(id, method, params.clone()), deadline)?;
         loop {
-            // Check on every iteration, including when a server floods unrelated messages.
             if Instant::now() >= deadline {
                 let (name, secs) = (self.name.clone(), allowance.as_secs_f64());
                 self.close();
@@ -277,23 +242,17 @@ impl Client {
                 })) if answered == id => {
                     return result.map_err(|why| anyhow!("`{}`: {why}", self.name));
                 }
-                // A request of the server's own: answered here, because this is the only place
-                // holding the pipe it must go back down (D114). The session is out of reach in a
-                // `service` closure, so the answer comes from what the client was given.
                 Ok(Message::Request { id, method, .. }) => {
                     let reply = host::answer(&self.roots, &method);
                     self.send_until(&protocol::response(id, reply), deadline)?;
                     continue;
                 }
                 Ok(Message::Notification { method }) => {
-                    // A server that changed its tool list mid-session: noticed, and re-read when
-                    // the next search runs rather than trusting a stale catalogue (D114).
                     if method == "notifications/tools/list_changed" {
                         self.stale = true;
                     }
                     continue;
                 }
-                // A reply to something else: keep waiting for ours.
                 Ok(_) => continue,
                 Err(RecvTimeoutError::Timeout) => {
                     service();
@@ -309,7 +268,6 @@ impl Client {
         }
     }
 
-    /// What the server said before it stopped, for an error message that explains itself.
     fn why(&mut self) -> String {
         let tail = self
             .stderr
@@ -327,20 +285,15 @@ impl Client {
         }
     }
 
-    /// Ends the server and everything it started. The child has its own process group (D106), so a
-    /// negative pid reaches the group rather than only the process that speaks the protocol.
     pub fn close(&mut self) {
         if self.closed {
             return;
         }
         self.closed = true;
         let pid = self.child.id() as libc::pid_t;
-        // SAFETY: `pid` is the group leader this client started; the call has no other effect.
         unsafe {
             libc::kill(-pid, libc::SIGKILL);
         }
-        // The group kill does not reach a child that was started without its own group (the test
-        // path), and `wait` on a process still holding its stdin would block forever.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -352,8 +305,6 @@ impl Drop for Client {
     }
 }
 
-/// The text of a `CallToolResult`: its text blocks joined, and anything else named rather than
-/// dropped, so an image or a resource link is visible instead of silently missing (D108).
 fn content_text(result: &Value) -> String {
     let blocks = result
         .get("content")
@@ -394,7 +345,6 @@ fn content_text(result: &Value) -> String {
     out.join("\n")
 }
 
-/// A command with the pipes a client needs, for a caller that is not using the sandbox (tests).
 #[cfg(test)]
 fn piped(mut command: Command) -> Result<Child> {
     command
@@ -454,8 +404,6 @@ mod tests {
         assert!(client.child.try_wait().unwrap().is_some());
     }
 
-    /// A server that answers the two methods a session needs, in the order they are asked, so the
-    /// transport is checked without a sandbox or a real MCP implementation.
     const FAKE: &str = r#"
 while IFS= read -r line; do
   case "$line" in

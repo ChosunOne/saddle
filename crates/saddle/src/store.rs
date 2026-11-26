@@ -1,19 +1,3 @@
-//! Saved conversations, in an embedded database (D53).
-//!
-//! A conversation is a tree, not a list: `/fork` starts a new conversation from an earlier message,
-//! and the message it branched at can hold more than one continuation. A JSON Lines file per
-//! session cannot say that without copying everything, so the store is SQLite, one row per message
-//! with a parent pointer, and a per-session pointer at the message the conversation is up to. The
-//! path from the root to that pointer is what the model is sent; the other branches are kept.
-//!
-//! The database lives in the state directory, which is outside every root (D16), so the agent
-//! cannot read earlier conversations through its own tools. That is the same guarantee the files
-//! had. What is new is that a damaged write cannot take the conversation with it: SQLite commits a
-//! message or it does not, where a torn last line used to be possible.
-//!
-//! Older files are imported once, on first open: a working tree that had sessions before this
-//! change keeps them, in the same order, with their tokens and cost intact.
-
 use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
@@ -30,38 +14,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider::{Contribution, Item, Part, ToolCall, ToolResult, Usage, reasoning_text};
 
-/// What a node holds. Every node is one of these, and the kind is a column so a query can pick
-/// one out without parsing the body.
 mod kind {
-    /// One [`crate::provider::Item`], as JSON.
     pub const ITEM: &str = "item";
-    /// What one reply used and cost.
     pub const USAGE: &str = "usage";
-    /// The start of a turn: which audit log covers it.
     pub const TURN: &str = "turn";
-    /// A summary that replaced the items before it.
     pub const COMPACTION: &str = "compaction";
-    /// Tools an MCP search declared (D108, D109). Bookkeeping like `usage`, not conversation: it
-    /// is replayed as a declaration, never as a message.
     pub const DECLARED: &str = "declared";
 }
 
-/// Which provider and model a conversation was last working in (D91).
-///
-/// The model is a property of the conversation, not of `config.toml`: what a person switched to
-/// while working on this one is what it comes back on, and a default changed since — in this
-/// session or in another one — does not rewrite a conversation that already exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Model {
     pub provider: String,
     pub model: String,
 }
 
-/// What one model request used and what answered it (D94).
-///
-/// A turn makes one request per reply and a compaction makes one of its own; both are paid for, so
-/// both are recorded. The provider and model go with each one because a conversation can switch
-/// between them (D91), and a cache hit rate only means anything for the pair that answered.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request {
     pub kind: RequestKind,
@@ -69,19 +35,13 @@ pub struct Request {
     pub model: String,
     pub usage: Usage,
     pub cost: f64,
-    /// Reasoning items the provider said it removed from what it was sent (D97).
     pub dropped: u64,
-    /// How many of the output tokens were spent thinking (D99), or 0 when the provider says
-    /// nothing about it or has no split to give.
     pub reasoning_tokens: u64,
 }
 
-/// Which request a `usage` row is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {
-    /// The reply to the conversation.
     Reply,
-    /// A compaction's summary, which is a request the person paid for (D78).
     Summary,
     Plugin,
 }
@@ -96,7 +56,6 @@ impl RequestKind {
     }
 }
 
-/// One recorded request, as `session_query` reads it (D94).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestRow {
     pub node: i64,
@@ -105,41 +64,28 @@ pub struct RequestRow {
     pub model: String,
     pub usage: Usage,
     pub cost: f64,
-    /// Reasoning items the provider said it removed from the prompt (D97).
     pub dropped: u64,
-    /// How many of the output tokens were spent thinking (D99).
     pub reasoning_tokens: u64,
-    /// When the row was written, to the second.
     pub at: String,
-    /// The ordinal of the last message before this request, or 0 when it came first.
     pub after: usize,
 }
 
-/// One reasoning block, as `session_query` reads it (D98).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReasoningRow {
-    /// The ordinal of the message it belongs to, in the same space as `messages`, so the two join.
     pub ordinal: usize,
     pub node: i64,
-    /// Its position among that message's parts, so several blocks keep the order they arrived in.
     pub part: usize,
-    /// What the block says, not the block itself: an encrypted item has no row at all (D98).
     pub text: String,
 }
 
-/// What one `session_query` may see of one conversation: its branch's messages, the requests that
-/// produced them (D94), and what the model thought while producing them (D98).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
-    /// `(node, role, text)` per message on the branch, in order.
     pub messages: Vec<(i64, String, String)>,
     pub calls: Vec<CompletedCall>,
     pub requests: Vec<RequestRow>,
-    /// Reasoning in branch order, each row naming the message it belongs to.
     pub reasoning: Vec<ReasoningRow>,
 }
 
-/// a completed call paired with its host-attributed result on the saved branch (D194).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletedCall {
     pub node: i64,
@@ -150,16 +96,8 @@ pub struct CompletedCall {
     pub ok: bool,
 }
 
-/// The schema version this build writes. A database from a newer build is refused rather than
-/// guessed at, because a wrong guess here loses a conversation. Version 2 added `sessions.name`;
-/// version 3 added `sessions.worker`, which keeps a live worker's conversation out of `/resume`
-/// while leaving it readable by id (D195).
 const VERSION: u32 = 3;
 
-/// One `usage` row as the transcript tool reports it (D94).
-///
-/// A row written before the provider, model and kind were recorded still reads: what it cost is
-/// still true, and the parts it never had come back empty rather than being guessed at.
 fn request_row(node: &Node, after: usize) -> RequestRow {
     let body: serde_json::Value = serde_json::from_str(&node.body).unwrap_or_default();
     RequestRow {
@@ -170,8 +108,6 @@ fn request_row(node: &Node, after: usize) -> RequestRow {
         usage: serde_json::from_value(body["usage"].clone()).unwrap_or_default(),
         cost: body["cost"].as_f64().unwrap_or(0.0),
         dropped: body["dropped"].as_u64().unwrap_or(0),
-        // A row written before this was recorded reads as 0: unknown is not a claim that the
-        // model did no thinking (D99).
         reasoning_tokens: body["reasoning_tokens"].as_u64().unwrap_or(0),
         at: node.created.clone(),
         after,
@@ -182,24 +118,17 @@ fn now() -> String {
     humantime::format_rfc3339_seconds(SystemTime::now()).to_string()
 }
 
-/// A saved conversation, opened for reading or appending.
-///
-/// Two of these can point at the same file: the agent thread appends while the UI thread lists.
-/// That is what SQLite is for, and it is why the store takes no lock of its own.
 pub struct Store {
     conn: Connection,
     pub workspace: PathBuf,
 }
 
 impl Store {
-    /// Opens (or creates) the database and, on a fresh one, imports any older session files.
     pub fn open(path: &Path, workspace: PathBuf) -> Result<Self> {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-        // Two writers are possible (the agent thread and the UI thread); WAL lets a reader in
-        // while a write is happening, and the busy timeout waits rather than failing.
         conn.pragma_update(None, "journal_mode", "wal")?;
         conn.pragma_update(None, "synchronous", "normal")?;
         conn.busy_timeout(Duration::from_secs(5))?;
@@ -236,9 +165,6 @@ impl Store {
                 path.display()
             );
         }
-        // Migrations run after `CREATE TABLE IF NOT EXISTS`, so a database this build made first
-        // gets the column added rather than replaced. Each one is written to be repeatable: a
-        // migration that runs twice must not fail (D55).
         if found < 2 {
             conn.execute_batch("ALTER TABLE sessions ADD COLUMN name TEXT")?;
         }
@@ -253,7 +179,6 @@ impl Store {
         Ok(store)
     }
 
-    /// An in-memory database, for tests.
     #[cfg(test)]
     pub fn in_memory(workspace: &str) -> Result<Self> {
         let conn = Connection::open_in_memory()?;
@@ -276,15 +201,10 @@ impl Store {
         })
     }
 
-    /// Starts a conversation. The id sorts by time, so the newest session is the first row of a
-    /// listing without reading every row's timestamp.
     pub fn begin(&self, provider: &str, model: &str) -> Result<String> {
         self.create(provider, model, false)
     }
 
-    /// Starts a worker's conversation. It is saved and readable by id, so what a worker did is
-    /// still there afterwards, but it is not one of the conversations `/resume` offers: a team's
-    /// transcripts belong to the team view, not to the person's own history (D195).
     pub fn begin_worker(&self, provider: &str, model: &str) -> Result<String> {
         self.create(provider, model, true)
     }
@@ -307,7 +227,6 @@ impl Store {
         Ok(id)
     }
 
-    /// The message the conversation is up to, which is the end of the branch being continued.
     fn leaf(&self, session: &str) -> Result<Option<i64>> {
         Ok(self
             .conn
@@ -320,9 +239,6 @@ impl Store {
             .flatten())
     }
 
-    /// Appends one node under the current leaf and moves the leaf onto it. The parent and the
-    /// pointer are written together, so a crash leaves a conversation that is one message shorter
-    /// rather than one that is inconsistent.
     fn push(&self, session: &str, kind: &str, body: &str) -> Result<i64> {
         let parent = self.leaf(session)?;
         let at = now();
@@ -338,8 +254,6 @@ impl Store {
         Ok(id)
     }
 
-    /// Names a conversation, for a `--resume` list that means something. An empty name clears it,
-    /// so `/name` with no argument goes back to showing the first prompt (D55).
     pub fn name(&self, session: &str, name: &str) -> Result<()> {
         let name = name.trim();
         self.conn.execute(
@@ -355,8 +269,6 @@ impl Store {
         Ok(())
     }
 
-    /// The audit session of the conversation's first turn. A worker's own audit log names it, so
-    /// this is how a conversation saved by a build without the worker column is recognised (D195).
     pub fn audit_of(&self, session: &str) -> Result<Option<String>> {
         let body: Option<String> = self
             .conn
@@ -373,7 +285,6 @@ impl Store {
         Ok(value["audit"].as_str().map(str::to_owned))
     }
 
-    /// Marks a conversation as a worker's, so `/resume` stops offering it (D195).
     pub fn mark_worker(&self, session: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE sessions SET worker = 1 WHERE id = ?1",
@@ -382,10 +293,6 @@ impl Store {
         Ok(())
     }
 
-    /// Marks the conversations an earlier build saved without the marker: each worker's own audit
-    /// log opens with a session-start record naming the worker, so the fact that a conversation
-    /// belonged to a worker is still on disk. A conversation whose log is gone is left alone
-    /// rather than guessed at. Returns how many it marked.
     pub fn adopt_workers(&self, audit_dir: &Path, sessions: &mut [Summary]) -> Result<usize> {
         let mut marked = 0;
         for summary in sessions.iter_mut().filter(|summary| !summary.worker) {
@@ -412,10 +319,6 @@ impl Store {
         Ok(marked)
     }
 
-    /// Records that the conversation moved to another model (D91).
-    ///
-    /// The row is what a resumed conversation is read back from, and what the resume list shows, so
-    /// a model chosen and then left behind is still the one the next turn is expected to use.
     pub fn model_change(&self, session: &str, provider: &str, model: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE sessions SET provider = ?2, model = ?3, updated = ?4 WHERE id = ?1",
@@ -424,8 +327,6 @@ impl Store {
         Ok(())
     }
 
-    /// The provider and model this conversation was last working in, if it has been saved and
-    /// something was recorded (D91).
     pub fn model_of(&self, session: &str) -> Result<Option<Model>> {
         let row: Option<(String, String)> = self
             .conn
@@ -440,12 +341,10 @@ impl Store {
         }))
     }
 
-    /// Records one model request: what it used, what it cost, and what answered it (D94).
     pub fn request(&self, session: &str, request: &Request) -> Result<()> {
         self.request_attributed(session, request, None)
     }
 
-    /// retain plugin identity and invocation alongside usage on the saved branch (D156).
     pub fn plugin_request(
         &self,
         session: &str,
@@ -485,9 +384,6 @@ impl Store {
         Ok(())
     }
 
-    /// Records that a search declared these tools on `session`'s current branch (D109). A node
-    /// rather than a column, so a rewind to before the declaration drops it with everything else
-    /// the branch left behind.
     pub fn declare(&self, session: &str, names: &[String]) -> Result<()> {
         let body = serde_json::json!({ "names": names });
         self.push(session, kind::DECLARED, &body.to_string())?;
@@ -500,7 +396,6 @@ impl Store {
         Ok(())
     }
 
-    /// One node as it was stored.
     fn node(&self, id: i64) -> Result<Node> {
         Ok(self.conn.query_row(
             "SELECT id, parent, kind, body, created FROM nodes WHERE id = ?1",
@@ -517,7 +412,6 @@ impl Store {
         )?)
     }
 
-    /// Every node from the root to `leaf` (or to the session's current leaf), in order.
     fn branch_to(&self, leaf: Option<i64>) -> Result<Vec<Node>> {
         let mut out = Vec::new();
         let mut at = leaf;
@@ -530,18 +424,10 @@ impl Store {
         Ok(out)
     }
 
-    /// The current branch, from the root to where the conversation is.
     fn branch(&self, session: &str) -> Result<Vec<Node>> {
         self.branch_to(self.leaf(session)?)
     }
 
-    /// What `session_query` may see of one conversation — the one in hand, or another of this
-    /// workspace when the grant covers it (D163): its branch's text, before compaction as well as
-    /// after it (D92), and what each request on that branch used (D94).
-    ///
-    /// One walk fills all three, which is what lets a request name the message it answered and a
-    /// reasoning block name the reply it produced: a request that cost nothing for a 100k-token
-    /// prompt is only diagnosable next to that prompt.
     pub fn snapshot(&self, session: &str) -> Result<Snapshot> {
         let mut out = Vec::new();
         let mut calls = Vec::new();
@@ -579,8 +465,6 @@ impl Store {
                     Item::Contribution(value) => ("plugin", value.content),
                     Item::Summary(text) => ("summary", text),
                     Item::Assistant(parts) => {
-                        // D98: the thinking is kept whole to replay it, and only its prose is
-                        // readable here, so the row carries the text rather than the block.
                         for (part, block) in parts.iter().enumerate() {
                             if let Some(text) = reasoning_text(block) {
                                 reasoning.push(ReasoningRow {
@@ -637,12 +521,10 @@ impl Store {
         })
     }
 
-    /// The current leaf, for a caller that needs to name a point in the tree (D54).
     pub fn current(&self, session: &str) -> Result<Option<i64>> {
         self.leaf(session)
     }
 
-    /// The conversation as it stood at `leaf`, for working out what a rewind leaves behind (D54).
     pub fn items_to(&self, leaf: Option<i64>) -> Result<Vec<Item>> {
         let mut items = Vec::new();
         for node in self.branch_to(leaf)? {
@@ -666,10 +548,6 @@ impl Store {
         Ok(items)
     }
 
-    /// Reads the current branch back as a conversation: its items, and what its replies cost.
-    ///
-    /// A tool call left without a result — the process died before it ran — gets one, so the
-    /// history is valid to send again.
     pub fn load(&self, session: &str) -> Result<Loaded> {
         let mut items = Vec::new();
         let mut usage = Usage::default();
@@ -679,8 +557,6 @@ impl Store {
             match node.kind.as_str() {
                 kind::ITEM => match serde_json::from_str::<Item>(&node.body) {
                     Ok(item) => items.push(item),
-                    // A body that does not parse is a row this build cannot read; skipping it is
-                    // better than refusing to open the whole conversation.
                     Err(_) => continue,
                 },
                 kind::USAGE => {
@@ -723,7 +599,6 @@ impl Store {
         })
     }
 
-    /// This workspace's conversations, most recently updated first.
     pub fn list(&self) -> Result<Vec<Summary>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, updated, model, from_session, name, worker,
@@ -750,12 +625,9 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             let (id, updated, model, from, name, worker, prompts, messages) = row?;
-            // A session with no prompt yet is not offered: it has nothing to resume.
             let Some(first) = self.first_prompt(&id)? else {
                 continue;
             };
-            // A name is what the user chose to recognise it by; without one the first prompt is
-            // the best title there is (D55).
             let title = name.clone().unwrap_or(first);
             out.push(Summary {
                 id,
@@ -772,14 +644,7 @@ impl Store {
         Ok(out)
     }
 
-    /// Every message in the session, in the order they were made, with the ones on the active
-    /// branch marked (D54).
-    ///
-    /// It is the whole session rather than the active branch on purpose: a branch left behind by a
-    /// rewind has to stay reachable, and after a rewind to the start the active branch is empty —
-    /// a view built from that alone would show nothing and strand everything.
     pub fn rows(&self, session: &str) -> Result<Vec<Point>> {
-        // The nodes the next request will carry: the path from the leaf to the root.
         let mut active = HashSet::new();
         let mut at = self.leaf(session)?;
         while let Some(id) = at {
@@ -814,7 +679,6 @@ impl Store {
         Ok(out)
     }
 
-    /// correction ownership includes pre-compaction facts, but only on this saved branch (D156).
     pub fn contributions(&self, session: &str) -> Result<Vec<Contribution>> {
         let mut facts = Vec::new();
         for node in self.branch(session)? {
@@ -827,8 +691,6 @@ impl Store {
         Ok(facts)
     }
 
-    /// One node as a row: its kind, a one-line preview, and the text a user message would be
-    /// edited as. `None` for the bookkeeping nodes (`turn`, `usage`), which are not conversation.
     fn point(&self, node: &Node, leaf: Option<i64>) -> Result<Option<Point>> {
         let (kind, preview, text) = match node.kind.as_str() {
             kind::ITEM => match serde_json::from_str::<Item>(&node.body) {
@@ -870,8 +732,6 @@ impl Store {
                 }
                 Err(_) => return Ok(None),
             },
-            // The turn markers and usage records are bookkeeping: they are what `/audit` and the
-            // cost line read, not what a person navigates.
             _ => return Ok(None),
         };
         Ok(Some(Point {
@@ -885,8 +745,6 @@ impl Store {
         }))
     }
 
-    /// Moves the conversation to a node, or to before the first one when `None`, without deleting
-    /// anything: what follows stays in the database and stays in the tree view (D54).
     pub fn rewind(&self, session: &str, node: Option<i64>) -> Result<()> {
         self.conn.execute(
             "UPDATE sessions SET leaf = ?2, updated = ?3 WHERE id = ?1",
@@ -895,18 +753,10 @@ impl Store {
         Ok(())
     }
 
-    /// Starts a new conversation from the prompt at `at`, or from the end of the branch when it is
-    /// absent. Every node up to that point is copied, so the fork stands on its own and the two can
-    /// be resumed separately.
-    ///
-    /// Forking at the prompt the conversation is currently up to copies the whole branch: that is
-    /// the answer a person expects from the row marked `here`, and it keeps the replies that came
-    /// after that prompt.
     pub fn fork(&self, session: &str, at: Option<i64>) -> Result<String> {
         let chain = match at {
             None => self.branch(session)?,
             Some(id) => {
-                // The chain to the chosen node, so a fork from the middle of a branch is possible.
                 let mut out = Vec::new();
                 let mut at = Some(id);
                 while let Some(id) = at {
@@ -941,7 +791,6 @@ impl Store {
         Ok(id)
     }
 
-    /// The first prompt on the branch, trimmed to one line.
     fn first_prompt(&self, session: &str) -> Result<Option<String>> {
         for node in self.branch(session)? {
             if node.kind != kind::ITEM {
@@ -955,9 +804,6 @@ impl Store {
         Ok(None)
     }
 
-    /// Imports the JSON Lines files earlier builds wrote, once. A file that fails to parse is left
-    /// where it is and reported, rather than deleted: losing a conversation to a migration is the
-    /// worst outcome available here.
     fn import_legacy(&self, db: &Path) -> Result<()> {
         let done: Option<String> = self
             .conn
@@ -983,7 +829,6 @@ impl Store {
         for file in files {
             match import_one(&self.conn, &file) {
                 Ok(()) => {
-                    // Renamed, not removed: if the import was wrong the file is still there.
                     let mut moved = file.clone().into_os_string();
                     moved.push(".imported");
                     let _ = fs::rename(&file, PathBuf::from(moved));
@@ -998,8 +843,6 @@ impl Store {
         Ok(())
     }
 
-    /// Removes a conversation and everything in it. The nodes go with it, because a message
-    /// without the session it belongs to is not anything (D55).
     pub fn delete(&self, session: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM nodes WHERE session = ?1", params![session])?;
@@ -1008,13 +851,11 @@ impl Store {
         Ok(())
     }
 
-    /// The most recent conversation in this workspace, for `--continue`.
     pub fn latest(&self) -> Result<Option<Summary>> {
         Ok(self.list()?.into_iter().next())
     }
 }
 
-/// One stored node.
 #[derive(Debug, Clone)]
 struct Node {
     id: i64,
@@ -1024,19 +865,14 @@ struct Node {
     created: String,
 }
 
-/// One message in the session, as the tree shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Point {
     pub node: i64,
     pub parent: Option<i64>,
     pub kind: PointKind,
-    /// One line, for the row.
     pub preview: String,
-    /// The whole message, for a user message chosen to be edited again. Empty otherwise.
     pub text: String,
-    /// Whether the conversation is at this message.
     pub here: bool,
-    /// Whether this message is on the active branch, which is what the next request carries.
     pub active: bool,
 }
 
@@ -1049,7 +885,6 @@ pub enum PointKind {
 }
 
 impl PointKind {
-    /// The mark in front of a row, so the kind is readable at a glance.
     pub fn mark(self) -> &'static str {
         match self {
             PointKind::User => "❯",
@@ -1060,8 +895,6 @@ impl PointKind {
     }
 }
 
-/// An id that sorts by time, so a listing is a query and not a scan of every timestamp. The
-/// counter keeps two sessions opened in the same millisecond apart, which a fork can easily be.
 fn session_id() -> String {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let ms = SystemTime::now()
@@ -1072,37 +905,27 @@ fn session_id() -> String {
     format!("{ms:012x}-{:x}-{n:x}", process::id())
 }
 
-/// A conversation read back: its items, and the tokens its replies have already cost.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Loaded {
     pub items: Vec<Item>,
     pub usage: Usage,
     pub cost: f64,
-    /// What this branch declared, in the order it was declared (D109).
     pub declared: Vec<String>,
 }
 
-/// One saved conversation, as a listing shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
     pub id: String,
-    /// What the user named it, if they named it (D55).
     pub name: Option<String>,
-    /// The name, or the first prompt's first line.
     pub title: String,
     pub prompts: usize,
-    /// Every message on the branch, for `/session` (D55).
     pub messages: usize,
     pub model: String,
-    /// The session this one was forked from, if it was.
     pub forked_from: Option<String>,
-    /// A live worker's conversation: readable by id, not offered by `/resume` (D195).
     pub worker: bool,
     pub updated: SystemTime,
 }
 
-/// The first line of a message that has anything on it, so a prompt that opens with a blank line is
-/// still recognisable in the tree.
 fn first_line(text: &str) -> String {
     text.lines()
         .map(str::trim)
@@ -1111,11 +934,6 @@ fn first_line(text: &str) -> String {
         .to_owned()
 }
 
-/// One line saying what a reply did (D54).
-///
-/// A reply that only calls tools has no text part at all, and in a working session those are the
-/// most common rows — one per round trip. Saying `(no text)` for each of them makes the tree a
-/// wall of identical rows that say nothing; the tool names say what kind of work it was.
 fn assistant_preview(parts: &[Part]) -> String {
     if let Some(text) = parts.iter().find_map(|p| match p {
         Part::Text(t) => Some(t.as_str()),
@@ -1139,14 +957,12 @@ fn assistant_preview(parts: &[Part]) -> String {
         let list = names.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
         return format!("calls {list}{more}");
     }
-    // A thinking model can reply with reasoning and nothing else, which is a real state.
     if parts.iter().any(|p| matches!(p, Part::Native { .. })) {
         return "thought, said nothing".to_owned();
     }
     "(empty reply)".to_owned()
 }
 
-/// Gives every tool call left without a result one, so a history cut short is still valid to send.
 fn repair(items: &mut Vec<Item>) {
     let mut i = 0;
     while i < items.len() {
@@ -1178,7 +994,6 @@ fn repair(items: &mut Vec<Item>) {
     }
 }
 
-/// The records an older build wrote, so they can be read one last time.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum Legacy {
@@ -1206,8 +1021,6 @@ enum Legacy {
     },
 }
 
-/// Reads one JSON Lines session into the database, keeping its id so a `--continue` that mentions
-/// it still works.
 fn import_one(conn: &Connection, path: &Path) -> Result<()> {
     let file = File::open(path).with_context(|| format!("{}", path.display()))?;
     let mut lines = BufReader::new(file).lines();
@@ -1238,7 +1051,6 @@ fn import_one(conn: &Connection, path: &Path) -> Result<()> {
     };
     for line in lines {
         let line = line?;
-        // A torn last line is dropped, the way a load used to skip it.
         match serde_json::from_str::<Legacy>(&line) {
             Ok(Legacy::Item { item }) => push(kind::ITEM, serde_json::to_string(&item)?)?,
             Ok(Legacy::Usage { usage, cost }) => push(
@@ -1322,9 +1134,6 @@ mod tests {
 
     #[test]
     fn a_snapshot_carries_the_reasoning_beside_the_message_it_produced() {
-        // D98: the reasoning was kept on the wire (D95, D96) and in the store, and every query
-        // dropped it on the floor, so "what did it think before it chose that tool" was an
-        // assumption about the transcript rather than something it could be asked.
         let s = store();
         let id = s.begin("synthetic", "glm").unwrap();
         conversation(&s, &id);
@@ -1333,7 +1142,6 @@ mod tests {
         assert_eq!(
             snapshot.reasoning,
             vec![ReasoningRow {
-                // The reply is the branch's second message, and the reasoning is its first part.
                 ordinal: 2,
                 node: snapshot.messages[1].0,
                 part: 0,
@@ -1386,7 +1194,6 @@ mod tests {
         let id = s.begin("synthetic", "glm").unwrap();
         conversation(&s, &id);
         let loaded = s.load(&id).unwrap();
-        // The call in the reply had no result stored, so one is filled in on the way (D31).
         assert_eq!(loaded.items.len(), 3);
         assert!(matches!(&loaded.items[0], Item::User(t) if t == "fix the build"));
         assert!(matches!(&loaded.items[1], Item::Assistant(p) if p.len() == 2));
@@ -1397,9 +1204,6 @@ mod tests {
 
     #[test]
     fn a_request_is_read_back_with_what_answered_it_and_which_message_it_followed() {
-        // D94: the numbers were kept per turn and thrown away from view, which is why a poor cache
-        // hit rate could not be diagnosed. A request now says what it used, which provider and
-        // model answered, and where in the conversation it landed.
         let s = store();
         let id = s.begin("synthetic", "glm").unwrap();
         s.append(&id, &Item::User("first".into())).unwrap();
@@ -1451,9 +1255,7 @@ mod tests {
         assert_eq!(rows[0].kind, "reply");
         assert_eq!(rows[0].usage.cache_read, 900);
         assert!((rows[0].cost - 0.02).abs() < 1e-9);
-        // What the provider said it removed from the prompt travels with the row (D97).
         assert_eq!(rows[0].dropped, 3);
-        // The second request follows the third message, and a compaction is recorded as one.
         assert_eq!(rows[0].after, 2);
         assert_eq!(rows[1].after, 3);
         assert_eq!(rows[1].kind, "summary");
@@ -1463,13 +1265,9 @@ mod tests {
 
     #[test]
     fn a_request_recorded_before_the_model_was_kept_still_reads() {
-        // Rows written by an older build (and imported from the JSON Lines files) have only what
-        // they cost. They are reported as unknown rather than dropped or guessed at: the cost is
-        // still true, and inventing a provider would make a hit rate lie.
         let s = store();
         let id = s.begin("p", "m").unwrap();
         s.append(&id, &Item::User("hello".into())).unwrap();
-        // Written as the older build wrote it: a usage row, with no provider, model or kind.
         s.request(
             &id,
             &Request {
@@ -1508,8 +1306,6 @@ mod tests {
 
     #[test]
     fn a_request_keeps_the_split_of_output_that_was_thinking() {
-        // D99: the reply's own count, kept with the request it belongs to rather than inside
-        // `Usage`, whose fields add up to the bill — this one is part of `output`.
         let s = store();
         let id = s.begin("openai", "gpt").unwrap();
         s.append(&id, &Item::User("hello".into())).unwrap();
@@ -1538,7 +1334,6 @@ mod tests {
 
     #[test]
     fn a_tool_call_without_a_result_is_repaired_on_load() {
-        // The process died between the reply and the call: the history must still be valid.
         let s = store();
         let id = s.begin("p", "m").unwrap();
         s.append(&id, &Item::User("go".into())).unwrap();
@@ -1585,13 +1380,11 @@ mod tests {
         let nodes = entries(&s, &id);
         assert_eq!(nodes.len(), 3);
 
-        // Fork at the second prompt: the new conversation has the first two and nothing after.
         let fork = s.fork(&id, Some(nodes[1])).unwrap();
         assert_eq!(
             s.load(&fork).unwrap().items,
             [Item::User("first".into()), Item::User("second".into())]
         );
-        // Copying, not sharing: appending to the fork leaves the original alone.
         s.append(&fork, &Item::User("another way".into())).unwrap();
         assert_eq!(s.load(&id).unwrap().items.len(), 3);
         assert_eq!(s.load(&fork).unwrap().items.len(), 3);
@@ -1604,8 +1397,6 @@ mod tests {
 
     #[test]
     fn an_older_worker_conversation_is_recognised_by_its_audit_log() {
-        // A build before the worker column saved these without the marker; the audit log's first
-        // record still names the worker, and that is enough to mark it once (D195).
         let s = store();
         let mine = s.begin("p", "m").unwrap();
         s.append(&mine, &Item::User("mine".into())).unwrap();
@@ -1629,7 +1420,6 @@ mod tests {
         assert_eq!(s.adopt_workers(dir.path(), &mut listed).unwrap(), 1);
         assert!(listed.iter().find(|x| x.id == theirs).unwrap().worker);
         assert!(!listed.iter().find(|x| x.id == mine).unwrap().worker);
-        // Marked in the database, not only in this listing.
         assert!(
             s.list()
                 .unwrap()
@@ -1638,15 +1428,12 @@ mod tests {
                 .unwrap()
                 .worker
         );
-        // A second pass finds nothing left to adopt.
         let mut again = s.list().unwrap();
         assert_eq!(s.adopt_workers(dir.path(), &mut again).unwrap(), 0);
     }
 
     #[test]
     fn a_worker_conversation_is_saved_but_not_offered_for_resume() {
-        // D195: what a worker did stays readable by id, and `/resume` lists the person's own
-        // conversations only.
         let s = store();
         let mine = s.begin("p", "m").unwrap();
         s.append(&mine, &Item::User("my own question".into()))
@@ -1687,7 +1474,6 @@ mod tests {
         assert_eq!(text, ["original secret word", "short summary", "current"]);
     }
 
-    /// The node ids of the rows that are messages, in order.
     fn entries(s: &Store, id: &str) -> Vec<i64> {
         s.rows(id).unwrap().into_iter().map(|p| p.node).collect()
     }
@@ -1720,7 +1506,6 @@ mod tests {
 
         let points = s.rows(&id).unwrap();
         let points: Vec<&Point> = points.iter().collect();
-        // The turn marker and the usage record are bookkeeping and are not shown (D54).
         assert_eq!(points.len(), 5);
         let kinds: Vec<PointKind> = points.iter().map(|p| p.kind).collect();
         assert_eq!(
@@ -1733,10 +1518,8 @@ mod tests {
                 PointKind::Assistant
             ]
         );
-        // The leaf is the last reply, so that is the marked one.
         assert_eq!(points.iter().filter(|p| p.here).count(), 1);
         assert!(points[4].here);
-        // A prompt carries its whole text, for the editor; a reply carries only a preview.
         assert_eq!(points[0].text, "fix the build");
         assert_eq!(points[1].preview, "looking at it");
         assert_eq!(points[1].text, "");
@@ -1744,8 +1527,6 @@ mod tests {
 
     #[test]
     fn a_reply_that_only_calls_tools_says_what_it_called() {
-        // These are the most common rows in a working session: one per tool round trip, with no
-        // text part at all. `(no text)` for each of them is a wall of rows saying nothing (D54).
         let s = store();
         let id = s.begin("p", "m").unwrap();
         s.append(&id, &Item::User("build it".into())).unwrap();
@@ -1821,7 +1602,6 @@ mod tests {
             ]),
         )
         .unwrap();
-        // A thinking model that answered with reasoning and nothing else.
         s.append(
             &id,
             &Item::Assistant(vec![Part::Native {
@@ -1848,7 +1628,6 @@ mod tests {
                 "thought, said nothing",
             ]
         );
-        // Not one of them says "no text".
         assert!(
             !previews.iter().any(|p| p.contains("no text")),
             "{previews:?}"
@@ -1878,16 +1657,12 @@ mod tests {
         .unwrap();
         let rows = s.rows(&id).unwrap();
         assert_eq!(rows[0].preview, "the real prompt");
-        // Text wins over the calls: the calls are still there, the sentence says more.
         assert_eq!(rows[1].preview, "Here is what I found.");
-        // The whole prompt is kept for the editor, blank lines and all.
         assert_eq!(rows[0].text, "\n\n  the real prompt  \nsecond line");
     }
 
     #[test]
     fn a_declaration_is_recorded_on_the_branch_and_rewinds_with_it() {
-        // D109: what a search declared is branch state, so a resume brings it back, a fork carries
-        // it, and a jump to before it forgets it — the conversation itself never changes.
         let s = store();
         let id = s.begin("p", "m").unwrap();
         s.append(&id, &Item::User("find me a tool".into())).unwrap();
@@ -1903,8 +1678,6 @@ mod tests {
             "and it is not a message: replaying it costs nothing"
         );
 
-        // A point in the tree is a place a conversation can continue from, so a declaration is
-        // not one.
         assert!(
             s.rows(&id)
                 .unwrap()
@@ -1913,7 +1686,6 @@ mod tests {
             "a declaration does not appear as a node a person could pick"
         );
 
-        // Forking copies the branch, declaration included.
         let nodes = entries(&s, &id);
         let fork = s.fork(&id, Some(nodes[0])).unwrap();
         assert!(
@@ -1921,7 +1693,6 @@ mod tests {
             "the fork was taken before it"
         );
 
-        // Rewinding to before the declaration forgets it, without touching the conversation.
         s.rewind(&id, Some(nodes[0])).unwrap();
         assert!(s.load(&id).unwrap().declared.is_empty());
         assert_eq!(
@@ -1938,13 +1709,11 @@ mod tests {
         s.append(&id, &Item::User("two".into())).unwrap();
         let nodes = entries(&s, &id);
 
-        // Go back to before the second prompt, the way `/tree` does, and send something else.
         s.rewind(&id, Some(nodes[0])).unwrap();
         assert_eq!(s.load(&id).unwrap().items, [Item::User("one".into())]);
         s.append(&id, &Item::User("two, differently".into()))
             .unwrap();
 
-        // The branch that was left is still there and still listed, marked as not active (D54).
         let rows = s.rows(&id).unwrap();
         assert_eq!(rows.len(), 3);
         let left = rows
@@ -1957,7 +1726,6 @@ mod tests {
         );
         assert!(rows.iter().any(|p| p.preview == "two, differently"));
 
-        // Choosing it puts the conversation back on the old branch.
         s.rewind(&id, Some(left.node)).unwrap();
         assert_eq!(
             s.load(&id).unwrap().items,
@@ -1973,8 +1741,6 @@ mod tests {
         s.append(&id, &Item::User("two".into())).unwrap();
         s.rewind(&id, None).unwrap();
         assert!(s.load(&id).unwrap().items.is_empty());
-        // The rows still show both messages, because a rewound conversation can be walked forward
-        // again from the tree.
         let rows = s.rows(&id).unwrap();
         assert_eq!(rows.len(), 2);
         assert!(!rows.iter().any(|p| p.here));
@@ -1982,8 +1748,6 @@ mod tests {
 
     #[test]
     fn a_model_change_is_what_the_conversation_is_read_back_as_using() {
-        // D91: the row a resumed conversation is read from says which model it was last working in,
-        // so a default changed since does not follow it there.
         let s = store();
         let id = s.begin("synthetic", "begun-on").unwrap();
         assert_eq!(
@@ -2003,9 +1767,7 @@ mod tests {
             s.model_of(&id).unwrap().map(|m| m.provider),
             Some("openai".into())
         );
-        // The resume list shows the same thing, because it reads the same row.
         assert_eq!(s.list().unwrap()[0].model, "moved-to");
-        // A conversation nothing is known about has no model rather than an empty one.
         assert_eq!(s.model_of("no-such-session").unwrap(), None);
     }
 
@@ -2017,7 +1779,6 @@ mod tests {
             .unwrap();
         s.append(&a, &Item::User("second".into())).unwrap();
         let empty = s.begin("p", "m").unwrap();
-        // The ids sort by time; make the order unambiguous.
         thread::sleep(Duration::from_millis(5));
         let b = s.begin("p", "m").unwrap();
         s.append(&b, &Item::User("later task".into())).unwrap();
@@ -2042,14 +1803,11 @@ mod tests {
         s.name(&id, "the sandbox refactor").unwrap();
         let listed = &s.list().unwrap()[0];
         assert_eq!(listed.name.as_deref(), Some("the sandbox refactor"));
-        // The title is what a picker shows, and a name wins over the prompt (D55).
         assert_eq!(listed.title, "the sandbox refactor");
 
-        // `/name` with no argument clears it, and the prompt is the title again.
         s.name(&id, "").unwrap();
         assert_eq!(s.list().unwrap()[0].name, None);
         assert_eq!(s.list().unwrap()[0].title, "the actual first prompt");
-        // Whitespace is not a name.
         s.name(&id, "   ").unwrap();
         assert_eq!(s.list().unwrap()[0].name, None);
     }
@@ -2066,7 +1824,6 @@ mod tests {
         let listed = s.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, a);
-        // Nothing is left pointing at the deleted session.
         let orphans: i64 = s
             .conn
             .query_row(
@@ -2076,13 +1833,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(orphans, 0);
-        // And the other conversation is untouched.
         assert_eq!(s.load(&a).unwrap().items, [Item::User("keep me".into())]);
     }
 
     #[test]
     fn a_database_from_the_previous_schema_gains_the_name_column() {
-        // The version before names existed: the file on disk is already there and must open (D55).
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("sessions.db");
         {
@@ -2113,7 +1868,6 @@ mod tests {
             .unwrap();
         }
         let s = Store::open(&db, PathBuf::from("/ws")).unwrap();
-        // The old conversations are there, and naming one now works.
         assert_eq!(
             s.load("old").unwrap().items,
             [Item::User("a prompt".into())]
@@ -2126,7 +1880,6 @@ mod tests {
                 .iter()
                 .any(|x| x.name.as_deref() == Some("named after the fact"))
         );
-        // Opening it again does not try to add the column twice.
         drop(s);
         let again = Store::open(&db, PathBuf::from("/ws")).unwrap();
         assert_eq!(again.list().unwrap().len(), 2);
@@ -2153,7 +1906,6 @@ mod tests {
             .to_string(),
         );
         text.push('\n');
-        // A torn last line, as an old crash left it.
         text.push_str("{\"type\":\"item\",\"item\":{\"us");
         fs::write(legacy.join(format!("{id}.jsonl")), text).unwrap();
 
@@ -2163,7 +1915,6 @@ mod tests {
         assert_eq!(loaded.items, [Item::User("old task".into())]);
         assert_eq!(loaded.usage.cache_read, 3);
         assert!((loaded.cost - 0.5).abs() < 1e-9);
-        // The file is renamed, not deleted, and a second open does not import it twice.
         assert!(legacy.join(format!("{id}.jsonl.imported")).exists());
         assert!(!legacy.join(format!("{id}.jsonl")).exists());
         let again = Store::open(&db, PathBuf::from("/ws")).unwrap();

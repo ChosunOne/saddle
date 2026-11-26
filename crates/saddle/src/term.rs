@@ -1,9 +1,3 @@
-//! Terminal output. The reply goes to stdout; tool calls and notes go to stderr.
-//!
-//! Model and tool text is untrusted, so control characters are removed before printing (D27).
-//! Raw escapes could move the cursor over host output, write the clipboard (OSC 52) or plant
-//! links (OSC 8).
-
 use crate::cancel;
 use crate::provider::Image;
 use std::io;
@@ -16,9 +10,7 @@ use crate::tools::ToolOutput;
 use crate::tools::timeout;
 
 pub struct Terminal {
-    /// stdout holds text without a trailing newline.
     mid_line: bool,
-    /// Reasoning is being written to stderr.
     reasoning: bool,
     dim: &'static str,
     reset: &'static str,
@@ -46,14 +38,12 @@ impl Terminal {
         }
     }
 
-    /// A host message on stderr.
     pub fn info(&mut self, s: &str) {
         self.end_line();
         eprintln!("{}{}{}", self.dim, clean(s), self.reset);
     }
 }
 
-/// Removes control characters other than newline and tab.
 pub fn clean(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
@@ -89,7 +79,6 @@ impl Sink for Terminal {
         self.info(s);
     }
 
-    /// Reasoning goes to stderr, dimmed, so stdout carries only the answer.
     fn reasoning(&mut self, s: &str) {
         let s = clean(s);
         if s.is_empty() {
@@ -146,8 +135,6 @@ impl Ui for Terminal {
         );
     }
 
-    /// Compaction goes to stderr: a line when it starts and ends, and the reasoning and summary
-    /// dimmed as they stream.
     fn compaction(&mut self, event: compact::Event) {
         match event {
             compact::Event::Started {

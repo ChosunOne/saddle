@@ -1,6 +1,3 @@
-//! Plugin manifests: the ceiling half of D9. The policy grants a subset of what the manifest
-//! declares; a grant above the ceiling is a load error.
-
 use std::collections::BTreeSet;
 use toml::de::Error;
 
@@ -14,7 +11,6 @@ use crate::scope::Scope;
 pub struct Manifest {
     pub id: PluginId,
     pub version: String,
-    /// Path of the component, relative to the manifest.
     pub component: String,
     pub scopes: BTreeSet<Scope>,
 }
@@ -25,7 +21,6 @@ impl Manifest {
     }
 }
 
-/// Scopes the policy grants that the manifest does not declare.
 pub fn above_ceiling(manifest: &Manifest, grants: &Grants) -> Vec<Scope> {
     grants
         .scopes()

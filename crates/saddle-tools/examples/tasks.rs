@@ -1,4 +1,3 @@
-//! the standard background-task surface over the delegated exec SDK (D182).
 #![cfg(target_arch = "wasm32")]
 use saddle_sdk::{self as bindings, export};
 use saddle_tools::tasks::Tasks;

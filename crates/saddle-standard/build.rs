@@ -1,5 +1,3 @@
-//! build the guest sources once, then compile immutable target-specific delivery artifacts (D147).
-
 use std::env;
 use std::error::Error;
 use std::fmt::Write as _;
@@ -51,8 +49,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
     let out = PathBuf::from(env::var("OUT_DIR")?);
-    // A distinct target directory avoids recursively acquiring the parent Cargo build lock.
-    // This invocation selects only guests/SDKs, never this package, and uses the same lockfile.
     let guest_target = workspace.join("target/standard-guests");
     let status = Command::new(env::var_os("CARGO").ok_or("CARGO is unavailable")?)
         .current_dir(&workspace)
@@ -113,9 +109,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .encode()?,
     )?;
     let target = env::var("TARGET")?;
-    let mut generated = String::from(
-        "/// immutable components shipped with this binary.\npub static ARTIFACTS: &[Artifact] = &[\n",
-    );
+    let mut generated = String::from("pub static ARTIFACTS: &[Artifact] = &[\n");
     for name in NAMES {
         let module = fs::read(guest_target.join(format!(
             "wasm32-unknown-unknown/release/examples/{name}.wasm"

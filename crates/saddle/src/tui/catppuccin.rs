@@ -1,23 +1,8 @@
-//! Catppuccin, built in: the four flavours and how each one paints this interface (D76).
-//!
-//! Catppuccin defines 26 named colours per flavour — 14 accents, then a five-step grey ramp
-//! (`text`, `subtext`, `overlay`, `surface`) and three backgrounds (`base`, `mantle`, `crust`).
-//! The numbers below are the palette's own, from the project's published table, and the port keeps
-//! them exactly: a flavour is recognisable by its hex values, so approximating one defeats the point
-//! of shipping it.
-//!
-//! What the palette does *not* define is what each colour is for, because that is the port's job
-//! (Catppuccin's style guide calls it the port's own decisions). [`Flavour::palette`] is that
-//! mapping, in one place, so it can be read and argued with: which accent is a heading, which grey
-//! is secondary text, and how a panel background is made from a colour that has no background to
-//! give.
-
 use ratatui::style::Color;
 
 use super::palette::{Palette, blend, luminance, rgb};
 use super::theme::Appearance;
 
-/// The four flavours, by the name this harness gives them (D76).
 pub const NAMES: [&str; 4] = [
     "catppuccin-latte",
     "catppuccin-frappe",
@@ -25,18 +10,11 @@ pub const NAMES: [&str; 4] = [
     "catppuccin-mocha",
 ];
 
-/// One flavour's 26 colours, spelled as Catppuccin spells them.
-///
-/// The whole table is recorded, not only the colours the mapping below happens to use: this is the
-/// palette, and a theme that is edited later should not have to go back to the source for
-/// `rosewater`. The test below checks the table as a table — 26 distinct values, a monotonic ramp —
-/// which is what makes keeping the unused ones worth anything.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct Flavour {
     pub name: &'static str,
     pub appearance: Appearance,
-    // The accents, in the palette's own order.
     pub rosewater: Color,
     pub flamingo: Color,
     pub pink: Color,
@@ -51,7 +29,6 @@ pub struct Flavour {
     pub sapphire: Color,
     pub blue: Color,
     pub lavender: Color,
-    // The grey ramp and the backgrounds.
     pub text: Color,
     pub subtext1: Color,
     pub subtext0: Color,
@@ -66,9 +43,7 @@ pub struct Flavour {
     pub crust: Color,
 }
 
-/// `#rrggbb` as a colour, at compile time, so the table below can be the published one verbatim.
 const fn hex(value: &str) -> Color {
-    // A closure cannot be called from a constant function, so this is a nested function.
     const fn digit(c: u8) -> u8 {
         match c {
             b'0'..=b'9' => c - b'0',
@@ -93,7 +68,6 @@ const fn hex(value: &str) -> Color {
     )
 }
 
-/// Latte, the light flavour.
 pub const LATTE: Flavour = Flavour {
     name: "catppuccin-latte",
     appearance: Appearance::Light,
@@ -125,7 +99,6 @@ pub const LATTE: Flavour = Flavour {
     crust: hex("dce0e8"),
 };
 
-/// Frappé, a dark flavour with the greys lifted.
 pub const FRAPPE: Flavour = Flavour {
     name: "catppuccin-frappe",
     appearance: Appearance::Dark,
@@ -157,7 +130,6 @@ pub const FRAPPE: Flavour = Flavour {
     crust: hex("232634"),
 };
 
-/// Macchiato, between Frappé and Mocha.
 pub const MACCHIATO: Flavour = Flavour {
     name: "catppuccin-macchiato",
     appearance: Appearance::Dark,
@@ -189,7 +161,6 @@ pub const MACCHIATO: Flavour = Flavour {
     crust: hex("181926"),
 };
 
-/// Mocha, the darkest flavour and Catppuccin's own default.
 pub const MOCHA: Flavour = Flavour {
     name: "catppuccin-mocha",
     appearance: Appearance::Dark,
@@ -221,43 +192,17 @@ pub const MOCHA: Flavour = Flavour {
     crust: hex("11111b"),
 };
 
-/// Every flavour, for the list a built-in palette is looked up in.
 pub const FLAVOURS: [Flavour; 4] = [LATTE, FRAPPE, MACCHIATO, MOCHA];
 
-/// The flavour a name means, if it is one of these (D76).
 pub fn flavour(name: &str) -> Option<Flavour> {
     FLAVOURS.iter().find(|f| f.name == name).copied()
 }
 
 impl Flavour {
-    /// This flavour as the palette the interface paints with.
-    ///
-    /// Two rules, and the difference between them is the whole mapping:
-    ///
-    /// - **A mark is the published colour.** A border, a bullet, a rule, a panel tint, a scrollbar,
-    ///   the colour of a reasoning level: none of them is read as a glyph, so pastel is free and the
-    ///   flavour stays exactly itself.
-    /// - **Text is the published colour where it can be read, and otherwise the same colour moved
-    ///   towards the flavour's own ink until it can** ([`Flavour::ink`]). Only Catppuccin Latte is
-    ///   affected, and only because of what it is: its accents are chosen as fills for a light
-    ///   surface, and as glyphs on its own `base` most of them sit near 2.5:1 — green is 2.96:1 and
-    ///   yellow 2.31:1. On the three dark flavours every accent already clears 4.5:1 by a wide
-    ///   margin, so this changes nothing there. Moving the colour towards `text` rather than towards
-    ///   black is what keeps it a Catppuccin colour: it lands on the dark, desaturated version of
-    ///   the same hue, which is what a light theme wants for that role anyway.
-    ///
-    /// The floors are D73's: 4.5:1 for what is read, 3:1 for secondary text, 2:1 for the faintest.
     pub fn palette(&self) -> Palette {
-        // Secondary and faint text are steps of the palette's own ramp.
         let muted = self.ink(self.subtext0, 4.5);
         let subtle = self.ink(self.overlay2, 3.0);
         let faint = self.ink(self.overlay1, 2.5);
-        // A panel background is a colour the palette has no name for, because Catppuccin defines
-        // surfaces as greys. On the dark flavours those greys are the right answer and are used as
-        // the palette intends. On Latte they sit too close to its own text ramp to carry text
-        // (`subtext1` on `surface1` is 3.44:1), so a panel there is a tint of `base` instead — the
-        // same trick as the pass/fail backgrounds, and the only way to have a panel that both reads
-        // as part of the flavour and holds readable text.
         let (quiet, selection) = match self.appearance {
             Appearance::Dark => (self.surface0, self.surface1),
             Appearance::Light => (
@@ -265,18 +210,12 @@ impl Flavour {
                 blend(self.base, self.mauve, 0.20),
             ),
         };
-        // A pass or fail panel is a tint, and how strong it can be is set by the text on it: on a
-        // light flavour the same tint takes more contrast away from `tool_output`, so it is
-        // lighter there.
         let tint = match self.appearance {
             Appearance::Dark => 0.18,
             Appearance::Light => 0.12,
         };
         let pass = blend(self.base, self.green, tint);
         let fail = blend(self.base, self.red, tint);
-        // A search match has to stand out *and* be readable, which in each kind of flavour means a
-        // different pair: on a dark one a solid accent with the dark `base` written on it, on a light
-        // one a pale tint with the flavour's own ink. A mid-tone background reads on neither.
         let (match_bg, match_text) = match self.appearance {
             Appearance::Dark => (self.yellow, self.base),
             Appearance::Light => (blend(self.base, self.yellow, 0.35), self.text),
@@ -326,7 +265,6 @@ impl Flavour {
             syntax_type: self.ink(self.yellow, 4.5),
             syntax_operator: self.ink(self.sky, 4.5),
             syntax_punctuation: faint,
-            // The reasoning levels climb the warm accents, so effort reads without a legend.
             thinking_off: faint,
             thinking_minimal: self.teal,
             thinking_low: self.blue,
@@ -342,8 +280,6 @@ impl Flavour {
         }
     }
 
-    /// `colour` moved towards this flavour's own ink, as little as it takes to clear `floor` against
-    /// [`Flavour::base`] — so a colour that already reads is returned untouched (D76).
     fn ink(&self, colour: Color, floor: f64) -> Color {
         if contrast(colour, self.base) >= floor {
             return colour;
@@ -364,7 +300,6 @@ impl Flavour {
     }
 }
 
-/// The WCAG contrast ratio between two colours.
 fn contrast(a: Color, b: Color) -> f64 {
     let lum = |c: Color| {
         let (r, g, b) = rgb(c).expect("a colour");
@@ -381,8 +316,6 @@ mod tests {
 
     #[test]
     fn the_table_is_the_published_one() {
-        // Spot checks against Catppuccin's table, one per flavour, including the values that are
-        // easiest to get wrong by memory. A flavour is its hex values (D76).
         assert_eq!(LATTE.base, Color::Rgb(0xef, 0xf1, 0xf5));
         assert_eq!(LATTE.mauve, Color::Rgb(0x88, 0x39, 0xef));
         assert_eq!(LATTE.text, Color::Rgb(0x4c, 0x4f, 0x69));
@@ -393,7 +326,6 @@ mod tests {
         assert_eq!(MOCHA.base, Color::Rgb(0x1e, 0x1e, 0x2e));
         assert_eq!(MOCHA.crust, Color::Rgb(0x11, 0x11, 0x1b));
         assert_eq!(MOCHA.green, Color::Rgb(0xa6, 0xe3, 0xa1));
-        // The ramp runs one way in each kind of flavour: lighter than base on dark, darker on light.
         for f in [FRAPPE, MACCHIATO, MOCHA] {
             assert!(luminance_of(f.text) > luminance_of(f.base), "{}", f.name);
             assert!(
@@ -413,8 +345,6 @@ mod tests {
 
     #[test]
     fn each_flavour_is_26_distinct_colours_and_a_ramp_that_runs_one_way() {
-        // Catppuccin's own definition: 26 colours, no repeats. A hex copied twice is the mistake
-        // this catches, and it is the mistake a table like this actually attracts.
         for f in FLAVOURS {
             let all = [
                 ("rosewater", f.rosewater),
@@ -452,8 +382,6 @@ mod tests {
                 }
                 seen.push((name.to_owned(), colour));
             }
-            // The grey ramp steps one way from `text` to `base`: darker and darker on a light
-            // flavour, lighter and lighter on a dark one.
             let ramp = [
                 f.text, f.subtext1, f.subtext0, f.overlay2, f.overlay1, f.overlay0, f.surface2,
                 f.surface1, f.surface0, f.base,
@@ -469,8 +397,6 @@ mod tests {
                     pair[1]
                 );
             }
-            // And the three backgrounds step away from the text in every flavour, so `crust` is the
-            // furthest from it.
             assert!(
                 luminance_of(f.base) > luminance_of(f.mantle)
                     && luminance_of(f.mantle) > luminance_of(f.crust),
@@ -512,8 +438,6 @@ mod tests {
 
     #[test]
     fn text_reads_on_the_background_it_is_drawn_on() {
-        // The floor D73 sets for a derived palette applies here too: a built-in that cannot be read
-        // is not a theme. 4.5:1 for what is read, 3:1 for secondary, 2:1 for the faintest.
         for f in FLAVOURS {
             let p = f.palette();
             for (role, colour, floor) in [
@@ -553,11 +477,8 @@ mod tests {
 
     #[test]
     fn the_text_drawn_in_a_panel_reads_on_that_panel() {
-        // A panel is its own background, so the floor is met again on each one — for the roles
-        // actually drawn there, which is why the list is per panel and not one blanket rule.
         let cases = |p: &Palette, f: &Flavour| {
             vec![
-                // A menu row: its label, then the detail beside it.
                 (
                     "selectedBg",
                     p.selected_bg,
@@ -593,7 +514,6 @@ mod tests {
                     p.search_match_bg,
                     vec![("searchMatchText", p.search_match_text, 4.5)],
                 ),
-                // The session's name and workspace are drawn on the frame's own background.
                 (
                     "base",
                     f.base,
@@ -624,8 +544,6 @@ mod tests {
 
     #[test]
     fn a_panel_is_told_apart_from_the_background_it_sits_on() {
-        // A background the same lightness as the base is a panel nobody can see (D73's rule for a
-        // derived palette, applied to a built one).
         for f in FLAVOURS {
             let p = f.palette();
             for (panel, bg) in [
@@ -637,7 +555,6 @@ mod tests {
                 let ratio = contrast(bg, f.base);
                 assert!(ratio > 1.05, "{}: {panel} is invisible: {ratio:.3}", f.name);
             }
-            // And pass must not look like fail.
             assert!(
                 contrast(p.tool_success_bg, p.tool_error_bg) > 1.05,
                 "{}: a pass and a fail look alike",

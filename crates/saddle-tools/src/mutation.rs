@@ -1,5 +1,3 @@
-//! mutable tool workflows over the same runtime-gated filesystem SDK (D140).
-
 use saddle_limits as budgets;
 #[cfg(target_arch = "wasm32")]
 use saddle_sdk::configure_limits;

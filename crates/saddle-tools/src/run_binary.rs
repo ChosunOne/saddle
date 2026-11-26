@@ -1,5 +1,3 @@
-//! literal argument handling and bounded presentation for named launches (D184, D186).
-
 use saddle_limits as budgets;
 use saddle_sdk::{
     Definition, ExecReply, Launch, Output, Tool, configure_limits, run_binary_with_options,

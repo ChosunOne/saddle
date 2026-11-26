@@ -1,5 +1,3 @@
-//! converts an SDK core module into a validated component for local development (D127).
-
 use std::env;
 use std::fs;
 

@@ -1,5 +1,3 @@
-//! directory listing presentation over a bounded, policy-filtered metadata service (D132).
-
 use saddle_limits as budgets;
 #[cfg(target_arch = "wasm32")]
 use saddle_sdk::configure_limits;
@@ -17,7 +15,6 @@ use serde_json::json;
 use crate::normalize_path;
 use crate::workspace;
 
-/// the standard listing tool; all names come from the host's filtered directory pages.
 pub struct Ls;
 
 #[derive(Deserialize)]
@@ -74,7 +71,6 @@ impl Tool for Ls {
     }
 }
 
-/// formats bounded pages; native tests substitute metadata without filesystem authority.
 pub fn list_with(
     arguments: &str,
     mut read: impl FnMut(&str, &str, &str, u32) -> Result<DirectoryPage, String>,

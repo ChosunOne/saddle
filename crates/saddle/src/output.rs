@@ -1,12 +1,3 @@
-//! Where line-mode output goes: a terminal for a person, or one JSON object per line for a
-//! program (D52).
-//!
-//! The JSON form is the same events the TUI receives, so a caller gets the text as it streams, the
-//! call and its result, what the reply used and cost, and how the turn ended — without parsing
-//! prose. Nothing is written to stdout that is not a JSON object, and the host's own errors still
-//! go to stderr with the `saddle:` prefix, so a consumer can read stdout as a stream of events and
-//! treat a non-zero exit as a host failure.
-
 use crate::cancel;
 use crate::plugins::services::ModelUsage;
 use crate::plugins::services::panel::PanelView;
@@ -28,14 +19,12 @@ use crate::provider::{Quota, Reply, Sink, ToolCall, Usage};
 use crate::term::Terminal;
 use crate::tools::ToolOutput;
 
-/// Line-mode output: the human terminal, or the JSON stream.
 pub enum Output {
     Human(Terminal),
     Json(Json),
 }
 
 impl Output {
-    /// A line for the person, or a `note` event.
     pub fn info(&mut self, s: &str) {
         match self {
             Output::Human(t) => t.info(s),
@@ -43,7 +32,6 @@ impl Output {
         }
     }
 
-    /// What a turn used, in total.
     pub fn usage(&mut self, u: Usage) {
         match self {
             Output::Human(t) => t.info(&format!(
@@ -60,7 +48,6 @@ impl Output {
         }
     }
 
-    /// How the turn ended, which a program needs to decide what to do next.
     pub fn turn_end(&mut self, end: &End) {
         match self {
             Output::Human(t) => {
@@ -72,7 +59,6 @@ impl Output {
         }
     }
 
-    /// The session's identity, said once at the start.
     pub fn opening(&mut self, provider: &str, model: &str, workspace: &str, audit: &str) {
         match self {
             Output::Human(t) => t.info(&format!("{provider} · {model} · audit {audit}")),
@@ -87,7 +73,6 @@ impl Output {
     }
 }
 
-/// The end of a turn, as a program spells it.
 fn end_name(end: &End) -> &'static str {
     match end {
         End::Answered => "answered",
@@ -100,8 +85,6 @@ fn end_name(end: &End) -> &'static str {
     }
 }
 
-/// One JSON object per line. The sink is anything writable so a test can read the stream back
-/// without a terminal, which is the only honest way to check what a caller receives (D52).
 pub struct Json {
     out: Box<dyn Write>,
 }
@@ -114,8 +97,6 @@ impl Json {
     }
 
     fn emit(&mut self, event: Value) {
-        // The encoder escapes control characters, so model text cannot move a cursor or write a
-        // clipboard, and the stream stays one object per line (D27, D52).
         let _ = writeln!(self.out, "{event}");
         let _ = self.out.flush();
     }
@@ -201,8 +182,6 @@ impl Ui for Output {
                     "type": "call",
                     "name": name,
                     "id": call.id,
-                    // The arguments as the model sent them, or the parse failure. A caller that
-                    // wants the detail line the terminal shows can build it from these.
                     "input": match &call.input {
                         Ok(v) => v.clone(),
                         Err(e) => json!({ "invalid": e }),
@@ -237,7 +216,6 @@ impl Ui for Output {
                 "type": "result",
                 "ok": out.ok,
                 "content": out.content,
-                // The transcript-only diff, so a consumer can show the change (D35).
                 "diff": out.diff,
                 "provenance": out.provenance,
             })),
@@ -266,8 +244,6 @@ impl Ui for Output {
         match self {
             Output::Human(t) => t.compaction(event),
             Output::Json(j) => match event {
-                // The streamed reasoning and summary end up in the conversation, so the JSON
-                // stream reports the phases and leaves the prose out of it (D52).
                 compact::Event::Started {
                     reason,
                     tokens,
@@ -303,9 +279,6 @@ impl Ui for Output {
     }
 }
 
-/// Line mode's question surface (D197): the choices and their previews go to stderr, where every
-/// other line of tool output goes, and the answer is read from stdin. A piped run never installs
-/// this, so a prompt line is never eaten by a question.
 pub struct LineQuestions;
 
 impl Questioner for LineQuestions {
@@ -314,8 +287,6 @@ impl Questioner for LineQuestions {
     }
 }
 
-/// Asks one question in the plainest way a terminal allows: number the choices, print the previews,
-/// and read a line. An empty line dismisses the question, which is an answer rather than an error.
 fn at_terminal(question: &Question, until: Option<Instant>) -> Outcome {
     if !io::stdin().is_terminal() {
         return Outcome::Unavailable("stdin is not a terminal".into());
@@ -360,8 +331,6 @@ fn at_terminal(question: &Question, until: Option<Instant>) -> Outcome {
         let Some(line) = read_line() else {
             return Outcome::Unavailable("the input ended".into());
         };
-        // Reading a line cannot be interrupted from here, so a deadline or a cancelled turn is
-        // noticed the moment the person — or the end of the input — arrives, rather than never.
         if cancel::requested() {
             return Outcome::Dismissed;
         }
@@ -426,7 +395,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    /// A JSON sink into a buffer, so the stream can be read back.
     fn captured() -> (Json, Arc<Mutex<Vec<u8>>>) {
         struct Shared(Arc<Mutex<Vec<u8>>>);
         impl Write for Shared {
@@ -472,7 +440,6 @@ mod tests {
         assert_eq!(events.len(), 5, "{events:?}");
         assert_eq!(events[0]["type"], "session");
         assert_eq!(events[0]["workspace"], "/ws");
-        // A newline inside the text stays inside one JSON line.
         assert_eq!(events[1]["text"], "hello\nworld");
         assert_eq!(events[2]["type"], "note");
         assert_eq!(events[3]["type"], "usage");
@@ -502,7 +469,6 @@ mod tests {
 
     #[test]
     fn a_turn_end_is_spelled_for_a_program() {
-        // The words a caller switches on are stable, and `cancelled` is not `failed` (D52).
         assert_eq!(end_name(&End::Answered), "answered");
         assert_eq!(end_name(&End::Cancelled), "cancelled");
         assert_eq!(end_name(&End::Repeating), "repeating");

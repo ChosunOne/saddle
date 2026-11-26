@@ -1,5 +1,3 @@
-//! file discovery uses only scoped metadata and reads (D133).
-
 #![cfg(target_arch = "wasm32")]
 
 use saddle_sdk::{self as bindings, export};

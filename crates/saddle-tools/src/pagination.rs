@@ -1,5 +1,3 @@
-//! streaming D51 pagination: bounded storage, complete line counts and UTF-8 validation (D135).
-
 use memchr::memchr_iter;
 use std::str;
 
@@ -75,7 +73,6 @@ impl Page {
     }
 }
 
-/// reads a D51 text page while retaining only the selected lines and one bounded line prefix.
 pub fn read_with(
     arguments: &str,
     mut read: impl FnMut(&str, &str, u64, u32) -> Result<(Vec<u8>, bool), String>,
@@ -102,7 +99,6 @@ pub fn read_with(
         body: Vec::new(),
     };
     let mut offset = 0;
-    // Preserve exact bytes only when the entire file fits, including its original line endings.
     let mut original = Vec::new();
     let mut pending = Vec::new();
     let mut ended_newline = false;
@@ -123,7 +119,6 @@ pub fn read_with(
         if bytes.contains(&0) {
             return Err("file contains NUL bytes; this tool reads text only".into());
         }
-        // Keep at most three trailing bytes between chunks; validation covers even unselected data.
         pending.extend_from_slice(&bytes);
         match str::from_utf8(&pending) {
             Ok(_) => pending.clear(),

@@ -1,51 +1,28 @@
-//! The dialog a tool's question opens (D197).
-//!
-//! A question is answered in two moves at most: pick a choice, then add a note or enter to finish.
-//! A preview is shown for the choice under the cursor, which is what makes a choice more than its
-//! label. Escape dismisses the question — an answer of its own, not an error — while ctrl+c cancels
-//! the turn the question belongs to. Nothing here decides anything: the answer travels back to the
-//! waiting tool through the question it arrived with.
-//!
-//! The question is drawn as the end of the transcript rather than over it, so the keys that walk the
-//! transcript are handed back to it: a person reading what led to the question scrolls without
-//! answering first (D197).
-
 use crate::questions::{Asked, Outcome, Reply, Selection};
 use saddle_limits as budgets;
 use std::sync::Arc;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-/// Where the keyboard is in the dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stage {
-    /// Moving through the choices.
     Choosing,
-    /// Writing the note that goes with the chosen choice.
     Noting { choice: usize, text: String },
-    /// Writing an answer of one's own.
     Typing { text: String },
 }
 
-/// What one key did to the question.
 #[derive(Debug, Clone)]
 pub enum Answer {
-    /// The dialog stays open.
     Stay,
-    /// The person answered; the dialog closes.
     Given(Outcome),
-    /// The person cancelled the turn the question belongs to.
     Cancel,
-    /// The key is the transcript's, not the question's: scrolling, while it is being answered.
     Pass,
 }
 
 pub struct AskDialog {
     pub asked: Arc<Asked>,
-    /// One row per choice, then the row whose answer is typed when it is offered.
     pub selected: usize,
     pub stage: Stage,
-    /// Why the last attempt was refused, such as an empty typed answer.
     pub error: Option<String>,
 }
 
@@ -59,10 +36,6 @@ impl AskDialog {
         }
     }
 
-    /// The keys the stage answers to, drawn on the frame's activity line so they are on the screen
-    /// even when the question itself has been scrolled out of view. A note names the choice it will
-    /// be attached to, because the person has already picked one and the block can be far away
-    /// (D197).
     pub fn help(&self) -> String {
         match &self.stage {
             Stage::Choosing => {
@@ -86,12 +59,10 @@ impl AskDialog {
         }
     }
 
-    /// How many rows the list has: the choices, and the typed answer when the question offers one.
     pub fn rows(&self) -> usize {
         self.asked.question.choices.len() + usize::from(self.asked.question.allow_other)
     }
 
-    /// The chosen index, or `None` for the typed-answer row.
     pub fn choice(&self, row: usize) -> Option<usize> {
         (row < self.asked.question.choices.len()).then_some(row)
     }
@@ -103,9 +74,6 @@ impl AskDialog {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Answer::Cancel;
         }
-        // Walking the transcript stays the transcript's: the question is its last rows, not a lid
-        // over them (D197). Home and End included — they mean "the start" and "the end" of the
-        // conversation, and the line being written has no cursor movement of its own to lose.
         if matches!(
             key.code,
             KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
@@ -161,7 +129,6 @@ impl AskDialog {
         }
     }
 
-    /// Pasted text goes into the line being written, never into the prompt under the dialog.
     pub fn paste(&mut self, text: &str) {
         let (Stage::Noting { text: note, .. } | Stage::Typing { text: note }) = &mut self.stage
         else {
@@ -190,8 +157,6 @@ impl AskDialog {
                 self.selected = (self.selected + 1) % rows;
                 Answer::Stay
             }
-            // A digit moves the highlight to that choice, and nothing else: answering is enter's
-            // job, so a number can never send an answer the person meant to look at (D197).
             KeyCode::Char(digit @ '1'..='9') => {
                 let row = digit.to_digit(10).unwrap_or(1) as usize - 1;
                 if row < rows {
@@ -200,14 +165,11 @@ impl AskDialog {
                 Answer::Stay
             }
             KeyCode::Enter => self.choose(),
-            // A note is an extra, never a step between picking a choice and answering it: `n`
-            // opens the line, and enter there sends the answer with it (D197).
             KeyCode::Char('n') => self.note(),
             _ => Answer::Stay,
         }
     }
 
-    /// Enter (or a digit) on the highlighted row: that is the answer, now.
     fn choose(&mut self) -> Answer {
         match self.choice(self.selected) {
             Some(choice) => Answer::Given(Outcome::Answered(Reply {
@@ -223,8 +185,6 @@ impl AskDialog {
         }
     }
 
-    /// `n`: write the note that goes with the choice under the cursor. A question that offers no
-    /// note, or the row whose answer is typed, has nothing to write one about.
     fn note(&mut self) -> Answer {
         if let Some(choice) = self.choice(self.selected)
             && self.asked.question.allow_note
@@ -238,7 +198,6 @@ impl AskDialog {
     }
 }
 
-/// Applies one editing key, answering whether the text changed enough to redraw.
 fn edit(text: &mut String, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Backspace => text.pop().is_some(),
@@ -293,7 +252,6 @@ mod tests {
     #[test]
     fn the_keys_that_walk_the_transcript_are_the_transcript_s_while_a_question_is_asked() {
         let (mut dialog, _answers) = dialog();
-        // The question is the transcript's last rows, so scrolling is still scrolling (D197).
         for code in [
             KeyCode::PageUp,
             KeyCode::PageDown,
@@ -306,8 +264,6 @@ mod tests {
             );
         }
         assert_eq!(dialog.selected, 0, "handing the key back chose nothing");
-        // The same holds while a note is being written: end still means the end of the
-        // conversation, and the note is where the cursor already is.
         dialog.key(key(KeyCode::Char('n')));
         assert!(matches!(dialog.stage, Stage::Noting { .. }));
         assert!(matches!(dialog.key(key(KeyCode::End)), Answer::Pass));
@@ -317,7 +273,6 @@ mod tests {
     #[test]
     fn a_choice_takes_a_note_and_the_note_is_the_answer() {
         let (mut dialog, _answers) = dialog();
-        // Down to the second choice, `n` for the note, then the words and enter.
         assert!(matches!(dialog.key(key(KeyCode::Down)), Answer::Stay));
         assert_eq!(dialog.selected, 1);
         assert!(matches!(dialog.key(key(KeyCode::Char('n'))), Answer::Stay));
@@ -341,8 +296,6 @@ mod tests {
     #[test]
     fn a_digit_only_moves_the_highlight() {
         let (mut moving, _answers) = dialog();
-        // A digit moves the highlight, so it can never send an answer the person meant to look at
-        // (D197); enter is what answers.
         assert!(matches!(moving.key(key(KeyCode::Char('2'))), Answer::Stay));
         assert_eq!(moving.selected, 1);
         let Answer::Given(Outcome::Answered(reply)) = moving.key(key(KeyCode::Enter)) else {
@@ -350,7 +303,6 @@ mod tests {
         };
         assert!(matches!(reply.selection, Selection::Chosen(1)));
         assert_eq!(reply.note, "");
-        // A digit past the last row moves nothing.
         let (mut fresh, _answers) = dialog();
         assert!(matches!(fresh.key(key(KeyCode::Char('9'))), Answer::Stay));
         assert_eq!(fresh.selected, 0);
@@ -375,10 +327,8 @@ mod tests {
         let (mut dialog, _answers) = dialog();
         assert!(matches!(dialog.key(key(KeyCode::Char('n'))), Answer::Stay));
         assert!(matches!(dialog.stage, Stage::Noting { .. }));
-        // The note stage is where escape goes back, not away.
         assert!(matches!(dialog.key(key(KeyCode::Esc)), Answer::Stay));
         assert_eq!(dialog.stage, Stage::Choosing);
-        // And a question that offers no note has none to open.
         let (asked, _answers) = Asked::pair(Question {
             question: "confirm?".into(),
             choices: vec![Choice {
@@ -398,9 +348,7 @@ mod tests {
     #[test]
     fn the_last_row_is_an_answer_of_one_s_own_and_needs_words() {
         let (mut dialog, _answers) = dialog();
-        // Three rows: two choices and the typed one.
         assert_eq!(dialog.rows(), 3);
-        // Up from the first row wraps to the typed-answer row, which is the last one.
         dialog.key(key(KeyCode::Up));
         assert_eq!(dialog.selected, 2);
         assert!(matches!(dialog.key(key(KeyCode::Enter)), Answer::Stay));

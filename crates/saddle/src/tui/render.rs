@@ -1,5 +1,3 @@
-//! Drawing: the transcript, the queue, the activity line, the editor and the status line.
-
 use crate::plugins::services::panel::{PanelView, Row as PanelRow, Tone};
 use crate::provider;
 use crate::provider::Image;
@@ -47,12 +45,9 @@ use crate::tui::theme::Theme;
 use super::login::{Choice, Listed, Outcome, Pick};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/// Output lines a collapsed tool block shows.
 const PREVIEW_LINES: usize = 5;
 const MAX_EDITOR_ROWS: usize = 10;
 
-/// One logical line: a prefix for its first visual row, a prefix for the rows it wraps onto, and
-/// its content.
 #[derive(Debug, Clone, Default)]
 pub struct Row {
     pub first: Vec<Span<'static>>,
@@ -73,8 +68,6 @@ fn spans_width(spans: &[Span<'_>]) -> usize {
     spans.iter().map(|s| s.content.width()).sum()
 }
 
-/// Word-wraps a row to `width` columns. Leading whitespace on the first row is kept (code
-/// indentation); whitespace at a break is dropped; a word longer than a row is split.
 pub fn wrap(row: &Row, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut current: Vec<Span<'static>> = row.first.clone();
@@ -140,7 +133,6 @@ pub fn wrap(row: &Row, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// Splits text into alternating runs of whitespace and non-whitespace.
 fn pieces(s: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0;
@@ -163,40 +155,16 @@ fn code_style(theme: &Theme) -> Style {
     Style::new().fg(theme.md_code)
 }
 
-/// A fenced block, which pi colours separately from inline code (D72).
 fn block_style(theme: &Theme) -> Style {
     Style::new().fg(theme.md_code_block)
 }
 
-/// The character a formula's first reserved row carries until the drawing pass finds it (D165).
-///
-/// A picture is placed at a row of the transcript, and a formula is not an entry of its own: it is
-/// inside a message, whose rows are wrapped and shifted before they are drawn. The marker is how a
-/// row that has to be blank in the end survives that, without the picture's position being counted
-/// through a wrap that splits other rows. It is a private-use character and is replaced by a blank
-/// before anything is drawn or copied.
 const FORMULA: char = '\u{E000}';
 
-/// The character the rest of an inline formula's reserved run carries (D165).
-///
-/// A formula inside a line of text takes cells of that line, and the cells are reserved as a run of
-/// characters the wrapper measures like any other text but cannot break: a private-use letter is
-/// one cell wide and is not whitespace, so the run moves to the next row whole rather than being
-/// split down the middle. Both characters are replaced by blanks before anything is drawn.
 const GUTTER: char = '\u{E001}';
 
-/// The most rows a formula may take. Beyond this the source is drawn instead: a page-high equation
-/// is not what a transcript is for (D165).
 const MAX_MATH_ROWS: u16 = 16;
 
-/// The Markdown as it was written, with the other spellings of a formula rewritten into the parser's
-/// own (D165).
-///
-/// `pulldown-cmark` knows `$x$` and `$$x$$` and nothing else. The two spellings people write instead
-/// reach it as ordinary text, and have to: a dollar with a space inside is what money looks like, and
-/// the backslash of `\(x\)` is an escape that is gone before any maths layer could see it. So they
-/// are rewritten here, before it parses anything — outside code, which is what a person wrote to be
-/// read exactly as it is: a fenced block, or a span between backticks.
 fn delimiters(text: &str) -> Cow<'_, str> {
     if !text.contains('$') && !text.contains("\\(") && !text.contains("\\[") {
         return Cow::Borrowed(text);
@@ -208,9 +176,6 @@ fn delimiters(text: &str) -> Cow<'_, str> {
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
-        // A fence line is a whole line, and is copied as one: read as an inline span instead, its
-        // backticks would open a span that never closes and the rest of the message would be left
-        // exactly as it was written (D165).
         if (i == 0 || chars[i - 1] == '\n')
             && let Some(marker) = fence_marker(&chars[i..])
         {
@@ -233,8 +198,6 @@ fn delimiters(text: &str) -> Cow<'_, str> {
             continue;
         }
         match c {
-            // A span in backticks is code however it reads, so it is copied to its closing run —
-            // and a run that never closes is just a backtick, which is what the parser makes of it.
             '`' => {
                 let run = chars[i..].iter().take_while(|c| **c == '`').count();
                 match code_span_end(&chars, i + run, run) {
@@ -248,7 +211,6 @@ fn delimiters(text: &str) -> Cow<'_, str> {
                     }
                 }
             }
-            // TeX's own delimiters: the backslash is what makes them unambiguous.
             '\\' if matches!(chars.get(i + 1), Some('(' | '[')) => {
                 let (close, mark) = match chars[i + 1] {
                     '(' => (')', "$"),
@@ -278,7 +240,6 @@ fn delimiters(text: &str) -> Cow<'_, str> {
                     }
                 }
             }
-            // A dollar with a space inside: maths when it reads as maths, money when it does not.
             '$' if chars.get(i + 1) != Some(&'$') => {
                 let mut j = i + 1;
                 let mut end = None;
@@ -325,7 +286,6 @@ fn delimiters(text: &str) -> Cow<'_, str> {
     }
 }
 
-/// Just past the run of `run` backticks that closes a code span beginning at `from`, if one does.
 fn code_span_end(chars: &[char], from: usize, run: usize) -> Option<usize> {
     let mut j = from;
     while j < chars.len() {
@@ -342,8 +302,6 @@ fn code_span_end(chars: &[char], from: usize, run: usize) -> Option<usize> {
     None
 }
 
-/// The fence a line opens or closes, when it starts with one: three or more backticks or tildes, no
-/// more than three spaces in.
 fn fence_marker(line: &[char]) -> Option<(char, usize)> {
     let indent = line.iter().take_while(|c| **c == ' ').count();
     if indent > 3 {
@@ -357,10 +315,6 @@ fn fence_marker(line: &[char]) -> Option<(char, usize)> {
     (count >= 3).then_some((marker, count))
 }
 
-/// Whether what stands between two dollars is a formula rather than an amount of money (D165).
-///
-/// A formula has TeX in it — a command, a script, a group, a relation — or else it is one word of
-/// symbols; money has figures in it, and prose has spaces.
 fn maths_like(body: &[char]) -> bool {
     let body: String = body.iter().collect();
     let trimmed = body.trim();
@@ -373,18 +327,10 @@ fn maths_like(body: &[char]) -> bool {
     !trimmed.contains([' ', '\t', ',']) && !trimmed.chars().any(|c| c.is_ascii_digit())
 }
 
-/// Markdown to rows, fitted to `room` columns. Soft breaks are kept as line breaks, since a model's
-/// line breaks are usually deliberate (tables, lists written by hand).
-///
-/// The room is what a table needs and nothing else does: a table is the one construct whose layout
-/// cannot survive being wrapped afterwards, because a wrapped row loses the alignment that makes
-/// it a table. Every other block is wrapped by [`wrap`] as it always was.
 pub fn markdown(text: &str, theme: &Theme, room: usize) -> Vec<Row> {
     markdown_over(text, theme, Style::new(), room, false, 1.0, &mut Vec::new())
 }
 
-/// Markdown drawn over `base`, which is what a message the user typed gets: the text is already in
-/// their colour, and the emphasis they wrote is a modifier on top of it.
 fn markdown_over(
     text: &str,
     theme: &Theme,
@@ -405,8 +351,6 @@ fn markdown_over(
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
-        // `$…$` and `$$…$$` arrive as their own events, which is what makes a formula a picture
-        // rather than a span of text (D165).
         | Options::ENABLE_MATH;
     for event in Parser::new_ext(&delimiters(text), options) {
         md.event(event);
@@ -417,38 +361,25 @@ fn markdown_over(
 }
 
 struct Markdown {
-    /// The columns a table may use, so it is fitted instead of wrapped apart.
     room: usize,
-    /// The colours, kept here because the parser's callbacks are methods on this struct (D71).
     theme: Theme,
     rows: Vec<Row>,
     line: Vec<Span<'static>>,
     styles: Vec<Style>,
-    /// One entry per open list: the next number, or `None` for bullets.
     lists: Vec<Option<u64>>,
     bullet: Option<String>,
     quote: usize,
     code: bool,
-    /// The language the open fence names, and the highlighter's carry-over state (D73).
     lang: Language,
     code_state: State,
     blank_before_next_block: bool,
     link: Option<String>,
     table: Option<Table>,
-    /// The style everything is drawn over: empty for a reply, the prompt's own colour for a message
-    /// the user typed, so the emphasis inside it is visible against their text (D81).
     base: Style,
-    /// Whether a formula can be drawn at all: a terminal with no graphics protocol gets its source
-    /// (D59, D165).
     pictures: bool,
-    /// The formulas this block reserved rows for, in the order their markers appear.
     images: Vec<Formula>,
-    /// A fence tagged `typst-math` while its body is being collected: what is between the fences is
-    /// a formula in Typst's own notation, and it is read as maths rather than as markdown (D165).
     math_block: Option<String>,
-    /// `[ui] math-scale`, which is 1.0 unless someone asked for larger or smaller formulas (D165).
     scale: f32,
-    /// Whether the last row pushed is the blank a block break asked for (D165).
     block_blank: bool,
 }
 
@@ -473,8 +404,6 @@ impl Default for Markdown {
             pictures: false,
             images: Vec::new(),
             math_block: None,
-            // Not a type's zero: the size the fonts and the cell work out to is the default, and
-            // zero would draw a formula half-size (D165).
             scale: 1.0,
             block_blank: false,
         }
@@ -512,7 +441,6 @@ impl Markdown {
             Some(bullet) => {
                 let depth = self.lists.len().saturating_sub(1);
                 let lead = format!("{}{bullet}", "  ".repeat(depth));
-                // Continuation lines line up with the text after the bullet.
                 let pad = lead.width().max(indent.width());
                 let rest = " ".repeat(pad);
                 return (
@@ -531,7 +459,6 @@ impl Markdown {
         )
     }
 
-    /// Ends the current line. A pending bullet waits for the first line with text.
     fn flush(&mut self) {
         if self.line.is_empty() {
             return;
@@ -548,21 +475,11 @@ impl Markdown {
         if blank {
             self.rows.push(Row::default());
         }
-        // Which row, if any, the break put there: a formula takes the break without it.
         self.block_blank = blank;
         self.blank_before_next_block = false;
     }
 
-    /// Typesets one display formula and reserves the rows it will be drawn in (D165).
-    ///
-    /// The rows are blank in the end, and the first of them carries a marker: the picture is placed
-    /// at that row, so the layout and the drawing pass agree even though the rows around it are
-    /// wrapped and counted later.
     fn formula(&mut self, source: &str, notation: math::Notation) {
-        // A block break puts a blank row above the block, and a picture's ink starts at the very top
-        // of its box: that row reads as a hole above a formula, where above a paragraph of text its
-        // own line leading fills the same gap. A formula brings its own room — the padding inside
-        // the picture — so it takes the break without the blank row (D165).
         self.flush();
         if self.block_blank {
             self.rows.pop();
@@ -577,8 +494,6 @@ impl Markdown {
         };
         let formula = if self.pictures {
             match notation {
-                // One reading, decided by how the formula was invoked: a `$…$` body is LaTeX and a
-                // fence tagged `typst-math` is Typst's own maths (D165).
                 math::Notation::Latex => math::render(source, &room),
                 math::Notation::Typst => math::render_typst(source, &room),
             }
@@ -586,16 +501,6 @@ impl Markdown {
             None
         };
         let Some(formula) = formula else {
-            // The rule that keeps the transcript honest: what cannot be typeset is drawn as the
-            // source, never as something wrong (D165). A formula written over several lines keeps
-            // them: a line break is a space to TeX, but the shape a writer gives a long formula is
-            // what makes its source readable, and a row of text holds no line break at all —
-            // `$$…$$` written on three lines came out on one, which is how a real transcript
-            // showed it.
-            //
-            // LaTeX's source is marked with the delimiters it was written in, so it is read back as
-            // a formula where it is pasted; a fence's body is shown as the block of code it is,
-            // since a fence is what says "Typst" and the copy keeps the fence (D166).
             let is_latex = notation == math::Notation::Latex;
             let style = if is_latex {
                 self.code_style()
@@ -626,8 +531,6 @@ impl Markdown {
             self.blank_before_next_block = true;
             return;
         };
-        // The rows this formula is drawn in are the rows the layout reserves (D165): the picture is
-        // scaled into them, so the two cannot disagree about how tall it is.
         let rows = formula.cells.1.max(1);
         self.rows
             .push(Row::plain(vec![Span::raw(FORMULA.to_string())]));
@@ -635,20 +538,10 @@ impl Markdown {
             self.rows.push(Row::default());
         }
         self.images.push(formula);
-        // The same reason below: the room inside the picture is the separation, so the text that
-        // follows a formula starts on the next row instead of after a blank one (D165).
         self.blank_before_next_block = false;
     }
 
-    /// Typesets one formula inside a line of text and reserves the cells it is drawn in (D165).
-    ///
-    /// It cannot have rows of its own, so what it gets instead is cells of the line it is in: a run
-    /// the wrapper measures as usual and cannot break inside. The run moves to the next row with
-    /// the words around it, and the drawing pass finds the marker and puts the picture at the column
-    /// the run ended up at.
     fn inline(&mut self, source: &str) {
-        // A table's cells are fitted rather than wrapped, so there is no column for a picture to
-        // take: a formula inside one stays its source, as it does in a terminal with no pictures.
         let formula = if self.table.is_some() || !self.pictures {
             None
         } else {
@@ -663,8 +556,6 @@ impl Markdown {
         };
         let Some(formula) = formula else {
             let style = self.code_style();
-            // A formula inside a line has no rows of its own, so a break in its source — a
-            // paragraph's soft break inside `$…$` — is written as the space TeX reads there.
             self.text(&format!("${}$", source.replace(['\n', '\r'], " ")), style);
             return;
         };
@@ -697,8 +588,6 @@ impl Markdown {
                     if l.is_empty() && lines.peek().is_none() {
                         break;
                     }
-                    // The block's own colour is the base; each run paints over it with its role
-                    // wherever the language is known (D73).
                     self.line
                         .push(Span::styled("  ".to_owned(), self.block_style()));
                     for (kind, text) in syntax::highlight(&self.lang, l, &mut self.code_state) {
@@ -708,8 +597,6 @@ impl Markdown {
                     self.flush();
                 }
             }
-            // A fence tagged `typst-math` holds a formula, and its body is taken as it is written:
-            // markdown inside maths would be read as emphasis, and a formula is not prose (D165).
             Event::Text(t) if self.math_block.is_some() => {
                 if let Some(body) = &mut self.math_block {
                     body.push_str(&t);
@@ -720,8 +607,6 @@ impl Markdown {
                 self.text(&t, style);
             }
             Event::Code(t) => self.text(&t, self.code_style()),
-            // A display formula is typeset and placed as a picture, and so is one inside a line:
-            // both are drawn in the cells the layout reserves for them (D165).
             Event::DisplayMath(t) => self.formula(&t, math::Notation::Latex),
             Event::InlineMath(t) => self.inline(&t),
             Event::SoftBreak | Event::HardBreak => self.flush(),
@@ -771,14 +656,9 @@ impl Markdown {
             Tag::CodeBlock(kind) => {
                 let lang = match kind {
                     CodeBlockKind::Fenced(tag) => Language::parse(&tag),
-                    // An indented block names no language, so there is nothing to look up.
                     CodeBlockKind::Indented => Language::Plain,
                 };
                 self.start_block();
-                // The one fence tag that is not code: Typst's own maths, which is a formula rather
-                // than the highlighted text a language tag gives (D165). `typst` itself stays code,
-                // because a tag that meant both would leave the same body read as maths when it
-                // happens to parse and as code when it does not.
                 if matches!(&lang, Language::Tagged(tag) if tag == math::TYPST) {
                     self.math_block = Some(String::new());
                 } else {
@@ -906,16 +786,6 @@ impl Markdown {
         }
     }
 
-    /// Lays a table out inside the room it was given.
-    ///
-    /// The widths are the natural ones when they fit, and otherwise shrunk towards a minimum, which
-    /// is what pi does with the same problem: a column's share falls in proportion to how much it
-    /// wanted above its minimum, so a table of one wide prose column and three short ones keeps the
-    /// short ones readable instead of squeezing every column equally.
-    ///
-    /// A cell is then wrapped inside its column and padded to it, so a row that has to be tall
-    /// stays aligned. That is the whole point: a table whose rows are wrapped by the generic
-    /// wrapper afterwards is not a table any more.
     fn table_rows(&mut self, t: Table) {
         let cols = t.rows.iter().map(Vec::len).max().unwrap_or(0);
         if cols == 0 {
@@ -933,7 +803,6 @@ impl Markdown {
         let sep = Style::new().fg(self.theme.muted);
         for (r, row) in t.rows.into_iter().enumerate() {
             let head = r < t.head_rows;
-            // Every cell wrapped to its column, then the row read across the tallest of them.
             let cells: Vec<Vec<Vec<Span<'static>>>> = (0..cols)
                 .map(|i| match row.get(i) {
                     Some(cell) => wrap_cell(cell, widths[i], head),
@@ -962,8 +831,6 @@ impl Markdown {
     }
 }
 
-/// The width of the longest word one cell cannot break, which is the narrowest its column may be
-/// before a word has to be split.
 fn longest_word_width(spans: &[Span<'_>]) -> usize {
     spans
         .iter()
@@ -973,26 +840,11 @@ fn longest_word_width(spans: &[Span<'_>]) -> usize {
         .unwrap_or(1)
 }
 
-/// Column widths for `natural` widths in `room` columns, separators included.
-///
-/// Fitting only ever shrinks: a table that already fits keeps its natural widths, so nothing moves
-/// when the terminal is wide enough.
-///
-/// The shrink is water-filling rather than an even split, which is the difference between a table
-/// that reads and one that does not. A column that would fit inside an equal share is given its
-/// natural width and takes no part in the squeeze, so a `yes` column stays `yes` while the one
-/// paragraph column beside it absorbs the whole deficit. An even split cuts the short word and
-/// starves the column that could give most, which shows up as `saddl` / `e`.
-///
-/// `min` is the longest word per column, as this does what pi does: a word is only split when the
-/// table cannot be laid out without splitting it, so `Plugin` stays whole and the column takes the
-/// room from the prose beside it.
 pub fn column_widths(natural: &[usize], min: &[usize], room: usize) -> Vec<usize> {
     let cols = natural.len();
     if cols == 0 {
         return Vec::new();
     }
-    // " │ " between columns.
     let separators = 3 * cols.saturating_sub(1);
     let total: usize = natural.iter().sum();
     if total <= room.saturating_sub(separators) {
@@ -1001,13 +853,9 @@ pub fn column_widths(natural: &[usize], min: &[usize], room: usize) -> Vec<usize
     let mut floors: Vec<usize> = (0..cols)
         .map(|i| min.get(i).copied().unwrap_or(1).min(natural[i]).max(1))
         .collect();
-    // The room a column has once every other column has its floor, which is what decides whether
-    // the floors themselves can be paid for.
     let floor_total: usize = floors.iter().sum();
     let budget = room.saturating_sub(separators).max(cols);
     if floor_total > budget {
-        // Even the longest words do not fit: every column takes one cell and the rest is shared by
-        // how much each still wants, so a wide table on a narrow screen still has a shape.
         floors = vec![1; cols];
         let mut widths = floors.clone();
         let want: Vec<usize> = natural.iter().map(|n| n.saturating_sub(1)).collect();
@@ -1031,7 +879,6 @@ pub fn column_widths(natural: &[usize], min: &[usize], room: usize) -> Vec<usize
             left -= want;
             unresolved -= 1;
         } else {
-            // The rest share what is left: the wide columns are the ones that can give.
             let rest = &order[position..];
             let asked: usize = rest
                 .iter()
@@ -1048,7 +895,6 @@ pub fn column_widths(natural: &[usize], min: &[usize], room: usize) -> Vec<usize
     top_up(widths, natural, budget)
 }
 
-/// Hands out the columns integer division left over, to whichever column still has most to gain.
 fn top_up(mut widths: Vec<usize>, natural: &[usize], budget: usize) -> Vec<usize> {
     let mut spare = budget.saturating_sub(widths.iter().sum::<usize>());
     while spare > 0 {
@@ -1066,10 +912,6 @@ fn top_up(mut widths: Vec<usize>, natural: &[usize], budget: usize) -> Vec<usize
     widths
 }
 
-/// One cell's spans wrapped to `width` columns, a line per row of the cell.
-///
-/// Words break at spaces and a word longer than the column is split, since a URL in a narrow column
-/// must not push the rest of the row off the screen.
 fn wrap_cell(spans: &[Span<'static>], width: usize, head: bool) -> Vec<Vec<Span<'static>>> {
     let styled = |content: String| -> Span<'static> {
         let style = spans
@@ -1107,7 +949,6 @@ fn wrap_cell(spans: &[Span<'static>], width: usize, head: bool) -> Vec<Vec<Span<
                 }
                 continue;
             }
-            // A word wider than the column: split it across the lines it needs.
             let mut rest: String = word.to_owned();
             while !rest.is_empty() {
                 let space = width.saturating_sub(used);
@@ -1124,8 +965,6 @@ fn wrap_cell(spans: &[Span<'static>], width: usize, head: bool) -> Vec<Vec<Span<
                     take = rest.len().min(1);
                 }
                 let (head_part, tail) = rest.split_at(take);
-                // At the start of a line the split's own space is dropped, or a continuation would
-                // begin with a blank and every wrapped row would look indented by one.
                 let text = if used == 0 {
                     head_part.trim_start()
                 } else {
@@ -1157,22 +996,14 @@ fn dim(theme: &Theme) -> Style {
     Style::new().fg(theme.muted)
 }
 
-/// Toggles that change how entries render.
 #[derive(Clone, Copy)]
 struct View {
     expand: bool,
     thinking: bool,
     spinner: usize,
-    /// True when the frame's activity line already names the call in flight, so a tool block that
-    /// is still running does not lead with a second spinner (D172).
     activity: bool,
-    /// The transcript width, so an image's reserved rows match what is drawn (D59).
     room: (u16, u16),
-    /// Whether the terminal can draw a picture, which decides whether an attachment gets rows
-    /// reserved for one (D59).
     images: bool,
-    /// `[ui] math-scale`: a formula drawn larger or smaller than the fonts and the cell work out to
-    /// (D165).
     scale: f32,
 }
 
@@ -1187,7 +1018,6 @@ fn thinking_rows(text: &str, shown: bool, theme: &Theme, room: usize) -> Vec<Row
             dim(theme).add_modifier(Modifier::ITALIC),
         )])];
     }
-    // D151: summaries contain Markdown too. Preserve list/code prefixes inside the thinking bar.
     let mut rows = markdown_over(
         text,
         theme,
@@ -1204,13 +1034,6 @@ fn thinking_rows(text: &str, shown: bool, theme: &Theme, room: usize) -> Vec<Row
     rows
 }
 
-/// What the user typed, read as markdown in their own colour (D81).
-///
-/// This is what pi does — its user-message component is its markdown renderer with the user's
-/// colour as the base and the user-message background behind it — so a prompt and a reply are read
-/// by the same code. The text is not bold, so that `**bold**` inside it is visible; the `>` marker is
-/// what says whose message it is. Every row gets the marker's width as its continuation, including
-/// a row a block construct made, so a list in a prompt still lines up under the message.
 fn user_rows(
     text: &str,
     theme: &Theme,
@@ -1239,10 +1062,6 @@ fn user_rows(
     rows
 }
 
-/// Rows for entries drawn as plain text; tool calls are drawn as blocks by [`tool_block`].
-/// One entry, drawn as the transcript draws it: a tool block with its spinner and diff, a
-/// compaction, or wrapped markdown rows. Shared by the lead's transcript and a worker's view, so
-/// entering a worker shows the same rendering rather than a plain tail (D195).
 fn entry_render(
     entry: &Entry,
     view: View,
@@ -1311,16 +1130,11 @@ fn entry_rows(entry: &Entry, view: View, theme: &Theme, images: &mut Vec<Formula
             images,
         ),
         Entry::Image(image) => {
-            // The picture is drawn over the rows after this one, so they are left empty for it. The
-            // marker line stays, and is all a terminal without a graphics protocol shows (D59).
             let mut out: Vec<Row> = vec![Row::plain(vec![Span::styled(
                 image::fallback(&image.name, image.width, image.height),
                 dim(theme),
             )])];
             if view.images {
-                // The rows the picture will cover, from its own size scaled into the transcript
-                // width: kitty draws it at its pixel size when it fits, and scaled when it does
-                // not (D59).
                 let fit = image::fit((image.width, image.height), (view.room.0, image::MAX_ROWS));
                 out.extend(iter::repeat_n(Row::plain(Vec::new()), fit.rows as usize));
             }
@@ -1341,10 +1155,6 @@ fn entry_rows(entry: &Entry, view: View, theme: &Theme, images: &mut Vec<Formula
     }
 }
 
-/// A compaction as a shaded block: what is being summarized, then the model's reasoning (unless
-/// hidden with ctrl+t) and a preview of the summary, then what was kept. The summary is collapsed
-/// the way a tool's output is (D124): while it streams the last few lines are shown, because the
-/// new text is at the end, and once it is done the first few, because the beginning is its gist.
 fn compaction_block(
     v: &CompactionView,
     thinking: bool,
@@ -1372,10 +1182,6 @@ fn compaction_block(
     let reasoning = v.reasoning.trim();
     if !reasoning.is_empty() {
         rows.push(Row::default());
-        // One control for the entry: ctrl+o opens the compaction, and the reasoning it was written
-        // from is part of what it opens. It used to follow ctrl+t instead, which meant a person who
-        // had reasoning on saw every compaction arrive with all of its thinking laid out — two
-        // toggles for one entry, and the default was the wrong way round (D124).
         if expand && thinking {
             rows.extend(thinking_rows(
                 reasoning,
@@ -1442,8 +1248,6 @@ fn compaction_block(
     (rows, bg)
 }
 
-/// A tool's output as the block shows it. For bash, the exit-code line moves to the end (where
-/// it stays visible under a long output) and the stream markers are dropped.
 fn tool_output(name: &str, content: &str) -> (Vec<String>, Option<String>) {
     let mut lines: Vec<String> = content.lines().map(str::to_owned).collect();
     if name != "bash" {
@@ -1468,7 +1272,6 @@ fn tool_output(name: &str, content: &str) -> (Vec<String>, Option<String>) {
     (lines, status)
 }
 
-/// background execution is host state, not a successful launch result or guest text (D159).
 fn background_block(
     rows: &mut [Row],
     bg: &mut Color,
@@ -1502,7 +1305,6 @@ fn background_block(
             );
         }
         for task in tasks {
-            // Each task is timed from when it started, not from when the interface drew it (D172).
             row.spans.push(Span::styled(
                 format!(
                     "  [{}: {} · {}]",
@@ -1516,10 +1318,6 @@ fn background_block(
     }
 }
 
-/// A tool call as a shaded block: the call, then its output. Collapsed, bash shows its last
-/// lines (where errors and test summaries are) and other tools their first.
-/// How long a call has been going, or took once it answered (D172), and the deadline it was given
-/// when the model set one (D152).
 #[derive(Clone, Copy, Default)]
 struct Timing<'a> {
     elapsed: Option<&'a str>,
@@ -1527,8 +1325,6 @@ struct Timing<'a> {
 }
 
 impl Timing<'_> {
-    /// The words after the command: `· 5.0s`, `· 5.0s of 30s`, or `· 30s limit` where there is no
-    /// stopwatch to put the limit after.
     fn words(&self) -> String {
         let mut words = String::new();
         if let Some(elapsed) = self.elapsed {
@@ -1556,8 +1352,6 @@ fn tool_block(
 ) -> (Vec<Row>, Color) {
     let (expand, spinner) = (view.expand, view.spinner);
     let bold = Style::new().add_modifier(Modifier::BOLD);
-    // The tool's own name has a role of its own, so a theme can quiet the titles without touching
-    // the accent everywhere else (D72).
     let accent = Style::new()
         .fg(theme.tool_title)
         .add_modifier(Modifier::BOLD);
@@ -1580,9 +1374,6 @@ fn tool_block(
             header.push(Span::styled(first, bold));
         }
     }
-    // A stopwatch beside the call — running while it works, the total once it has answered, so a
-    // command that took a minute says so afterwards (D172) — and the deadline the call set when it
-    // set one (D152).
     let tail = timing.words();
     if !tail.is_empty() {
         header.push(Span::styled(tail, dim(theme)));
@@ -1613,7 +1404,6 @@ fn tool_block(
     if let (Some(diff), true) = (diff, *ok) {
         body = diff_rows(diff, expand, theme);
     } else if name == "read" && *ok && !expand {
-        // A file's contents are noise in the transcript until asked for.
         body.push(Row::plain(vec![Span::styled(
             format!("{} lines", lines.len()),
             note,
@@ -1664,11 +1454,8 @@ fn tool_block(
     (rows, bg)
 }
 
-/// Diff lines shown in an edit or write block, before ctrl+o.
 const DIFF_PREVIEW: usize = 16;
 
-/// A diff from [`crate::tools`], one row per line: a gutter with the sign and line number, then
-/// the text. Wrapped text stays to the right of the gutter.
 fn diff_rows(diff: &str, expand: bool, theme: &Theme) -> Vec<Row> {
     let lines: Vec<&str> = diff.lines().collect();
     let width = lines
@@ -1719,8 +1506,6 @@ fn diff_rows(diff: &str, expand: bool, theme: &Theme) -> Vec<Row> {
     rows
 }
 
-/// Rows on a background that spans the full width, with a column of padding on each side and a
-/// line of padding above and below.
 fn shaded(rows: &[Row], bg: Color, width: usize) -> Vec<Line<'static>> {
     let fill = Style::new().bg(bg);
     let blank = || Line::from(Span::styled(" ".repeat(width), fill));
@@ -1746,35 +1531,16 @@ fn shaded(rows: &[Row], bg: Color, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// All transcript lines at `width`, reusing cached entries.
-/// The transcript, and the line each attachment is announced on, so the picture can be drawn just
-/// below it (D59).
-/// One picture the transcript drew, and where it goes.
 struct At {
-    /// The line the picture's box starts at: for a picture its own text announces, the row below the
-    /// line announcing it; for a formula, the row below its marker, or the marker's own row when the
-    /// formula sits inside a line (D165).
     line: usize,
-    /// The column its first cell is at, or `None` when it starts its row. A formula inside a line of
-    /// text starts where the words before it leave off (D165).
     column: Option<u16>,
-    /// The picture, and the cells it is drawn in. An attachment states its own size; a formula's
-    /// cells are the rows the layout reserved for it (D165).
     picture: Picture,
-    /// The formula as it was written, which is what a copy of it takes (D166). Empty for a picture
-    /// an attachment brings, which has no source in the conversation.
     tex: String,
-    /// Whether the formula sits inside a line: `$…$` when it is copied, `$$…$$` when it is a block.
     inline: bool,
-    /// Whether it was written in Typst's own notation, in which case a copy carries the fence that
-    /// asks for it rather than TeX's delimiters (D166).
     typst: bool,
-    /// The id the terminal knows it by: the entry's position gives it, so the same picture keeps
-    /// the same id every frame and does not have to be re-sent (D59).
     id: u32,
 }
 
-/// A picture the transcript places, and its size in cells.
 struct Picture {
     image: Image,
     cells: image::Fit,
@@ -1820,16 +1586,12 @@ fn transcript_with_images(
         if i > 0 {
             lines.push(Line::default());
         }
-        // The marker line is where the picture goes, so its index is taken before the entry's own
-        // lines are added and the picture starts there.
         if let Some(image) = app.cached_image(i) {
             let cells = image::fit((image.width, image.height), (width, image::MAX_ROWS));
             images.push(At {
-                // The picture goes under the line that announces it.
                 line: lines.len() + 1,
                 column: None,
                 picture: Picture { image, cells },
-                // An attachment has no source in the conversation: it *is* the content.
                 tex: String::new(),
                 inline: false,
                 typst: false,
@@ -1844,9 +1606,6 @@ fn transcript_with_images(
                 .into_iter()
                 .flatten(),
         );
-        // Every formula left a marker where it is drawn: a row of its own for a block, and a run of
-        // cells inside a row for one that sits in a line. What is drawn is the picture; the cells it
-        // took are blanked so nothing shows through it (D165).
         let pictures = app
             .cache
             .get(i)
@@ -1857,8 +1616,6 @@ fn transcript_with_images(
                 .iter()
                 .position(|line| plain(line).contains(FORMULA))
             else {
-                // The block was cached without its picture, which means the source is what is on
-                // screen; there is nothing to place.
                 continue;
             };
             let (line, column) = if image.inline {
@@ -1867,7 +1624,6 @@ fn transcript_with_images(
                 };
                 (start + at, Some(column as u16))
             } else {
-                // A block's marker has the row to itself, and the picture starts on the row below.
                 lines[start + at] = Line::default();
                 (start + at + 1, None)
             };
@@ -1877,8 +1633,6 @@ fn transcript_with_images(
                 tex: image.source.clone(),
                 inline: image.inline,
                 typst: image.notation == math::Notation::Typst,
-                // The cells the formula says it occupies, asked for as a box: the terminal scales
-                // the picture into them, whatever its own pixels are (D165).
                 picture: Picture {
                     cells: image::Fit {
                         cols: image.cells.0.max(1),
@@ -1894,17 +1648,10 @@ fn transcript_with_images(
     (lines, images)
 }
 
-/// The terminal id of one of an entry's pictures (D59, D165).
-///
-/// An id has to be the same in every frame and different for every picture on the screen: the entry
-/// it belongs to and its place in that entry give both, and the room for 63 pictures in a message
-/// is far beyond what one reply holds.
 fn picture_id(entry: usize, within: usize) -> u32 {
     (entry as u32) * 64 + within as u32 + 1
 }
 
-/// The colour a formula is drawn in: the theme's text colour, or near-black or near-white when the
-/// theme leaves it to the terminal, which a picture cannot do (D165).
 fn maths_colour(theme: &Theme) -> (u8, u8, u8) {
     match theme.text {
         Color::Rgb(r, g, b) => (r, g, b),
@@ -1915,10 +1662,6 @@ fn maths_colour(theme: &Theme) -> (u8, u8, u8) {
     }
 }
 
-/// Blanks the run a formula reserved inside a line, returning the column it started at (D165).
-///
-/// The run is the marker and the fillers after it, one cell each: spaces keep the line's layout
-/// exactly, so what the row shows at that column is the picture and nothing else.
 fn unmark(line: &mut Line<'static>) -> Option<usize> {
     let mut column = 0;
     for span in &mut line.spans {
@@ -1943,19 +1686,14 @@ fn unmark(line: &mut Line<'static>) -> Option<usize> {
     None
 }
 
-/// A rendered line's text, as it appears on screen.
 fn plain(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
-/// The background a selected character sits on. It replaces only the colours, so dim tool output
-/// stays readable while selected, and reversed text keeps its emphasis (D35).
 fn selected_style(theme: &Theme) -> Style {
     Style::new().bg(theme.selected_bg).fg(theme.selection_fg)
 }
 
-/// Puts the selection's background behind characters `from..to` of one rendered line, splitting
-/// spans where the selection starts and ends inside them.
 fn shade(line: &mut Line<'static>, from: usize, to: usize, theme: &Theme) {
     if to <= from {
         return;
@@ -2073,14 +1811,10 @@ fn draw_panels(frame: &mut Frame<'_>, panels: &[PanelView], area: Rect, theme: &
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
-    // Filled in as the frame is drawn: a menu or dialog that covers a picture keeps it off the
-    // screen (D161).
     app.covered.clear();
     let inner_width = area.width.saturating_sub(2) as usize;
     let layout = app.editor.layout(inner_width.max(1));
     let editor_rows = layout.rows.len().clamp(1, MAX_EDITOR_ROWS);
-    // What is waiting to be delivered, the sooner one first: a steer enters at the next request,
-    // a queued prompt only after the turn (D149).
     let queue_rows = (app.steering.len() + app.jobs.len()).min(3);
     let panel_rows = app
         .plugin_panels
@@ -2110,8 +1844,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     {
         draw_worker(frame, &worker, app, transcript_area);
     } else {
-        // This transcript is the one the frame's activity line speaks for, so a call in flight is
-        // named there and does not spin in its own block as well (D172).
         draw_transcript(frame, app, transcript_area, true);
     }
     draw_panels(frame, &app.plugin_panels, panels_area, &app.theme);
@@ -2137,11 +1869,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     );
     frame.render_widget(Paragraph::new(queued), queue_area);
 
-    // A question is answered where it is drawn, at the end of the transcript, so the line that is
-    // always visible carries its keys and says when it has been scrolled out of sight (D197).
     let activity = match &app.ask {
-        // The question is the transcript's last rows, so it can be scrolled away: then the line
-        // says where it is rather than listing keys for a block that is not on the screen (D197).
         Some(dialog) if app.scroll > 0 => Line::from(vec![
             Span::styled("question below ", Style::new().fg(app.theme.accent)),
             Span::styled("· end to see it", dim(&app.theme)),
@@ -2180,8 +1908,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
                         format!("copied {}", app.copied_what),
                         Style::new().fg(app.theme.success),
                     )];
-                    // Only the transcript's own selection needs the hint; a dialog's text was never
-                    // the terminal's to select (D86).
                     if app.copied_what == "the selection" {
                         spans.push(Span::styled(
                             "  (shift+drag still selects in the terminal)",
@@ -2199,16 +1925,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     };
     frame.render_widget(Paragraph::new(activity), activity_area);
 
-    // The editor scrolls to keep the cursor visible.
     let (cursor_row, cursor_col) = layout.cursor;
     let top = (cursor_row + 1).saturating_sub(editor_rows);
     let shown: Vec<Line> = layout.rows[top..(top + editor_rows).min(layout.rows.len())]
         .iter()
         .map(|r| Line::raw(r.clone()))
         .collect();
-    // The editor's border is the one place that says whether the agent is working: muted while a
-    // turn runs, the accent colour when it is waiting for you.
-    // Three states, three roles: a command being typed, a turn running, and waiting for you (D72).
     let border = if app.editor.text().trim_start().starts_with('!') {
         app.theme.bash_mode
     } else if app.busy.is_some() {
@@ -2222,8 +1944,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             .border_style(Style::new().fg(border)),
     );
     frame.render_widget(editor, editor_area);
-    // While a question is open the prompt keeps its text but not the cursor: what is typed goes to
-    // the note or the answer, which draws its own (D197).
     if app.ask.is_none() {
         frame.set_cursor_position(Position::new(
             editor_area.x + 1 + cursor_col as u16,
@@ -2231,7 +1951,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         ));
     }
 
-    // The line is whatever `[ui] status` says, filled from the session (D36).
     let right = app.header.status.render(&StatusData {
         provider: &app.header.provider,
         model: &app.header.model,
@@ -2240,7 +1959,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         priced: app.header.priced,
         quota: app.quota.as_ref(),
         running_tasks: app.running_tasks,
-        // Finished workers keep their conversation but are not agents at work (D195).
         workers: Workers {
             live: app.team.iter().filter(|worker| !worker.finished).count(),
             active: app
@@ -2252,11 +1970,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         context: app.context,
         window: app.header.context_window,
         workspace: &home_relative(&app.header.workspace),
-        // A refill is counted down from the moment the frame is drawn (D49).
         now: SystemTime::now(),
     });
-    // The workspace is drawn on the left unless the template already places it, so a user who
-    // moves it into the line does not see it twice (D36).
     if !app.header.status.contains(Field::Workspace) {
         let room = (status_area.width as usize).saturating_sub(right.width() + 2);
         let left = keep_tail(&home_relative(&app.header.workspace), room);
@@ -2274,8 +1989,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     draw_menu(frame, app, editor_area);
 
-    // A dialog owns the screen while it is open, and its text is selected and copied the way the
-    // transcript's is, so the text it drew is kept for the mouse (D87).
     let mut surface = None;
     if let Some(selected) = app.overview {
         surface = Some(draw_overview(frame, app, selected, area));
@@ -2296,13 +2009,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         surface = Some(draw_permissions(frame, dialog, area, &app.theme));
     }
     if let Some(picker) = &app.themes {
-        // Drawn in the theme the highlight offers, which is the point of the preview (D74).
         surface = Some(draw_themes(frame, picker, area, &app.theme));
     }
     app.open_url_at = None;
     if let Some(login) = &app.login {
         let (seen, link) = draw_login(frame, login, area, app.spinner, &app.theme);
-        // Kept for the click: a link drawn on the screen is not the terminal's to click (D86).
         app.open_url_at = link;
         surface = Some(seen);
     }
@@ -2310,23 +2021,14 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let opened = !had_dialog && surface.is_some();
     app.dialog_seen = surface;
     if opened || (had_dialog && app.dialog_seen.is_none()) {
-        // The selection belonged to the surface that has just changed, and its line numbers mean
-        // nothing on the other one: keeping it would highlight unrelated text and copy it (D87).
         app.selection = None;
     }
     if app.dialog_seen.is_some() {
-        // A modal owns the screen, so no picture is drawn while it is open (D161). A question is
-        // the transcript's own last rows, so the pictures above it stay where they are (D197).
         app.covered.push(area);
     }
     shade_dialog(frame, app);
 }
 
-/// Puts the selection's background behind the dialog's cells, on the buffer itself (D87).
-///
-/// The transcript's selection is shaded by splitting spans before they are drawn. A dialog is built
-/// by a dozen functions that each own their lines, so its selection is painted where it ended up
-/// instead: the cells of the box the drag covered, which is the same thing from the reader's side.
 fn shade_dialog(frame: &mut Frame<'_>, app: &App) {
     let (Some(seen), Some(sel)) = (app.dialog_seen.as_ref(), app.selection) else {
         return;
@@ -2360,18 +2062,6 @@ fn shade_dialog(frame: &mut Frame<'_>, app: &App) {
     }
 }
 
-/// Asks whether the branch a move in `/tree` leaves behind is worth a summary (D167).
-///
-/// One keystroke either way, and escape leaves the conversation where it is: the move is the
-/// person's decision already, and the summary is the only part of it that spends a request.
-/// A tool's question as the last rows of the transcript (D197): the person reads what led to it and
-/// scrolls as ever, and the question is simply the end of the conversation rather than a lid over
-/// it. Returns the rows, and the cell the cursor belongs on counted from the block's first row.
-///
-/// A choice's preview has a panel of its own beside the question when the screen is wide enough for
-/// both, and goes under the choices when it is not. Either way the block's height belongs to the
-/// question and its choices rather than to the choice under the cursor, so walking them moves
-/// nothing else on the screen.
 fn ask_rows(
     dialog: &AskDialog,
     width: usize,
@@ -2385,8 +2075,6 @@ fn ask_rows(
         .choices
         .iter()
         .any(|choice| !choice.preview.trim().is_empty());
-    // The rule above the block spans the whole width; the question keeps the left of it and the
-    // preview takes a panel on the right, two cells for the rule between them (D197).
     let panel = (has_preview && width >= PREVIEW_SIDE_MIN).then(|| (width * 2 / 5).clamp(20, 48));
     let column_width = panel.map_or(width, |panel| width - panel - 2);
     let preview = dialog
@@ -2426,8 +2114,6 @@ fn ask_rows(
             theme,
         ));
     }
-    // A preview with no panel of its own goes under the choices, and gives way when the block
-    // would be taller than the viewport it lands in.
     if panel.is_none() && has_preview {
         let wrapped: Vec<Vec<String>> = question
             .choices
@@ -2441,7 +2127,6 @@ fn ask_rows(
             })
             .collect();
         let tallest = wrapped.iter().map(Vec::len).max().unwrap_or(0);
-        // The blank, the word "preview" and the footer row are the region's own rows.
         let cap = match room {
             Some(room) => room.saturating_sub(column.len() + 4).min(MAX_PREVIEW_ROWS),
             None => MAX_PREVIEW_ROWS,
@@ -2488,9 +2173,6 @@ fn ask_rows(
         AskStage::Typing { text } => ("answer › ", text.as_str()),
     };
     if !matches!(dialog.stage, AskStage::Choosing) {
-        // The cursor is where the next character goes, and a line too long to fit keeps its end —
-        // which is the end being written. One column short of the edge: a cursor placed past it
-        // wraps, and a wrap scrolls the screen out from under a block meant to stay put (D197).
         let room = column_width.saturating_sub(2 + label.width());
         let used = text.width().min(room);
         let col = (2 + label.width() + used).min(column_width.saturating_sub(1));
@@ -2520,7 +2202,6 @@ fn ask_rows(
         rule,
         Style::new().fg(theme.border_accent),
     ))];
-    // The cursor counts from the block's first row, and the rule is that row.
     let cursor = note.map(|(row, col)| (row + 1, col));
     match panel {
         Some(panel_width) => {
@@ -2539,9 +2220,6 @@ fn ask_rows(
     (lines, cursor)
 }
 
-/// The preview's own panel: a title row, as much of the preview as the question's rows make room
-/// for, and the count of what was left out. Its height is the question's, never its own, so a long
-/// diff cannot make the block taller than the choices beside it (D197).
 fn preview_panel(preview: &str, width: usize, rows: usize, theme: &Theme) -> Vec<Line<'static>> {
     let mut panel = vec![Line::from(Span::styled("preview", dim(theme)))];
     let wrapped = if preview.trim().is_empty() {
@@ -2569,7 +2247,6 @@ fn preview_panel(preview: &str, width: usize, rows: usize, theme: &Theme) -> Vec
     panel
 }
 
-/// One row of the question with the preview's panel beside it, and the rule between them.
 fn with_panel(
     left: Option<&Line<'static>>,
     right: Option<&Line<'static>>,
@@ -2586,16 +2263,10 @@ fn with_panel(
     Line::from(spans)
 }
 
-/// How many rows of a choice's preview are drawn under the choices at most, however tall the screen
-/// (D197).
 const MAX_PREVIEW_ROWS: usize = 10;
 
-/// How wide the screen must be before a choice's preview gets a panel of its own beside the
-/// question rather than under it (D197).
 const PREVIEW_SIDE_MIN: usize = 64;
 
-/// One choice: its number and label, the recommended marker on the one the asker advises, and the
-/// description as subtext under it in a quieter colour than the label (D197).
 fn choice_rows(
     width: usize,
     number: usize,
@@ -2658,7 +2329,6 @@ fn draw_confirm(frame: &mut Frame<'_>, confirm: &Confirm, area: Rect, theme: &Th
     .seen
 }
 
-/// The `/` menu, drawn over the transcript just above the editor.
 fn draw_menu(frame: &mut Frame<'_>, app: &mut App, editor_area: Rect) {
     const ROWS: usize = 8;
     let Some(popup) = app.popup() else {
@@ -2717,14 +2387,11 @@ fn draw_menu(frame: &mut Frame<'_>, app: &mut App, editor_area: Rect) {
         ),
         rect,
     );
-    // The menu is drawn over the transcript, so a picture under it would sit on top of it (D161).
     app.covered.push(rect);
 }
 
 fn login_title(login: &Login) -> String {
     let c = login.choice();
-    // The picker names the provider and model in force, so a list that spans every provider is read
-    // against something (D88, D89).
     if login.purpose() == Purpose::Model {
         return match login.in_force() {
             Some((provider, model)) if !model.is_empty() => {
@@ -2740,9 +2407,6 @@ fn login_title(login: &Login) -> String {
     format!(" Log in to {} ", c.name)
 }
 
-/// The /login dialog, centred over the screen. Keys are shown as dots.
-/// Draws the login dialog, and answers with where the link was drawn, so a click on it can open it
-/// rather than doing nothing (D86).
 fn draw_login(
     frame: &mut Frame<'_>,
     login: &Login,
@@ -2882,13 +2546,9 @@ fn draw_login(
         }
         Stage::SigningIn { .. } => {
             let d = &login.device;
-            // The failure goes beside the code rather than instead of it: what failed is usually
-            // the browser, and the address and code are still what the person needs (D86).
             if let Some(code) = &d.code {
                 lines.push(Line::from("A browser on any device signs this in".bold()));
                 lines.push(Line::default());
-                // The link is underlined so it reads as one, and its cells are recorded: a click
-                // here opens the browser, because drawn text is not the terminal's to click (D86).
                 lines.push(Line::from(vec![
                     Span::styled("  1. open  ", dim(theme)),
                     Span::styled(
@@ -2898,11 +2558,8 @@ fn draw_login(
                             .add_modifier(Modifier::UNDERLINED),
                     ),
                 ]));
-                // The column the address begins at, inside the box: the label it follows.
                 let start = "  1. open  ".width();
                 let room = inner.saturating_sub(start);
-                // Only the part of the address that fits is on screen, so only that is clickable:
-                // the box is drawn from the left and the rest never appears.
                 let shown = d.url.width().min(room);
                 link_at = Some((lines.len() - 1, start, shown));
                 lines.push(Line::from(vec![
@@ -2970,9 +2627,6 @@ fn draw_login(
                 Span::raw(visible),
             ]));
             let list = matching(models, filter);
-            // The ids are padded to one column so the providers line up under each other, and the
-            // width comes from the whole list rather than the filtered one, so typing does not make
-            // the column jump about (D89).
             let id_width = models
                 .iter()
                 .map(|p| p.model.width())
@@ -3022,8 +2676,6 @@ fn draw_login(
                 ),
                 dim(theme),
             )));
-            // The two keys do different things, so which is which is said rather than discovered by
-            // changing the default by accident (D91).
             if login.purpose() == Purpose::Model {
                 lines.push(Line::from(Span::styled(
                     "ctrl+s also makes it the default, for new sessions",
@@ -3034,7 +2686,6 @@ fn draw_login(
         }
     };
     let at = modal(frame, area, width, &title, lines, cursor, theme);
-    // A row inside the box, and a column inside the address that was drawn there.
     let link = link_at.map(|(row, col, len)| {
         let x = at.rect.x.saturating_add(1).saturating_add(col as u16);
         let room = at.rect.right().saturating_sub(1).saturating_sub(x);
@@ -3048,7 +2699,6 @@ fn draw_login(
     (at.seen, link)
 }
 
-/// A bordered box centred over `area`, with an optional cursor at (row, column) inside it.
 fn modal(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3059,8 +2709,6 @@ fn modal(
     theme: &Theme,
 ) -> Surface {
     let height = (lines.len() as u16 + 2).min(area.height);
-    // What each row says, cut to the cells it occupies: a dialog clips its text at the border, so
-    // the part that was never drawn is not selectable either (D87).
     let inner = width.saturating_sub(2) as usize;
     let text: Vec<String> = lines
         .iter()
@@ -3090,7 +2738,6 @@ fn modal(
     }
     Surface {
         seen: Seen {
-            // The text, not the border: a drag that starts on the frame selects the line it is on.
             area: Rect::new(
                 rect.x.saturating_add(1),
                 rect.y.saturating_add(1),
@@ -3099,30 +2746,21 @@ fn modal(
             ),
             top: 0,
             lines: text,
-            // A dialog is not the transcript and draws no formula pictures (D166).
             pictures: Vec::new(),
         },
         rect,
     }
 }
 
-/// What a modal put on the screen: the box it drew in, and the text inside it (D87).
 struct Surface {
     seen: Seen,
     rect: Rect,
 }
 
-/// `/tree`: every message on the branch, the one the conversation is at, and where another branch
-/// leaves from (D54).
 fn draw_tree(frame: &mut Frame<'_>, tree: &mut Tree, area: Rect, theme: &Theme) -> Seen {
-    // The whole screen, as pi has it: the tree is a mode of the terminal rather than a window in
-    // it, so a long conversation is one scroll instead of a scroll inside a scroll (D168).
     let width = area.width as usize;
     let height = area.height as usize;
     let accent = Style::new().fg(theme.accent);
-    // The title and the footers are the rows the list does not get, and the list is what the keys
-    // are measured in: a page is a screenful, and the scroll keeps the keyboard's row on it. Two
-    // key lines rather than one because a narrow terminal was cutting the last of them off.
     let room = height.saturating_sub(5).max(1);
     tree.rows = room;
     let mut lines: Vec<Line> = vec![
@@ -3145,9 +2783,6 @@ fn draw_tree(frame: &mut Frame<'_>, tree: &mut Tree, area: Rect, theme: &Theme) 
     for (i, row) in rows.iter().enumerate().skip(top).take(room) {
         let chosen = i == tree.selected;
         let label = keep_head(&tree.label(row), width.saturating_sub(2));
-        // The message the conversation is at is marked in green, so "where am I" is answered
-        // before reading a word; a message on a branch the next request would not carry is dimmed
-        // (D54).
         let style = if chosen {
             Style::new().add_modifier(Modifier::BOLD)
         } else if tree.is_here(row) {
@@ -3167,8 +2802,6 @@ fn draw_tree(frame: &mut Frame<'_>, tree: &mut Tree, area: Rect, theme: &Theme) 
         lines.push(Line::from(Span::styled("no messages yet", dim(theme))));
         drawn += 1;
     }
-    // The list fills the screen even where it has nothing to say, so the transcript cannot show
-    // through between its rows and the mode looks like a mode.
     for _ in drawn..room {
         lines.push(Line::default());
     }
@@ -3192,8 +2825,6 @@ fn draw_tree(frame: &mut Frame<'_>, tree: &mut Tree, area: Rect, theme: &Theme) 
         keep_head(&counts, width),
         dim(theme),
     )));
-    // The branch ends have a key only if `[keys]` gave them one, so the footer names it when it
-    // exists and says nothing about it when it does not (D169).
     let mut move_keys = "↑↓ move".to_owned();
     if leaves > 1
         && let Some(ends) = tree.keys.ends()
@@ -3211,8 +2842,6 @@ fn draw_tree(frame: &mut Frame<'_>, tree: &mut Tree, area: Rect, theme: &Theme) 
         )));
     }
     lines.truncate(height);
-    // What each row says, cut to the cells it occupies, so a drag copies the tree and not the
-    // transcript underneath it (D87).
     let text: Vec<String> = lines
         .iter()
         .map(|line| plain(line).chars().take(width).collect())
@@ -3223,7 +2852,6 @@ fn draw_tree(frame: &mut Frame<'_>, tree: &mut Tree, area: Rect, theme: &Theme) 
         area,
         top: 0,
         lines: text,
-        // The tree draws no formula pictures (D166).
         pictures: Vec::new(),
     }
 }
@@ -3246,8 +2874,6 @@ fn draw_resume(frame: &mut Frame<'_>, picker: &SessionPicker, area: Rect, theme:
         let chosen = i == picker.selected;
         let plural = if s.prompts == 1 { "" } else { "s" };
         let meta = format!("  {} · {} prompt{plural}", age(s.updated, now), s.prompts);
-        // A session that came from a fork says so, so two rows with the same title are told apart
-        // (D53).
         let head = if s.forked_from.is_some() {
             format!("↳ {}", s.title)
         } else {
@@ -3274,7 +2900,6 @@ fn draw_resume(frame: &mut Frame<'_>, picker: &SessionPicker, area: Rect, theme:
         lines.push(Line::from(Span::styled("no session matches", dim(theme))));
     }
     lines.push(Line::default());
-    // A delete needs the key twice, so the footer says so while it is waiting for the second one.
     let confirming = picker
         .confirming
         .as_ref()
@@ -3362,7 +2987,6 @@ fn draw_settings(
     modal(frame, area, width, " Settings ", lines, cursor, theme).seen
 }
 
-/// `/theme`: every theme by name, the highlight previewed on the whole screen (D74).
 fn draw_themes(frame: &mut Frame<'_>, picker: &ThemePicker, area: Rect, theme: &Theme) -> Seen {
     let width = area.width.saturating_sub(4).min(72);
     let inner = width.saturating_sub(2) as usize;
@@ -3378,7 +3002,6 @@ fn draw_themes(frame: &mut Frame<'_>, picker: &ThemePicker, area: Rect, theme: &
     let top = picker.offset();
     for (i, entry) in picker.entries.iter().enumerate().skip(top).take(THEME_ROWS) {
         let chosen = i == picker.selected;
-        // The theme that was in force when the list opened, so escape has something to name.
         let was = if entry.name == picker.original {
             "*"
         } else {
@@ -3409,7 +3032,6 @@ fn draw_themes(frame: &mut Frame<'_>, picker: &ThemePicker, area: Rect, theme: &
         ]));
     }
     lines.push(Line::default());
-    // What the highlight does, in the theme it offers: the preview is the whole point.
     let help = match &picker.current().theme {
         Ok(_) => format!(
             "{} · {} · enter uses it and saves it",
@@ -3510,8 +3132,6 @@ fn draw_permissions(
             ),
         ]));
         cursor = Some((lines.len() - 1, 2 + 5 + typed.width()));
-        // The entry the line would write, or what is wrong with it, is on screen as it is typed
-        // (D173), so nothing is written to find out.
         match &dialog.draft {
             Draft::Ready(preview) => {
                 lines.push(Line::from(Span::styled(
@@ -3542,8 +3162,6 @@ fn draw_permissions(
                 dim(theme),
             )));
         }
-        // A write can still fail for a reason the line cannot show, such as a file that changed
-        // underneath the prompt.
         if let Some(e) = &dialog.error {
             lines.push(Line::from(Span::styled(
                 keep_tail(e, inner),
@@ -3585,7 +3203,6 @@ fn draw_permissions(
     .seen
 }
 
-/// The start of `s` in at most `max` columns, with `…` marking the cut.
 fn keep_head(s: &str, max: usize) -> String {
     if s.width() <= max {
         return s.to_owned();
@@ -3604,9 +3221,6 @@ fn keep_head(s: &str, max: usize) -> String {
     out
 }
 
-/// The end of `s` in at most `max` columns, with `…` marking the cut.
-/// A message as lines that fit `width`, so a failed click says all of what went wrong rather than
-/// the tail of it (D86).
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(20);
     let mut out = Vec::new();
@@ -3627,7 +3241,6 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// Word-wraps plain text to `width` columns and at most `max` lines, marking a cut with `…`.
 fn wrap_columns(text: &str, width: usize, max: usize) -> Vec<String> {
     let width = width.max(8);
     let mut out: Vec<String> = Vec::new();
@@ -3653,7 +3266,6 @@ fn wrap_columns(text: &str, width: usize, max: usize) -> Vec<String> {
     out
 }
 
-/// The start of `s` in at most `max` columns, with `…` marking the cut.
 fn clip(s: &str, max: usize) -> String {
     if s.width() <= max {
         return s.to_owned();
@@ -3695,9 +3307,6 @@ fn keep_tail(s: &str, max: usize) -> String {
     iter::once('…').chain(out.into_iter().rev()).collect()
 }
 
-/// The whole team on one page: the sessions in a list on the left, and the selected one drawn
-/// large on the right with what it has streamed, so moving down the list is the only navigation
-/// there is (D195).
 fn draw_overview(frame: &mut Frame<'_>, app: &mut App, selected: usize, area: Rect) -> Seen {
     let sessions = app.team.len() + 1;
     let rows = sessions + 2;
@@ -3713,8 +3322,6 @@ fn draw_overview(frame: &mut Frame<'_>, app: &mut App, selected: usize, area: Re
     frame.render_widget(Clear, area);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    // A third of the page for the list, so the detail keeps room for a wrapped paragraph even
-    // on a narrow terminal.
     let list_width = (inner.width / 3)
         .clamp(20, 36)
         .min(inner.width.saturating_sub(16));
@@ -3748,8 +3355,6 @@ fn draw_overview(frame: &mut Frame<'_>, app: &mut App, selected: usize, area: Re
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(format!("{glyph} {state} "), Style::new().fg(colour)),
-                    // Which model it is on, so the page says what a worker costs before a person
-                    // opens it (D195).
                     Span::styled(format!("· {} ", worker.model), dim(&app.theme)),
                 ]),
                 "nothing yet",
@@ -3779,8 +3384,6 @@ fn draw_overview(frame: &mut Frame<'_>, app: &mut App, selected: usize, area: Re
     let detail_inner = detail.inner(detail_area);
     frame.render_widget(detail, detail_area);
     match selected {
-        // A session's detail is its own transcript, drawn by the lead's renderer from the start
-        // of what is kept, so PgUp walks back through its turns and reasoning (D195).
         0 => draw_transcript(frame, app, detail_inner, false),
         index if index < sessions => {
             let worker = app.team[index - 1].clone();
@@ -3796,8 +3399,6 @@ fn draw_overview(frame: &mut Frame<'_>, app: &mut App, selected: usize, area: Re
             draw_board(frame, app, lines, empty, detail_inner);
         }
     }
-    // The page is a surface of its own: what was drawn into it is what a drag copies, and the
-    // selection's rows map to the cells it covered (D87).
     let lines = (0..inner.height)
         .map(|y| {
             (0..inner.width)
@@ -3819,8 +3420,6 @@ fn draw_overview(frame: &mut Frame<'_>, app: &mut App, selected: usize, area: Re
     }
 }
 
-/// A board is one wrapped paragraph scrolled as a whole: the full messages on the bus, the full
-/// commands and reasons in the queue, newest at the end unless the person scrolled back (D196).
 fn draw_board(
     frame: &mut Frame<'_>,
     app: &mut App,
@@ -3844,9 +3443,6 @@ fn draw_board(
     frame.render_widget(Paragraph::new(wrapped[start..].to_vec()), inner);
 }
 
-/// Wraps styled lines at a column count, splitting a span and carrying its style onto the next
-/// row, so a board's full text can be read and scrolled by row rather than cut to one line
-/// (D196).
 fn wrap_styled(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
     if width == 0 {
         return lines;
@@ -3879,8 +3475,6 @@ fn wrap_styled(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// One row per session, the person's own first, then the two team boards — the message bus and
-/// the shared command queue — so everything the team shares is in the same list (D195).
 fn draw_session_list(frame: &mut Frame<'_>, app: &App, selected: usize, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -3927,8 +3521,6 @@ fn draw_session_list(frame: &mut Frame<'_>, app: &App, selected: usize, area: Re
         }
         rows.push(Line::from(spans));
     }
-    // The boards are separate from the conversations: a blank row, then one row each with how
-    // much each holds (D195).
     rows.push(Line::default());
     let bus = index_row(
         app.team.len() + 1,
@@ -3948,7 +3540,6 @@ fn draw_session_list(frame: &mut Frame<'_>, app: &App, selected: usize, area: Re
     frame.render_widget(Paragraph::new(rows), inner);
 }
 
-/// One board's row in the session list: its name and how many things it holds (D195).
 fn index_row(
     index: usize,
     selected: usize,
@@ -3974,8 +3565,6 @@ fn index_row(
     ])
 }
 
-/// The live message bus, as a paragraph: who wrote to whom and every line of what was said, so a
-/// long finding is readable in full rather than reduced to one row (D196).
 fn bus_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     for message in &app.bus {
@@ -3998,8 +3587,6 @@ fn bus_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
-/// The shared command queue as a paragraph: each item's full command and reason, with its state
-/// and who enqueued it, so nothing is cut to fit a row (D196).
 fn queue_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     for item in &app.jobs {
@@ -4041,7 +3628,6 @@ fn queue_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
-/// What a worker is doing, as one glyph and the colour it is drawn in (D195).
 fn overview_mark(state: &str, theme: &Theme) -> (char, Color) {
     if state.starts_with("running") {
         ('●', theme.success)
@@ -4056,9 +3642,6 @@ fn overview_mark(state: &str, theme: &Theme) -> (char, Color) {
     }
 }
 
-/// A worker's own conversation, drawn by the lead's transcript renderer — the same markdown,
-/// highlighted code, tool blocks, collapsed output, scrolling and pictures — under one line that
-/// says whose transcript this is (D195).
 fn draw_worker(frame: &mut Frame<'_>, worker: &Render, app: &mut App, area: Rect) {
     let state = if worker.state.is_empty() {
         "starting"
@@ -4088,9 +3671,6 @@ fn draw_worker(frame: &mut Frame<'_>, worker: &Render, app: &mut App, area: Rect
     draw_worker_transcript(frame, worker, app, body);
 }
 
-/// The body of a worker view or of its tab in the overview: the lead's own transcript path, with
-/// the worker's conversation swapped in. The rendering, the collapse, the scroll arithmetic and
-/// the picture placement are one implementation, so the views cannot drift apart (D195).
 fn draw_worker_transcript(frame: &mut Frame<'_>, worker: &Render, app: &mut App, body: Rect) {
     let entries = worker_entries(worker);
     let fresh = iter::repeat_with(|| None).take(entries.len()).collect();
@@ -4108,8 +3688,6 @@ fn draw_worker_transcript(frame: &mut Frame<'_>, worker: &Render, app: &mut App,
     app.cache = lead_cache;
 }
 
-/// A worker's beats as the transcript entries the lead's renderer takes: streamed text and
-/// reasoning join the block before them, and a result belongs to the call it answered (D195).
 fn worker_entries(worker: &Render) -> Vec<Entry> {
     let mut out: Vec<Entry> = Vec::new();
     for beat in &worker.beats {
@@ -4143,8 +3721,6 @@ fn worker_entries(worker: &Render) -> Vec<Entry> {
                 diff,
                 images,
             } => {
-                // A picture a tool returned is kept the way an attached one is, above the block
-                // that answered (D58, D59).
                 for image in images {
                     out.push(Entry::Image(image.clone()));
                 }
@@ -4174,9 +3750,6 @@ fn worker_entries(worker: &Render) -> Vec<Entry> {
 
 fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect, activity: bool) {
     let (mut lines, at) = transcript_with_images(app, area.width.max(1), activity);
-    // A question a tool is waiting on is the end of the transcript, not a lid over it (D197): the
-    // rows go after everything said, the transcript's own scrolling reaches them, and a person
-    // reading what led to the question scrolls exactly as ever.
     let question = app.ask.as_ref().map(|dialog| {
         ask_rows(
             dialog,
@@ -4193,7 +3766,6 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect, activity: b
     let mut placed: Vec<Placed> = Vec::new();
     let height = area.height as usize;
     let total = lines.len();
-    // While scrolled up, new output must not move the view.
     if app.scroll > 0 && total > app.total_lines {
         app.scroll += total - app.total_lines;
     }
@@ -4201,14 +3773,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect, activity: b
     app.total_lines = total;
     app.view_height = height;
     let top = total.saturating_sub(height + app.scroll);
-    // The text of each line as drawn: a click maps to a character through it, and a copy takes
-    // exactly what the screen showed (D35).
     let text: Vec<String> = lines.iter().map(plain).collect();
-    // Only when the transcript owns the selection: a drag inside an open dialog records line
-    // numbers in the dialog's own frame, and shading these lines with them painted a second
-    // highlight near the top of the screen (D87).
-    // A dialog is a surface of its own: a drag inside it records line numbers in its own frame, and
-    // shading these lines with them painted a second highlight near the top of the screen (D87).
     let dialog_open = app.resume.is_some()
         || app.tree.is_some()
         || app.confirm.is_some()
@@ -4231,19 +3796,11 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect, activity: b
             shade(line, from, to, &app.theme);
         }
     }
-    // An image is drawn in the rows below its marker line, and stays on screen while any of those
-    // rows is: the marker scrolling off the top does not take the picture with it (D59). Its cells
-    // and its pixels come from the layout, which is what stops a picture from being drawn at a size
-    // other than the one the rows were reserved for (D165).
-    // Where each formula's words belong, so a drag over the picture copies the TeX it was drawn
-    // from rather than the blank cells it left on screen (D166). Built for every picture, not only
-    // the ones on screen: a selection can start above them.
     let sources: Vec<Source> = at
         .iter()
         .filter(|at| !at.tex.is_empty())
         .map(|at| Source {
             line: at.line,
-            // A block formula starts its row, and its box is the rows the layout gave it.
             column: at.column.unwrap_or(0),
             rows: at.picture.cells.rows.max(1),
             cols: at.picture.cells.cols.max(1),
@@ -4275,8 +3832,6 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect, activity: b
     }
     let visible: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
     frame.render_widget(Paragraph::new(visible), area);
-    // The cursor of the line being written sits in the block, unless the person has scrolled it
-    // off the screen, in which case nothing on this screen has the cursor (D197).
     if let Some((row, col)) = cursor {
         let line = total.saturating_sub(asked) + row;
         if line >= top && line < top + height {
@@ -4395,7 +3950,6 @@ mod tests {
 
     #[test]
     fn two_attached_pictures_are_both_placed() {
-        // Two images in one conversation is the ordinary case for "@a.png @b.png" (D59).
         let mut app = bare_app();
         app.protocol = image::Protocol::Kitty;
         app.entries.push(Entry::User("look at these".into()));
@@ -4413,7 +3967,6 @@ mod tests {
             app.images
         );
         assert_ne!(app.images[0].id, app.images[1].id, "with different ids");
-        // And the drawing pass plans both, on their own rows.
         let area = Rect::new(0, 0, 80, 40);
         let plan = plan_images(
             image::Protocol::Kitty,
@@ -4432,11 +3985,6 @@ mod tests {
 
     #[test]
     fn the_rows_left_for_a_picture_are_the_box_it_is_drawn_in() {
-        // One fit, one width: the layout reserves blank rows from the same computation the drawing
-        // pass puts the picture in. They were worked out on widths four columns apart, so a picture
-        // that fitted the wider room left a row spare and, at the boundary, had the next row of the
-        // transcript drawn over its last one (D59). 1000×400 is scaled here, which is the case
-        // where the two widths disagree: the wider room gives it a row more than the narrower one.
         let mut app = bare_app();
         app.protocol = image::Protocol::Kitty;
         app.entries.push(Entry::User("look".into()));
@@ -4448,9 +3996,6 @@ mod tests {
         let area = app.seen.as_ref().unwrap().area;
         let box_ = image::fit((1000, 400), (area.width, image::MAX_ROWS));
         assert_eq!(app.images[0].box_, box_, "fitted to the transcript width");
-        // The marker line, then one blank row per row of the picture, and nothing else: this entry
-        // is the last one in the transcript. Four columns narrower and the fit is one row shorter,
-        // which is what the layout used to reserve against.
         let (lines, at) = transcript_with_images(&mut app, area.width, false);
         let start = at[0].line;
         let reserved = lines.len().saturating_sub(start);
@@ -4464,16 +4009,12 @@ mod tests {
 
     #[test]
     fn a_picture_is_placed_while_any_of_it_is_on_screen() {
-        // The bug: placement was skipped unless the picture's *marker line* was inside the view, so
-        // scrolling the marker off the top made the picture disappear although nearly all of it was
-        // still on screen. The marker is a caption, not the picture (D59).
         let mut app = bare_app();
         app.protocol = image::Protocol::Kitty;
         app.entries.push(Entry::User("look at this".into()));
         app.cache.push(None);
         app.entries.push(Entry::Image(img("shot.png", 64, 64)));
         app.cache.push(None);
-        // Enough transcript below the picture that it can be scrolled past the top of the screen.
         let below: String = (0..60).map(|i| format!("line {i}\n")).collect();
         app.entries.push(Entry::User(below));
         app.cache.push(None);
@@ -4485,8 +4026,6 @@ mod tests {
         let (_, at) = transcript_with_images(&mut app, width, false);
         let start = at[0].line;
 
-        // Put the picture's own first row above the top of the view, so that one row of it is off
-        // screen and the rest is visible.
         let want_top = start + 1;
         app.scroll = total.saturating_sub(height + want_top);
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -4504,7 +4043,6 @@ mod tests {
         );
         let placed = &app.images[0];
         assert_eq!(placed.line, start);
-        // And the drawing pass crops it to the rows that are on screen, at the top of the area.
         let plan = plan_images(
             image::Protocol::Kitty,
             &app.drawn,
@@ -4525,14 +4063,12 @@ mod tests {
         );
     }
 
-    /// The runs of a row as (text, foreground colour), wrapped wide so nothing splits.
     fn block_runs(row: &Row) -> Vec<(String, Option<Color>)> {
         wrap(row, 200)
             .iter()
             .flat_map(|l| {
                 l.spans
                     .iter()
-                    // The row's own prefix runs are empty; the block's runs are the content.
                     .filter(|s| !s.content.is_empty())
                     .map(|s| (s.content.to_string(), s.style.fg))
                     .collect::<Vec<_>>()
@@ -4540,7 +4076,6 @@ mod tests {
             .collect()
     }
 
-    /// How many distinct foreground colours a row is drawn in.
     fn distinct(runs: &[(String, Option<Color>)]) -> usize {
         let mut seen: Vec<Option<Color>> = runs.iter().map(|(_, c)| *c).collect();
         seen.sort_by_key(|c| format!("{c:?}"));
@@ -4560,7 +4095,6 @@ mod tests {
         );
     }
 
-    /// What a prompt is drawn as: its text, and the modifier on each run of it.
     fn prompt(text: &str) -> Vec<(String, Modifier)> {
         let theme = Theme::default();
         let view = View {
@@ -4579,8 +4113,6 @@ mod tests {
             .collect()
     }
 
-    /// The runs carrying `modifier`, however else they are styled: `***this***` is both, and asking
-    /// for one of the two should still find it.
     fn marked(text: &str, modifier: Modifier) -> Vec<String> {
         prompt(text)
             .into_iter()
@@ -4595,7 +4127,6 @@ mod tests {
 
     #[test]
     fn a_word_in_asterisks_is_italic_in_a_prompt() {
-        // D81: a prompt is read as markdown, which is what pi does with one.
         assert_eq!(marked("make *this* italic", Modifier::ITALIC), ["this"]);
         assert_eq!(marked("**this** is bold", Modifier::BOLD), ["this"]);
         assert_eq!(drawn("make *this* italic"), "make this italic");
@@ -4605,38 +4136,29 @@ mod tests {
 
     #[test]
     fn three_asterisks_are_bold_and_italic_together() {
-        // Markdown nests strong around em; the two modifiers patch onto the base rather than one
-        // replacing the other, so `***this***` gets both.
         assert_eq!(
             marked("***test***", Modifier::BOLD | Modifier::ITALIC),
             ["test"]
         );
-        // All three on one line, each with its own modifier.
         assert_eq!(marked("*a* **b** ***c***", Modifier::ITALIC), ["a", "c"]);
         assert_eq!(marked("*a* **b** ***c***", Modifier::BOLD), ["b", "c"]);
-        // The text around it is untouched.
         assert_eq!(drawn("x ***y*** z"), "x y z");
     }
 
     #[test]
     fn a_prompt_follows_markdown_even_where_that_eats_a_character() {
-        // This is CommonMark, and it is what pi's own parser does with the same text: an asterisk
-        // inside a word opens emphasis. The test says so rather than hiding it, because it is the
-        // one place a prompt is not drawn exactly as it was typed.
         assert_eq!(drawn("2*3*4"), "234");
         assert_eq!(marked("2*3*4", Modifier::ITALIC), ["3"]);
         assert_eq!(
             marked("src/*.rs with tests/*.rs", Modifier::ITALIC),
             [".rs with tests/"]
         );
-        // An unmatched asterisk is a literal, as in any markdown.
         assert_eq!(drawn("src/*.rs alone"), "src/*.rs alone");
         assert_eq!(drawn("an *unclosed one"), "an *unclosed one");
     }
 
     #[test]
     fn a_prompt_is_markdown_in_every_other_way_too() {
-        // The marker is on the first row only, and the rest lines up under it.
         let rows = entry_rows(
             &Entry::User("first\nsecond".into()),
             View {
@@ -4653,7 +4175,6 @@ mod tests {
         );
         assert_eq!(rows[0].first[0].content.as_ref(), "› ");
         assert_eq!(rows[1].first[0].content.as_ref(), "  ");
-        // A fence in a prompt is a code block, as a reply's would be.
         let themed = Theme::default();
         let rows = entry_rows(
             &Entry::User("```rust\nlet x = 1;\n```".into()),
@@ -4685,8 +4206,6 @@ mod tests {
 
     #[test]
     fn a_prompt_keeps_its_own_colour() {
-        // The base style is the prompt's colour, so text that is not emphasised is still the user's,
-        // and inline code keeps the code colour rather than taking the prompt's.
         let theme = Theme::default();
         let rows = entry_rows(
             &Entry::User("plain and *marked* and `code`".into()),
@@ -4721,8 +4240,6 @@ mod tests {
 
     #[test]
     fn a_fenced_block_with_a_language_is_highlighted_and_one_without_is_not() {
-        // A highlighted line shows more than one colour, and the text is unchanged: highlighting
-        // paints, it does not edit (D73).
         let theme = Theme::default();
         let rows = markdown("```rust\nlet x: u32 = foo(1);\n```", &theme, 80);
         let runs = block_runs(&rows[0]);
@@ -4731,7 +4248,6 @@ mod tests {
         let joined: String = runs.iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(joined, "  let x: u32 = foo(1);");
 
-        // A fence that names no language gets one colour, as it did before highlighting existed.
         let rows = markdown("```\nlet x = 1;\n```", &theme, 80);
         let runs = block_runs(&rows[0]);
         assert_eq!(distinct(&runs), 1, "{runs:?}");
@@ -4739,17 +4255,13 @@ mod tests {
 
     #[test]
     fn a_multiline_block_comment_stays_a_comment_on_every_line() {
-        // The highlighter carries state across lines, so a block's rows are walked in order (D73).
         let theme = Theme::default();
         let rows = markdown("```rust\n/* one\ntwo */ let x = 1;\n```", &theme, 80);
-        // The first run of each row is the indent, in the block's own colour; the next is the
-        // comment, in the comment role, on both lines.
         for row in rows.iter().take(2) {
             let runs = block_runs(row);
             assert_eq!(runs[0].0, "  ", "{runs:?}");
             assert_eq!(runs[1].1, Some(theme.syntax.comment), "{runs:?}");
         }
-        // After `*/` the same line is code again.
         let runs = block_runs(&rows[1]);
         assert!(
             runs.iter()
@@ -4821,7 +4333,6 @@ mod tests {
         assert_eq!(keep_tail("/x", 0), "");
     }
 
-    /// Every row of a rendered table, as text, so a test can see the alignment.
     fn table_text(text: &str, room: usize) -> Vec<String> {
         markdown(text, &Theme::default(), room)
             .iter()
@@ -4836,8 +4347,6 @@ mod tests {
 
     #[test]
     fn a_table_is_fitted_to_the_room_instead_of_wrapped_apart() {
-        // The failure this fixes: a table wider than the terminal used to be handed to the generic
-        // wrapper, which broke its rows into pieces and destroyed the columns.
         let md = "| a | b | c |\n|---|---|---|\n| alpha | beta | gamma |";
         for room in [80usize, 40, 24, 16] {
             let rows = table_text(md, room);
@@ -4848,7 +4357,6 @@ mod tests {
                     row.width()
                 );
             }
-            // The rule and the separators survive, which is what says it is still a table.
             assert!(
                 rows.iter().any(|r| r.contains('┼')),
                 "room {room}: {rows:?}"
@@ -4862,17 +4370,12 @@ mod tests {
 
     #[test]
     fn a_narrow_column_wraps_its_cell_rather_than_pushing_the_row_off() {
-        // Long prose in one column of a narrow table: the cell becomes several lines and the other
-        // columns still line up beside it.
         let md = "| gap | pi | opencode | saddle |\n|---|---|---|---|\n\
                   | plugin system | TypeScript extensions with registerTool and lifecycle events | plugins and custom tools | none yet |";
         let rows = table_text(md, 60);
         assert!(rows.iter().all(|r| r.width() <= 60), "{rows:#?}");
-        // The first column appears on every physical line of that row, so it lines up.
         let saddles = rows.iter().filter(|r| r.contains("saddle")).count();
         assert!(saddles >= 1, "{rows:#?}");
-        // The word pair wraps at its space rather than being split, which is the difference between
-        // a narrow table and a mangled one.
         assert!(rows.iter().any(|r| r.contains("plugin")), "{rows:#?}");
         assert!(rows.iter().any(|r| r.contains("system")), "{rows:#?}");
         assert!(
@@ -4885,34 +4388,24 @@ mod tests {
 
     #[test]
     fn a_table_that_fits_keeps_its_natural_widths() {
-        // Fitting only shrinks: on a wide terminal every cell is padded to its own content, so a
-        // short table does not get spread across the screen.
         let widths = column_widths(&[3, 6, 4], &[3, 6, 4], 80);
         assert_eq!(widths, vec![3, 6, 4]);
-        // A wide one shrinks, and never below the longest word while those fit at all.
         let wide = column_widths(&[60, 60, 60], &[8, 8, 8], 40);
         assert!(wide.iter().sum::<usize>() <= 40, "{wide:?}");
         assert!(wide.iter().all(|w| *w >= 8), "{wide:?}");
-        // A column whose longest word fits inside its fair share keeps the word whole, while the
-        // prose column beside it gives up the room: `yes` must not become `ye`/`s`.
         let mixed = column_widths(&[4, 40, 5], &[4, 8, 5], 30);
         assert_eq!(mixed[0], 4, "{mixed:?}");
         assert_eq!(mixed[2], 5, "{mixed:?}");
         assert!(mixed[1] < 40, "{mixed:?}");
-        // When even the longest words do not fit, the columns still have a shape and each has a
-        // cell, rather than the table running off the screen.
         let tiny = column_widths(&[20, 20], &[20, 20], 3);
         assert_eq!(tiny.len(), 2);
         assert!(tiny.iter().all(|w| *w >= 1), "{tiny:?}");
         assert!(tiny.iter().sum::<usize>() <= 3, "{tiny:?}");
-        // An empty table is not a panic.
         assert_eq!(column_widths(&[], &[], 40), Vec::<usize>::new());
     }
 
     #[test]
     fn a_finished_compaction_shows_its_first_lines_and_ctrl_o_shows_the_rest() {
-        // D124: the summary is collapsed like a tool's output, so a long one does not push the
-        // conversation up by thirty lines every time the context is compacted.
         let summary = (1..=20)
             .map(|n| format!("line {n} of the summary"))
             .collect::<Vec<_>>()
@@ -4964,7 +4457,6 @@ mod tests {
             "ctrl+o did not show the whole summary: {expanded:#?}"
         );
 
-        // While it streams, the lines that just arrived are the informative end, as for bash.
         let running = block(CompactState::Running, false);
         assert!(
             running.iter().any(|l| l.contains("line 20 of the summary")),
@@ -4980,9 +4472,6 @@ mod tests {
 
     #[test]
     fn a_compaction_collapses_its_reasoning_with_the_summary() {
-        // D124: the entry is one thing, opened by one key. The reasoning a compaction was written
-        // from used to follow ctrl+t, so a session with reasoning on showed every compaction with
-        // all of its thinking laid out — the opposite of collapsing it.
         let reasoning = (1..=12)
             .map(|n| format!("thought {n} of the compaction"))
             .collect::<Vec<_>>()
@@ -5001,7 +4490,6 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        // The default: reasoning on, ctrl+o never pressed. One line that says what is there.
         let collapsed = block(true, false);
         assert!(
             collapsed
@@ -5014,15 +4502,12 @@ mod tests {
             "the reasoning was laid out unasked: {collapsed:#?}"
         );
 
-        // ctrl+o opens the entry, and the reasoning is part of what it opens.
         let expanded = block(true, true);
         assert!(
             expanded.iter().any(|l| l.contains("thought 1 of")),
             "ctrl+o did not open the reasoning with the rest: {expanded:#?}"
         );
 
-        // A person who turned reasoning off keeps it off, and the note says which key would show
-        // it rather than promising one that would not.
         let off = block(false, true);
         assert!(!off.iter().any(|l| l.contains("thought 1 of")), "{off:#?}");
         assert!(
@@ -5031,7 +4516,6 @@ mod tests {
         );
     }
 
-    /// Render options for a block drawn by a test: a width, and whether it is expanded.
     fn view(expand: bool) -> View {
         View {
             expand,
@@ -5067,8 +4551,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let passing = format!("exit code 0\n--- stdout ---\n{output}");
-        // A call with nothing to name falls back to the tool's own name: a lone `$` with a
-        // stopwatch beside it is what a polled task looked like (D181).
         let (lines, _) = block("bash", "", true, "exit code 0", false);
         assert_eq!(lines.first().map(String::as_str), Some("bash"), "{lines:?}");
         let (lines, bg) = block("bash", "cargo test", true, &passing, false);
@@ -5143,10 +4625,6 @@ mod tests {
 
     #[test]
     fn a_call_in_flight_spins_at_the_bottom_and_not_in_its_block() {
-        // D172: the frame's activity line already says what is running, so the block it is running
-        // from does not lead with a second spinner. The pending shade and the stopwatch still mark
-        // the call, and a worker's view keeps its block spinner because that frame has no activity
-        // line of its own.
         let mut app = bare_app();
         let now = Instant::now();
         app.now = now;
@@ -5185,8 +4663,6 @@ mod tests {
 
     #[test]
     fn a_call_with_a_deadline_says_what_it_is_capped_at() {
-        // D152: the deadline the model set belongs on the call's own line — after the stopwatch
-        // while it runs, and as a bare limit where there is no stopwatch to put it after.
         let (rows, _) = tool_block(
             "bash",
             "sleep 9",
@@ -5217,8 +4693,6 @@ mod tests {
 
     #[test]
     fn the_transcript_shows_the_deadline_the_call_was_given() {
-        // The whole path: the call event carries the timeout, and the frame draws it beside the
-        // stopwatch the frame's own clock keeps.
         let mut app = bare_app();
         let now = Instant::now();
         app.now = now;
@@ -5239,9 +4713,6 @@ mod tests {
 
     #[test]
     fn the_transcript_ticks_a_running_command_and_a_running_task_from_its_own_start() {
-        // The whole path, not just the block: the frame's clock times a call in flight (D172), and a
-        // task is timed from when the session started it, which may be before this interface drew a
-        // row for it.
         let mut app = bare_app();
         let now = Instant::now();
         app.now = now;
@@ -5258,7 +4729,6 @@ mod tests {
         let shown = lines.iter().map(plain).collect::<Vec<_>>().join("\n");
         assert!(shown.contains("⠋ $ sleep 9 · 5.0s"), "{shown}");
 
-        // The launch answered, and the work it started is still going with its own timer.
         app.agent(AgentEvent::Result {
             ok: true,
             content: "started task-1".into(),
@@ -5278,7 +4748,6 @@ mod tests {
         assert!(shown.contains("[task-1: running · 12s]"), "{shown}");
         assert!(shown.contains("⠋ $ sleep 9"), "still pending: {shown}");
 
-        // Once it lands, the task keeps the time it ran rather than counting on.
         app.agent(AgentEvent::Tasks(vec![TaskView {
             id: "task-1".into(),
             call: Some("c1".into()),
@@ -5328,8 +4797,6 @@ mod tests {
 
     #[test]
     fn a_call_in_flight_and_a_finished_one_both_show_how_long_it_took() {
-        // D172: the stopwatch sits after the call, on the header row, and the spinner still leads it
-        // while it runs.
         let (rows, bg) = tool_block(
             "bash",
             "sleep 9",
@@ -5358,7 +4825,6 @@ mod tests {
         );
         assert_eq!(text(&wrap(&rows[0], 80)), ["$ cargo test · 1m 05s"]);
         assert_eq!(bg, Theme::default().tool_success_bg);
-        // A resumed call has no timing of its own, so it shows none.
         let (rows, _) = tool_block(
             "bash",
             "cargo test",
@@ -5396,8 +4862,6 @@ mod tests {
 
     #[test]
     fn a_catppuccin_flavour_paints_the_screen() {
-        // The palette has to reach the renderer, not just build (D76): the frame in Mocha's mauve,
-        // its own text colour, and syntax in its own colours.
         let tables = ThemeTables::new();
         let mut app = bare_app();
         app.theme = theme::build("catppuccin-mocha", &tables).unwrap();
@@ -5419,7 +4883,6 @@ mod tests {
         assert!(seen.contains(&mauve), "the frame is Mocha's mauve");
         assert!(seen.contains(&number), "the number is Mocha's peach");
         assert!(seen.contains(&keyword), "the keyword is Mocha's mauve");
-        // And nothing from the old default palette's own syntax colours is left.
         assert!(
             !seen.contains(&Color::Rgb(165, 214, 255)),
             "the previous palette's string colour is gone"
@@ -5428,9 +4891,6 @@ mod tests {
 
     #[test]
     fn a_sign_in_on_screen_shows_the_address_and_the_code() {
-        // D85: the code is the whole point of the screen, so it has to be legible there rather than
-        // only in a log. The dialog is drawn with the code the host reported, and with the error
-        // where the code was when the sign-in fails.
         let mut app = bare_app();
         let choice = |name: &str, oauth: bool| Choice {
             name: name.into(),
@@ -5502,8 +4962,6 @@ mod tests {
 
     #[test]
     fn the_question_about_leaving_a_branch_is_drawn_over_the_transcript() {
-        // D167: the question is a dialog of its own, so it is drawn over the transcript and owns
-        // the selection while it is up, like every other one (D87).
         let mut app = bare_app();
         app.agent(AgentEvent::Text("a reply on the branch".into()));
         app.confirm = Some(Confirm {
@@ -5531,8 +4989,6 @@ mod tests {
 
     #[test]
     fn a_drag_inside_a_dialog_copies_the_dialog_text() {
-        // D87: a dialog owns the screen while it is open, so a drag there means its text. Without
-        // this the text was drawn and unselectable, which is what the sign-in screen made obvious.
         let mut app = bare_app();
         app.settings = Some(SettingsDialog::new(Values {
             provider: "synthetic".into(),
@@ -5560,7 +5016,6 @@ mod tests {
             .find(|l| l.contains("provider"))
             .cloned()
             .unwrap_or_else(|| panic!("no provider row in {:?}", seen.lines));
-        // Drag from the start of that row to its end, the way a mouse would.
         let row = seen
             .lines
             .iter()
@@ -5591,7 +5046,6 @@ mod tests {
         assert_eq!(what, "the selection");
         assert_eq!(text, wanted.trim(), "the whole row, as drawn");
 
-        // The selection is drawn where it is: the highlight is on the buffer, not just in state.
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
         let at = (seen.area.x, row);
@@ -5603,13 +5057,7 @@ mod tests {
 
     #[test]
     fn a_drag_in_a_dialog_highlights_nothing_in_the_transcript() {
-        // The transcript is shaded before the dialogs are drawn, and a dialog's selection records
-        // line numbers in the dialog's own frame. Shading the transcript with them painted a second
-        // highlight near the top of the screen, over unrelated text (D87).
         let mut app = bare_app();
-        // A short transcript, so the lines the dialog's indices name are on screen: with a long one
-        // they are scrolled away and the bug would not show, which is why it surfaced on a fresh
-        // session (D87).
         for i in 0..3 {
             app.entries
                 .push(Entry::User(format!("transcript line {i}")));
@@ -5635,7 +5083,6 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let seen = app.dialog_seen.clone().unwrap();
-        // Select the dialog's first two rows.
         app.mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: seen.area.x,
@@ -5651,7 +5098,6 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
         let highlight = app.theme.selected_bg;
-        // Everything outside the dialog's box is unhighlighted: the transcript saw none of it.
         let mut outside = 0;
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
@@ -5665,7 +5111,6 @@ mod tests {
             outside, 0,
             "the highlight must not appear outside the dialog"
         );
-        // And inside it, the two rows are.
         assert_eq!(buf[(seen.area.x, seen.area.y)].bg, highlight);
         assert_eq!(buf[(seen.area.x, seen.area.y + 1)].bg, highlight);
     }
@@ -5702,8 +5147,6 @@ mod tests {
             row: first,
             modifiers: KeyModifiers::NONE,
         });
-        // Dragged far below the box: the selection stops at the last line it drew rather than
-        // reaching into the transcript underneath, which is not what the mouse was over.
         app.mouse(MouseEvent {
             kind: MouseEventKind::Drag(MouseButton::Left),
             column: seen.area.x + 4,
@@ -5719,15 +5162,11 @@ mod tests {
             "the transcript must not be in the copy"
         );
 
-        // A dialog that closes leaves its selection behind: the same indices would land on other
-        // text.
         app.settings = None;
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         assert_eq!(app.dialog_seen, None);
         assert_eq!(app.selection, None);
 
-        // And so does a dialog that opens over one the transcript had: the same indices would land
-        // on the dialog's text instead.
         app.entries
             .push(Entry::User("another transcript line".into()));
         app.cache.push(None);
@@ -5766,8 +5205,6 @@ mod tests {
 
     #[test]
     fn the_model_picker_shows_every_providers_list_and_names_the_model_in_force() {
-        // D89: the list spans providers, so the screen has to say which one serves each model, and
-        // name the model in force so the list is read against something.
         let mut app = bare_app();
         let choice = |name: &str, model: &str| Choice {
             name: name.into(),
@@ -5819,13 +5256,11 @@ mod tests {
         for m in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.4"] {
             assert!(text.contains(m), "{m} is missing:\n{text}");
         }
-        // Both providers are named, which is what makes a union list readable.
         for p in ["synthetic", "openai"] {
             assert!(text.contains(p), "{p} is missing:\n{text}");
         }
         assert!(text.contains("type to filter"), "{text}");
         assert!(text.contains("esc close"), "{text}");
-        // The model in force is where the highlight starts.
         assert!(
             matches!(
                 &app.login.as_ref().unwrap().stage,
@@ -5835,7 +5270,6 @@ mod tests {
             app.login.as_ref().unwrap().stage
         );
 
-        // Typing a provider narrows to it; typing a model narrows to that.
         for c in "openai".chars() {
             app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
@@ -5851,9 +5285,6 @@ mod tests {
 
     #[test]
     fn the_sign_in_link_is_a_thing_a_click_can_open() {
-        // D86: a drawn link is the terminal's to ignore, and a dialog's text is not selectable, so
-        // the address has to be a target. What is checked here is that the cells the click lands on
-        // are the cells the address was drawn in.
         let mut app = bare_app();
         let choice = Choice {
             name: "openai-chatgpt".into(),
@@ -5876,7 +5307,6 @@ mod tests {
             panic!("a sign-in to start");
         };
         app.open_login(login);
-        // Nothing to click until the server names an address.
         let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         assert_eq!(app.open_url_at, None);
@@ -5893,7 +5323,6 @@ mod tests {
             .open_url_at
             .expect("the link was drawn, so it has cells");
         let screen = terminal.backend().buffer();
-        // The first cell of the target is the first character of the address.
         assert_eq!(
             screen[(at.x, at.y)].symbol(),
             "h",
@@ -5901,7 +5330,6 @@ mod tests {
         );
         let start = at.x + at.width - 1;
         assert_eq!(screen[(start, at.y)].symbol(), "e", "and ends with it");
-        // Clicking it asks to open that address; clicking the code does not.
         let click = |column, row| MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column,
@@ -5914,7 +5342,6 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         };
-        // A click is a press and a release in the same place: that is what follows the link.
         assert_eq!(
             app.mouse(click(at.x + 3, at.y)),
             None,
@@ -5931,8 +5358,6 @@ mod tests {
         assert_eq!(app.mouse(click(0, 0)), None);
         app.mouse(up(0, 0));
 
-        // A drag that *starts* on the link selects it, which is what it could not do while the
-        // press was swallowed by the link (D87).
         app.mouse(click(at.x, at.y));
         app.mouse(MouseEvent {
             kind: MouseEventKind::Drag(MouseButton::Left),
@@ -5949,10 +5374,6 @@ mod tests {
 
     #[test]
     fn a_formula_asks_for_the_rows_it_reserved_rather_than_its_pixel_size() {
-        // D165: a formula has no size of its own for the terminal to preserve — the rows the
-        // transcript reserved are its size. It therefore carries a cell box, so a terminal whose
-        // cell is bigger than the one saddle measured (a display scaled 2x, a query never answered)
-        // still draws it across those rows instead of at its own pixel count.
         let mut app = bare_app();
         app.protocol = image::Protocol::Kitty;
         app.entries.push(Entry::Assistant(
@@ -5962,8 +5383,6 @@ mod tests {
         let (lines, at) = transcript_with_images(&mut app, 80, false);
         assert_eq!(at.len(), 1, "one formula, one picture");
         let At { line, picture, .. } = &at[0];
-        // The marker line is blanked, and the picture's cells are the box the terminal is asked
-        // for — not a size computed from its pixels.
         assert_eq!(plain(&lines[*line]), "");
         let Picture { image, cells } = picture;
         assert!(cells.scaled, "a formula is always drawn in a cell box");
@@ -5977,9 +5396,6 @@ mod tests {
 
     #[test]
     fn a_formula_written_the_other_ways_people_write_it_is_typeset() {
-        // D165: the parser knows `$x$` and `$$x$$`. The two spellings a person writing by hand
-        // reaches for first — `\(x\)` and a padded `$ x $` — reach it as prose, so they are
-        // rewritten before it parses anything.
         assert_eq!(delimiters(r"so \(x^2\) is").as_ref(), "so $x^2$ is");
         assert_eq!(
             delimiters(r"\[ \frac{a}{b} \]").as_ref(),
@@ -5988,35 +5404,26 @@ mod tests {
         assert_eq!(delimiters("a $ x^2 $ b").as_ref(), "a $x^2$ b");
         assert_eq!(delimiters("a $ x $ b").as_ref(), "a $x$ b");
         assert_eq!(delimiters(r"$ \theta $").as_ref(), "$\\theta$");
-        // Money is not a formula, and neither is prose between two dollar signs.
         let money = "costs $5 and $10 today";
         assert_eq!(delimiters(money).as_ref(), money);
         let prose = "from $ here to $ there";
         assert_eq!(delimiters(prose).as_ref(), prose);
-        // Code is read exactly as it was written, which is what code is for.
         let fenced = "```\n\\(x\\) and $ y $\n```\n";
         assert_eq!(delimiters(fenced).as_ref(), fenced);
         let span = "a `\\(x\\)` b";
         assert_eq!(delimiters(span).as_ref(), span);
-        // And the text after a fence is still text: read as an inline span, the closing fence's
-        // backticks opened one that never closed, and every formula after the block was left as
-        // its source — which is what a real terminal showed (D165).
         let after = "```\nx\n```\n\nso \\(x^2\\) holds, and `a` too.";
         assert_eq!(
             delimiters(after).as_ref(),
             "```\nx\n```\n\nso $x^2$ holds, and `a` too."
         );
-        // A backtick with no partner is a backtick, not the end of the message.
         assert_eq!(delimiters("a ` b and \\(x\\)").as_ref(), "a ` b and $x$");
-        // Nothing to rewrite means the text is parsed where it is, without a copy.
         assert!(matches!(delimiters("a $x$ b"), Cow::Borrowed(_)));
         assert!(matches!(delimiters("plain prose"), Cow::Borrowed(_)));
     }
 
     #[test]
     fn a_formula_in_tex_s_own_delimiters_is_drawn_too() {
-        // End to end: `\(…\)` is what a mathematician types, and it reaches the same picture as
-        // `$…$` does (D165).
         let mut app = bare_app();
         app.protocol = image::Protocol::Kitty;
         app.entries
@@ -6033,9 +5440,6 @@ mod tests {
 
     #[test]
     fn a_copy_of_a_drawn_formula_is_the_tex_it_was_drawn_from() {
-        // D166: end to end, through the drawing pass. The layout is what knows where each picture
-        // stands, so the copy is tested from there: a drag over the whole transcript takes the words
-        // each formula was typeset from, in places where the screen has blank cells.
         let mut app = bare_app();
         app.protocol = image::Protocol::Kitty;
         app.entries.push(Entry::Assistant(
@@ -6063,17 +5467,12 @@ mod tests {
             "{text:?}"
         );
         assert!(text.contains("\\(x^2\\)"), "{text:?}");
-        // What was drawn over is not in the copy twice, and the source text the picture replaced is
-        // not there either.
         assert!(!text.contains("$$"), "{text:?}");
         assert_eq!(text.matches("x^2").count(), 1, "{text:?}");
     }
 
     #[test]
     fn a_fence_that_says_typst_math_is_a_formula_and_a_plain_typst_fence_is_code() {
-        // D165: the same body cannot be both. `$…$` and `$$…$$` are LaTeX and only LaTeX, so the
-        // notation that would otherwise be read as six letters there has an invocation of its own —
-        // and a fence tagged `typst`, which is how Typst code is shown, stays code.
         let mut app = bare_app();
         app.protocol = image::Protocol::Kitty;
         app.entries.push(Entry::Assistant(
@@ -6103,9 +5502,6 @@ mod tests {
 
     #[test]
     fn a_typst_formula_that_cannot_be_typeset_is_shown_as_the_block_it_was_written_as() {
-        // D165: what cannot be drawn is drawn as its source. For a body in Typst's notation that
-        // source is a block of Typst, so that is what is shown — never the TeX delimiters of the
-        // other invocation, which would name a notation it was not written in.
         let mut app = bare_app();
         app.protocol = image::Protocol::Kitty;
         app.entries
@@ -6128,8 +5524,6 @@ mod tests {
 
     #[test]
     fn a_copy_of_a_typst_formula_is_the_fence_that_asks_for_it() {
-        // D166: a Typst body is not LaTeX, so copying it in TeX's delimiters would paste it back as
-        // letters. What travels with the copy is the invocation it was drawn from.
         let mut app = bare_app();
         app.protocol = image::Protocol::Kitty;
         app.entries.push(Entry::Assistant(
@@ -6153,8 +5547,6 @@ mod tests {
 
     #[test]
     fn a_copy_from_a_terminal_with_no_pictures_keeps_what_it_shows() {
-        // No pictures means the source is on screen, and a copy of it is the text that is there: the
-        // copy must not wrap delimiters around delimiters (D166).
         let mut app = bare_app();
         app.protocol = image::Protocol::Text;
         app.entries.push(Entry::Assistant("so $x^2$ holds".into()));
@@ -6176,8 +5568,6 @@ mod tests {
 
     #[test]
     fn a_formula_in_a_line_takes_cells_of_that_line() {
-        // D165: a formula inside a sentence is drawn in cells the words around it leave, at the
-        // column it starts at, and the row is the same width it was as source.
         let mut app = bare_app();
         app.protocol = image::Protocol::Kitty;
         app.entries
@@ -6203,12 +5593,10 @@ mod tests {
             "as wide as it is: {:?}",
             picture.cells
         );
-        // The words are where they were, and nothing of the reservation is left on screen.
         let shown = plain(&lines[*line]);
         let words: Vec<&str> = shown.split_whitespace().collect();
         assert_eq!(words, ["if", "holds", "then"], "{shown:?}");
         assert!(!shown.contains(FORMULA) && !shown.contains(GUTTER));
-        // And the marker is not anywhere else either.
         assert!(
             lines.iter().all(|l| !plain(l).contains(FORMULA)),
             "every formula was placed"
@@ -6217,13 +5605,8 @@ mod tests {
 
     #[test]
     fn a_formula_in_a_line_moves_to_the_next_row_whole() {
-        // The run is measured like a word and cannot be broken: a formula that does not fit where
-        // it was written goes to the next row in one piece, rather than being cut in half by the
-        // wrapper (D165).
         let mut app = bare_app();
         app.protocol = image::Protocol::Kitty;
-        // Eight words of four and a space fill 39 of the 40 columns, leaving room for no run at
-        // all: the formula written after them has to move.
         let words = "1234 5678 9012 3456 7890 1234 5678 9012";
         app.entries
             .push(Entry::Assistant(format!("{words} $\\frac{{a}}{{b}}$ end")));
@@ -6252,8 +5635,6 @@ mod tests {
 
     #[test]
     fn a_terminal_with_no_pictures_gets_an_inline_formula_as_its_source() {
-        // D165: a formula whose picture cannot be drawn is drawn as the TeX it was written as, and
-        // that holds for one inside a sentence as much as for one on its own line.
         let mut app = bare_app();
         app.protocol = image::Protocol::Text;
         app.entries
@@ -6269,8 +5650,6 @@ mod tests {
 
     #[test]
     fn a_formula_in_a_table_cell_stays_its_source() {
-        // A table's columns are fitted rather than wrapped, so there is no run of cells for a
-        // picture to sit in: it stays the TeX it was written as (D165).
         let mut app = bare_app();
         app.protocol = image::Protocol::Kitty;
         app.entries.push(Entry::Assistant(
@@ -6287,8 +5666,6 @@ mod tests {
 
     #[test]
     fn the_theme_list_is_drawn_with_the_theme_it_offers() {
-        // D74: the point of the picker is that you see the choice before making it, so the box has
-        // to be drawn in the highlighted theme and say which one that is.
         let mut app = bare_app();
         let tables: ThemeTables = toml::from_str("[mine]\nborder = \"#ff0000\"\n").unwrap();
         let name = app.theme.name.clone();
@@ -6304,7 +5681,6 @@ mod tests {
         assert!(text.contains("built in"), "the source is shown:\n{text}");
         assert!(text.contains("config.toml"), "{text}");
 
-        // Moving to the config theme draws the box with its border colour, which is the preview.
         while app.themes.as_ref().unwrap().current().name != "mine" {
             app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
@@ -6313,7 +5689,6 @@ mod tests {
             Color::Rgb(0xff, 0x00, 0x00),
             "the drawing is now `mine`"
         );
-        // And the box itself carries that colour, so the list is read in what it offers.
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
         let reds = (0..buf.area.height)
@@ -6361,9 +5736,6 @@ mod tests {
 
     #[test]
     fn the_overview_page_lists_the_team_and_shares_the_bus_and_queue() {
-        // D195: ctrl+b opens a page with the sessions in a list on the left and the selected one
-        // drawn large on the right, with the team's message bus and shared command queue as two
-        // more rows of the same list.
         use crate::team::{Beat, BusMessage, QueueItem, QueueState, Render};
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         fn runtime() -> Render {
@@ -6392,7 +5764,6 @@ mod tests {
             }
         }
         let mut app = bare_app();
-        // Reasoning is drawn as it streams, in the page and in a worker's own view alike.
         app.show_thinking = true;
         app.agent(AgentEvent::Text("the lead's own words".into()));
         app.agent(AgentEvent::Workers(vec![
@@ -6420,8 +5791,6 @@ mod tests {
         assert_eq!(app.key(ctrl_b), Some(Action::Workers));
         assert_eq!(app.overview, Some(1), "opens on the running worker");
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        // The editor is behind the page, so a prompt typed there cannot be on screen while it is
-        // open: the page owns the whole frame.
         app.editor.set("zzz-prompt".into());
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let shown = screen(&terminal);
@@ -6431,15 +5800,12 @@ mod tests {
         assert!(shown.contains("tests"), "{shown}");
         assert!(shown.contains("bus (1)"), "{shown}");
         assert!(shown.contains("queue (1)"), "{shown}");
-        // The selected session is drawn large beside the list: reasoning, markdown without its
-        // markers, and the tool block with its call and answer.
         assert!(shown.contains("the reload path is here"), "{shown}");
         assert!(shown.contains("Looking at the loader now."), "{shown}");
         assert!(!shown.contains("**"), "markdown markers: {shown}");
         assert!(shown.contains("grep -n reload src"), "{shown}");
         assert!(shown.contains("src/lib.rs:17"), "{shown}");
         assert!(!shown.contains("zzz-prompt"), "{shown}");
-        // The list walks the sessions and then the two boards, and the detail pane follows.
         assert_eq!(app.key(KeyEvent::from(KeyCode::Down)), None);
         assert_eq!(app.overview, Some(2), "the idle worker");
         app.key(KeyEvent::from(KeyCode::Down));
@@ -6455,15 +5821,12 @@ mod tests {
         assert!(queue.contains("#1"), "{queue}");
         assert!(queue.contains("pending"), "{queue}");
         assert!(queue.contains("cargo test -p saddle-cap"), "{queue}");
-        // A board is read, not run: enter and the worker keys do nothing there, and a digit still
-        // picks a session.
         assert_eq!(app.key(KeyEvent::from(KeyCode::Enter)), None);
         assert_eq!(app.overview, Some(4));
         assert_eq!(app.key(KeyEvent::from(KeyCode::Char('i'))), None);
         assert_eq!(app.key(KeyEvent::from(KeyCode::Char('x'))), None);
         assert_eq!(app.key(KeyEvent::from(KeyCode::Char('1'))), None);
         assert_eq!(app.overview, Some(1));
-        // Enter on a worker opens its own full transcript, and esc returns to the page on it.
         assert_eq!(
             app.key(KeyEvent::from(KeyCode::Enter)),
             Some(Action::OpenWorker("runtime".into()))
@@ -6479,11 +5842,8 @@ mod tests {
         );
         assert_eq!(app.overview, Some(1));
         assert!(app.worker.is_none());
-        // ctrl+b closes the page, back to the person's own conversation.
         assert_eq!(app.key(ctrl_b), None);
         assert!(app.overview.is_none());
-        // With no workers yet the page still opens, with the person's own row and both empty
-        // boards; `/workers` is the same page for a terminal that eats the key.
         let mut empty = bare_app();
         assert_eq!(empty.key(ctrl_b), Some(Action::Workers));
         assert_eq!(empty.overview, Some(0));
@@ -6501,8 +5861,6 @@ mod tests {
             Some(Action::Workers)
         );
         assert_eq!(empty.overview, Some(0));
-        // A prompt typed in a worker's own view goes to the worker, not the lead, and ctrl+b
-        // there returns to the page on that worker.
         app.worker = Some("runtime".into());
         app.overview = None;
         app.editor.set("keep going".to_string());
@@ -6516,8 +5874,6 @@ mod tests {
 
     #[test]
     fn a_board_stays_selected_when_the_team_has_no_workers() {
-        // The views event arrives on every agent-thread tick; bounding the selection by the team
-        // (zero workers) pulled the bus and queue rows back to the lead at once (D195).
         use ratatui::crossterm::event::{KeyCode, KeyEvent};
         let mut app = bare_app();
         app.overview = Some(0);
@@ -6535,9 +5891,6 @@ mod tests {
 
     #[test]
     fn the_page_scrolls_a_sessions_history_and_a_boards_full_text() {
-        // D195/D196: the detail is a session's own transcript from the start of what is kept, so
-        // PgUp walks back through its turns and reasoning, and a board wraps its full text so a
-        // long message or a multi-line command is readable rather than cut to a row.
         use crate::team::{Beat, BusMessage, QueueItem, QueueState, Render};
         use ratatui::crossterm::event::{KeyCode, KeyEvent};
         let mut app = bare_app();
@@ -6577,8 +5930,6 @@ mod tests {
         let older = screen(&terminal);
         assert!(!older.contains("turn line 59"), "{older}");
         assert!(older.contains("PgUp/PgDn history"), "{older}");
-        // The bus shows every line of the message; the bottom of the log is where it opens, and
-        // Home takes the reader to its beginning.
         app.overview = Some(2);
         app.board_scroll = 0;
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -6588,7 +5939,6 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let oldest = screen(&terminal);
         assert!(oldest.contains("bus line 0"), "{oldest}");
-        // A queued command's own newlines are kept, so a multi-command item is read as written.
         app.overview = Some(3);
         app.board_scroll = 0;
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -6632,8 +5982,6 @@ mod tests {
             state: CompactState::Running,
             blocks: false,
         };
-        // The reasoning is inside the entry's own toggle: it is drawn when the compaction is open,
-        // not merely because reasoning is on (D124).
         let (rows, _) = compaction_block(&view, true, true, 0, &theme, 30);
         let shown = rows
             .iter()
@@ -6689,7 +6037,6 @@ mod tests {
         ));
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
-        // The first reply line, wherever the last draw put it.
         let area = app.seen.as_ref().expect("transcript geometry").area;
         let first = app
             .seen
@@ -6740,9 +6087,7 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(plain_part, "abf");
-        // The text's own colour survives outside the selection.
         assert_eq!(line.spans.last().unwrap().style.fg, Some(Color::Red));
-        // A whole-line selection needs no splitting.
         let mut whole = Line::from(vec![Span::raw("xy")]);
         shade(&mut whole, 0, usize::MAX, &Theme::default());
         assert_eq!(whole.spans.len(), 1);
@@ -6788,14 +6133,12 @@ mod tests {
             "Permissions for this project",
             "› agent.fs-read[0]",
             "read workspace  exclude [.env*]",
-            // A row that cannot be changed is still listed, and marked.
             "agent.exec      ·",
             "run commands",
             "home%me%proj.toml",
         ] {
             assert!(all.contains(want), "missing {want:?} in\n{all}");
         }
-        // A row that cannot be changed says why when it is the one selected.
         if let Some(dialog) = &mut app.permissions {
             dialog.selected = 1;
         }
@@ -6806,7 +6149,6 @@ mod tests {
 
     #[test]
     fn the_add_prompt_shows_the_entry_before_it_is_written() {
-        // D173: the grant a line would add, and what it reaches, are on screen while it is typed.
         let mut app = bare_app();
         app.permissions = Some(Permissions::new(
             Vec::new(),
@@ -6832,13 +6174,11 @@ mod tests {
             r#"[[agent.net]]  host = "api.example.com""#,
             r#"scheme = "https""#,
             "net grant for https://api.example.com:443",
-            // The base grants a list this project's own would replace, which the entry cannot say.
             "own list replaces config.toml's 1 `net` entry",
             "enter add · tab complete · esc cancel",
         ] {
             assert!(all.contains(want), "missing {want:?} in\n{all}");
         }
-        // A line that cannot be a grant says so instead, and nothing is drawn as if it could.
         if let Some(dialog) = &mut app.permissions {
             dialog.retry("net https://".into());
         }
@@ -6849,8 +6189,6 @@ mod tests {
 
     #[test]
     fn a_theme_paints_the_screen_so_a_custom_one_actually_shows() {
-        // D71: the theme is not a decoration on the settings struct — every role the renderer uses
-        // comes from it, so a theme that sets `accent` and `muted` changes what is drawn.
         let mut app = bare_app();
         app.entries = vec![Entry::User("hello".into())];
         app.theme = Theme {
@@ -6871,7 +6209,6 @@ mod tests {
         );
         assert!(painted(Color::Rgb(0, 255, 0)), "and the muted colour");
 
-        // The default theme still paints cyan, which is what most of this renderer's accent is.
         let mut app = bare_app();
         app.entries = vec![Entry::User("hello".into())];
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
@@ -6884,8 +6221,6 @@ mod tests {
 
     #[test]
     fn the_built_in_themes_build_and_the_light_one_differs() {
-        // The shipped themes must be usable, not just parseable: a theme with a role left out would
-        // be a colour nobody chose.
         for name in theme::builtin_names() {
             let theme =
                 theme::build(name, &ThemeTables::new()).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -6907,8 +6242,6 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let rows: Vec<String> = screen(&terminal).lines().map(str::to_owned).collect();
-        // Status line at 19, editor at 16..=18, so the menu's last row is 15. Four matches now
-        // (/login, /logout, /clone, /reload), so the list starts one row higher.
         assert!(rows[15].starts_with("╰ ↑↓ select"), "{}", rows[15]);
         assert!(
             rows[11].contains("› /login") && rows[11].contains("choose a provider"),
@@ -6946,14 +6279,12 @@ mod tests {
         assert!(all.contains("❯ fix the build"), "{all}");
         assert!(all.contains("◆ looking"), "{all}");
         assert!(all.contains("⚙ tool results"), "{all}");
-        // The message the conversation is at, and one on a branch it would not carry (D54).
         assert!(all.contains("⋯ we compacted here   ← here"), "{all}");
         assert!(
             all.contains("❯ a branch left behind   (other branch)"),
             "{all}"
         );
         assert!(all.contains("enter continue here"), "{all}");
-        // D168: the tree is the screen, not a window in it — its rows reach the last one.
         assert_eq!(
             app.dialog_seen.as_ref().map(|s| s.lines.len()),
             Some(20),
@@ -6965,8 +6296,6 @@ mod tests {
 
     #[test]
     fn the_tree_fills_the_screen_and_scrolls_inside_it() {
-        // D168: the mode is the screen. A conversation longer than it scrolls with the keyboard, and
-        // the list takes every row the title and the footers leave.
         let mut app = bare_app();
         let points = (1..=40)
             .map(|n| Point {
@@ -6990,7 +6319,6 @@ mod tests {
             .expect("the tree is its own surface");
         assert_eq!(seen.lines.len(), 20, "every row of the screen");
         assert_eq!((seen.area.height, seen.top), (20, 0));
-        // Title, a blank, fifteen rows of list, then the counts and the two key lines.
         assert_eq!(app.tree.as_ref().unwrap().rows, 15);
         assert!(
             seen.lines[0].contains("conversation tree"),
@@ -7005,7 +6333,6 @@ mod tests {
         assert!(seen.lines[16].starts_with('›'), "{:?}", seen.lines[16]);
         assert!(seen.lines[17].contains("40 messages"), "{:?}", seen.lines);
         assert!(seen.lines[19].contains("esc closes"), "{:?}", seen.lines);
-        // Nothing of the transcript is left on the screen behind it.
         assert!(
             !seen.lines[1].contains("saddle ·"),
             "the header shows through: {:?}",
@@ -7095,8 +6422,6 @@ mod tests {
             allow_note: true,
         });
         app.ask = Some(AskDialog::new(asked));
-        // A conversation long enough to scroll, with the line that must stay visible just above
-        // the question at its end.
         for line in 0..30 {
             app.note(NoteKind::Info, &format!("line {line} of what was said"));
         }
@@ -7107,8 +6432,6 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let all = screen(&terminal);
-        // The question is the transcript's last rows: what was said above it is still there, and
-        // the frame carries its keys because the question itself can be scrolled away (D197).
         assert!(
             all.contains("a line of the conversation that must stay visible"),
             "the transcript was covered:\n{all}"
@@ -7133,7 +6456,6 @@ mod tests {
             assert!(all.contains(want), "missing {want:?} in\n{all}");
         }
 
-        // The label is the theme's text; its subtext is the muted colour, so the two read apart.
         let row_of = |needle: &str| {
             let buf = terminal.backend().buffer();
             (0..buf.area.height).find(|y| {
@@ -7160,7 +6482,6 @@ mod tests {
             "the subtext is drawn in the quiet colour"
         );
 
-        // `n` opens a note on the choice under the cursor, and the cursor sits on that line.
         if let Some(dialog) = &mut app.ask {
             dialog.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
             assert!(matches!(dialog.stage, AskStage::Noting { .. }));
@@ -7177,8 +6498,6 @@ mod tests {
             "the note line did not cover the transcript either:\n{all}"
         );
 
-        // Scrolling walks the transcript, and the question walks off the bottom with it: reading
-        // what led to a question is the same gesture as ever (D197).
         for _ in 0..4 {
             app.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
         }
@@ -7201,8 +6520,6 @@ mod tests {
     #[test]
     fn moving_through_a_questions_choices_keeps_its_question_and_choices_on_the_screen() {
         let mut app = bare_app();
-        // The shape that got this wrong: three choices whose previews are long enough that the
-        // block is taller than the screen, walked with the keys the question uses (D197).
         let (asked, _answers) = Asked::pair(AskedQuestion {
             question: "Where should the words you type go?".into(),
             choices: (1..=3)
@@ -7234,8 +6551,6 @@ mod tests {
             );
             assert_eq!(app.scroll, 0, "turn {turn} scrolled the transcript");
             if turn == 0 {
-                // The preview gives way rather than the question: it is cut, and says how much it
-                // left out.
                 assert!(
                     all.contains("more line"),
                     "the preview was cut short:\n{all}"
@@ -7244,8 +6559,6 @@ mod tests {
             app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
 
-        // `n` opens the note of the choice under the cursor, and the frame names the choice it
-        // belongs to, so an answer is never sent by a keystroke that meant to add to it (D197).
         app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let all = screen(&terminal);
@@ -7296,8 +6609,6 @@ mod tests {
             allow_note: true,
         });
         let mut dialog = AskDialog::new(asked);
-        // The room the preview takes belongs to the question, not to the choice under the cursor:
-        // walking the choices must not change the block's height and shift the screen (D197).
         let mut heights = Vec::new();
         for row in 0..dialog.rows() {
             dialog.selected = row;
@@ -7307,7 +6618,6 @@ mod tests {
             heights.windows(2).all(|pair| pair[0] == pair[1]),
             "the block changed height while the choices were walked: {heights:?}"
         );
-        // Including the rows the note and the error add, and the same with no room to spare.
         dialog.stage = AskStage::Noting {
             choice: 0,
             text: "half".into(),
@@ -7428,7 +6738,6 @@ mod tests {
             assert!(all.contains(want), "missing {want:?} in\n{all}");
         }
         assert!(screen[19].starts_with("/ws"), "{}", screen[19]);
-        // The refused call sits on the error shade, edge to edge.
         let row = screen
             .iter()
             .position(|l| l.contains("denied: agent"))
@@ -7436,7 +6745,6 @@ mod tests {
         let buf = terminal.backend().buffer();
         assert_eq!(buf[(0, row)].bg, Theme::default().tool_error_bg);
         assert_eq!(buf[(59, row)].bg, Theme::default().tool_error_bg);
-        // Inspect the painted glyph, not just its text: matching foreground/background hid errors.
         let column = screen[row as usize].find("denied:").unwrap() as u16;
         assert_eq!(buf[(column, row)].fg, Theme::default().error);
         assert_ne!(buf[(column, row)].fg, buf[(column, row)].bg);
@@ -7482,17 +6790,12 @@ mod tests {
             assert_eq!(bg, expected);
             let line = text(&wrap(&rows[0], 200)).join(" ");
             assert!(line.contains(state.label()), "{line}");
-            // Each task says how long it ran, from its own start to its own stop (D172).
             assert!(line.contains("2.0s"), "{line}");
         }
     }
 
     #[test]
     fn a_formula_with_a_transpose_in_it_is_drawn_rather_than_shown_as_its_source() {
-        // Reported from a real terminal: two of the formulas in one paragraph were left as their
-        // source while the ones around them were typeset. The whole formula is refused when one
-        // command is not translated (`\top` was not), so a single absent symbol costs the picture
-        // — and the paragraph reads as if `$$` and `$…$` were not supported at all (D165).
         let mut app = bare_app();
         app.protocol = image::Protocol::Kitty;
         app.entries.push(Entry::Assistant(
@@ -7510,9 +6813,6 @@ mod tests {
 
     #[test]
     fn a_rate_bound_with_a_slanted_inequality_is_drawn_rather_than_shown_as_its_source() {
-        // Reported from a real terminal: `$k \epsilon^2 \gtrsim \log n$` came out as its source,
-        // because `\gtrsim` had no Typst name and one untranslated command refuses the whole
-        // formula (D165). The slanted inequality is a glyph Typst has, so the line is a picture.
         let mut app = bare_app();
         app.protocol = image::Protocol::Kitty;
         app.entries.push(Entry::Assistant(
@@ -7530,9 +6830,6 @@ mod tests {
 
     #[test]
     fn a_display_formula_left_to_its_source_keeps_the_lines_it_was_written_on() {
-        // A row of text holds no line break — the drawing pass drops a control character — so a
-        // source written over three lines used to reach the screen as one line. The shape a writer
-        // gives a long formula is what makes its source readable (D165).
         let mut app = bare_app();
         app.protocol = image::Protocol::Text;
         app.entries.push(Entry::Assistant(

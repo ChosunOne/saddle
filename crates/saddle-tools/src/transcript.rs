@@ -1,5 +1,3 @@
-//! transcript tool schema and presentation; the gated core service owns SQL execution (D137).
-
 use saddle_limits as budgets;
 #[cfg(target_arch = "wasm32")]
 use saddle_sdk::configure_limits;
@@ -16,8 +14,6 @@ pub struct SessionQuery;
 #[serde(deny_unknown_fields)]
 struct Arguments {
     sql: String,
-    /// The conversation to read: absent for the one in hand, or the id (or unique prefix) of
-    /// another session of this workspace, which the grant has to cover (D163).
     #[serde(default)]
     session: Option<String>,
 }

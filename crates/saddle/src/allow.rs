@@ -1,12 +1,3 @@
-//! A session may use a workspace that puts credentials in reach, once a person has allowed that
-//! session id to use it (D60).
-//!
-//! Nothing here is reachable from inside a session: the files live in the state directory, which no
-//! root may contain (D16), so the agent cannot write an allowance for itself and a sandboxed child
-//! cannot either. An allowance is written by `saddle session allow <id>` from a terminal the person
-//! is sitting at, and it is removed when the session it names ends — so it is a permission for one
-//! session, not a property of the workspace.
-
 use std::cmp::Reverse;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,20 +7,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// What an allowance says: the workspace it covers, and who asked for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub workspace: PathBuf,
-    /// The process that asked, so `session pending` can show whether it is still running.
     pub pid: u32,
-    /// Seconds since the epoch, for a person reading the list.
     pub when: u64,
 }
 
 impl Entry {
-    /// Whether this entry covers `workspace`. Paths are compared after canonicalising, because the
-    /// same directory reaches the prompt as `/home/me`, `/home/me/` and `/home/me/.` and all three
-    /// are the same permission.
     pub fn covers(&self, workspace: &Path) -> bool {
         let same = |a: &Path, b: &Path| {
             let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
@@ -39,13 +24,11 @@ impl Entry {
     }
 }
 
-/// The directory of session allowances, and the ids waiting for one.
 pub struct Allowance {
     dir: PathBuf,
 }
 
 impl Allowance {
-    /// `state` is saddle's state directory.
     pub fn new(state: &Path) -> Self {
         Self {
             dir: state.join("allowances"),
@@ -60,8 +43,6 @@ impl Allowance {
         self.dir.join(format!("{id}.allow"))
     }
 
-    /// Records that session `id` is waiting to use `workspace`, which is what makes an id findable
-    /// after the terminal that printed it has scrolled away.
     pub fn request(&self, id: &str, workspace: &Path) -> Result<()> {
         let entry = Entry {
             workspace: workspace.to_path_buf(),
@@ -71,19 +52,15 @@ impl Allowance {
         write(&self.pending_path(id), &entry)
     }
 
-    /// The entry for `id`, if a person has allowed it.
     pub fn granted(&self, id: &str) -> Option<Entry> {
         read(&self.allow_path(id))
     }
 
-    /// Whether session `id` may use `workspace`: an allowance exists and names that workspace.
     pub fn allows(&self, id: &str, workspace: &Path) -> bool {
         self.granted(id)
             .is_some_and(|entry| entry.covers(workspace))
     }
 
-    /// Allows session `id` to use `workspace`. Called by `saddle session allow`, which only a
-    /// person runs: the file is outside every root, so nothing the agent starts can write it.
     pub fn allow(&self, id: &str, workspace: &Path) -> Result<()> {
         let entry = Entry {
             workspace: workspace.to_path_buf(),
@@ -93,8 +70,6 @@ impl Allowance {
         write(&self.allow_path(id), &entry)
     }
 
-    /// Every allowance, most recently made first, so a person can pick one instead of remembering
-    /// an id (D61).
     pub fn allowed(&self) -> Vec<(String, Entry)> {
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return Vec::new();
@@ -115,8 +90,6 @@ impl Allowance {
         out
     }
 
-    /// The allowances that cover `workspace`, which is what the picker offers when a session in a
-    /// sensitive workspace is refused (D61).
     pub fn for_workspace(&self, workspace: &Path) -> Vec<(String, Entry)> {
         let mut out: Vec<(String, Entry)> = self
             .allowed()
@@ -127,9 +100,6 @@ impl Allowance {
         out
     }
 
-    /// Resolves what a person typed to one of `candidates`: a 1-based number from the list, or an
-    /// id or unique id prefix. `None` when nothing matches, and an error when a prefix is
-    /// ambiguous, so a typo cannot silently pick the wrong session.
     pub fn resolve(typed: &str, candidates: &[(String, Entry)]) -> Result<Option<String>> {
         let typed = typed.trim();
         if typed.is_empty() {
@@ -163,14 +133,11 @@ impl Allowance {
         }
     }
 
-    /// Forgets everything about `id`: its allowance and its pending request, so an allowance is
-    /// gone when a person says so rather than when a process exits (D61).
     pub fn revoke(&self, id: &str) {
         let _ = fs::remove_file(self.allow_path(id));
         let _ = fs::remove_file(self.pending_path(id));
     }
 
-    /// The sessions waiting for an allowance, oldest first.
     pub fn waiting(&self) -> Vec<(String, Entry)> {
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return Vec::new();
@@ -192,7 +159,6 @@ impl Allowance {
     }
 }
 
-/// How long ago `when` was, for a person reading the pending list.
 pub fn ago(when: u64) -> String {
     let secs = now().saturating_sub(when);
     match secs {
@@ -223,7 +189,6 @@ fn read(path: &Path) -> Option<Entry> {
     toml::from_str(&text).ok()
 }
 
-/// Checks that an allowance may be written for `id`, so a typo is refused rather than stored.
 pub fn check_id(id: &str) -> Result<()> {
     let ok = !id.is_empty()
         && id.len() <= 64
@@ -254,9 +219,7 @@ mod tests {
         assert!(!allowance.allows("abc-1", ws.path()), "nothing allowed yet");
         allowance.allow("abc-1", ws.path()).unwrap();
         assert!(allowance.allows("abc-1", ws.path()));
-        // The same directory spelled differently is the same permission.
         assert!(allowance.allows("abc-1", &ws.path().join(".")));
-        // Another workspace, or another session id, is not covered.
         assert!(!allowance.allows("abc-1", other.path()));
         assert!(!allowance.allows("def-2", ws.path()));
     }
@@ -279,8 +242,6 @@ mod tests {
 
     #[test]
     fn a_waiting_session_is_findable_by_id() {
-        // The id is printed once, so it has to be recoverable afterwards: this is what
-        // `saddle session pending` shows.
         let state = temp();
         let ws = temp();
         let allowance = Allowance::new(state.path());
@@ -295,7 +256,6 @@ mod tests {
 
     #[test]
     fn an_allowance_is_picked_by_number_or_by_prefix() {
-        // D61: the point of persisting an allowance is not having to copy a 16-character id.
         let state = temp();
         let ws = temp();
         let allowance = Allowance::new(state.path());
@@ -304,18 +264,14 @@ mod tests {
         let candidates = allowance.for_workspace(ws.path());
         assert_eq!(candidates.len(), 2);
 
-        // A number picks by position, which the printed list shows.
         let by_number = Allowance::resolve("2", &candidates).unwrap();
         assert_eq!(by_number.as_deref(), Some(candidates[1].0.as_str()));
-        // An exact id and a unique prefix both work.
         let exact = Allowance::resolve("9f2c2b0000000000", &candidates).unwrap();
         assert_eq!(exact.as_deref(), Some("9f2c2b0000000000"));
         let unique = Allowance::resolve("9f2c2b", &candidates).unwrap();
         assert_eq!(unique.as_deref(), Some("9f2c2b0000000000"));
-        // An ambiguous prefix is an error rather than a guess, so a typo cannot pick a session.
         let ambiguous = Allowance::resolve("9f2c", &candidates);
         assert!(ambiguous.is_err(), "{ambiguous:?}");
-        // Nothing, out of range, and no match are all "nothing chosen".
         for none in ["", "0", "3", "deadbeef"] {
             assert_eq!(
                 Allowance::resolve(none, &candidates).unwrap(),

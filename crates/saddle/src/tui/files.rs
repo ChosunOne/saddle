@@ -1,9 +1,7 @@
-//! human file-picker enumeration, not an agent filesystem tool (D147).
 use crate::ignore::{self, Rules};
 use cap_std::fs::Dir;
 use saddle_limits as budgets;
 use std::path::Path;
-/// A file found by a walk: its path relative to the root.
 struct Found {
     rel: String,
 }
@@ -14,7 +12,6 @@ struct Walk {
     cut_short: bool,
 }
 
-/// Adds the rules of every ignore file in `base`, which is a directory relative to `root`.
 fn load_ignores(root: &Dir, rules: &mut Rules, base: &str) {
     for name in ignore::FILES {
         let file = if base.is_empty() {
@@ -28,8 +25,6 @@ fn load_ignores(root: &Dir, rules: &mut Rules, base: &str) {
     }
 }
 
-/// Walks the files beneath `start` (a directory relative to the root), skipping `.git`, ignored
-/// paths, symlinks, and any path `allowed` refuses. Stops after `limit` files.
 fn walk(
     root: &Dir,
     start: &str,
@@ -39,7 +34,6 @@ fn walk(
 ) -> Walk {
     let mut ignores = Rules::default();
     if gitignore {
-        // Rules from the root down to the start apply too.
         load_ignores(root, &mut ignores, "");
         let mut base = String::new();
         for part in start.split('/').filter(|p| !p.is_empty()) {
@@ -110,7 +104,6 @@ fn walk(
                 out.found.push(Found { rel });
             }
         }
-        // Visit subdirectories in name order.
         stack.extend(subdirs.into_iter().rev());
     }
     out

@@ -1,6 +1,3 @@
-//! Cancelling a turn. There is one flag per process. The TUI sets it on Esc or Ctrl-C, and in line
-//! mode a SIGINT handler sets it. The model stream, the loop and a running command all check it.
-
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,13 +16,11 @@ pub fn reset() {
     FLAG.store(false, Ordering::SeqCst);
 }
 
-/// While the guard lives, the first SIGINT cancels the turn and a second one exits with 130.
 pub struct SigintGuard {
     previous: libc::sigaction,
 }
 
 extern "C" fn on_sigint(_: libc::c_int) {
-    // An atomic swap and _exit are both async-signal-safe.
     if FLAG.swap(true, Ordering::SeqCst) {
         unsafe { libc::_exit(130) }
     }
@@ -33,7 +28,6 @@ extern "C" fn on_sigint(_: libc::c_int) {
 
 impl SigintGuard {
     pub fn install() -> Self {
-        // SAFETY: a zeroed sigaction is valid; the handler only touches an atomic and calls _exit.
         unsafe {
             let mut action: libc::sigaction = mem::zeroed();
             action.sa_sigaction = on_sigint as *const () as libc::sighandler_t;
@@ -48,7 +42,6 @@ impl SigintGuard {
 
 impl Drop for SigintGuard {
     fn drop(&mut self) {
-        // SAFETY: restores the handler saved in install.
         unsafe {
             libc::sigaction(libc::SIGINT, &self.previous, ptr::null_mut());
         }

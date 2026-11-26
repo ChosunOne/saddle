@@ -1,4 +1,3 @@
-//! the standard fetch workflow over delegated HTTP (D143).
 #![cfg(target_arch = "wasm32")]
 use saddle_sdk::{self as bindings, export};
 use saddle_tools::fetch::Fetch;

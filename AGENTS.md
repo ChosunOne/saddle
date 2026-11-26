@@ -34,9 +34,8 @@ because it is followed.
 | `crates/saddle-sandbox` | applies a sandbox spec to the current process and execs the target, including the command's own network namespace and the relay in it (D79); starts a long-lived child whose stdin and stdout belong to the caller, with the spec on fd 3 (D106); also builds the `saddle-sandbox` helper binary used by its own tests |
 | `crates/saddle` | the binary: tool dispatch, model providers, the model loop, the TUI |
 
-`lints/qualified-paths` is outside the workspace: a Dylint library holding the one lint no rustc or
-Clippy lint can express (D148), with its own nightly toolchain and its own UI test. It is not a
-workspace member, so `cargo build` never compiles it.
+`lints/qualified-paths` is outside the workspace: a Dylint library holding the source style lints
+(D148, D198), with its own nightly toolchain and UI tests. `cargo build` never compiles it.
 
 Inside `crates/saddle/src`:
 
@@ -260,21 +259,21 @@ cargo nextest run -p saddle-cap              # one crate
 cargo nextest run -E 'test(/^tui::/)'        # by name, with nextest's filter expressions
 cargo fmt --all --check                      # must stay clean; no rustfmt.toml, so defaults apply
 cargo clippy --all-targets                   # must stay clean
-cargo dylint --all                           # the D148 lint; needs cargo-dylint and its nightly
+cargo dylint --all                           # source style lints; needs cargo-dylint and its nightly
 ```
 
-`cargo dylint` is separate from Clippy and is the only command that needs nightly: install
+`cargo dylint` is separate from Clippy: install
 `cargo-dylint` and `dylint-link` once, and the pinned `lints/qualified-paths/rust-toolchain.toml` is
 fetched by rustup on first use. It checks the workspace with that nightly, guest builds included, so
-`wasm32-unknown-unknown` must be available for it too. Everything else stays on the stable toolchain.
+`wasm32-unknown-unknown` must be available for it too. The lint library’s own tests also use
+its pinned nightly: run `cargo nextest run` from `lints/qualified-paths`. The main workspace
+stays on stable.
 
 `nextest` is installed at `~/.cargo/bin/cargo-nextest` (0.9.146). Three differences from
 `cargo test` are worth knowing:
 
 - **Doctests are not run** — nextest runs test binaries, not rustdoc. Nothing here documents a
-  runnable example (the fenced block in `config.rs` is a sample file, in a binary crate, which has
-  no doctests at all), so nothing is missed today; `cargo test --doc` is what would run one if it
-  were written.
+  runnable example in Rustdoc (D198), so nothing is missed today.
 - **One test is one process**, so a test that relies on state another test set up will not see it,
   and `-j`/`--test-threads` is how many run at once rather than how many share a process. It is
   also why a test that leaks a global (an `std::env` variable, a signal handler) passes under
@@ -458,18 +457,10 @@ is optional (D41). Exclusions live inside the grant they narrow (D22).
 
 ## Decision log
 
-Decisions are cited by number as **D1** onward (D197 at the time of writing) in `docs/plan.md` §3, and
-nearly every module header names the ones it implements, for example:
+Decisions are numbered from **D1** in `docs/plan.md` §3. That section is the source of truth.
+Read the relevant decisions before editing a module; they usually explain why the obvious
+implementation is wrong.
 
-```rust
-//! D20: landlock grants cannot carve a path out of a granted root, so an `exclude` pattern narrows the
-//! tools and plugin host calls, and a command reaches what the sandbox list names.
-```
-
-- Read the cited decisions before editing a module; they usually explain why the obvious
-  implementation is wrong.
-- `docs/plan.md` §3 is the source of truth for a number. If code cites a decision the plan does not
-  define, that is a gap to close by writing the decision, not by dropping the citation.
 - New behaviour cites a decision. If none covers it, add a decision to `docs/plan.md` (or a bullet to
   §8 Deferred) in the same change.
 - Do not renumber or reuse decision numbers — they are cited across the codebase. Superseding a
@@ -495,10 +486,11 @@ nearly every module header names the ones it implements, for example:
   `cargo dylint --all` (D148). It is outside the workspace members because it needs the nightly its
   own `rust-toolchain.toml` pins, which is the lint's requirement and not the project's. An
   `#[allow(dead_code)]` is for an item that must exist without being read — a colour table, a field
-  that is there so a file parses, a fixture one of two test binaries uses — and says why. New crates
-  must set `[lints] workspace = true`.
-- Doc comments are lowercase sentences and explain intent, not mechanics. `//!` opens a module with
-  its purpose and its decision numbers; `///` covers public items.
+  that is there so a file parses, a fixture one of two test binaries uses. Use an attribute `reason` when an explanation is
+  needed. New crates must set `[lints] workspace = true`.
+- Rust source has no comments, including Rustdoc (D198). Use clear names, explicit control flow,
+  and tests for examples. Put API guidance in Markdown and design rationale in `docs/plan.md`.
+  `cargo dylint --all` denies Rust comment tokens; strings containing comment markers are unaffected.
 - `anyhow` with `bail!`/`Context` in the `saddle` binary crate; typed `thiserror` errors in the
   library crates.
 - Messages are lowercase sentences. Host errors are prefixed `saddle:` by `main`; policy denials are

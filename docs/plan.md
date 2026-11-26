@@ -4866,6 +4866,13 @@ hash, never either's words (D10, D24). The bounds are `[tool-limits]` (`ask-byte
 question the interface could not draw before it reaches the person, including one that recommends two
 choices.
 
+**D198.** Rust source has no comments, including line, block, and Rustdoc comments. Use code and
+focused tests to show what happens; put user guidance and design rationale in Markdown. Run
+`cargo dylint --all` with the other checks: `no_source_comments` is deny-by-default and uses the
+compiler's lexer on local Rust source loaded by the compiler, so comment syntax inside a literal is
+not a violation. This supersedes the inline documentation convention without changing D148's
+import rule.
+
 ## 4. Scope enumeration
 
 | scope | grants | declared by | enforced at |

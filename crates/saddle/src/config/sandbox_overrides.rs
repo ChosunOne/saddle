@@ -1,5 +1,3 @@
-//! protected workspace sandbox list overrides; operators never become grants (D157, D158).
-
 use std::fs;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -27,7 +25,6 @@ pub struct Source {
     pub sha256: Option<String>,
 }
 
-/// base configuration has no inherited list to modify; do not silently accept operators there.
 pub fn validate_global(sandbox: &SandboxConfig) -> Result<()> {
     for (name, entries) in [("read", &sandbox.read), ("write", &sandbox.write)] {
         if entries.iter().any(|entry| operator(entry.path()).is_some()) {
@@ -39,7 +36,6 @@ pub fn validate_global(sandbox: &SandboxConfig) -> Result<()> {
     Ok(())
 }
 
-/// read the existing workspace override beneath protected configuration without following links.
 pub fn read(paths: &Paths, path: &Path) -> Result<Option<String>> {
     let pinned = match fs::canonicalize(&paths.config) {
         Ok(path) => path,
@@ -58,7 +54,6 @@ pub fn read(paths: &Paths, path: &Path) -> Result<Option<String>> {
     Ok(Some(text))
 }
 
-/// sandbox lists share the protected workspace document with grants, never a second file.
 pub fn apply(
     user: &mut UserConfig,
     paths: &Paths,
@@ -117,7 +112,6 @@ fn operator(path: &str) -> Option<char> {
     path.chars().next().filter(|c| matches!(c, '+' | '-'))
 }
 
-/// reuse the ordinary sandbox resolver and protected-path/tool-name checks, not a second allowlist.
 fn key(entry: &SandboxEntry, roots: &Roots, protected: &[PathBuf]) -> Result<PathBuf> {
     let config = UserConfig {
         sandbox: SandboxConfig {
@@ -146,7 +140,6 @@ fn key(entry: &SandboxEntry, roots: &Roots, protected: &[PathBuf]) -> Result<Pat
     Ok(actual)
 }
 
-/// resolve an existing ancestor too, so a missing leaf cannot hide a protected symlink target.
 pub(crate) fn resolve_missing(path: &Path) -> Result<PathBuf> {
     let mut base = path;
     let mut suffix = Vec::new();
@@ -189,7 +182,6 @@ fn merge(
         .filter(|entry| operator(entry.path()).is_some())
         .count();
     if prefixed == 0 {
-        // An explicit empty list also replaces; omission is how a list inherits.
         for entry in &entries {
             key(entry, roots, protected)?;
         }
@@ -215,7 +207,6 @@ fn merge(
         }
         let target = key(&entry, roots, protected)?;
         if op == '+' {
-            // Keep each claim's tool roles; the ordinary resolver unions duplicate roles.
             if !merged.contains(&entry) {
                 merged.push(entry);
             }

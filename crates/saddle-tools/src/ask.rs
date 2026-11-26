@@ -1,11 +1,3 @@
-//! ask the person a question, with choices, previews and an optional note (D197).
-//!
-//! The guest owns the schema, the bounds and how the answer is put to the model; the host owns the
-//! question surface, the audit and the wait, because a question reaches a person rather than a file
-//! or a socket. Asking grants nothing: the person may dismiss the question, and that dismissal is an
-//! answer the model is told not to ask again. The preview of a choice is shown while it is selected,
-//! so a choice can be judged by a diff or a paragraph rather than by its label alone.
-
 use saddle_limits as budgets;
 use saddle_sdk::question::{Outcome, Reply, Selection};
 use serde::Deserialize;
@@ -34,8 +26,6 @@ pub struct Arguments {
     pub allow_note: bool,
 }
 
-/// One choice as the model writes it: a label, an optional line of subtext under it, an optional
-/// preview shown while it is selected, and whether it is the one being recommended.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Choice {
@@ -49,7 +39,6 @@ pub struct Choice {
 }
 
 impl Arguments {
-    /// Refuse a question the interface could not draw before anything reaches the person.
     pub fn validate(&self) -> Result<(), String> {
         if self.question.trim().is_empty() {
             return Err("question must not be empty".into());
@@ -106,8 +95,6 @@ impl Arguments {
         Ok(())
     }
 
-    /// What the model is told, and whether the call succeeded. A dismissal is not an answer: it is
-    /// reported as a failure so the model does not read silence as consent.
     pub fn answer(&self, outcome: &Outcome) -> (String, bool) {
         match outcome {
             Outcome::Answered(reply) => match self.render(reply) {
@@ -153,8 +140,6 @@ impl Arguments {
 #[cfg(target_arch = "wasm32")]
 impl Tool for Ask {
     fn describe() -> Definition {
-        // The schema states the same bounds the host enforces, so read them from the snapshot the
-        // host handed this instance; a session that cannot read it keeps the defaults (D145).
         let _ = configure_limits();
         Definition {
             name: "ask".into(),

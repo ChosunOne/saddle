@@ -1,5 +1,3 @@
-//! protected launch profiles layer without lending any authority (D184).
-
 use std::fs;
 use std::os::unix::fs::symlink;
 #[cfg(target_os = "linux")]
@@ -152,9 +150,6 @@ fn launch_profile_runtime_is_independent_of_bash_and_revocable() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_named_launch_starts_in_the_workspace_it_claims() {
-    // D184: a launch's cwd is the workspace it claims, so a repository tool finds its repository
-    // without being handed an absolute path; only a profile that claims neither the read (D190)
-    // nor the write (D193) starts in the private launch directory.
     if saddle_sandbox::launch_availability().is_err() {
         return;
     }
@@ -218,8 +213,6 @@ fn launch_profile_fields_inherit_replace_and_clear() {
 #[test]
 fn launch_profile_definition_does_not_lend_read_access() {
     let env = Env::new();
-    // Use the throwaway home, outside the workspace and the session's tmp root. The ordinary
-    // sandbox's default includes do not enumerate this directory.
     let secret = env.home.path().join("private");
     fs::write(&secret, "fixture secret").unwrap();
     env.write_config("[launch-profiles.fixture]\nexecutable = '/bin/cat'\nread = ['~/private']\n");
@@ -300,7 +293,6 @@ fn launch_profile_helpers_are_default_on_bounded_and_narrowable() {
     fs::write(&denied, "must-not-be-disclosed").unwrap();
     let local_helper = env.ws.path().join("local-cat");
     fs::copy("/usr/bin/cat", &local_helper).unwrap();
-    // Protected config can whitelist binaries installed by the user, outside writable roots.
     fs::copy("/usr/bin/bash", env.home.path().join("fixture-bash")).unwrap();
     fs::copy("/usr/bin/cat", env.home.path().join("fixture-cat")).unwrap();
     env.write_config(
@@ -319,7 +311,6 @@ fn launch_profile_helpers_are_default_on_bounded_and_narrowable() {
             format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out)),
         )
     };
-    // Force a child process, not bash's optimization of a final external command into exec.
     let read = |path: &Path, allow_children| {
         run(
             "fixture-cat -- \"$1\" & wait $!",
@@ -407,7 +398,6 @@ fn launch_profile_workspace_read_is_default_and_can_be_disabled() {
     let (ok, text) = run("exec 3<>/dev/null && printf discarded >&3", &input);
     assert!(ok && !text.contains("discarded"), "{text}");
 
-    // Writing implies reading, so both switches are needed to remove the workspace entirely.
     env.write_override(&format!(
         "{grant}[launch-profiles.fixture]\nread-workspace = false\nwrite-workspace = false\n"
     ));

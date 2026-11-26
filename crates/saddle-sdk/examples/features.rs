@@ -1,5 +1,3 @@
-//! complete extension SDK fixture; every effect still requires its own runtime grant (D156).
-
 #![cfg(target_arch = "wasm32")]
 
 use saddle_sdk::ui::{self as ui_bindings, Panel, Progress, Span, Style, Ui, Widget, export_ui};

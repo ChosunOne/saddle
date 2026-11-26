@@ -1,6 +1,3 @@
-//! typed interface catalogue and pre-initialization eligibility checks (D11, D14, D139, D150).
-//! pure and wasmtime-free; service bindings never substitute for per-resource authorization.
-
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -9,12 +6,9 @@ use crate::scope::Scope;
 
 pub const HOST_PACKAGE: &str = "saddle:host";
 pub const PLUGIN_PACKAGE: &str = "saddle:plugin";
-/// Version line of the saddle WIT packages this build supports (D14).
 pub const SADDLE_ABI_LINE: &str = "0.1.";
-/// Version line of the WASI interfaces this build supports.
 pub const WASI_LINE: &str = "0.2.";
 
-/// A parsed `namespace:package/interface@version` name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceName<'a> {
     pub namespace: &'a str,
@@ -58,7 +52,6 @@ impl fmt::Display for Direction {
     }
 }
 
-/// service eligibility is not per-resource operational authority (D139, D150).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Requirement {
     Scope(Scope),
@@ -98,7 +91,6 @@ const FILESYSTEM_SCOPES: &[Scope] = &[
     Scope::ToolWrite,
 ];
 
-// One production catalogue generates identities, names, requirements and availability (D150).
 macro_rules! catalogue {
     ($kind:ident { $( $variant:ident => ($name:literal, $requirement:expr, $implemented:literal) ),* $(,)? }) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,8 +123,6 @@ catalogue!(HostInterface {
     ContextContribute => ("saddle:host/context-contribute", Requirement::Scope(Scope::ContextContribute), true),
     Workers => ("saddle:host/workers", Requirement::Scope(Scope::Tool), true),
     ModelInvoke => ("saddle:host/model-invoke", Requirement::Scope(Scope::ModelInvoke), true),
-    // A question reaches only the person in front of this session, who may dismiss it; a registered
-    // tool needs no grant beyond the one that registered it (D197).
     Ask => ("saddle:host/ask", Requirement::Scope(Scope::Tool), true),
     Widgets => ("saddle:widgets/types", Requirement::Ambient, true),
     Ui => ("saddle:host/ui", Requirement::Scope(Scope::Ui), true),
@@ -212,7 +202,6 @@ impl Interface {
         }
     }
 }
-/// rejects unsupported grants even when their service is not imported (D150).
 pub fn runtime_supports_scope(scope: Scope) -> bool {
     Interface::all().any(|i| i.implemented() && i.requirement().mentions(scope))
 }
@@ -232,7 +221,6 @@ pub fn classify(direction: Direction, name: &str) -> Result<Interface, String> {
         }
         None => return Err(format!("unversioned; this host supports {line}x")),
     }
-    // Canonical Saddle bindings remain exact; WASI retains its compatible 0.2.x line.
     if n.namespace == "saddle" && n.version != Some("0.1.0") {
         return Err("only the canonical saddle ABI version 0.1.0 is implemented".into());
     }
@@ -255,13 +243,11 @@ impl fmt::Display for Refusal {
         write!(f, "{} `{}`: {}", self.direction, self.name, self.reason)
     }
 }
-/// interface identities checked for eligibility and implementation before initialization.
 #[derive(Debug)]
 pub struct CheckedComponent {
     pub imports: Vec<Interface>,
     pub exports: Vec<Interface>,
 }
-/// collects all refusals, including unused interfaces, before any guest initialization (D150).
 pub fn check_component<'a>(
     granted: &BTreeSet<Scope>,
     imports: impl IntoIterator<Item = &'a str>,
@@ -292,7 +278,6 @@ pub fn check_component<'a>(
                     Import => &mut checked.imports,
                     Export => &mut checked.exports,
                 };
-                // Compatible WASI patch versions can name the same adapter more than once.
                 if !plan.contains(&i) {
                     plan.push(i);
                 }
@@ -455,7 +440,6 @@ mod tests {
         }
     }
 
-    /// What a minimal Rust std component imports before it touches any scope.
     const STD_AMBIENT: &[&str] = &[
         "wasi:cli/environment@0.2.3",
         "wasi:cli/exit@0.2.3",
@@ -473,7 +457,6 @@ mod tests {
         STD_AMBIENT.iter().chain(extra).copied().collect()
     }
 
-    /// The v1 thesis at the pure level: importing fs-read without the grant is refused.
     #[test]
     fn hostile_fs_read_import_is_refused() {
         let granted = BTreeSet::new();
@@ -503,7 +486,6 @@ mod tests {
         let custom = BTreeSet::from([Scope::EventSubscribe]);
         check_component(&custom, [], ["saddle:plugin/plugin-events@0.1.0"]).unwrap();
         assert!(check_component(&custom, [], ["saddle:plugin/observer@0.1.0"]).is_err());
-        // A command-style export is not a plugin hook.
         assert!(check_component(&ok, [], ["wasi:cli/run@0.2.3"]).is_err());
     }
 

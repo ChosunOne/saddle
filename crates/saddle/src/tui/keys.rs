@@ -1,15 +1,3 @@
-//! The keys a person binds for themselves (D169).
-//!
-//! Most of the interface takes its keys from what a mode is for — up and down move, enter chooses,
-//! escape closes — and those are not configurable. A keybinding layer is a feature of its own, and
-//! pi needs one because it has several modes to keep distinct; saddle has a handful of keys and
-//! says them in the footer of each mode, which is cheaper than a file that has to agree with them.
-//!
-//! The exception is a move that saddle would otherwise not offer at all, where there is no key to
-//! print because nobody has chosen one: moving between the ends of the branches in `/tree`. A key
-//! that changes where the keyboard lands is a person's to pick, so `[keys]` in `config.toml` is how
-//! it exists — and with no `[keys]` table, there is no such key (D169).
-
 use std::fmt;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -17,18 +5,14 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::de::Error as DeError;
 
-/// The keys this file lets a person choose.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Keys {
-    /// The key that moves to the next end of a branch in `/tree`, or `None` for no key.
     pub tree_next_end: Option<Stroke>,
-    /// The key for the previous end.
     pub tree_previous_end: Option<Stroke>,
 }
 
 impl Keys {
-    /// The two ends of a branch, as a footer says them, or `None` when neither has a key.
     pub fn ends(&self) -> Option<String> {
         match (&self.tree_next_end, &self.tree_previous_end) {
             (None, None) => None,
@@ -39,12 +23,6 @@ impl Keys {
     }
 }
 
-/// One keystroke as `config.toml` spells it: `ctrl+n`, `alt+j`, `shift+tab`, `f5`, `page-up`,
-/// `enter`, or one character like `n`.
-///
-/// A modifier it names is one it requires; other modifiers on the press are ignored, because a
-/// terminal reports more of them than a person wrote down (a shifted letter arrives as the capital
-/// with `shift` beside it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stroke {
     code: KeyCode,
@@ -52,8 +30,6 @@ pub struct Stroke {
 }
 
 impl Stroke {
-    /// Reads one of those spellings. The error is a sentence, because it is shown to the person who
-    /// wrote the line rather than to a developer.
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = text.trim();
         if text.is_empty() {
@@ -82,11 +58,9 @@ impl Stroke {
         Ok(Self { code, mods })
     }
 
-    /// The key itself, with the modifiers a press of it also reports.
     fn code(name: &str, mods: KeyModifiers) -> Result<(KeyCode, KeyModifiers), String> {
         let lower = name.to_lowercase();
         let named = match lower.as_str() {
-            // `shift+tab` is one key: a terminal sends it as `BackTab`, not as tab with a modifier.
             "tab" if mods.contains(KeyModifiers::SHIFT) => {
                 return Ok((KeyCode::BackTab, KeyModifiers::empty()));
             }
@@ -106,8 +80,6 @@ impl Stroke {
             "page-up" | "pageup" | "pgup" => KeyCode::PageUp,
             "page-down" | "pagedown" | "pgdn" => KeyCode::PageDown,
             other => {
-                // A function key, or one character. Anything else is a spelling this file does not
-                // know, which is an error rather than a key that quietly never fires.
                 if let Some(number) = other.strip_prefix('f')
                     && let Ok(number) = number.parse::<u8>()
                     && (1..=24).contains(&number)
@@ -117,10 +89,6 @@ impl Stroke {
                 let mut chars = name.chars();
                 return match (chars.next(), chars.next()) {
                     (Some(ch), None) => {
-                        // A terminal sends a shifted letter as the capital, so a stroke that names
-                        // `shift` stores the capital. Without it the case is not a choice a person
-                        // made — a keyboard cannot send `N` unshifted — so it is kept lowercase,
-                        // which is what the footer then prints.
                         let ch = if mods.contains(KeyModifiers::SHIFT) {
                             ch.to_ascii_uppercase()
                         } else {
@@ -137,13 +105,10 @@ impl Stroke {
         Ok((named, mods))
     }
 
-    /// Whether a press is this stroke.
     pub fn is(&self, key: &KeyEvent) -> bool {
         key.code == self.code && key.modifiers.contains(self.mods)
     }
 
-    /// The press this stroke is, for a caller that has to build the event rather than receive it —
-    /// which is a test, since a press in the interface arrives from the terminal.
     #[cfg(test)]
     pub fn keystroke(&self) -> KeyEvent {
         KeyEvent::new(self.code, self.mods)
@@ -151,7 +116,6 @@ impl Stroke {
 }
 
 impl fmt::Display for Stroke {
-    /// The canonical spelling, which is what a footer shows: `ctrl+n`, never `Control+N`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = String::new();
         for (flag, name) in [
@@ -170,7 +134,6 @@ impl fmt::Display for Stroke {
 }
 
 impl Stroke {
-    /// The key's own name, for [`fmt::Display`].
     fn name(code: KeyCode) -> String {
         match code {
             KeyCode::Char(' ') => "space".to_owned(),
@@ -197,8 +160,6 @@ impl Stroke {
 }
 
 impl<'de> Deserialize<'de> for Stroke {
-    /// Read as the string it is written as, so a misspelt key is an error in the file that names it
-    /// rather than a key that never fires (D169).
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
         Self::parse(&text).map_err(DeError::custom)
@@ -211,7 +172,6 @@ mod tests {
 
     #[test]
     fn a_key_is_read_the_way_a_person_writes_it() {
-        // D169: what `config.toml` says, and what the terminal sends for it, are the same thing.
         for (text, code, mods) in [
             ("ctrl+n", KeyCode::Char('n'), KeyModifiers::CONTROL),
             ("alt+j", KeyCode::Char('j'), KeyModifiers::ALT),
@@ -233,7 +193,6 @@ mod tests {
             assert_eq!(stroke.mods, mods, "{text}");
             assert!(stroke.is(&KeyEvent::new(code, mods)), "{text}");
         }
-        // shift+tab is one key, not tab with a modifier, because that is how it arrives.
         assert_eq!(
             Stroke::parse("shift+tab"),
             Ok(Stroke {
@@ -249,7 +208,6 @@ mod tests {
 
     #[test]
     fn a_stroke_says_itself_back() {
-        // The footer prints it, so the spelling has to be the one a person could report back.
         for text in [
             "ctrl+n",
             "alt+j",
@@ -263,7 +221,6 @@ mod tests {
             assert_eq!(stroke.to_string(), text);
         }
         assert_eq!(Stroke::parse("Control + N").unwrap().to_string(), "ctrl+n");
-        // A shifted letter is the capital, which is what the terminal sends for it.
         let shifted = Stroke::parse("shift+n").expect("a key");
         assert_eq!(shifted.to_string(), "shift+N");
         assert!(shifted.is(&KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)));
@@ -280,7 +237,6 @@ mod tests {
                 .contains("not a modifier")
         );
         assert!(Stroke::parse("shiftkey").unwrap_err().contains("not a key"));
-        // The error is what the config loader shows, so it names the line's own text.
         assert!(Stroke::parse("f99").unwrap_err().contains("f99"));
     }
 

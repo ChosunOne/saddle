@@ -1,5 +1,3 @@
-//! guest-owned apply-patch parsing and exact hunk matching (D56, D140).
-
 #[derive(Debug)]
 pub enum Op {
     Add {

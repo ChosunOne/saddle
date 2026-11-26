@@ -1,5 +1,3 @@
-//! bounded HTTP effects with per-hop caller authority and checked DNS, never guest sockets (D143).
-
 use saddle_limits as budgets;
 use std::io::Read;
 use std::sync::atomic::Ordering;

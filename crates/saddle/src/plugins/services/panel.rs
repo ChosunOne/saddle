@@ -1,5 +1,3 @@
-//! host-owned plugin frames with closed styles, never terminal programs (D27, D156).
-
 use saddle_limits::Budgets;
 use saddle_wit::saddle::widgets::types::{Panel, Style, Widget};
 use serde::{Deserialize, Serialize};

@@ -1,10 +1,3 @@
-//! The exec sandbox (D18, D19).
-//!
-//! Two halves. [`run`] is the host side: it starts the helper with an empty environment in its own
-//! process group, writes the spec to its stdin, enforces the timeout, and kills the group when the
-//! command ends. [`helper_main`] is the helper side: it reads the spec, confines itself with
-//! landlock and seccomp, and execs the target, which inherits the confinement.
-
 use std::convert::Infallible;
 use std::fs;
 use std::fs::File;
@@ -35,10 +28,8 @@ mod namespaces;
 #[cfg(target_os = "linux")]
 mod relay;
 
-/// Landlock ABI below which exec is unavailable: ABI 3 adds control over `truncate(2)`.
 pub const REQUIRED_LANDLOCK_ABI: i32 = 3;
 
-/// Exit code when the helper fails before exec.
 pub const EXIT_SETUP_FAILED: i32 = 125;
 
 #[derive(Debug, thiserror::Error)]
@@ -70,7 +61,6 @@ impl SandboxError {
     }
 }
 
-/// The running kernel's landlock ABI version, or `None` if landlock is missing or disabled.
 pub fn landlock_abi() -> Option<i32> {
     #[cfg(target_os = "linux")]
     {
@@ -82,7 +72,6 @@ pub fn landlock_abi() -> Option<i32> {
     }
 }
 
-/// `Ok(abi)` when exec can run sandboxed here, otherwise the reason it cannot.
 pub fn availability() -> Result<i32, String> {
     if !cfg!(target_os = "linux") {
         return Err("the exec sandbox is Linux-only in v1".into());
@@ -96,8 +85,6 @@ pub fn availability() -> Result<i32, String> {
     }
 }
 
-/// What a command's network will be, for `check` to print. A user namespace cannot be created in
-/// this process to find out, so this reports what the kernel's own switches say (D79).
 pub fn launch_availability() -> Result<(), String> {
     match landlock_abi() {
         Some(abi) if abi >= 6 => Ok(()),
@@ -105,7 +92,6 @@ pub fn launch_availability() -> Result<(), String> {
     }
 }
 
-/// hash a protected launch path using the same no-follow open as the launcher (D189).
 pub fn launch_digest(path: &Path) -> Result<[u8; 32], SandboxError> {
     #[cfg(target_os = "linux")]
     {
@@ -133,7 +119,6 @@ pub fn network_availability() -> Result<String, String> {
         .map(|text| namespaces::resolvers(&text))
         .unwrap_or_default();
     if resolvers.is_empty() {
-        // The proxy still works, because it is reached by an address rather than a name.
         return Ok(
             "its own namespace; no resolver on loopback, so only the proxy variables work".into(),
         );
@@ -144,8 +129,6 @@ pub fn network_availability() -> Result<String, String> {
     ))
 }
 
-/// Entry point for the helper process. Never returns: it execs the target or exits with 125
-/// (setup failed), 126 (target not executable) or 127 (target not found).
 pub fn helper_main() -> ! {
     let err = match helper() {
         Ok(never) => match never {},
@@ -155,7 +138,6 @@ pub fn helper_main() -> ! {
     process::exit(err.exit_code())
 }
 
-/// The descriptor a long-lived command's spec arrives on, so fd 0 stays the command's (D106).
 const SPEC_FD: i32 = 3;
 
 fn helper() -> Result<Infallible, SandboxError> {
@@ -167,7 +149,6 @@ fn helper() -> Result<Infallible, SandboxError> {
             (parse_spec(buf)?, true)
         }
     };
-    // Only a run-to-completion command gives up its stdin: one the host speaks to needs it.
     if spec_was_on_stdin {
         reopen_stdin_null()?;
     }
@@ -178,11 +159,7 @@ fn parse_spec(bytes: Vec<u8>) -> Result<SandboxSpec, SandboxError> {
     serde_json::from_slice(&bytes).map_err(|e| SandboxError::Spec(e.to_string()))
 }
 
-/// The spec on fd 3, when the host put one there (D106). A helper started by `run` has no fd 3:
-/// Rust closes every descriptor it opens, so the read fails and the spec comes from stdin.
 fn spec_from_fd3() -> Option<Vec<u8>> {
-    // SAFETY: fd 3 is either the socket the host made or not open at all. The File is forgotten
-    // rather than dropped, so a closed descriptor is never closed a second time.
     let mut file = ManuallyDrop::new(unsafe { File::from_raw_fd(SPEC_FD) });
     let mut buf = Vec::new();
     match file.read_to_end(&mut buf) {
@@ -191,16 +168,8 @@ fn spec_from_fd3() -> Option<Vec<u8>> {
     }
 }
 
-/// Host side: starts a long-lived sandboxed command whose stdin and stdout belong to the caller, so
-/// it can be spoken to (D106). The spec travels on fd 3 because fd 0 is the command's, and the
-/// child gets its own process group so the caller can end it and everything it started.
-///
-/// The caller owns the pipes: it must read stdout, drain stderr, and wait or kill the child. It
-/// also owns servicing the network relay while it waits, which is why this does not do it.
 pub fn spawn(helper: &Path, helper_args: &[&str], spec: &SandboxSpec) -> io::Result<Child> {
     let payload = serde_json::to_vec(spec).map_err(io::Error::other)?;
-    // A socket pair, so both ends are owned: the child's end becomes fd 3, and closing ours is
-    // what tells the helper the spec is complete.
     let (mut ours, theirs) = UnixStream::pair()?;
     let fd = theirs.as_raw_fd();
     let mut command = Command::new(helper);
@@ -211,7 +180,6 @@ pub fn spawn(helper: &Path, helper_args: &[&str], spec: &SandboxSpec) -> io::Res
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // SAFETY: dup2 between fork and exec, on two descriptors that are valid in the child.
     unsafe {
         command.pre_exec(move || {
             if libc::dup2(fd, SPEC_FD) < 0 {
@@ -229,14 +197,12 @@ pub fn spawn(helper: &Path, helper_args: &[&str], spec: &SandboxSpec) -> io::Res
 
 fn reopen_stdin_null() -> io::Result<()> {
     let null = File::open("/dev/null")?;
-    // SAFETY: dup2 on two valid descriptors; fd 0 is replaced atomically.
     if unsafe { libc::dup2(null.as_raw_fd(), 0) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
 }
 
-/// Confines the current process according to `spec` and execs `spec.argv`.
 pub fn enter(spec: &SandboxSpec) -> Result<Infallible, SandboxError> {
     if spec.argv.is_empty() {
         return Err(SandboxError::Spec("empty argv".into()));
@@ -253,7 +219,6 @@ pub fn enter(spec: &SandboxSpec) -> Result<Infallible, SandboxError> {
     }
 }
 
-/// Finds `program` in the spec's `PATH`, the way `execvp` would, before the sandbox applies.
 fn resolve_program(program: &str, env: &[(String, String)]) -> Result<PathBuf, SandboxError> {
     if program.contains('/') {
         return Ok(PathBuf::from(program));
@@ -279,24 +244,15 @@ fn is_executable(path: &Path) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
-    /// Exit code, or `None` if the command was killed by a signal.
     pub code: Option<i32>,
     pub signal: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub timed_out: bool,
-    /// The caller set the cancel flag and the command was killed.
     pub cancelled: bool,
-    /// Output beyond the limit was discarded.
     pub truncated: bool,
 }
 
-/// Host side: runs `helper helper_args...` with an empty environment in a new process group,
-/// feeds it `spec`, and waits at most `timeout`, or until `cancel` is set. Afterwards the whole
-/// group is killed, so background processes the command started do not outlive it (unless they
-/// called `setsid`).
-/// `service` is called while the command runs, once per poll, so the caller can answer the
-/// questions the command's network asks without blocking the wait for it (D79).
 pub fn run(
     helper: &Path,
     helper_args: &[&str],
@@ -318,7 +274,6 @@ pub fn run(
     )
 }
 
-/// bounded live capture shared with a session-owned background task (D153).
 #[derive(Default, Clone, Debug)]
 pub struct Capture {
     pub stdout: Vec<u8>,
@@ -326,8 +281,7 @@ pub struct Capture {
     pub truncated: bool,
 }
 
-/// the same sandbox execution with optional incremental bounded capture.
-#[allow(clippy::too_many_arguments)] // the existing execution contract plus an observer, not authority.
+#[allow(clippy::too_many_arguments)]
 pub fn run_observed(
     helper: &Path,
     helper_args: &[&str],
@@ -350,7 +304,6 @@ pub fn run_observed(
 
     let payload = serde_json::to_vec(spec).map_err(io::Error::other)?;
     if let Some(mut stdin) = child.stdin.take() {
-        // A helper that died early closes the pipe; its exit status explains why.
         let _ = stdin.write_all(&payload);
     }
 
@@ -411,7 +364,6 @@ pub fn run_observed(
         cancelled,
         truncated: false,
     };
-    // A process that escaped the group can hold the pipes open; stop waiting after a second.
     let grace = Instant::now() + Duration::from_secs(1);
     for _ in 0..2 {
         let left = grace.saturating_duration_since(Instant::now());
@@ -429,7 +381,6 @@ pub fn run_observed(
 }
 
 fn kill_group(pgid: libc::pid_t) {
-    // SAFETY: kill(2) with a negative pid signals the process group; ESRCH is fine.
     unsafe {
         libc::kill(-pgid, libc::SIGKILL);
     }

@@ -1,8 +1,3 @@
-//! D125: recover a Responses stream once, before any text or reasoning has been shown.
-//!
-//! Only failures marked by the transport or parser are transient. A rejected request, malformed
-//! event, cancellation or partial reply is not a reason to silently generate another answer.
-
 use std::error::Error;
 use std::fmt;
 use std::thread;
@@ -14,7 +9,6 @@ use super::{Cancelled, Quota, Reply, Sink};
 
 const DELAY: Duration = Duration::from_secs(1);
 
-/// a failure for which a fresh request may succeed, subject to the output and retry guards.
 #[derive(Debug)]
 pub struct Transient {
     message: String,
@@ -31,7 +25,6 @@ impl Transient {
         }
     }
 
-    /// identifies the failure using host-chosen labels, never backend text or request data (D130).
     pub fn with_reason(mut self, reason: &'static str) -> Self {
         self.reason = reason;
         self
@@ -53,7 +46,6 @@ impl fmt::Display for Transient {
 
 impl Error for Transient {}
 
-/// retries once over HTTP with the whole history, never replaying a visible partial response.
 pub fn once(
     sink: &mut dyn Sink,
     mut attempt: impl FnMut(bool, &mut dyn Sink) -> Result<Reply>,

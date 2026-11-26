@@ -1,15 +1,11 @@
-//! The prompt editor: a multi-line text buffer with a cursor.
-
 use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Default, Clone)]
 pub struct Editor {
     text: String,
-    /// Byte offset, always on a char boundary.
     cursor: usize,
 }
 
-/// The editor hard-wrapped to a width: visual rows and the cursor's (row, column).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Layout {
     pub rows: Vec<String>,
@@ -29,7 +25,6 @@ impl Editor {
         self.cursor
     }
 
-    /// Replaces the bytes `start..end` and puts the cursor after the new text.
     pub fn replace(&mut self, start: usize, end: usize, with: &str) {
         self.text.replace_range(start..end, with);
         self.cursor = start + with.len();
@@ -49,8 +44,6 @@ impl Editor {
         self.cursor += c.len_utf8();
     }
 
-    /// Inserts pasted text. Line endings become `\n`, tabs become four spaces, and other control
-    /// characters are dropped.
     pub fn insert_str(&mut self, s: &str) {
         let s = s.replace("\r\n", "\n").replace('\r', "\n");
         let mut clean = String::with_capacity(s.len());
@@ -123,7 +116,6 @@ impl Editor {
         self.text[self.line_start()..self.cursor].chars().count()
     }
 
-    /// Byte offset of char column `col` in the line starting at `start`, clamped to its end.
     fn offset_in_line(&self, start: usize, col: usize) -> usize {
         let line = &self.text[start..];
         let end = line.find('\n').unwrap_or(line.len());
@@ -133,7 +125,6 @@ impl Editor {
             .map_or(start + end, |(i, _)| start + i)
     }
 
-    /// Moves up one line. Returns false on the first line.
     pub fn up(&mut self) -> bool {
         let start = self.line_start();
         if start == 0 {
@@ -145,7 +136,6 @@ impl Editor {
         true
     }
 
-    /// Moves down one line. Returns false on the last line.
     pub fn down(&mut self) -> bool {
         let end = self.line_end();
         if end == self.text.len() {
@@ -234,7 +224,6 @@ impl Editor {
     }
 }
 
-/// The cursor after the last character of the last row; a full row moves it to a new row.
 fn end_cursor(rows: &mut Vec<String>, col: usize, width: usize) -> (usize, usize) {
     if col >= width {
         rows.push(String::new());
@@ -308,7 +297,6 @@ mod tests {
         e.cursor = 2;
         assert_eq!(e.layout(10).cursor, (0, 2));
         assert_eq!(ed("").layout(10).cursor, (0, 0));
-        // Wide characters wrap by display width.
         assert_eq!(ed("日本語").layout(4).rows, vec!["日本", "語"]);
     }
 }

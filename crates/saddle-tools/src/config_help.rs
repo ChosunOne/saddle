@@ -1,10 +1,3 @@
-//! D171: saddle's own configuration reference, as a shipped standard component. The text is
-//! compiled into the guest, and the only thing the guest imports for it is the budgets snapshot,
-//! which is ambient and carries no authority (D145, D150): no path, no host, no grant. That is the
-//! point — a session opened in someone else's project has no copy of saddle's documentation, and
-//! answering from a place that holds none of the session's reach is how it stays a documentation
-//! tool rather than one more surface to escape through.
-
 use std::fmt::Write as _;
 
 use saddle_limits::Budgets;
@@ -19,7 +12,6 @@ use saddle_sdk::{Definition, Output, Tool};
 #[cfg(target_arch = "wasm32")]
 use serde_json::json;
 
-/// `docs/settings.md`, the reference a person reads in a checkout of saddle.
 const REFERENCE: &str = include_str!("../../../docs/settings.md");
 
 pub struct ConfigHelp;
@@ -27,19 +19,16 @@ pub struct ConfigHelp;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Arguments {
-    /// One `## section` of the reference, or absent for all of them.
     #[serde(default)]
     section: Option<String>,
 }
 
-/// One `## name` section of the reference.
 struct Section<'a> {
     name: &'a str,
     body: &'a str,
 }
 
 fn sections(text: &'static str) -> Vec<Section<'static>> {
-    // The heading's own start, its name, and where its body begins.
     let mut found: Vec<(usize, &'static str, usize)> = Vec::new();
     let mut at = 0;
     for line in text.split_inclusive('\n') {
@@ -65,7 +54,6 @@ pub fn reference(arguments: &str, limits: &Budgets) -> Result<String, String> {
     answer(args.section.as_deref(), limits)
 }
 
-/// The reference, whole or one section of it, plus the budgets this session is running under.
 pub fn answer(section: Option<&str>, limits: &Budgets) -> Result<String, String> {
     let asked = section.unwrap_or_default().trim();
     let all = sections(REFERENCE);
@@ -106,8 +94,6 @@ pub fn answer(section: Option<&str>, limits: &Budgets) -> Result<String, String>
     Ok(out.trim_end().to_owned())
 }
 
-/// The budgets in force, which `/reload` may have changed from the defaults, kebab-case as
-/// `config.toml` spells them.
 fn in_force(limits: &Budgets) -> String {
     let mut out = String::from("\n\nin force for this session:\n");
     match serde_json::to_value(limits) {
@@ -172,8 +158,6 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// The names the schema offers, so a section the reference lost is a failing test rather than
-    /// an argument the model is told about and refused.
     const OFFERED: &[&str] = &[
         "files",
         "top-level",

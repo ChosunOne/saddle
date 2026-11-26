@@ -1,5 +1,3 @@
-//! OpenAI-compatible chat completions, streamed.
-
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
@@ -35,15 +33,12 @@ pub fn body(cfg: &ProviderConfig, conv: &Conversation<'_>) -> Value {
         "stream_options": { "include_usage": true },
         "messages": messages(conv.system, conv.items),
     });
-    // D100: one conversation, one cache. Both fields are OpenAI's own, so a server that is not
-    // OpenAI's gets neither.
     if let Some(key) = prompt_cache_key(cfg, conv.session) {
         body["prompt_cache_key"] = key.into();
     }
     if let Some(ttl) = prompt_cache_retention(cfg) {
         body["prompt_cache_retention"] = ttl.into();
     }
-    // An empty list is left out: some servers reject `"tools": []`.
     if !tools.is_empty() {
         body["tools"] = tools.into();
     }
@@ -56,23 +51,12 @@ pub fn body(cfg: &ProviderConfig, conv: &Conversation<'_>) -> Value {
     body
 }
 
-/// Renders the conversation. Reasoning goes back as `reasoning_content` on every assistant message
-/// that arrived with some (D96).
-///
-/// Nothing is dropped by default: a provider that sent reasoning is telling us it wants it back, and
-/// deleting an earlier one rewrites the middle of the prompt, which costs a prompt-cache miss and,
-/// on DeepSeek, a 400 — a request that carries `tools` must pass every earlier turn's
-/// `reasoning_content` back, and a request without `tools` ignores what it is given. Always sending
-/// is therefore right for both. A server that sends no reasoning, such as OpenAI's own chat
-/// completions, has none to echo, so nothing is added for it.
 pub fn messages(system: &str, items: &[Item]) -> Vec<Value> {
     let mut out = vec![json!({ "role": "system", "content": system })];
     for item in items {
         match item {
             Item::Contribution(value) => out.push(json!({"role":"user","content":value.content})),
             Item::User(text) => out.push(json!({ "role": "user", "content": text })),
-            // OpenAI carries an image as a second content part with a data URL, which is the only
-            // shape it accepts for an inline picture (D58).
             Item::Attached { text, images } => {
                 let mut content = vec![json!({ "type": "text", "text": text })];
                 content.extend(images.iter().map(|i| {
@@ -87,14 +71,9 @@ pub fn messages(system: &str, items: &[Item]) -> Vec<Value> {
                 "role": "user",
                 "content": format!("{SUMMARY_INTRO}{text}"),
             })),
-            // A Chat Completions tool message has no image field, so a picture a tool returned
-            // travels in the user message after it, which is what pi does and what the API
-            // accepts (D58).
             Item::ToolResults(results) => {
                 let mut images: Vec<Value> = Vec::new();
                 for r in results {
-                    // The tool message needs text; a picture with no words gets a placeholder so
-                    // the model knows the result was not empty.
                     let content = if r.content.trim().is_empty() && !r.images.is_empty() {
                         "(see the attached image)".to_owned()
                     } else {
@@ -135,7 +114,6 @@ pub fn messages(system: &str, items: &[Item]) -> Vec<Value> {
                             "type": "function",
                             "function": {
                                 "name": c.name,
-                                // Servers parse this, so an unparseable input goes back as `{}`.
                                 "arguments": c.input.as_ref().map_or_else(|_| "{}".to_owned(), Value::to_string),
                             },
                         })),
@@ -211,8 +189,6 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
             model = chunk["model"].as_str().unwrap_or_default().to_owned();
         }
         if chunk["usage"].is_object() {
-            // prompt_tokens includes the cached part here, unlike Anthropic's input_tokens.
-            // `input` is made to mean the uncached part for both, so the parts add up.
             let u = &chunk["usage"];
             let prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
             let cached = u["prompt_tokens_details"]["cached_tokens"]
@@ -221,13 +197,10 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
                 .unwrap_or(0);
             usage.input = prompt.saturating_sub(cached);
             usage.cache_read = cached;
-            // D97: a cache write is billed above the ordinary input rate (D36).
             usage.cache_write = u["prompt_tokens_details"]["cache_write_tokens"]
                 .as_u64()
                 .unwrap_or(0);
             usage.output = u["completion_tokens"].as_u64().unwrap_or(usage.output);
-            // D99: how much of that output was thinking. A count, not text: a server that hides
-            // its reasoning reports the split here and nothing else.
             reasoning_tokens = u["completion_tokens_details"]["reasoning_tokens"]
                 .as_u64()
                 .unwrap_or(0);
@@ -236,7 +209,6 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
             continue;
         };
         let delta = &choice["delta"];
-        // Servers name it either way (vLLM, DeepSeek: reasoning_content; others: reasoning).
         if let Some(r) = delta["reasoning_content"]
             .as_str()
             .or_else(|| delta["reasoning"].as_str())
@@ -325,8 +297,6 @@ mod tests {
 
     #[test]
     fn a_formula_is_sent_as_the_tex_and_never_as_a_picture() {
-        // D165: the typesetting happens on the person's screen. What the request carries is the
-        // source, unwrapped and unescaped, so a formula in an earlier turn is readable to the model.
         let formula = "$$\\oint \\mathbf{B} \\cdot d\\mathbf{l} = \\mu_0 I$$";
         let items = [
             Item::User(format!("is this right? {formula}")),
@@ -335,8 +305,6 @@ mod tests {
         let m = messages("sys", &items);
         assert_eq!(m[1]["content"], format!("is this right? {formula}"));
         assert_eq!(m[2]["content"], format!("it is: {formula}"));
-        // A picture in a chat-completions request is an `image_url` part, and only an attached one
-        // ever becomes that (D58, D162).
         assert!(!json!(m).to_string().contains("image_url"));
     }
 
@@ -363,9 +331,6 @@ mod tests {
 
     #[test]
     fn a_request_to_openai_carries_the_cache_key_and_no_other_server_does() {
-        // D100: without the key OpenAI routes a conversation's requests by whatever machine has
-        // room, so a warm prefix is luck. With it, every request of one conversation asks for the
-        // same cache - and nothing is added for a server that would refuse the field.
         let items = [Item::User("hello".into())];
         let conv = |session: &'static str| Conversation {
             system: "s",
@@ -386,7 +351,6 @@ mod tests {
             ..config("https://api.openai.com/v1")
         };
         assert_eq!(body(&long, &conv("s1"))["prompt_cache_retention"], "24h");
-        // Signed in, the endpoint rejects that field, so it is not sent.
         let signed_in = ProviderConfig {
             auth: Auth::Oauth,
             ..long
@@ -396,7 +360,6 @@ mod tests {
             None
         );
 
-        // A compatible server gets neither field, whatever the configuration says.
         let other = ProviderConfig {
             cache_retention: CacheRetention::Long,
             ..config("https://api.synthetic.new/openai/v1")
@@ -405,7 +368,6 @@ mod tests {
         assert_eq!(sent.get("prompt_cache_key"), None);
         assert_eq!(sent.get("prompt_cache_retention"), None);
 
-        // No saved conversation, no key.
         assert_eq!(
             body(&config("https://api.openai.com/v1"), &conv("")).get("prompt_cache_key"),
             None
@@ -430,21 +392,16 @@ mod tests {
         assert_eq!(user["role"], "user");
         let content = user["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "text");
-        // OpenAI takes an image as a second part with a data URL (D58).
         assert_eq!(content[1]["type"], "image_url");
         assert_eq!(
             content[1]["image_url"]["url"],
             "data:image/jpeg;base64,BBBB"
         );
-        // A prompt with pictures still counts as the current turn, so the reasoning that goes with
-        // this API stays attached to the right message.
         assert!(msgs.iter().any(|m| m["role"] == "user"));
     }
 
     #[test]
     fn a_tool_result_image_travels_in_the_user_message_after_it() {
-        // A Chat Completions tool message has no image field, so the picture follows it as a user
-        // message, which is what the API accepts (D58).
         let image = Image {
             media_type: "image/png".into(),
             data: "AAAA".into(),
@@ -490,8 +447,6 @@ mod tests {
         }])];
         let msgs = messages("sys", &items);
         let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
-        // The API requires content on a tool message, so a placeholder says the result was not
-        // empty (D58).
         assert!(tool["content"].as_str().unwrap().contains("attached image"));
     }
 
@@ -580,9 +535,6 @@ mod tests {
             Item::User("two".into()),
             current,
         ];
-        // D96: the earlier turn's reasoning is still on the wire. Dropping it rewrites the middle
-        // of the prompt, which costs a prompt-cache miss, and DeepSeek answers a request that
-        // carries `tools` with a 400 when an earlier turn's reasoning is missing.
         let m = messages("s", &items);
         assert_eq!(m[2]["reasoning_content"], "think more");
         assert_eq!(m[4]["reasoning_content"], "think more");
@@ -590,8 +542,6 @@ mod tests {
 
     #[test]
     fn a_cache_write_is_counted() {
-        // D97: a write is billed above the ordinary input rate, so a cold turn priced as a plain
-        // read under-reports what it cost (D36).
         let stream = sse(&[
             json!({"choices":[{"index":0,"delta":{"content":"x"}}]}),
             json!({"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":100,"cache_write_tokens":800}}}),
@@ -608,8 +558,6 @@ mod tests {
 
     #[test]
     fn the_part_of_the_output_that_was_thinking_is_read() {
-        // D99: a server that hides its reasoning reports only the split, so this number is the
-        // sole evidence that the model thought at all — and `output` alone cannot give it.
         let stream = sse(&[
             json!({"choices":[{"index":0,"delta":{"content":"x"}}]}),
             json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":900,

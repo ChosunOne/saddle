@@ -1,5 +1,3 @@
-//! guest tool bindings, generated from the host's canonical WIT (D12, D127, D140).
-
 use saddle::host::budgets::read as read_budgets;
 use saddle_limits::{self as limits, Budgets};
 use serde_json::{Value, from_str, from_value, to_value};
@@ -41,7 +39,6 @@ pub use saddle::host::web_search::{
 };
 pub use saddle::host::workers;
 
-/// register host-originated lifecycle hooks; this API cannot publish harness events (D155).
 pub mod harness {
     wit_bindgen::generate!({
         path: "../saddle-wit/wit",
@@ -52,7 +49,6 @@ pub mod harness {
     pub use exports::saddle::plugin::observer::{Event, Guest as Hooks, Kind};
 }
 
-/// register custom-event subscriptions independently of harness hooks (D155).
 pub mod events {
     wit_bindgen::generate!({
         path: "../saddle-wit/wit",
@@ -64,7 +60,6 @@ pub mod events {
     pub use exports::saddle::plugin::plugin_events::{Event, Guest as Handler, Subscription};
 }
 
-/// append attributed facts, never system instructions or history rewrites (D156).
 pub mod context {
     pub use crate::saddle::host::context_contribute::{
         Body, Contribution, Diagnostic, Severity, append,
@@ -83,12 +78,10 @@ pub mod context {
     }
 }
 
-/// a question put to the person, with choices, previews and a note of their own (D197).
 pub mod question {
     pub use crate::saddle::host::ask::{Choice, Outcome, Question, Reply, Selection, ask};
 }
 
-/// bounded atomic private storage, not filesystem access (D156).
 pub mod persist {
     pub use crate::saddle::host::persist::{Change, Expectation, apply, get};
     pub fn put(key: &str, value: &[u8]) -> Result<(), String> {
@@ -122,12 +115,10 @@ pub mod persist {
     }
 }
 
-/// isolated host-provider requests; replies never execute tools (D156).
 pub mod model {
     pub use crate::saddle::host::model_invoke::{Message, Reply, Request, Role, Usage, invoke};
 }
 
-/// pre-tool checks can only abstain or deny (D156).
 pub mod veto {
     wit_bindgen::generate!({
         path: "../saddle-wit/wit", world: "veto-hook",
@@ -136,7 +127,6 @@ pub mod veto {
     pub use exports::saddle::plugin::veto::{Decision, Guest as Veto, PendingToolCall};
 }
 
-/// host-framed widgets, with no input or arbitrary terminal access (D156).
 pub mod ui {
     wit_bindgen::generate!({
         path: "../saddle-wit/wit", world: "ui-hook",
@@ -148,8 +138,6 @@ pub mod ui {
     pub use exports::saddle::plugin::ui::Guest as Ui;
 }
 
-/// read resource budgets from the host before a standard guest workflow starts (D145).
-/// fresh instances prevent cached settings from surviving a config reload.
 pub fn configure_limits() -> Result<(), String> {
     limits::initialize(parse_budgets(&read_budgets())?);
     Ok(())
@@ -157,8 +145,6 @@ pub fn configure_limits() -> Result<(), String> {
 
 fn parse_budgets(text: &str) -> Result<Budgets, String> {
     let mut value: Value = from_str(text).map_err(|e| format!("invalid host budgets: {e}"))?;
-    // Ignore future metadata keys so a host upgrade need not rebuild a pinned guest.
-    // Protected config parsing remains strict; only this public snapshot is extensible.
     let known = to_value(Budgets::default()).map_err(|e| e.to_string())?;
     if let (Some(values), Some(known)) = (value.as_object_mut(), known.as_object()) {
         values.retain(|name, _| known.contains_key(name));
@@ -168,7 +154,6 @@ fn parse_budgets(text: &str) -> Result<Budgets, String> {
     Ok(budgets)
 }
 
-/// preserve the ordinary denial shape across standard filesystem workflows (D147).
 pub fn failure_message(error: Failure) -> String {
     match error {
         Failure::Denied(why) => format!("denied: {why}"),

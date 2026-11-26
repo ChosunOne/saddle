@@ -25,7 +25,6 @@ use crate::{SandboxError, SandboxSpec, resolve_program};
 const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
 
 pub(crate) fn landlock_abi() -> Option<i32> {
-    // SAFETY: with a null attr, size 0 and the VERSION flag, the syscall only returns the ABI.
     let abi = unsafe {
         libc::syscall(
             libc::SYS_landlock_create_ruleset,
@@ -38,8 +37,6 @@ pub(crate) fn landlock_abi() -> Option<i32> {
 }
 
 pub(crate) fn enter(spec: &SandboxSpec) -> Result<Infallible, SandboxError> {
-    // The network comes first: it needs `/proc/self/uid_map` and the loopback interface, and
-    // landlock refuses both once it is applied (D79).
     if let Some(guard) = &spec.named_launch {
         return launch::enter(spec, guard);
     }
@@ -57,25 +54,14 @@ pub(crate) fn enter(spec: &SandboxSpec) -> Result<Infallible, SandboxError> {
     Err(SandboxError::Exec { program, source })
 }
 
-/// Gives the command its own network, or leaves it with none. True means sockets may be allowed
-/// because everything they can reach is the command's own loopback (D79).
-///
-/// Every step can fail, and every failure means the answer is "no network": an environment without
-/// user namespaces runs the command exactly as it ran before D79, with `socket(2)` refused. That is
-/// why the answer is a `bool` rather than a result — the caller must not be able to treat a failure
-/// as permission.
 pub(crate) fn start_network(spec: &SandboxSpec) -> bool {
     let Some(net) = &spec.net else {
         return false;
     };
-    // Read before landlock restricts /etc to reading, and before the command exists, so the
-    // resolver list cannot be influenced by anything the command does.
     let resolvers = fs::read_to_string("/etc/resolv.conf")
         .map(|text| namespaces::resolvers(&text))
         .unwrap_or_default();
     if let Err(why) = namespaces::enter(&resolvers) {
-        // Said out loud rather than swallowed: the command still runs, but with no network, and a
-        // person needs to know which of the two they got and why.
         eprintln!("saddle-sandbox: no network for this command: {why}");
         return false;
     }
@@ -94,11 +80,9 @@ fn apply_landlock(spec: &SandboxSpec) -> Result<(), SandboxError> {
     let ll = |e: landlock::RulesetError| SandboxError::Landlock(e.to_string());
     let abi = ABI::V3;
     let status = Ruleset::default()
-        // The filesystem rules are the sandbox; refuse to run without all of them.
         .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(AccessFs::from_all(abi))
         .map_err(ll)?
-        // Signal scoping needs ABI 6 (Linux 6.12); use it where the kernel has it.
         .set_compatibility(CompatLevel::BestEffort)
         .scope(Scope::Signal)
         .map_err(ll)?
@@ -130,14 +114,6 @@ fn apply_seccomp(networked: bool) -> Result<(), SandboxError> {
     let sc = |e: seccompiler::BackendError| SandboxError::Seccomp(e.to_string());
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
-    // socket(domain, ...) for any domain that reaches outside the sandbox. socketpair stays open.
-    //
-    // With a network namespace of its own (D79) the internet domains are no longer a way out —
-    // there is nothing on the other side of them but the command's own loopback — so they are
-    // allowed. Unix sockets stay refused: they are the way to `docker.sock`, `gpg-agent` and every
-    // other local daemon, which a network namespace does not confine. Netlink stays allowed too,
-    // because glibc uses it to ask about interfaces, and inside this namespace there is nothing to
-    // learn but the loopback that was just raised.
     let domains: &[libc::c_int] = if networked {
         &[libc::AF_UNIX, libc::AF_PACKET]
     } else {
@@ -163,8 +139,6 @@ fn apply_seccomp(networked: bool) -> Result<(), SandboxError> {
         .map_err(sc)?;
     rules.insert(libc::SYS_socket, socket_rules);
 
-    // io_uring can open sockets without calling socket(2). An empty rule list matches always.
-    // So can setns(2), which would let a command walk back out into another namespace.
     for nr in [
         libc::SYS_io_uring_setup,
         libc::SYS_io_uring_enter,

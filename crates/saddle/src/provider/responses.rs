@@ -1,15 +1,3 @@
-//! OpenAI's Responses API, streamed: the wire format a ChatGPT subscription token reaches (D85).
-//!
-//! It differs from `/chat/completions` in more than the path. The conversation goes in as a flat
-//! list of typed *items* rather than role-tagged messages with tool calls hanging off them, the
-//! system prompt is a field of its own rather than the first message, tool calls and their results
-//! refer to each other by `call_id` rather than by a message index, and the stream is a sequence of
-//! named events rather than deltas on a choice. That is why it is a module and not a flag.
-//!
-//! Only what saddle sends is understood: text, images, function calls and their outputs, and the
-//! reasoning summaries a subscription model emits. Anything else the server sends is ignored rather
-//! than refused, because the event vocabulary here is larger than any one turn uses and grows.
-
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Error as AnyError, Result, anyhow};
@@ -22,15 +10,6 @@ use super::{
 };
 use super::{Cancelled, SUMMARY_INTRO, sse};
 
-/// The Codex CLI version this client reports when it asks what the backend serves (D85).
-///
-/// The catalogue is gated on it: the backend answers a version it does not recognise with an empty
-/// list and no error, and an older one with a shorter list, so a stale number here is a picker that
-/// quietly loses models. It is a version and not a list of models on purpose — the list is the
-/// service's to change, and this is the only claim saddle makes about being a client of it.
-///
-/// Bump it when the list comes back empty or short. `CODEX_CLIENT_VERSION` is checked against
-/// `npm view @openai/codex version`, and there is a test below that notices when it is old.
 pub const CLIENT_VERSION: &str = "0.169.0";
 
 pub fn complete(p: &Provider, conv: &Conversation<'_>, sink: &mut dyn Sink) -> Result<Reply> {
@@ -48,8 +27,6 @@ fn complete_at(
 ) -> Result<Reply> {
     let headers = p.request_headers_for(conv.session);
     let body = body(&p.config, conv);
-    // D125: a successful send does not prove the socket is alive. Recover read-time failures too,
-    // but only before output. The second attempt always uses HTTP and the whole input, not a delta.
     retry::once(sink, |retry, sink| {
         if retry && !p.retry_requests {
             return Err(anyhow!(
@@ -75,7 +52,6 @@ fn complete_at(
         };
         let reply = read_stream(streamed, sink)?;
         if let Some(pending) = pending {
-            // The next request's input shape, not the server's response.output shape (D101).
             pending.finish(input(&[Item::Assistant(reply.parts.clone())]));
         }
         Ok(reply)
@@ -92,7 +68,6 @@ pub fn body(cfg: &ProviderConfig, conv: &Conversation<'_>) -> Value {
                 "name": t.name,
                 "description": t.description,
                 "parameters": t.schema,
-                // D154: Responses otherwise normalizes optional fields into required ones.
                 "strict": false,
             })
         })
@@ -102,11 +77,8 @@ pub fn body(cfg: &ProviderConfig, conv: &Conversation<'_>) -> Value {
         "instructions": conv.system,
         "input": input(conv.items),
         "stream": true,
-        // The subscription endpoint keeps no conversation of its own; every request carries it.
         "store": false,
     });
-    // D100: the same key and lifetime the chat-completions surface sends, under this API's own
-    // names. Neither goes to a server that is not OpenAI's.
     if let Some(key) = prompt_cache_key(cfg, conv.session) {
         body["prompt_cache_key"] = key.into();
     }
@@ -119,25 +91,14 @@ pub fn body(cfg: &ProviderConfig, conv: &Conversation<'_>) -> Value {
     if let Some(n) = cfg.max_tokens {
         body["max_output_tokens"] = n.into();
     }
-    // D95: a summary is only emitted when it is asked for, so without this key the TUI has nothing
-    // to show even though the model reasoned. `auto` is the most detailed summarizer a model has;
-    // the named ones differ by model and `concise` is refused outright by some of them.
-    //
-    // `reasoning.context` is deliberately left out, which means `auto`: the model's own default.
-    // Naming `all_turns` would be refused by models that do not have it, and the client does not
-    // need it — every reasoning item is replayed below, so the prefix is the same either way.
     let mut reasoning = json!({ "summary": "auto" });
     if let Some(effort) = &cfg.effort {
         reasoning["effort"] = effort.as_str().into();
     }
     body["reasoning"] = reasoning;
-    // The encrypted reasoning comes back by itself in stateless mode, so the legacy
-    // `reasoning.encrypted_content` include is not sent: it buys nothing and a strict server may
-    // refuse a value it does not know.
     body
 }
 
-/// The conversation as Responses items.
 pub fn input(items: &[Item]) -> Vec<Value> {
     let mut out = Vec::new();
     for item in items {
@@ -168,8 +129,6 @@ pub fn input(items: &[Item]) -> Vec<Value> {
                     }));
                     images.extend(r.images.iter().map(image_part));
                 }
-                // A tool's picture cannot ride in its output, so it follows as a user message, as
-                // it does for chat completions (D58).
                 if !images.is_empty() {
                     out.push(message("user", &images));
                 }
@@ -184,14 +143,8 @@ pub fn input(items: &[Item]) -> Vec<Value> {
                             "type": "function_call",
                             "call_id": c.id,
                             "name": c.name,
-                            // The server parses this, so an input that could not be parsed on the
-                            // way in goes back as `{}`.
                             "arguments": c.input.as_ref().map_or_else(|_| "{}".to_owned(), Value::to_string),
                         })),
-                        // D95: every reasoning item goes back, in the position it was produced, for
-                        // the whole conversation. Deleting an earlier one is a change to the prefix:
-                        // it stops the prompt cache matching from that point, and the API answers
-                        // by dropping the reasoning that follows it as well.
                         Part::Native { api, block } if *api == Api::OpenaiResponses => {
                             out.push(block.clone());
                         }
@@ -223,7 +176,6 @@ fn message(role: &str, content: &[Value]) -> Value {
     json!({ "role": role, "content": content })
 }
 
-/// One tool call while its arguments stream in.
 #[derive(Default)]
 struct Pending {
     id: String,
@@ -235,16 +187,10 @@ struct Pending {
 pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<Reply> {
     let mut text = String::new();
     let mut reasoning = String::new();
-    // D151: delimit display paragraphs, not token chunks. Native replay items stay verbatim.
     let mut reasoning_segment = None;
     let mut reasoning_break = false;
-    // D95: the reasoning items exactly as the server sent them. They carry an opaque
-    // `encrypted_content` and an id, and only the server can read either: what comes back here must
-    // go back out unchanged, or the model starts the next step without the thinking it already did.
     let mut reasoning_items: Vec<Value> = Vec::new();
     let mut calls: BTreeMap<u64, Pending> = BTreeMap::new();
-    // The event stream identifies a call by its output index and by `item_id`; both are kept so a
-    // delta lands on the right one whichever the server sends.
     let mut by_item: BTreeMap<String, u64> = BTreeMap::new();
     let mut usage = Usage::default();
     let mut reasoning_tokens = 0;
@@ -314,7 +260,6 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
             | "response.reasoning_summary_part.done"
             | "response.reasoning_summary_text.done"
             | "response.reasoning_text.done" => {
-                // Some compatible servers omit indices; explicit boundaries still separate parts.
                 reasoning_break = !reasoning.is_empty();
             }
             "response.output_item.added" => {
@@ -349,8 +294,6 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
             "response.output_item.done" => {
                 let item = &event["item"];
                 if item["type"] == "reasoning" {
-                    // Verbatim: id, summary, encrypted_content and whatever else the server put
-                    // there. This is the thing D95 exists for.
                     reasoning_items.push(item.clone());
                     reasoning_break = !reasoning.is_empty();
                     reasoning_segment = None;
@@ -369,8 +312,6 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
                         .unwrap_or(&pending.name)
                         .to_owned();
                     if let Some(args) = item["arguments"].as_str() {
-                        // `.done` carries the whole argument string; the deltas before it were the
-                        // same bytes arriving in pieces.
                         pending.arguments = args.to_owned();
                     }
                     pending.done = true;
@@ -391,13 +332,10 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
                     .unwrap_or(0);
                 usage.input = input_tokens.saturating_sub(cached);
                 usage.cache_read = cached;
-                // D97: a write is billed above the ordinary input rate, so leaving it out prices a
-                // cold turn as if it were a plain read (D36).
                 usage.cache_write = u["input_tokens_details"]["cache_write_tokens"]
                     .as_u64()
                     .unwrap_or(0);
                 usage.output = u["output_tokens"].as_u64().unwrap_or(usage.output);
-                // D99: the same split, under this API's name for it.
                 reasoning_tokens = u["output_tokens_details"]["reasoning_tokens"]
                     .as_u64()
                     .unwrap_or(0);
@@ -422,8 +360,6 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
 
     let mut parts = Vec::new();
     if reasoning_items.is_empty() && !reasoning.is_empty() {
-        // A server that streamed a summary without sending an item of its own: the text is still
-        // kept, so the transcript and the display have it.
         parts.push(Part::Native {
             api: Api::OpenaiResponses,
             block: json!({ "type": "reasoning", "summary": [{ "type": "summary_text", "text": reasoning }] }),
@@ -486,11 +422,6 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
     })
 }
 
-/// How many input items the API said it removed before answering (D97).
-///
-/// The field is reported but not documented field by field, so an entry that does not say what it
-/// touched counts as a removal: a drop that was silently ignored because the schema moved is the
-/// one thing this number must never do.
 fn dropped(transformations: &Value) -> u64 {
     let Some(list) = transformations.as_array() else {
         return 0;
@@ -590,8 +521,6 @@ mod tests {
 
     #[test]
     fn a_formula_is_sent_as_the_tex_and_never_as_a_picture() {
-        // D165: a display formula is drawn by the person's terminal, so the input carries the TeX
-        // in an ordinary text part — never an `input_image`, which only an attachment produces.
         let formula =
             "$$\\nabla \\times \\mathbf{E} = -\\frac{\\partial \\mathbf{B}}{\\partial t}$$";
         let items = [
@@ -681,7 +610,6 @@ mod tests {
         }
     }
 
-    /// a real upgrade and HTTP fallback on one endpoint, with no external credentials or requests.
     fn transports(
         ws_events: Option<Vec<Value>>,
         http_replies: Vec<Vec<Value>>,
@@ -711,7 +639,6 @@ mod tests {
                             .unwrap();
                     }
                 }
-                // Deliberately drop without a close handshake, including after a successful send.
             }
             for events in http_replies {
                 let mut reader = BufReader::new(accept_request(&listener));
@@ -994,8 +921,6 @@ mod tests {
 
     #[test]
     fn a_request_to_openai_carries_the_cache_key_and_no_other_server_does() {
-        // D100: the same two fields under this surface's own names. Its configured host is the
-        // subscription backend, not `api.openai.com`, so the default configuration carries neither.
         let items = vec![Item::User("hello".into())];
         let conv = |session: &'static str| Conversation {
             system: "s",
@@ -1027,8 +952,6 @@ mod tests {
 
     #[test]
     fn the_conversation_is_sent_as_typed_items() {
-        // The Responses API has no tool messages: a call and its output are items that name each
-        // other by call_id, and the system prompt is a field rather than the first message.
         let items = vec![
             Item::User("hi".into()),
             Item::Assistant(vec![
@@ -1069,7 +992,6 @@ mod tests {
         assert_eq!(sent[3]["type"], "function_call_output");
         assert_eq!(sent[3]["call_id"], "call_1");
         assert_eq!(sent[3]["output"], "the file");
-        // No tools means no `tools` key, and a tool has its own shape here.
         assert!(sent_body.get("tools").is_none());
         let tools = vec![ToolDef {
             name: "read".into(),
@@ -1092,8 +1014,6 @@ mod tests {
 
     #[test]
     fn tool_schemas_keep_optional_arguments_optional_on_responses() {
-        // D154: omitted strict mode lets Responses require every property, breaking both
-        // bash run (which forbids task_id) and status (which forbids command).
         let schemas = [
             json!({
                 "type": "object",
@@ -1203,7 +1123,6 @@ mod tests {
         assert_eq!(calls[0].id, "call_9");
         assert_eq!(calls[0].name, "bash");
         assert_eq!(calls[0].input.as_ref().unwrap()["command"], "ls");
-        // Reasoning comes back as an item of its own, so the next request can carry it.
         assert!(reply.parts.iter().any(|p| matches!(
             p,
             Part::Native {
@@ -1234,7 +1153,6 @@ mod tests {
 
     #[test]
     fn a_failure_is_reported_rather_than_an_empty_reply() {
-        // A stream that stops before `response.completed` is a broken reply, not a short one.
         let events = Script(vec![(
             "response.output_text.delta",
             r#"{"type":"response.output_text.delta","delta":"half"}"#,
@@ -1242,7 +1160,6 @@ mod tests {
         let mut sink = Silent;
         assert!(read_stream(events, &mut sink).is_err());
 
-        // And a failure the server states is reported in its own words.
         let events = Script(vec![(
             "response.failed",
             r#"{"type":"response.failed","response":{"error":{"message":"quota exhausted"}}}"#,
@@ -1420,9 +1337,6 @@ mod tests {
 
     #[test]
     fn a_reasoning_item_is_carried_back_exactly_as_it_arrived() {
-        // D95: the item carries an opaque `encrypted_content` that only the server can read.
-        // Rebuilding it from the summary text throws that away, and with `store: false` it is the
-        // only continuity between one step of a tool loop and the next.
         let events = Script(vec![
             (
                 "response.reasoning_summary_text.delta",
@@ -1462,7 +1376,6 @@ mod tests {
         assert_eq!(kept[0]["id"], "rs_1");
         assert_eq!(kept[0]["encrypted_content"], "gAAAA-opaque");
 
-        // And it goes back out unchanged — in an earlier turn as much as this one.
         let items = vec![
             Item::User("first".into()),
             Item::Assistant(reply.parts.clone()),
@@ -1476,8 +1389,6 @@ mod tests {
 
     #[test]
     fn a_summary_is_asked_for_and_the_legacy_include_is_not_sent() {
-        // D95: without `summary` the server answers with an empty summary array, so the interface
-        // has nothing to show however much the model thought.
         let items = vec![Item::User("hello".into())];
         let conv = Conversation {
             system: "s",
@@ -1501,15 +1412,11 @@ mod tests {
         let with_effort = body(&cfg, &conv);
         assert_eq!(with_effort["reasoning"]["effort"], "high");
         assert_eq!(with_effort["reasoning"]["summary"], "auto");
-        // `context` is left to the model: naming `all_turns` is refused by models without it, and
-        // every reasoning item is replayed anyway, so the prefix is the same either way.
         assert!(with_effort["reasoning"].get("context").is_none());
     }
 
     #[test]
     fn a_cache_write_and_the_reasoning_the_api_dropped_are_read() {
-        // D97: a write is billed above the ordinary input rate, and a drop is the API telling us
-        // it rewrote our prompt. Both are invisible in the token counts alone.
         let events = Script(vec![(
             "response.completed",
             r#"{"type":"response.completed","response":{"model":"m","status":"completed","usage":{"input_tokens":900,"output_tokens":7,"input_tokens_details":{"cached_tokens":100,"cache_write_tokens":800}},"input_transformations":[{"item_type":"reasoning","reason":"prefix_mismatch"}]}}"#,
@@ -1523,7 +1430,6 @@ mod tests {
 
     #[test]
     fn the_part_of_the_output_that_was_thinking_is_read() {
-        // D99: the same split under this API's name for it.
         let events = Script(vec![(
             "response.completed",
             r#"{"type":"response.completed","response":{"model":"m","status":"completed","usage":{"input_tokens":5,"output_tokens":900,"output_tokens_details":{"reasoning_tokens":850}}}}"#,

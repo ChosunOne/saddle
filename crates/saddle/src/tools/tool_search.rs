@@ -1,8 +1,3 @@
-//! D108: `tool_search` is how a server's tools reach the model. Nothing an MCP server offers is
-//! declared until a search matches it, so a session with ten configured servers costs ten lines in
-//! the prompt rather than ten tool schemas. A match is declared for the rest of the session, and
-//! what a search can never do is declare a tool the grant does not name.
-
 use anyhow::Result;
 use serde_json::Value;
 use std::mem;
@@ -16,14 +11,9 @@ pub fn search(session: &mut Session, input: &Value) -> Result<ToolOutput> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    // The registry lives on the session it has to ask, so it is taken out for the call and put
-    // back afterwards: starting a server needs the engine and the audit log, which are the
-    // session's too.
     let mut registry = mem::take(&mut session.mcp);
     let failing = registry.discover(session);
     let declared = registry.search(&query);
-    // Named rather than listed: a tool the grant does not name is not the model's to reach, but
-    // knowing it exists is not a secret either (D103).
     let withheld = registry.ungranted().len();
     session.mcp = registry;
 

@@ -1,5 +1,3 @@
-//! protected launch-profile definitions and workspace overlays (D184, D186, D189, D190); no invocation authority.
-
 use std::collections::BTreeMap;
 use std::env;
 use std::num::NonZeroU32;
@@ -12,10 +10,8 @@ use serde::Deserialize;
 
 use super::sandbox_overrides::resolve_missing;
 
-/// definitions as written in one protected configuration source.
 pub type Definitions = BTreeMap<String, Definition>;
 
-/// Partial in a workspace overlay; a new definition must name an executable.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Definition {
@@ -30,7 +26,6 @@ pub struct Definition {
     timeout_secs: Option<NonZeroU32>,
 }
 
-/// effective paths and field provenance for `saddle check`, not pinned runtime handles.
 #[derive(Debug)]
 pub struct Resolved {
     pub executable: PathBuf,
@@ -45,7 +40,6 @@ pub struct Resolved {
     pub workspace_fields: Vec<&'static str>,
 }
 
-/// reject incomplete defaults even if the current workspace does not use them.
 pub fn validate_global(definitions: &Definitions) -> Result<()> {
     for (name, definition) in definitions {
         validate(name, definition)?;
@@ -56,7 +50,6 @@ pub fn validate_global(definitions: &Definitions) -> Result<()> {
     Ok(())
 }
 
-/// Compute the effective definitions without adding them to any of the ordinary reach lists.
 pub fn resolve(
     mut base: Definitions,
     overlay: Definitions,
@@ -245,12 +238,9 @@ fn check_path(written: &str, protected: &[PathBuf]) -> Result<PathBuf> {
             }
         }
     }
-    // Do not turn an untrusted alias into a trusted runtime path. The launcher opens the
-    // original expanded claim with no symlink traversal, after this configuration-time check.
     Ok(path)
 }
 
-/// Baselines belong to the running session, not the config or a persistent trust store.
 #[derive(Default)]
 pub struct Baselines(BTreeMap<PathBuf, Result<[u8; 32], String>>);
 
@@ -258,7 +248,6 @@ impl Baselines {
     pub fn enroll(&mut self, profiles: &BTreeMap<String, Resolved>) {
         for profile in profiles.values().filter(|profile| profile.verify_sha256) {
             for path in [&profile.executable].into_iter().chain(&profile.helpers) {
-                // Even a failed baseline is sticky: don't approve bytes on a subsequent reload.
                 self.0
                     .entry(path.clone())
                     .or_insert_with(|| launch_digest(path).map_err(|error| error.to_string()));

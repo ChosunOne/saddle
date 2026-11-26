@@ -1,6 +1,6 @@
 # qualified_paths
 
-A Dylint library holding saddle's one lint that no rustc or Clippy lint can express (D148): a path
+A Dylint library holding Saddle's source style checks. `qualified_paths` (D148) catches a path
 is imported where its module keeps the imports, never written inline.
 
 `absolute_paths` allows `crate::`, `self::` and `super::` because they start with a keyword, and
@@ -36,3 +36,7 @@ stable.
 
 The lint reports through the compiler rather than a source scan, so it sees types, patterns and
 macro expansions the way rustc does, and a `use` statement is never reported.
+
+`no_source_comments` (D198) denies line, block, and Rustdoc comments in Rust files
+loaded by the compiler. It uses the Rust lexer, so comment markers in strings and
+a file's shebang are not reported. Keep API and design prose in Markdown.

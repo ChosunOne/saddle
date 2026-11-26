@@ -1,5 +1,3 @@
-//! explicit extension effects, each decided by the session's one engine (D156).
-
 mod model;
 pub use model::Used as ModelUsage;
 pub mod panel;
@@ -86,7 +84,6 @@ pub fn execute(
         operation,
         arguments: &arguments,
     };
-    // Model admission additionally reserves parent/child quotas before a provider request.
     let mut decision = if matches!(service, Service::Model(_) | Service::Worker(_)) {
         session
             .engine

@@ -1,5 +1,3 @@
-//! session-owned, principal-isolated background execution, never detached commands (D153).
-
 use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,16 +18,8 @@ use crate::net::bridge::Bridge;
 use crate::plugins::HostFailure;
 use crate::session::{Session, session_id};
 
-/// How long a cancellation waits for the monitors to reap what they killed, so its own reply can
-/// say how the task ended rather than "running" (D180).
 const CANCEL_REAP: Duration = Duration::from_secs(1);
 
-/// Whose task this is. A shipped standard tool acts for the agent — it holds only what the agent
-/// delegated to that profile, and `standard-*` identities are reserved for the components built with
-/// the binary — so a task `bash` started is the agent's, and the `tasks` profile of the same agent
-/// reads it (D182). A third-party plugin's task belongs to that plugin, which is what keeps one
-/// principal from reading another's output (D153). The recorded owner stays the principal that ran
-/// the command, so the proxy decides a task's network under that profile and the audit names it.
 fn holder(who: &Principal) -> Principal {
     match who {
         Principal::Plugin(id) if id.as_str().starts_with("standard-") => Principal::Agent,
@@ -47,19 +37,15 @@ struct Task {
     worker: Option<JoinHandle<Result<Completed>>>,
     bridge: Option<Bridge>,
     output: Option<Reply>,
-    /// When the command was started, and when its reply landed (D172). The transcript times it from
-    /// these rather than from when it first drew the task.
     started: Instant,
     stopped: Option<Instant>,
     denials: Vec<String>,
     announced: bool,
     shown: bool,
-    /// Whether finishing should resume the agent, as the launch or a `wait` said (D174).
     wake: Wake,
 }
 
 impl Task {
-    /// Whether this task's completion is worth a follow-up turn (D159, D174).
     fn wakes(&self) -> bool {
         match self.wake {
             Wake::Armed => true,
@@ -81,19 +67,14 @@ impl Drop for Task {
     }
 }
 
-/// What a task's completion should do about the agent (D174). A task started by a model tool call
-/// wakes the agent unless that call declined; `wait` arms one that declined, and nothing else wakes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Wake {
-    /// Nothing was said, so the general rule decides: the task a model tool call started wakes the
-    /// agent when it finishes (D159), and work with no such call does not.
     #[default]
     Unsaid,
     Armed,
     Quiet,
 }
 
-/// host-owned presentation state, never parsed from a tool's output (D159).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Running,
@@ -122,14 +103,11 @@ pub struct View {
     pub id: String,
     pub call: Option<String>,
     pub state: State,
-    /// When it started, and when it stopped: a running task's elapsed time is measured from the
-    /// first, not from when the interface first saw it (D172).
     pub started: Instant,
     pub stopped: Option<Instant>,
 }
 
 impl View {
-    /// How long the command has been running, or did run (D172).
     pub fn elapsed(&self, now: Instant) -> Duration {
         self.stopped
             .unwrap_or(now)
@@ -137,7 +115,6 @@ impl View {
     }
 }
 
-/// `0.4s`, `12s`, `1m 05s`, `1h 02m`: a duration as a person reads a stopwatch (D172).
 pub fn elapsed_text(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
     if elapsed.as_secs_f64() < 10.0 {
@@ -161,7 +138,6 @@ impl Tasks {
         self.entries.iter().map(|task| task.id.clone()).collect()
     }
 
-    /// link only tasks created during this serialized tool invocation, not earlier hook work.
     pub fn associate_new(&mut self, before: &[String], call: &str) {
         for task in &mut self.entries {
             if !before.contains(&task.id) {
@@ -189,22 +165,18 @@ impl Tasks {
             .collect()
     }
 
-    /// Whether a completion is waiting to be shown to the agent (D159, D174).
     pub fn pending(&self) -> bool {
         self.entries
             .iter()
             .any(|task| task.wakes() && task.output.is_some() && !task.announced)
     }
 
-    /// Whether some task will resume the agent when it finishes, so a session with nothing else to
-    /// do has a reason to stay open (D174).
     pub fn waiting(&self) -> bool {
         self.entries
             .iter()
             .any(|task| task.wakes() && task.worker.is_some())
     }
 
-    /// Says whether finishing one of this principal's tasks should resume the agent (D174).
     fn set_wake(&mut self, id: &str, who: &Principal, wake: bool) -> Option<&Task> {
         let caller = holder(who);
         let task = self
@@ -246,7 +218,6 @@ fn snapshot(task: &Task) -> Result<TaskReply> {
     })
 }
 
-/// keeps the sole engine/audit log on the session thread; monitors own no policy.
 pub fn service(session: &mut Session) -> Result<()> {
     let mut tasks = mem::take(&mut session.tasks);
     let result = (|| {
@@ -296,7 +267,6 @@ pub fn service(session: &mut Session) -> Result<()> {
     result.map_err(|error| HostFailure(error).into())
 }
 
-/// cancel and join before replacing grants or closing the audit log.
 pub fn stop_all(session: &mut Session) -> Result<()> {
     for task in &session.tasks.entries {
         task.stop.store(true, Ordering::Relaxed);
@@ -384,7 +354,6 @@ pub fn start(
     Ok(Ok(reply))
 }
 
-/// each observation/control operation is authorized and audited under its requesting principal.
 pub fn access(
     session: &mut Session,
     who: &Principal,
@@ -414,9 +383,6 @@ pub fn access(
     service(session)?;
     let caller = holder(who);
     if cancel {
-        // Ask first, then wait for the monitors to reap what they killed, so the call that asked
-        // for the cancellation answers with the ending rather than "running" (D180). The wait is
-        // bounded: a child that cannot be reaped at once still gets an honest snapshot.
         let cancelled: Vec<String> = session
             .tasks
             .entries
@@ -469,10 +435,6 @@ pub fn access(
     Ok(Ok(replies))
 }
 
-/// says whether finishing one of this principal's tasks should resume the agent (D174).
-///
-/// It answers at once with the task as it stands: the wake is the session's, so nothing here waits
-/// for the task, and a task that has already finished answers with its output instead.
 pub fn wake(
     session: &mut Session,
     who: &Principal,
@@ -511,21 +473,16 @@ pub fn wake(
     Ok(Ok(vec![reply]))
 }
 
-/// whether a session with nothing else to do has a task that will resume it (D174).
 pub fn waiting(session: &mut Session) -> Result<bool> {
     service(session)?;
     Ok(session.tasks.waiting())
 }
 
-/// an idle turn is needed only for an unconsumed completion, not a running task.
 pub fn pending(session: &mut Session) -> Result<bool> {
     service(session)?;
     Ok(session.tasks.pending())
 }
 
-/// what one completion notice says: the id, whose task it is and how it ended, then where the output
-/// is (D153). Reading a task is `tasks`, not `bash`, since D182 — and a task another principal
-/// started is no more readable by naming that tool, so the notice says where the reach ends instead.
 fn notice_line(id: &str, owner: &Principal, state: &str) -> String {
     if holder(owner) == Principal::Agent {
         format!("background {id} ({owner}) {state}; read it with the tasks tool (action: status)")
@@ -534,7 +491,6 @@ fn notice_line(id: &str, owner: &Principal, state: &str) -> String {
     }
 }
 
-/// notices contain only host-owned ids and state, never command output from an untrusted process.
 pub fn notices(session: &mut Session, model: bool) -> Result<Vec<String>> {
     service(session)?;
     let mut notices = Vec::new();
@@ -562,7 +518,6 @@ pub fn notices(session: &mut Session, model: bool) -> Result<Vec<String>> {
     Ok(notices)
 }
 
-/// human-only UI control; cancelling cannot widen the process's authority.
 pub fn human(session: &mut Session, argument: &str) -> Result<String> {
     service(session)?;
     if let Some(id) = argument.strip_prefix("cancel ") {
@@ -612,7 +567,6 @@ pub fn human(session: &mut Session, argument: &str) -> Result<String> {
                         .saturating_duration_since(task.started)
                 )
             );
-            // Whether the agent asked to be resumed by it, which is what will happen next (D174).
             if task.wakes() {
                 line.push_str("  wake");
             }
@@ -670,7 +624,6 @@ mod tests {
             stopped: Some(started + Duration::from_secs(3)),
             ..running
         };
-        // A finished task shows how long it ran, not how long ago it finished.
         assert_eq!(finished.elapsed(now), Duration::from_secs(3));
         assert_eq!(
             finished.elapsed(now + Duration::from_secs(60)),

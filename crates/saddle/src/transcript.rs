@@ -1,9 +1,3 @@
-//! transcript SQL behind the gated SDK service, not a native tool (D92, D137, D147).
-//!
-//! Four views over one conversation's active branch: its messages, one row per model request with
-//! what it used and what answered it (D94), the reasoning behind those messages (D98), and the
-//! conversations of this workspace that may be read (D163).
-
 use saddle_limits as budgets;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -34,11 +28,7 @@ pub fn execute(
     let active = session.query_conversation.clone();
     let mode = session.engine.transcript_sessions(who);
     let wanted = selector.trim();
-    // A selector names another conversation; that is the part the grant has to cover, and it is
-    // what makes this more than a query of the conversation in hand (D163).
     let others = !wanted.is_empty();
-    // Only a grant that covers the workspace resolves a selector or lists the others, so a
-    // refusal never says which ids exist (D163).
     let listed = if others || mode == Some(Sessions::Workspace) {
         session.transcript_store()?.list()?
     } else {
@@ -73,8 +63,6 @@ pub fn execute(
     if !decision.allow {
         return Ok(Err(format!("denied: {}", decision.explanation)));
     }
-    // The agent has already built this conversation's snapshot around the call; another
-    // conversation, or one it did not build, is loaded here.
     let snapshot = if target == active {
         session.query_snapshot.take()
     } else {
@@ -86,8 +74,6 @@ pub fn execute(
     }) else {
         return Ok(Err("no saved conversation is active".into()));
     };
-    // A grant that covers only this conversation lists only this conversation, so the titles of
-    // the others say nothing (D163).
     let allowed: Vec<SessionRow> = match mode {
         Some(Sessions::Workspace) => listed.iter().map(row).collect(),
         _ => listed
@@ -100,7 +86,6 @@ pub fn execute(
         .map_err(|error| format!("session query failed: {error}")))
 }
 
-/// One row of the `sessions` view: the saved conversations a query may name (D163).
 fn row(summary: &Summary) -> SessionRow {
     SessionRow {
         id: summary.id.clone(),
@@ -117,9 +102,6 @@ fn row(summary: &Summary) -> SessionRow {
     }
 }
 
-/// The one conversation `selector` names in this workspace, or why it names none or several
-/// (D163). An exact id wins; otherwise the prefix has to be unique, the way `saddle session`
-/// takes one, so a partial id is never a guess between conversations.
 fn resolve<'a>(selector: &str, listed: &'a [Summary]) -> Result<&'a str, String> {
     if let Some(found) = listed.iter().find(|s| s.id == selector) {
         return Ok(&found.id);
@@ -144,7 +126,6 @@ fn authorize(ctx: AuthContext<'_>) -> Authorization {
     match ctx.action {
         AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
         AuthAction::Read { table_name, .. } => match (table_name, ctx.accessor) {
-            // The three views, and the backing table each of them reads (D92, D94, D98).
             ("calls" | "messages" | "requests" | "reasoning" | "sessions", _) => {
                 Authorization::Allow
             }
@@ -178,7 +159,6 @@ fn check_deadline(deadline: Option<Instant>) -> Result<()> {
     Ok(())
 }
 
-/// One saved conversation as the `sessions` view says it (D163).
 struct SessionRow {
     id: String,
     name: String,
@@ -187,8 +167,6 @@ struct SessionRow {
     updated: i64,
     messages: i64,
     forked_from: String,
-    /// 1 for a live worker's conversation, so a query can keep the team out of the person's own
-    /// history (D195).
     worker: i64,
 }
 
@@ -261,8 +239,6 @@ fn query_bounded(
                 row.usage.output as i64,
                 row.usage.cache_read as i64,
                 row.usage.cache_write as i64,
-                // Whether the prompt was served from a provider cache at all. The counts stay the
-                // source of truth; this is the question a hit rate is about (D94).
                 i64::from(row.usage.cache_read > 0),
                 row.cost,
                 row.dropped as i64,
@@ -330,8 +306,6 @@ fn query_bounded(
         }),
     )?;
     conn.authorizer(Some(authorize))?;
-    // Wrapping accepts exactly one query, not a batch or a PRAGMA. The authorizer still decides
-    // every operation: lexical SELECT checks would not protect functions or virtual tables.
     let sql = sql.trim().trim_end_matches(';');
     let mut statement = conn.prepare(&format!("SELECT * FROM ({sql}\n)"))?;
     if !statement.readonly() {
@@ -388,7 +362,6 @@ mod tests {
         }
     }
 
-    /// A request row, as the store would export it (D94).
     fn request(provider: &str, model: &str, input: u64, cache_read: u64) -> RequestRow {
         RequestRow {
             node: 9,
@@ -444,8 +417,6 @@ mod tests {
 
     #[test]
     fn a_selector_is_an_id_or_a_prefix_that_names_exactly_one_conversation() {
-        // D163: an id is taken exactly, a prefix only when it is the only one, so a partial id is
-        // never a guess between two conversations.
         let listed = [
             summary("abcdefghij", "first"),
             summary("abcxyz", "second"),
@@ -461,8 +432,6 @@ mod tests {
 
     #[test]
     fn the_sessions_view_names_the_conversations_and_nothing_else_is_readable() {
-        // D163: what a query can find out about the other conversations is what the host put in
-        // the table — id, name, title, model, update time and size — and no table of the database.
         let rows = [SessionRow {
             id: "abcdefghij".into(),
             name: String::new(),
@@ -481,7 +450,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["rows"], json!([["abcdefghij", "remember teal", 4]]));
-        // The backing table has no name of its own to guess at: only the view is authorized.
         let error = query_bounded(&messages(), &rows, "SELECT * FROM sessions", None)
             .and_then(|_| {
                 query_bounded(
@@ -497,9 +465,6 @@ mod tests {
 
     #[test]
     fn reports_what_each_request_used_and_whether_it_read_the_cache() {
-        // D94: the store had the numbers and the tool could not see them, so "why does this
-        // provider's cache miss" was answerable only from the audit log. This is the query the
-        // view exists for.
         let snapshot = Snapshot {
             calls: Vec::new(),
             messages: messages().messages,
@@ -520,7 +485,6 @@ mod tests {
             out["rows"],
             json!([["openai", 0, 0, 1], ["synthetic", 900, 1, 2]])
         );
-        // One request, with the columns a person joins the messages on.
         let out = query(
             &snapshot,
             "SELECT ordinal, kind, model, input, cache_read, cached, after FROM requests
@@ -532,7 +496,6 @@ mod tests {
 
     #[test]
     fn a_request_carries_the_reasoning_the_provider_dropped() {
-        // D97: the number that answers "is the API eating my reasoning" from a query.
         let mut dropped = request("openai", "gpt", 500, 0);
         dropped.dropped = 2;
         let snapshot = Snapshot {
@@ -555,8 +518,6 @@ mod tests {
 
     #[test]
     fn a_request_says_how_much_of_its_output_was_thinking() {
-        // D99: the split, beside the output it is part of, so "what did we pay for that we never
-        // saw" is a sum rather than an estimate from character counts.
         let mut thinking = request("openai", "gpt", 500, 400);
         thinking.reasoning_tokens = 850;
         let snapshot = Snapshot {
@@ -581,8 +542,6 @@ mod tests {
 
     #[test]
     fn reasoning_is_searchable_beside_the_text_it_produced() {
-        // D98: reasoning was replayed to the model and stored on the item (D95, D96) and no view
-        // could see it, so the transcript was searchable and the thinking behind it was not.
         let snapshot = Snapshot {
             calls: Vec::new(),
             messages: vec![

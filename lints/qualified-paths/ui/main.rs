@@ -1,5 +1,3 @@
-//! The shapes the lint catches, and the ones it does not.
-
 mod inner {
     pub struct Shape;
 

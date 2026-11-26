@@ -1,23 +1,3 @@
-//! User-level config (`$XDG_CONFIG_HOME/saddle/config.toml`). Extra roots and model providers live
-//! here, never in the repository policy (D16).
-//!
-//! ```toml
-//! # The provider `saddle run` uses without --provider. Built in: openai, synthetic; any other
-//! # goes under [providers.<name>]. A table named after a built-in overrides that preset's fields.
-//! provider = "local"
-//!
-//! # Explicit command-only paths supplement granted roots and narrow built-in toolchain reads.
-//! [sandbox]
-//! read = ["~/tools/custom"]
-//! write = []
-//!
-//! [providers.local]
-//! api = "openai"                       # or "anthropic"
-//! base-url = "http://127.0.0.1:8080/v1"
-//! model = "qwen3-coder"
-//! # api-key-env = "LOCAL_KEY"          # omit when the server takes no key
-//! ```
-
 pub mod launch_profiles;
 pub mod sandbox_overrides;
 
@@ -54,28 +34,16 @@ pub struct UserConfig {
     pub standard_tools: Profiles,
     #[serde(default, rename = "tool-limits")]
     pub tool_limits: Budgets,
-    /// explicit plugin grants, separate from installed/enabled artifact configuration (D128).
     #[serde(default)]
     pub plugin: BTreeMap<PluginId, toml::Value>,
     #[serde(default)]
     pub plugins: BTreeMap<PluginId, PluginEntry>,
-    /// The grants every workspace inherits (D63). This was `policy.toml`; it is the same TOML,
-    /// under `[agent]` here.
     #[serde(default)]
     pub agent: Option<toml::Value>,
-    /// Named grant sets a person switches between instead of editing `[agent]` each time (D175):
-    /// `[profiles.<name>]`, each holding what `[agent]` holds. The profile in force *is* the base a
-    /// workspace's own grants are layered on, so this selects authority rather than adding to it.
     #[serde(default)]
     pub profiles: BTreeMap<String, toml::Value>,
-    /// The profile used unless `--profile` or `/profile` picks another (D175). `none` means `[agent]`
-    /// as written. A name that is not defined is refused rather than falling back to `[agent]`.
     #[serde(default)]
     pub profile: Option<String>,
-    /// Accepted and ignored: one version briefly kept workspace grants here as a table, and a
-    /// config written then is split back into `policies/<key>.toml` by `migrate` (D63). Read by
-    /// `migrate` through the raw document rather than through this field, which exists only so a
-    /// file containing the table still parses.
     #[serde(default)]
     #[allow(dead_code)]
     pub workspaces: BTreeMap<String, toml::Value>,
@@ -85,15 +53,10 @@ pub struct UserConfig {
     pub sandbox: SandboxConfig,
     #[serde(default, rename = "launch-profiles")]
     pub launch_profiles: launch_profiles::Definitions,
-    /// The provider used when `--provider` is not given.
     #[serde(default)]
     pub provider: Option<String>,
-    /// Model requests per prompt before the loop stops and waits. Unset means no limit (D37).
     #[serde(default, rename = "max-steps")]
     pub max_steps: Option<usize>,
-    /// Whether a workspace that holds credentials may be entered without an allowance (D60). For a
-    /// machine where the home directory has no secrets; off unless a person turns it on, and this
-    /// file is outside every root, so nothing the agent runs can set it (D42).
     #[serde(default, rename = "allow-sensitive")]
     pub allow_sensitive: bool,
     #[serde(default)]
@@ -102,69 +65,43 @@ pub struct UserConfig {
     pub context: ContextConfig,
     #[serde(default)]
     pub skills: SkillsConfig,
-    /// Named colour roles, `[themes.<name>]`, and `[ui] theme` selects one (D71).
     #[serde(default)]
     pub themes: ThemeTables,
     #[serde(default)]
     pub compaction: CompactionConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderEntry>,
-    /// The MCP servers a person declared, `[mcp.<name>]` (D104). A grant (D103) still decides
-    /// whether any of them runs.
     #[serde(default)]
     pub mcp: McpTable,
-    /// `[keys]`: the few moves with no default key (D169). An empty table means there are none.
     #[serde(default)]
     pub keys: Keys,
 }
 
-/// How the TUI starts; ctrl+t and ctrl+o change these for the session only.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct UiConfig {
-    /// The theme to draw with: a built-in name, or one this file defines under `[themes.<name>]`
-    /// (D71). Unset means `default`, which is what the interface looked like before themes.
     pub theme: Option<String>,
     pub show_reasoning: Option<bool>,
     pub expand_tools: Option<bool>,
-    /// The status line, as a template of `{field}` placeholders (D36). Empty uses the default.
     pub status: Option<String>,
-    /// Handle the mouse in saddle: wheel scrolling, and dragging to select text with the highlight
-    /// saddle draws and the copy it sends (D35). On by default; `false` hands the mouse back to the
-    /// terminal, which brings back its own selection and loses the wheel.
     pub mouse: Option<bool>,
-    /// How an attached picture is drawn: `kitty`, `iterm2`, `none`, or unset to work it out from
-    /// the environment (D59).
     pub images: Option<String>,
-    /// How a turn that ends while the terminal is not focused is announced: `bell`, `osc9`,
-    /// `osc777` or `off` (D164). Unset is `bell`.
     pub notify: Option<Notify>,
-    /// How large a formula is drawn relative to the size its fonts and the terminal's cell work
-    /// out to: 1.0 is that size, 1.2 a fifth larger (D165). Unset is 1.0, and values outside
-    /// half to four times it are held to those.
     pub math_scale: Option<f32>,
 }
 
-/// Instruction files (D32).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ContextConfig {
-    /// The global AGENTS.md; empty turns it off. Defaults to `$XDG_CONFIG_HOME/saddle/AGENTS.md`.
     pub global: Option<String>,
-    /// Read CLAUDE.md where no AGENTS.md exists (and `~/.claude/CLAUDE.md` when there is no
-    /// global AGENTS.md). Defaults to on.
     pub claude_fallback: Option<bool>,
 }
 
-/// Skills (D64). The locations are fixed and portable; this only says whether to look and how many
-/// to advertise.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct SkillsConfig {
-    /// Whether skills are discovered at all. Defaults to on.
     #[serde(default = "yes")]
     pub enabled: bool,
-    /// How many skills are advertised in the prompt. Defaults to 32.
     #[serde(default = "skill_limit")]
     pub max: usize,
 }
@@ -182,26 +119,16 @@ impl Default for SkillsConfig {
     }
 }
 
-/// Compaction (D33).
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct CompactionConfig {
-    /// Compact when the context nears the window, and once after a context-overflow error.
     pub auto: Option<bool>,
-    /// Tokens kept free below the context window; compaction starts past this point.
     pub reserve_tokens: Option<u64>,
-    /// Recent conversation kept word for word beside the summary.
     pub keep_recent_tokens: Option<u64>,
-    /// Compact a session that has been left alone once it is half full, so coming back to it does
-    /// not spend the whole window on a prompt typed before a break (D77).
     pub idle: Option<bool>,
-    /// The share of the window at which an idle session is compacted, 0 to 1.
     pub idle_fraction: Option<f64>,
-    /// How long a session is left alone before that happens.
     pub idle_seconds: Option<u64>,
-    /// Summarize in the background while the turn carries on, rather than stopping it (D78).
     pub background: Option<bool>,
-    /// The share of the window at which that starts, 0 to 1.
     pub background_fraction: Option<f64>,
 }
 
@@ -212,34 +139,20 @@ pub struct SandboxConfig {
     pub read: Vec<SandboxEntry>,
     #[serde(default)]
     pub write: Vec<SandboxEntry>,
-    /// Directories worked out by walking a base and excluding what matches, so a command gets what
-    /// it needs without saddle knowing about each tool (D62).
     #[serde(default)]
     pub include: Vec<IncludeConfig>,
-    /// whether the narrow toolchain/config includes are applied (D160). Explicit rules sharing a
-    /// base merge their exclusions; false keeps only the rules written in protected config.
     #[serde(default = "yes", rename = "include-defaults")]
     pub include_defaults: bool,
-    /// Whether the built-in tool path is added: `~/.agents`, readable by the tools that only read
-    /// (D66). On by default, because the shared skills directory is the case the property exists
-    /// for; set false to keep the tools to what is written in this file.
     #[serde(default = "yes", rename = "tools-defaults")]
     pub tools_defaults: bool,
 }
 
-/// One `[sandbox]` entry: a directory a sandboxed command may reach (D62), and, if it names tools,
-/// a directory the file tools may reach too (D66).
-///
-/// A bare path is what every entry was before tool access existed: indirect reach only, through a
-/// command. A table adds `tools`, the list of file tools that may name the directory directly.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum SandboxEntry {
     Path(String),
     WithTools {
         path: String,
-        /// Tool names, from `tools::NAMES`. Empty means indirect reach only, which is the default
-        /// for an entry that does not say otherwise (D66).
         #[serde(default)]
         tools: Vec<String>,
     },
@@ -253,7 +166,6 @@ impl SandboxEntry {
         }
     }
 
-    /// The tools the file tools may use on this directory; empty for a bare path.
     pub fn tools(&self) -> &[String] {
         match self {
             Self::Path(_) => &[],
@@ -263,10 +175,6 @@ impl SandboxEntry {
 }
 
 impl Default for SandboxConfig {
-    /// The same values serde would use for a table that omits them, because `UserConfig.sandbox`
-    /// is `#[serde(default)]`: without this a config with no `[sandbox]` table at all silently lost
-    /// the built-in include rule (D62) and the built-in tool path (D66). Both are on by default, so
-    /// "absent" must not mean "off".
     fn default() -> Self {
         Self {
             read: Vec::new(),
@@ -278,21 +186,15 @@ impl Default for SandboxConfig {
     }
 }
 
-/// The tools the built-in `~/.agents` path allows: the ones that only read. A skill is
-/// instructions, and nothing needs to write the directory they are installed in (D66).
 pub const DEFAULT_TOOL_TOOLS: &[&str] = &["read", "ls", "find", "grep"];
 
-/// A directory the file tools may reach outside every root, with the tools allowed on it (D66).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolPath {
     pub dir: PathBuf,
-    /// As written in `config.toml`, for `check` and the prompt.
     pub written: String,
     pub tools: Vec<String>,
 }
 
-/// A policy document from an `[agent]` table: the `version` line the parser requires, and the
-/// grants as written. `None` is an empty `[agent]`, which inherits everything (D63).
 pub fn policy_document_pub(agent: Option<toml::Value>) -> toml::Value {
     policy_document(agent)
 }
@@ -313,10 +215,7 @@ fn yes() -> bool {
     true
 }
 
-/// known credential patterns relative to home, rebased for .config and retained for explicit
-/// home includes (D62, D160). An unmatched pattern grants nothing by itself.
 pub const DEFAULT_EXCEPTS: &[&str] = &[
-    // keys and secret managers
     r"^\.ssh$",
     r"^\.gnupg$",
     r"^\.pki$",
@@ -325,7 +224,6 @@ pub const DEFAULT_EXCEPTS: &[&str] = &[
     r"^\.local/share/kwalletd$",
     r"^\.config/op$",
     r"^\.vault-token$",
-    // cloud and containers: a provider token, or a kubeconfig that carries one
     r"^\.aws$",
     r"^\.azure$",
     r"^\.config/gcloud$",
@@ -339,7 +237,6 @@ pub const DEFAULT_EXCEPTS: &[&str] = &[
     r"^\.config/rclone$",
     r"^\.config/doctl$",
     r"^\.config/hcloud$",
-    // forges and git credential helpers
     r"^\.config/gh$",
     r"^\.config/glab-cli$",
     r"^\.config/hub$",
@@ -347,7 +244,6 @@ pub const DEFAULT_EXCEPTS: &[&str] = &[
     r"^\.netrc$",
     r"^\.git-credentials$",
     r"^\.config/git/credentials$",
-    // package registries: a token for publishing, or for a private index
     r"^\.npmrc$",
     r"^\.yarnrc$",
     r"^\.yarnrc\.yml$",
@@ -363,30 +259,25 @@ pub const DEFAULT_EXCEPTS: &[&str] = &[
     r"^\.hex$",
     r"^\.cargo/credentials$",
     r"^\.cargo/credentials\.toml$",
-    // databases
     r"^\.pgpass$",
     r"^\.my\.cnf$",
     r"^\.mylogin\.cnf$",
-    // mail
     r"^\.msmtprc$",
     r"^\.offlineimaprc$",
     r"^\.fetchmailrc$",
     r"^\.authinfo$",
-    // shell and repl history: a secret pasted on a command line is kept here
     r"^\.bash_history$",
     r"^\.zsh_history$",
     r"^\.python_history$",
     r"^\.node_repl_history$",
     r"^\.psql_history$",
     r"^\.mysql_history$",
-    // browser and mail profiles: a session cookie is a credential
     r"^\.mozilla$",
     r"^\.thunderbird$",
     r"^\.config/google-chrome$",
     r"^\.config/chromium$",
 ];
 
-/// implicit command reads are confined to toolchain/config directories, never all of home (D160).
 pub fn default_includes() -> Vec<IncludeConfig> {
     vec![
         IncludeConfig {
@@ -414,7 +305,6 @@ pub fn default_includes() -> Vec<IncludeConfig> {
     ]
 }
 
-/// preserve the old exclusions only when a person explicitly includes their whole home (D160).
 pub fn explicit_home_defaults() -> IncludeConfig {
     IncludeConfig {
         base: "~".to_owned(),
@@ -423,31 +313,20 @@ pub fn explicit_home_defaults() -> IncludeConfig {
     }
 }
 
-/// One `[[sandbox.include]]` rule, before it is resolved.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct IncludeConfig {
-    /// The directory to walk: a root name, or a path, `~` allowed.
     pub base: String,
-    /// How deep to look for exclusions. A landlock rule is recursive, so this bounds the search,
-    /// not what is granted (D62).
     #[serde(default = "default_depth")]
     pub depth: usize,
-    /// Regular expressions matched against each directory's path relative to the base. A match
-    /// excludes that directory and everything under it.
     #[serde(default)]
     pub except: Vec<String>,
 }
 
-/// How far below the base to enumerate. Three, because the credential stores that matter are not
-/// all at the top: `.local/share/keyrings` and `.config/git/credentials` are three levels down, and
-/// a walk that stops short of them leaves the pattern matching nothing (D62).
 fn default_depth() -> usize {
     3
 }
 
-/// Applies `change` to config.toml, keeping its comments and layout, and writes the result only if
-/// it still parses as a valid config.
 pub fn edit(
     path: &Path,
     change: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
@@ -473,7 +352,6 @@ pub fn edit(
     fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
 }
 
-/// A top-level `[name]` table, created if missing.
 pub fn table<'a>(
     doc: &'a mut toml_edit::DocumentMut,
     name: &str,
@@ -484,7 +362,6 @@ pub fn table<'a>(
         .with_context(|| format!("`{name}` in config.toml must be a table"))
 }
 
-/// The `[providers.<name>]` table, created if missing.
 pub fn provider_table<'a>(
     doc: &'a mut toml_edit::DocumentMut,
     name: &str,
@@ -502,11 +379,8 @@ pub fn provider_table<'a>(
         .with_context(|| format!("`providers.{name}` in config.toml must be a table"))
 }
 
-/// The profile name that means "[agent] as written" rather than a table of its own (D175). Reserved,
-/// so `/profile none` always has somewhere to go back to.
 pub const NONE_PROFILE: &str = "none";
 
-/// A profile name must be typable after `/profile` and usable as a TOML key (D175).
 fn validate_profile_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 64
@@ -523,11 +397,6 @@ fn validate_profile_name(name: &str) -> Result<()> {
 }
 
 impl UserConfig {
-    /// The profile this run's base grants come from: what `--profile` or `/profile` chose, else the
-    /// file's own default, else none at all (D175).
-    ///
-    /// A name that is not defined is an error rather than a fallback to `[agent]`: a switch that
-    /// silently kept the wider grants would be the worst possible way for this to fail.
     pub fn profile_in_force(&self, chosen: Option<&str>) -> Result<Option<String>> {
         let Some(name) = chosen.or(self.profile.as_deref()) else {
             return Ok(None);
@@ -548,8 +417,6 @@ impl UserConfig {
         Ok(Some(name.to_owned()))
     }
 
-    /// A profile is only ever read as an `[agent]` table, so a name that cannot be typed and a
-    /// definition that is not a table are refused where they are written (D175).
     fn validate_profiles(&self) -> Result<()> {
         for (name, grants) in &self.profiles {
             validate_profile_name(name)?;
@@ -621,33 +488,18 @@ impl UserConfig {
             .collect()
     }
 
-    /// The grant document every workspace inherits, as the policy parser reads it (D63): `[agent]`
-    /// with the profile in force layered on it (D175, D176, D177).
     pub fn global_policy(&self, profile: Option<&str>) -> Result<toml::Value> {
-        // The order is the file's: `[agent]`, then the profile, then this workspace's own grants,
-        // which `Setup::load` layers on what this returns (D63, D176). So a profile names what it
-        // changes and inherits the rest — it is a layer, not a second copy of the table.
-        //
-        // No `[agent]` at all is "not configured yet", so the built-in grants apply; an `[agent]`
-        // table that is present and empty is a decision and is taken as written (D63). A profile
-        // inherits that the same way, so an empty one changes nothing.
         let agent = self.agent.clone().or_else(|| {
             toml::from_str::<toml::Value>(defaults::DEFAULT_AGENT)
                 .ok()
                 .map(|v| toml::Value::Table(v.as_table().cloned().unwrap_or_default()))
         });
         let mut document = policy_document(agent);
-        // A `-name` entry narrows what a layer below granted, and the base grants are what
-        // everything inherits (D177): refused here so it is not blamed on a profile.
         policy::check_base(&document).context("config.toml")?;
         if let Some(name) = profile {
             let Some(grants) = self.profiles.get(name).cloned() else {
-                // Unreachable: `profile_in_force` refuses a name that is not defined, before this
-                // is called. Granting nothing is the fail-closed answer if it ever is reached.
                 return Ok(policy_document(None));
             };
-            // A profile subtracts from the base with `-name` entries (D177), so a name the base
-            // does not grant is reported as the profile's mistake rather than the file's.
             document = policy::merge(document, policy_document(Some(grants)))
                 .with_context(|| format!("profiles.{name}"))?;
         }
@@ -665,9 +517,6 @@ impl UserConfig {
         Ok(document)
     }
 
-    /// The extras every child gets: named roots, plus the directories the include rules work out
-    /// (D62). Enumeration happens here because the protected directories are known here, and the
-    /// result is a plain list of paths, so the lowering itself stays a mapping.
     pub fn sandbox_extras(
         &self,
         roots: &Roots,
@@ -675,7 +524,6 @@ impl UserConfig {
     ) -> Result<(SandboxExtras, Vec<ToolPath>)> {
         let home = env::var_os("HOME").map(PathBuf::from);
         let expand = |path: &str| -> Result<PathBuf> {
-            // `~` is home itself, and `~/x` is a path in it; anything else is taken as written.
             if path == "~" {
                 return match &home {
                     Some(home) => Ok(home.clone()),
@@ -688,10 +536,6 @@ impl UserConfig {
                 (None, _) => Ok(PathBuf::from(path)),
             }
         };
-        // An entry is a root name, or a path. A path is what a toolchain directory should be:
-        // making one a root makes it nameable by every policy in the tree, and a workspace policy
-        // could then grant `fs-write` on `~/.cargo` and plant a program in `~/.cargo/bin` that runs
-        // outside the sandbox later (D62).
         let resolve = |n: &str| -> Result<PathBuf> {
             match RootName::new(n) {
                 Ok(name) if roots.contains(&name) => roots
@@ -710,11 +554,6 @@ impl UserConfig {
                 }
             }
         };
-        // An entry may not name, contain, or sit inside the state or config directory: those hold
-        // the policy, the audit log and the stored keys, and D16 says no root contains them. A
-        // sandbox entry is the same claim by another route, and it used to be unchecked, so
-        // `read = ["~/.config/saddle"]` handed a command the policy file. A rule over `~` prunes
-        // these instead, because it is a pattern rather than a claim.
         let check_protected = |path: &Path, written: &str| -> Result<()> {
             for protected in protected {
                 if path.starts_with(protected) || protected.starts_with(path) {
@@ -737,17 +576,10 @@ impl UserConfig {
                 })
                 .collect()
         };
-        // Entries that name tools are also readable by the file tools (D66). An unknown name is an
-        // error rather than a silent no-op: the list is the authority for these directories, and
-        // there is no kernel check behind a host-side tool, so a typo would otherwise read as a
-        // permission that silently does nothing.
         let mut tool_paths: Vec<ToolPath> = Vec::new();
         if self.sandbox.tools_defaults
             && let Some(home) = &home
         {
-            // The shared skills directory is the case this property exists for, so it is a default
-            // rather than something each machine writes by hand (D66). Read-only: a skill is
-            // instructions, and nothing needs to write this one.
             let dir = home.join(".agents");
             if dir.is_dir() {
                 tool_paths.push(ToolPath {
@@ -774,9 +606,6 @@ impl UserConfig {
             }
             let dir = resolve(entry.path())?;
             check_protected(&dir, entry.path())?;
-            // Two entries over one directory are one claim: the tools add up, so writing an entry
-            // for `~/.agents` adds to the default rather than replacing it. Subtracting would need
-            // a second syntax for "none of these", which is what leaving it out already means.
             let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
             match tool_paths
                 .iter_mut()
@@ -788,8 +617,6 @@ impl UserConfig {
                             existing.tools.push(tool.clone());
                         }
                     }
-                    // The written spelling is what a person recognises, so it wins over the
-                    // built-in `~/.agents`.
                     existing.written = entry.path().to_owned();
                 }
                 None => tool_paths.push(ToolPath {
@@ -816,8 +643,6 @@ impl UserConfig {
             let base = base.canonicalize().unwrap_or(base);
             explicit_home |= canonical_home.as_ref() == Some(&base);
         }
-        // An explicit home rule keeps its previous merged exclusions. Do not also add overlapping
-        // default rules: those would re-grant children that the explicit home rule excludes.
         let built_in = if !self.sandbox.include_defaults {
             Vec::new()
         } else if explicit_home {
@@ -829,15 +654,9 @@ impl UserConfig {
             .iter()
             .map(|rule| (rule, true))
             .chain(self.sandbox.include.iter().map(|rule| (rule, false)));
-        // Rules are combined per base rather than enumerated separately, and their `except` lists
-        // are merged. Two rules over the same base would otherwise *union*: the broader one grants
-        // a directory the narrower one excluded, so a person's extra pattern would do nothing.
-        // Adding an exclusion has to narrow (D62).
         let mut by_base: BTreeMap<PathBuf, (usize, Vec<regex::Regex>)> = BTreeMap::new();
         for (rule, implicit) in rules {
             let base = include_base(rule)?;
-            // A conventional include name must not silently follow a symlink to personal data.
-            // Explicit user rules retain their existing canonical-base behavior.
             if implicit
                 && !explicit_home
                 && fs::symlink_metadata(&base)
@@ -846,8 +665,6 @@ impl UserConfig {
                 continue;
             }
             if !base.is_dir() {
-                // Nothing to walk. A missing base grants nothing rather than failing the session,
-                // so a rule for a toolchain on another machine is harmless (D62).
                 continue;
             }
             let except = rule
@@ -858,7 +675,6 @@ impl UserConfig {
                         .with_context(|| format!("config.toml: [[sandbox.include]] except `{p}`"))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            // Canonical, so `~` and `/home/me` are one base rather than two that overlap.
             let key = base.canonicalize().unwrap_or_else(|_| base.clone());
             let slot = by_base.entry(key).or_insert((0, Vec::new()));
             slot.0 = slot.0.max(rule.depth);
@@ -894,8 +710,6 @@ mod tests {
     use crate::tui::keys::Keys;
     use std::fs;
 
-    /// A profile is a layer between the base and the project's own grants: it names what it
-    /// changes and inherits the rest (D176).
     #[test]
     fn a_profile_is_layered_on_the_base_and_an_unknown_one_grants_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -924,7 +738,6 @@ mod tests {
             Some(20),
             "the base as written"
         );
-        // A scope the profile names replaces that scope; every other scope is inherited.
         let build = agent(Some("build"));
         assert_eq!(build["exec"]["timeout-secs"].as_integer(), Some(300));
         assert_eq!(
@@ -932,20 +745,16 @@ mod tests {
             Some("api.example.com"),
             "a profile inherits what it does not name: {build:?}"
         );
-        // A list scope can be emptied by a layer, which is how a profile narrows one.
         let offline = agent(Some("offline"));
         assert!(offline["net"].as_array().unwrap().is_empty());
         assert!(
             offline.contains_key("exec"),
             "a scope written as a table cannot be removed by a layer: {offline:?}"
         );
-        // An empty profile changes nothing, and an unknown one never reaches here — if it did, it
-        // grants nothing rather than falling back to the base.
         assert_eq!(agent(Some("empty")), agent(None));
         assert!(agent(Some("missing")).is_empty());
     }
 
-    /// Which profile a run uses, and what a name that does not exist does (D175).
     #[test]
     fn the_profile_in_force_is_the_runs_choice_else_the_files_default() {
         let dir = tempfile::tempdir().unwrap();
@@ -981,8 +790,6 @@ mod tests {
         );
     }
 
-    /// A name that cannot be typed after `/profile`, and a definition that is not a table, are
-    /// refused where they are written (D175).
     #[test]
     fn a_profile_name_and_body_are_validated_where_they_are_written() {
         let dir = tempfile::tempdir().unwrap();
@@ -1031,8 +838,6 @@ mod tests {
 
     #[test]
     fn the_maths_scale_is_read_and_a_misspelling_is_refused() {
-        // D165: how large a formula is drawn is the person's setting, like the theme; a key that
-        // does not exist is an error rather than something silently ignored.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(&path, "[ui]\nmath-scale = 1.25\n").unwrap();
@@ -1048,8 +853,6 @@ mod tests {
 
     #[test]
     fn a_bound_key_is_read_from_the_file_and_a_misspelt_one_is_an_error() {
-        // D169: the table is the only place a key with no default can come from, so a line that does
-        // not name a key has to fail here rather than become a key that never fires.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(
@@ -1062,28 +865,20 @@ mod tests {
             bound.keys.ends().as_deref(),
             Some("ctrl+n/alt+j branch ends")
         );
-        // Absent is a session with no such key, not an error.
         fs::write(&path, "").unwrap();
         let none = UserConfig::load(&path).unwrap();
         assert_eq!(none.keys, Keys::default());
         assert_eq!(none.keys.ends(), None);
-        // A spelling this build does not know names the line it was written on.
         fs::write(&path, "[keys]\ntree-next-end = \"ctrln\"\n").unwrap();
-        // The chain, because the outermost message is only the file: what says `ctrln` is the
-        // parse error inside it, and that is what a person needs to see.
         let error = format!("{:#}", UserConfig::load(&path).unwrap_err());
         assert!(error.contains("ctrln"), "{error}");
         assert!(error.contains("not a key"), "{error}");
-        // And a key this table does not have is refused like any other unknown field.
         fs::write(&path, "[keys]\ntree-nxt-end = \"ctrl+n\"\n").unwrap();
         assert!(UserConfig::load(&path).is_err());
     }
 
     #[test]
     fn an_old_percent_grants_file_is_renamed_and_stamped_in_one_pass() {
-        // D63: the `%` name is the only one that decodes exactly, so the rename and the
-        // `workspace` line happen together. Doing them as two passes left the line behind, and it
-        // arrived only on the next run.
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
         fs::write(&config, "provider = \"synthetic\"\n").unwrap();
@@ -1100,7 +895,6 @@ mod tests {
         assert!(text.contains("workspace = \"/home/me/my-proj\""), "{text}");
         assert!(text.contains("exec"), "the grants survive: {text}");
 
-        // Running again changes nothing.
         assert!(migrate(&config, &policies).unwrap().is_empty());
         assert_eq!(fs::read_to_string(&new).unwrap(), text);
     }
@@ -1153,31 +947,18 @@ mod tests {
     }
 }
 
-/// Grants changed for one run, from `--grant` and `--revoke` (D63).
-///
-/// They are folded into the workspace's own document before it is parsed, so a session override
-/// goes through exactly the same validation and the same audit record as a grant written in the
-/// file. Nothing is stored: the session ends and they are gone.
 #[derive(Debug, Clone, Default)]
 pub struct Overrides {
-    /// `scope` or `scope:root`, as in `--grant fs-read:scratch` or `--grant exec`.
     pub grant: Vec<String>,
-    /// A scope whose grants are dropped for this session, as in `--revoke net`.
     pub revoke: Vec<String>,
-    /// The profile this run or session chose, from `--profile` or `/profile` (D175). It travels
-    /// here because it has the same lifetime as the two above — a run's choice, never written — and
-    /// because a reload reads it again from the same place, so a switch survives one.
     pub profile: Option<String>,
 }
 
 impl Overrides {
-    /// Whether a grant was changed by hand. A profile is not one: it selects the base those grants
-    /// come from, so it does not turn on the merge below.
     pub fn is_empty(&self) -> bool {
         self.grant.is_empty() && self.revoke.is_empty()
     }
 
-    /// A phrase for the session intro, so what was changed is visible rather than remembered.
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
         for g in &self.grant {
@@ -1192,7 +973,6 @@ impl Overrides {
         parts.join(" ")
     }
 
-    /// Applies the overrides to an `[agent]` table, in place.
     pub fn apply(&self, agent: &mut toml::Table) -> Result<()> {
         for scope in &self.revoke {
             let (scope, rest) = split_scope(scope);
@@ -1208,7 +988,6 @@ impl Overrides {
                 .or_insert_with(|| toml::Value::Array(Vec::new()));
             match rest {
                 "" => {
-                    // A scope with no parameters: `exec`, `net` is not one of these.
                     if matches!(
                         scope,
                         "fs-read" | "fs-write" | "net" | "tool" | "tool-read" | "run-binary"
@@ -1284,15 +1063,8 @@ fn split_scope(spec: &str) -> (&str, &str) {
     }
 }
 
-/// Folds `policy.toml` and `policies/*.toml` into `config.toml`, once (D63).
-///
-/// **Temporary.** The split between a policy file and a config file is gone, so an older install
-/// has grants in files that are no longer read. This moves them into the one file and renames the
-/// originals `.imported`, the same way the JSON Lines transcripts were imported (D53). It is
-/// written to be deleted in the next version, when only the merged layout exists.
 pub fn migrate(path: &Path, policies: &Path) -> Result<Vec<PathBuf>> {
     let mut touched = Vec::new();
-    // 1. The base grants, if they are still in `policy.toml`.
     let global = path.with_file_name("policy.toml");
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -1317,14 +1089,10 @@ pub fn migrate(path: &Path, policies: &Path) -> Result<Vec<PathBuf>> {
                 fs::create_dir_all(dir)?;
             }
             fs::write(path, &out).with_context(|| format!("{}", path.display()))?;
-            // Kept under a name nothing reads, so a second run is a no-op.
             let _ = fs::rename(&global, global.with_extension("toml.imported"));
             touched.push(global);
         }
     }
-    // 2. Workspace grants files named with the old `%` separator: renamed, and the `workspace`
-    // line stamped in the same step. The `%` form is the only name that decodes exactly, and doing
-    // the two as separate passes is what made the line arrive one run late (D63).
     if let Ok(entries) = fs::read_dir(policies) {
         let mut found: Vec<PathBuf> = entries
             .flatten()

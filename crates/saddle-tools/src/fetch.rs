@@ -1,5 +1,3 @@
-//! fetch schema, UTF-8 interpretation and bounded presentation belong to the guest (D143).
-
 use saddle_limits as budgets;
 #[cfg(target_arch = "wasm32")]
 use saddle_sdk::configure_limits;

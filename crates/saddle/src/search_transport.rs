@@ -1,5 +1,3 @@
-//! protected search-provider communication and per-principal bounded response snapshots (D143).
-
 use saddle_limits as budgets;
 use saddle_limits::Budgets;
 use std::collections::BTreeMap;
@@ -24,7 +22,6 @@ pub struct CachedSearch {
     pub source: String,
 }
 
-/// apply narrower cache budgets immediately on reload, not just on the next insertion (D145).
 pub fn trim_cache(session: &mut Session) {
     trim_snapshots(&mut session.search_snapshots, &session.setup.tool_limits);
 }
@@ -96,8 +93,6 @@ pub fn search(
     if let Err(why) = network::permit(session, who, call, "POST", &target, &headers)? {
         return Ok(Err(why));
     }
-    // Only this fixed provider protocol can carry protected credentials. No endpoint/header/key
-    // selector is accepted from the guest, and redirects are never followed with these headers.
     let secret = if let Some(target) = &provider {
         let Some(secret) = provider_key(session, target) else {
             return Ok(Err(format!(

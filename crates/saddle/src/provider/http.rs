@@ -1,5 +1,3 @@
-//! The provider's HTTP request, with retries for overload and rate limits.
-
 use std::cmp::Reverse;
 use std::io::{BufRead, BufReader};
 use std::thread;
@@ -20,14 +18,12 @@ use super::{
 };
 
 const ATTEMPTS: u32 = 4;
-/// A reply larger than this is cut off rather than buffered without bound.
 const BODY_LIMIT: u64 = 512 * 1024 * 1024;
 
 pub fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(30)))
-        // A local server can take minutes to read a long prompt before it answers.
         .timeout_recv_response(Some(Duration::from_secs(600)))
         .timeout_per_read(Some(Duration::from_secs(300)))
         .user_agent(concat!("saddle/", env!("CARGO_PKG_VERSION")))
@@ -35,25 +31,18 @@ pub fn agent() -> ureq::Agent {
         .into()
 }
 
-/// What the request thread sends back.
 pub(crate) enum Msg {
     Event(sse::Event),
-    /// What the response's headers said about the allowance left (D36).
     Quota(Quota),
     Note(String),
     Failed(anyhow::Error),
     End,
 }
 
-/// A streamed reply fed by something other than HTTP, such as the WebSocket the subscription
-/// backend takes (D101). The consumer cannot tell the two apart.
 pub(crate) fn event_stream(rx: Receiver<Msg>, stop: Arc<AtomicBool>) -> EventStream {
     EventStream { rx, stop }
 }
 
-/// A streamed reply read on its own thread. Waiting on it checks for a cancel every 50 ms, so a
-/// cancel takes effect at once even while the network is silent: the stream is abandoned, and
-/// its thread exits (closing the connection) as soon as its blocked read returns.
 pub struct EventStream {
     rx: Receiver<Msg>,
     stop: Arc<AtomicBool>,
@@ -84,8 +73,6 @@ impl sse::Events for EventStream {
     }
 }
 
-/// POSTs `body` on a new thread, retrying overload and rate limits, and streams back the
-/// server-sent events of a successful response.
 pub fn stream(
     p: &Provider,
     url: String,
@@ -156,7 +143,6 @@ impl Request {
         let _ = self.tx.send(Msg::Note(text));
     }
 
-    /// The response body once the status is a success, or `None` if the stream was abandoned.
     fn send(&self) -> Result<Option<impl BufRead + use<>>> {
         let url = &self.url;
         let mut attempt = 0;
@@ -174,8 +160,6 @@ impl Request {
             }
             let (status, retry_after, text) = match req.send(&self.bytes[..]) {
                 Ok(resp) if resp.status().is_success() => {
-                    // The allowance headers are only on the response, so they are read here and
-                    // handed to the sink with the stream (D36).
                     if let Some(quota) = quota_from(resp.headers()) {
                         let _ = self.tx.send(Msg::Quota(quota));
                     }
@@ -224,7 +208,6 @@ impl Request {
         }
     }
 
-    /// Sleeps for `wait`, returning early when the stream is abandoned.
     fn pause(&self, wait: Duration) {
         let end = Instant::now() + wait;
         while !self.stopped() {
@@ -239,14 +222,11 @@ impl Request {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelsError {
-    /// The server refused the key (401 or 403).
     Rejected(String),
-    /// Anything else: no route, no models endpoint, a server error.
     Failed(String),
 }
 
 impl ModelsError {
-    /// The reason, for a message that has to carry it.
     pub fn reason(&self) -> &str {
         match self {
             Self::Rejected(why) | Self::Failed(why) => why,
@@ -254,7 +234,6 @@ impl ModelsError {
     }
 }
 
-/// Ids that are not chat models, in the lists OpenAI and others return.
 const NOT_CHAT: &[&str] = &[
     "embed",
     "tts",
@@ -271,8 +250,6 @@ const NOT_CHAT: &[&str] = &[
     "sora",
 ];
 
-/// One entry of a model list, with the context window and the price the server stated for it,
-/// where it states them at all (D34, D36).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelInfo {
     pub id: String,
@@ -280,22 +257,11 @@ pub struct ModelInfo {
     pub price: Option<Price>,
 }
 
-/// Lists the provider's chat models, newest first where the server says when each was created.
-/// It also checks the key, so `/login` calls it before saving anything.
-///
-/// The windows it carries are where a real context limit comes from, so `/login` and `/model`
-/// cache them (D34).
 pub fn list_models(p: &Provider) -> Result<Vec<ModelInfo>, ModelsError> {
     let served = served(list_from_endpoint(p)?, p.config.api)?;
     Ok(served)
 }
 
-/// What an answer means, once it has been parsed.
-///
-/// Separated from the request because the interesting case is an answer with nothing in it: the
-/// subscription backend gates its catalogue on the client version and replies `{"models": []}`
-/// rather than an error, so silence there has a cause, and naming it is the difference between a
-/// picker and a bug report (D85). Every other server is allowed to list nothing.
 pub fn served(models: Vec<ModelInfo>, api: Api) -> Result<Vec<ModelInfo>, ModelsError> {
     if models.is_empty() && api == Api::OpenaiResponses {
         return Err(ModelsError::Failed(format!(
@@ -307,11 +273,6 @@ pub fn served(models: Vec<ModelInfo>, api: Api) -> Result<Vec<ModelInfo>, Models
     Ok(models)
 }
 
-/// Where to ask what a provider serves.
-///
-/// One place, because the subscription backend's route is `/codex/models` *with* a version, and a
-/// base URL that already ends in `/codex` makes this the easiest thing in the file to get wrong
-/// (D85).
 pub fn listing_url(config: &ProviderConfig) -> String {
     let base = config.base_url.trim_end_matches('/');
     match config.api {
@@ -331,13 +292,9 @@ fn list_from_endpoint(p: &Provider) -> Result<Vec<ModelInfo>, ModelsError> {
         .build()
         .into();
     let base = &config.base_url;
-    // The credential goes where the provider wants it and the provider's own headers ride along, so
-    // a listing checks the same thing a turn will send: a login's token and its account (D84, D85).
     let headers = p.request_headers();
     let mut request = match config.api {
         Api::Openai => agent.get(format!("{base}/models")),
-        // The subscription backend states which catalogue it serves in a query parameter, and
-        // answers an empty list to a version it does not know (D85).
         Api::OpenaiResponses => agent.get(listing_url(config)),
         Api::Anthropic => agent
             .get(format!("{base}/v1/models?limit=1000"))
@@ -371,11 +328,6 @@ fn list_from_endpoint(p: &Provider) -> Result<Vec<ModelInfo>, ModelsError> {
     Ok(model_entries(&parsed))
 }
 
-/// Fetches the provider's own usage or quota endpoint and reads what it says (D36).
-///
-/// A usage endpoint is not standardised, so this takes the URL from the config and reads the answer
-/// for the fields in use rather than for one documented shape. The JSON is walked, so a figure
-/// nested under `data`, `usage` or `quota` is found where a server puts it.
 pub(super) fn fetch_usage_headers(
     url: &str,
     headers: &[(String, String)],
@@ -413,8 +365,6 @@ pub(super) fn fetch_usage_headers(
         .map_err(|_| ModelsError::Failed("the usage page is not JSON".into()))
 }
 
-/// Every key whose value is a number, paired with its own name and its parents', lowercased, so a
-/// field can be recognised by the words around it rather than by one fixed path.
 fn flattened(v: &Value, path: &str, out: &mut Vec<(String, f64)>) {
     match v {
         Value::Object(map) => {
@@ -438,7 +388,6 @@ fn flattened(v: &Value, path: &str, out: &mut Vec<(String, f64)>) {
                 out.push((path.to_owned(), n));
             }
         }
-        // A number sent as a string, which several billing APIs do.
         Value::String(s) => {
             if let Ok(n) = s.trim().parse::<f64>() {
                 out.push((path.to_owned(), n));
@@ -448,8 +397,6 @@ fn flattened(v: &Value, path: &str, out: &mut Vec<(String, f64)>) {
     }
 }
 
-/// The paths a usage page holds numbers at, lowercased and dot-joined, which is the schema a
-/// person needs to say why a figure was not found, without printing the figures themselves (D36).
 pub fn page_paths(page: &Value) -> Vec<String> {
     let mut numbers = Vec::new();
     flattened(page, "", &mut numbers);
@@ -459,16 +406,7 @@ pub fn page_paths(page: &Value) -> Vec<String> {
     paths
 }
 
-/// The shape Synthetic's `/v2/quotas` states, read by name rather than by words (D49).
-///
-/// The page reports three pools at once, and only the first is this conversation's allowance:
-/// `subscription` is the chat requests, `search.hourly` is web searches, and `planWeeklyLimit` is
-/// the plan as a percentage. Matching by words anywhere in the page would take whichever came
-/// first, which here is the search pool — so a page of a known shape is read at its paths.
 fn known_quota(page: &Value) -> Option<Quota> {
-    // The plan's own allowance, which is the one figure worth the space: the page also reports a
-    // five-hour request pool and a web-search pool, and neither is what governs a week of work
-    // (D49). The pools it does not report are left absent rather than shown as zero.
     if let Some(percent) = at(page, "planWeeklyLimit.percentRemaining")
         .or_else(|| at(page, "planWeeklyLimit.percent_remaining"))
         .and_then(number)
@@ -482,10 +420,6 @@ fn known_quota(page: &Value) -> Option<Quota> {
             ..Quota::default()
         });
     }
-    // A plan that states no weekly figure still states its request pool, and that pool is a cap.
-    // `subscription.requests` is what has been spent of it, not what is left: it reads 0 against a
-    // limit of 500 with a refill hours away, and had it meant what is left the account would be
-    // locked out at that moment, while the caller is talking to it (D49).
     let limit = at(page, "subscription.limit").and_then(number)?;
     let used = at(page, "subscription.requests")
         .and_then(number)
@@ -501,16 +435,11 @@ fn known_quota(page: &Value) -> Option<Quota> {
     })
 }
 
-/// Reads a usage page into a [`Quota`] (D36). A shape that is known is read by name (D49); anything
-/// else is matched by the words in its path, so `data.usage.remaining_tokens` and
-/// `quota.tokens_left` are the same figure. Anything not found stays absent rather than becoming a
-/// zero.
 pub fn quota_from_page(page: &Value) -> (Quota, Option<f64>) {
     if let Some(quota) = openai_account::quota(page) {
         return (quota, None);
     }
     if let Some(quota) = known_quota(page) {
-        // What was spent is not on this page, so there is nothing to add to it (D49).
         return (quota, None);
     }
     let mut numbers = Vec::new();
@@ -541,8 +470,6 @@ pub fn quota_from_page(page: &Value) -> (Quota, Option<f64>) {
             .map(|(_, n)| *n as u64)
     };
     let text = |words: &[&str]| -> Option<String> {
-        // A reset is a date or a duration, so it is a string rather than a number, wherever the
-        // server puts it.
         fn walk(v: &Value, words: &[&str], found: &mut Option<String>) {
             match v {
                 Value::Object(map) => {
@@ -570,17 +497,12 @@ pub fn quota_from_page(page: &Value) -> (Quota, Option<f64>) {
         found
     };
 
-    // A page that reports usage rather than what is left is still a quota as long as it states the
-    // cap: 40 used against 500 leaves 460. The cap is read first so the derivation can use it.
     let left = |left: Option<f64>, used: Option<f64>, limit: Option<u64>| -> Option<u64> {
         match (left, used, limit) {
             (None, Some(used), Some(limit)) => Some(limit.saturating_sub(used as u64)),
             (left, _, _) => left.map(|n| n as u64),
         }
     };
-    // A cap is spelled `limit`, `cap` or `total`; a bare `limit` is matched too, because that is
-    // what it is called next to a pool it belongs to (`{"limit": 500, "requests": 0}`), and the
-    // context word keeps it from being read as the other pool's (D49).
     let tokens_limit = limit_of(
         &[
             "limit_tokens",
@@ -637,9 +559,6 @@ pub fn quota_from_page(page: &Value) -> (Quota, Option<f64>) {
     (quota, spent)
 }
 
-/// The context window a listing states for one model, if it states one. Servers disagree on the
-/// field name, so all the ones seen in the wild are read; an entry that states none leaves the
-/// question to `config.toml` and to [`super::known_window`].
 fn stated_window(m: &Value) -> Option<u64> {
     const FIELDS: &[&str] = &[
         "context_window",
@@ -652,16 +571,11 @@ fn stated_window(m: &Value) -> Option<u64> {
     let stated = FIELDS
         .iter()
         .find_map(|f| m.get(f).and_then(Value::as_u64))
-        // An aggregator reports the limit of the endpoint behind the model.
         .or_else(|| m.get("top_provider")?.get("context_length")?.as_u64())
         .or_else(|| m.get("meta")?.get("n_ctx")?.as_u64());
-    // A zero or an absurdly small number is a placeholder, not a limit.
     stated.filter(|n| *n >= 1_000)
 }
 
-/// A figure, whether the wire sent it as a number or as a string. Billing APIs do both, and
-/// Synthetic writes prices with a currency symbol (`"$0.0000006"`), so the symbol and any thousands
-/// separators are dropped first (D36).
 fn number(v: &Value) -> Option<f64> {
     match v {
         Value::Number(n) => n.as_f64(),
@@ -676,19 +590,12 @@ fn number(v: &Value) -> Option<f64> {
     }
 }
 
-/// Looks one field up by a dotted path, so a known shape can be named rather than guessed at (D49).
 fn at<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
     path.split('.')
         .try_fold(v, |v, key| v.get(key))
         .filter(|v| !v.is_null())
 }
 
-/// The price a listing states for one model, if it states one (D36).
-///
-/// Servers publish prices in two units and under several shapes: per token as a decimal string
-/// ("0.000003", how the aggregators do it), or per million tokens as a number ("3.0", how a model
-/// card reads). The unit is taken from a stated one where the server states it, and otherwise from
-/// the magnitude, because the two are a million apart and a wrong guess is not a rounding error.
 fn listing_price(m: &Value) -> Option<Price> {
     stated_price(m).map(|(price, unit)| match unit {
         Unit::Token => price,
@@ -701,7 +608,6 @@ fn listing_price(m: &Value) -> Option<Price> {
     })
 }
 
-/// Which unit a listing's prices are in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Unit {
     Token,
@@ -709,11 +615,9 @@ enum Unit {
 }
 
 fn stated_price(m: &Value) -> Option<(Price, Unit)> {
-    // The price object, wherever this server puts it.
     let p = ["pricing", "price", "cost", "costs", "billing"]
         .iter()
         .find_map(|k| m.get(*k).filter(|v| v.is_object()))?;
-    // A nested `per_million` object is the unit, spelled out.
     let nested = |k: &str| p.get(k).filter(|v| v.is_object());
     let (table, mut unit) = match (nested("per_million"), nested("per_token")) {
         (Some(t), _) => (t, Unit::Million),
@@ -756,7 +660,6 @@ fn stated_price(m: &Value) -> Option<(Price, Unit)> {
         ])
         .unwrap_or(0.0),
         cache_read: field(&[
-            // Synthetic names the cache prices in the plural, and the others in the singular.
             "input_cache_reads",
             "input_cache_read",
             "cache_read",
@@ -775,9 +678,6 @@ fn stated_price(m: &Value) -> Option<(Price, Unit)> {
     if !price.is_known() {
         return None;
     }
-    // With no stated unit, the magnitude decides: per-token prices are far below a thousandth of a
-    // dollar, and per-million prices are far above it, so the gap leaves no doubt. A server that
-    // states its unit is never overruled.
     if !stated && unit == Unit::Token {
         let largest = [
             Some(price.input),
@@ -798,7 +698,6 @@ fn stated_price(m: &Value) -> Option<(Price, Unit)> {
 fn model_entries(v: &Value) -> Vec<ModelInfo> {
     let items = v["data"]
         .as_array()
-        // The subscription backend's catalogue: `{"models": [{"slug": "gpt-…"}]}` (D85).
         .or_else(|| v["models"].as_array())
         .or_else(|| v.as_array())
         .cloned()
@@ -821,7 +720,6 @@ fn model_entries(v: &Value) -> Vec<ModelInfo> {
             ))
         })
         .collect();
-    // Stable: servers that give no dates keep their own order.
     models.sort_by_key(|m| Reverse(m.0));
     models.dedup_by(|a, b| a.1.id == b.1.id);
     models.into_iter().map(|(_, m)| m).collect()
@@ -834,17 +732,10 @@ fn transient(e: &ureq::Error) -> bool {
     )
 }
 
-/// 408, 409, 429 and 5xx, including Anthropic's 529 (overloaded).
 fn retryable(status: u16) -> bool {
     matches!(status, 408 | 409 | 429) || status >= 500
 }
 
-/// The allowance left, from the response headers (D36).
-///
-/// Two families are in use: `x-ratelimit-*`, which OpenAI-compatible servers send and which name a
-/// limit alongside the remainder, and `anthropic-ratelimit-*`, which names the resource and then
-/// the field. Both are read from whichever header the server actually sent, since a server that
-/// states only one of the four is common.
 fn quota_from(headers: &HeaderMap) -> Option<Quota> {
     let mut primary = serde_json::Map::new();
     let mut secondary = serde_json::Map::new();
@@ -925,7 +816,6 @@ fn backoff(attempt: u32, retry_after: Option<u64>) -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Both APIs put the message at `error.message`.
 fn error_message(text: &str) -> String {
     let parsed: Option<Value> = serde_json::from_str(text).ok();
     let message = parsed.as_ref().and_then(|v| {
@@ -933,9 +823,6 @@ fn error_message(text: &str) -> String {
             .as_str()
             .or_else(|| v["message"].as_str())
             .or_else(|| v["error"].as_str())
-            // FastAPI's shape, which is what the subscription backend speaks: `detail` is a string,
-            // or a list of `{loc, msg}` entries that reads as a fragment of JSON if it is not
-            // unpacked (D85).
             .or_else(|| v["detail"].as_str());
         if let Some(m) = direct {
             return Some(m.to_owned());
@@ -954,8 +841,6 @@ fn error_message(text: &str) -> String {
         })
     });
     let mut m = message.unwrap_or_else(|| text.trim().to_owned());
-    // A body that is not JSON at all may still be several lines of it; one line reads better in a
-    // dialog that shows one.
     if m.contains('\n') && m.lines().count() > 1 {
         m = m.split_whitespace().collect::<Vec<_>>().join(" ");
     }
@@ -1012,7 +897,6 @@ mod tests {
             .into_iter()
             .map(|m| m.context_window)
             .collect();
-        // An absent or placeholder field leaves the question open rather than answering zero.
         assert_eq!(
             windows,
             [
@@ -1028,7 +912,6 @@ mod tests {
 
     #[test]
     fn a_listing_carries_the_price_its_server_states() {
-        // OpenRouter publishes dollars per token as strings; a few servers send numbers.
         let v: Value = serde_json::from_str(
             r#"{"data": [
                 {"id": "a", "pricing": {"prompt": "0.000003", "completion": "0.000015",
@@ -1044,14 +927,12 @@ mod tests {
         assert_eq!(prices[0].unwrap().output, 1.5e-5);
         assert_eq!(prices[0].unwrap().cache_read, Some(3e-7));
         assert_eq!(prices[1].unwrap().input, 1e-6);
-        // A stated zero is not a price; it is a model nobody priced.
         assert_eq!(prices[2], None);
         assert_eq!(prices[3], None);
     }
 
     #[test]
     fn a_price_is_read_in_the_shape_and_unit_its_server_uses() {
-        // Per token, as a decimal string: the aggregator shape.
         let v: Value = serde_json::from_str(
             r#"{"data": [{"id": "a", "pricing": {"prompt": "0.000003", "completion": "0.000015"}}]}"#,
         )
@@ -1060,7 +941,6 @@ mod tests {
         assert_eq!(p.input, 3e-6);
         assert_eq!(p.output, 1.5e-5);
 
-        // Per million, as numbers, which is a million-fold difference: $3 in, $15 out.
         let v: Value = serde_json::from_str(
             r#"{"data": [{"id": "a", "pricing": {"input": 3.0, "output": 15.0, "cache_read": 0.3}}]}"#,
         )
@@ -1070,7 +950,6 @@ mod tests {
         assert_eq!(p.output, 1.5e-5);
         assert_eq!(p.cache_read, Some(3e-7));
 
-        // The unit stated outright beats the guess.
         let v: Value = serde_json::from_str(
             r#"{"data": [{"id": "a", "pricing": {"unit": "per_million_tokens", "input": 2.0, "output": 4.0}}]}"#,
         )
@@ -1086,7 +965,6 @@ mod tests {
             "a stated unit is not overruled by the magnitude"
         );
 
-        // Nested objects and other key names still answer.
         let v: Value = serde_json::from_str(
             r#"{"data": [{"id": "a", "cost": {"per_million": {"input_price": 1.0, "output_price": 2.0}}}]}"#,
         )
@@ -1098,9 +976,6 @@ mod tests {
 
     #[test]
     fn a_listing_priced_with_currency_symbols_is_read() {
-        // The shape Synthetic actually serves, copied from a live /models response: prices per
-        // token as `$`-prefixed strings, the cache prices in the plural, and the window in
-        // `context_length`.
         let v: Value = serde_json::from_str(
             r#"{"data": [{
                 "id": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
@@ -1120,17 +995,14 @@ mod tests {
         )
         .unwrap();
         let m = &model_entries(&v)[0];
-        // The window was in the field the parser reads, so 524288 and not the 128k default.
         assert_eq!(m.context_window, Some(524_288));
         let price = m.price.expect("a price despite the `$`");
         assert_eq!(price.input, 6e-7, "$0.60 per million");
         assert_eq!(price.output, 1.2e-6, "$1.20 per million");
         assert_eq!(price.cache_read, Some(3e-8), "$0.03 per million");
         assert_eq!(price.cache_write, Some(0.0), "stated as free");
-        // The magnitude rule leaves a per-token price per token.
         assert!((price.input * 1e6 - 0.6).abs() < 1e-9);
 
-        // A free model states zeros, which is no price rather than a price of zero (D36).
         let v: Value = serde_json::from_str(
             r#"{"data": [{"id": "infinite:small:vision", "context_length": 524288,
                 "pricing": {"prompt": "0", "completion": "0", "input_cache_reads": "0"}}]}"#,
@@ -1143,7 +1015,6 @@ mod tests {
 
     #[test]
     fn a_usage_page_is_read_wherever_its_figures_sit() {
-        // One shape: a balance and a reset.
         let page: Value = serde_json::from_str(
             r#"{"data": {"credits": {"remaining": 12.5, "resets_at": "2026-12-01T00:00:00Z"}}}"#,
         )
@@ -1153,7 +1024,6 @@ mod tests {
         assert_eq!(q.reset.as_deref(), Some("2026-12-01T00:00:00Z"));
         assert_eq!(spent, None);
 
-        // Another: token and request windows with limits, plus spend.
         let page: Value = serde_json::from_str(
             r#"{"usage": {"limits": [
                 {"remaining_tokens": 48000, "limit_tokens": 1000000},
@@ -1168,7 +1038,6 @@ mod tests {
         assert_eq!(q.requests_limit, Some(100));
         assert_eq!(spent, Some(0.4231));
 
-        // A page with nothing recognisable is empty rather than a row of zeros.
         let page: Value = serde_json::from_str(r#"{"ok": true, "balance_updated": null}"#).unwrap();
         let (q, spent) = quota_from_page(&page);
         assert!(q.is_empty());
@@ -1177,8 +1046,6 @@ mod tests {
 
     #[test]
     fn the_synthetic_quota_page_is_read_at_its_paths() {
-        // The real body of `https://api.synthetic.new/v2/quotas`, with the figures as they came
-        // back (D49).
         let page: Value = serde_json::from_str(
             r#"{"subscription":{"limit":500,"requests":0,
                     "renewsAt":"2026-11-12T13:18:26.671Z"},
@@ -1189,13 +1056,8 @@ mod tests {
         )
         .unwrap();
         let (q, spent) = quota_from_page(&page);
-        // The weekly allowance is the figure, and it comes with its own regen stamp.
         assert_eq!(q.percent.map(|p| p.round()), Some(94.0));
         assert_eq!(q.reset.as_deref(), Some("2026-11-12T08:26:09.000Z"));
-        // The request pool refills in a five-hour window and the search pool is not this
-        // conversation's allowance, so neither is read: the page reports them, and a status bar
-        // shows one figure (D49). Reading them by words would have taken the *search* pool, since
-        // `search` sorts before `subscription` in the page.
         assert_eq!(q.requests, None);
         assert_eq!(q.requests_limit, None);
         assert_eq!(q.tokens, None);
@@ -1204,8 +1066,6 @@ mod tests {
 
     #[test]
     fn a_plan_without_a_weekly_figure_states_its_request_pool() {
-        // The same page with no `planWeeklyLimit`, which is a plan sold by request count: 0 spent
-        // of 500 leaves 500 (D49).
         let page: Value = serde_json::from_str(
             r#"{"subscription":{"limit":500,"requests":0,
                 "renewsAt":"2026-11-12T13:18:26.671Z"},
@@ -1221,8 +1081,6 @@ mod tests {
 
     #[test]
     fn a_page_that_reports_usage_yields_what_is_left() {
-        // The word-matching path, for a shape nobody has named yet: 40 used of 500 is 460 left,
-        // and a page that states what is left directly is not second-guessed (D49).
         let used: Value =
             serde_json::from_str(r#"{"data": {"requests_used": 40, "requests_limit": 500}}"#)
                 .unwrap();
@@ -1233,14 +1091,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(quota_from_page(&left).0.requests, Some(460));
-        // Usage with no cap says nothing about what is left, so it stays absent rather than zero.
         let uncapped: Value = serde_json::from_str(r#"{"data": {"tokens_used": 40}}"#).unwrap();
         assert_eq!(quota_from_page(&uncapped).0.tokens, None);
     }
 
     #[test]
     fn an_unrecognised_page_reports_its_field_names_not_its_figures() {
-        // The diagnostic that matters when a provider's shape is new: what the numbers are called.
         let page: Value = serde_json::from_str(
             r#"{"data": {"monthly": {"tokens_used": 1234567, "cap": 5000000},
                 "reset_at": "2026-12-01T00:00:00Z"}}"#,
@@ -1262,7 +1118,6 @@ mod tests {
         assert_eq!(q.tokens_limit, Some(1_000_000));
         assert_eq!(q.reset.as_deref(), Some("6m0s"));
 
-        // Anthropic names the resource first, and often states only one of the pair.
         let mut h = HeaderMap::new();
         h.insert(
             "anthropic-ratelimit-input-tokens-remaining",
@@ -1277,7 +1132,6 @@ mod tests {
         assert_eq!(q.requests, Some(9));
         assert_eq!(q.tokens_limit, None);
 
-        // A server that states neither leaves the status line as it was.
         assert_eq!(quota_from(&HeaderMap::new()), None);
         let mut other = HeaderMap::new();
         other.insert("retry-after", "3".parse().unwrap());
@@ -1307,8 +1161,6 @@ mod tests {
 
     #[test]
     fn the_listing_url_is_the_one_the_backend_serves() {
-        // D85: the route is `/codex/models` and it *requires* the version, so both halves matter
-        // and both were wrong at some point.
         let mut config = ProviderConfig {
             api: Api::OpenaiResponses,
             base_url: "https://chatgpt.com/backend-api/codex".into(),
@@ -1334,14 +1186,12 @@ mod tests {
                 CLIENT_VERSION
             )
         );
-        // The trailing slash a user's base URL may carry is not part of the route.
         config.base_url = "https://chatgpt.com/backend-api/codex/".into();
         assert!(
             listing_url(&config).contains("/codex/models?"),
             "{}",
             listing_url(&config)
         );
-        // A compatible server keeps its own, plain listing.
         config.api = Api::Openai;
         assert_eq!(
             listing_url(&config),
@@ -1351,8 +1201,6 @@ mod tests {
 
     #[test]
     fn the_served_catalogue_is_read_from_slugs() {
-        // D85: the subscription backend answers `{"models": [{"slug": …}]}`, not `{"data":
-        // [{"id": …}]}`, and the ids are what a request has to name.
         let served: Value = serde_json::from_str(
             r#"{"models":[
                 {"slug":"gpt-6.1-sol","display_name":"GPT-6.1 Sol"},
@@ -1366,7 +1214,6 @@ mod tests {
             ["gpt-6.1-sol", "gpt-5.6-luna"],
             "the served order is kept"
         );
-        // The `/v1/models` shape still reads, because a compatible server is not that backend.
         let openai: Value =
             serde_json::from_str(r#"{"data":[{"id":"gpt-5.4","created":2}]}"#).unwrap();
         assert_eq!(model_entries(&openai)[0].id, "gpt-5.4");
@@ -1374,21 +1221,16 @@ mod tests {
 
     #[test]
     fn an_empty_served_catalogue_names_the_client_version() {
-        // The backend gates its list on `client_version` and answers an empty list, not an error, so
-        // silence there has a cause and the message has to say which version was asked with (D85).
         let ModelsError::Failed(why) = served(Vec::new(), Api::OpenaiResponses).unwrap_err() else {
             panic!("an empty catalogue is a failure with a reason");
         };
         assert!(why.contains(CLIENT_VERSION), "{why}");
         assert!(why.contains("too old"), "{why}");
-        // A server that simply has no models is not that case, and says nothing.
         assert_eq!(served(Vec::new(), Api::Openai).unwrap(), vec![]);
     }
 
     #[test]
     fn the_reported_client_version_is_a_current_one() {
-        // D85: the catalogue is gated on this, and an old value silently returns fewer models, so it
-        // has to be a plain Codex CLI version and not something that predates the gate.
         let v = CLIENT_VERSION;
         let parts: Vec<&str> = v.split('.').collect();
         assert_eq!(parts.len(), 3, "{v}");
@@ -1409,8 +1251,6 @@ mod tests {
             "Overloaded"
         );
         assert_eq!(error_message("upstream down"), "upstream down");
-        // The shape the subscription backend answers with, which used to reach the dialog as a
-        // fragment of JSON (D85).
         assert_eq!(
             error_message(
                 r#"{"detail":[{"loc":["body","client_version"],"msg":"Field required","input":null}]}"#

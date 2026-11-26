@@ -1,11 +1,3 @@
-//! pi's theme vocabulary (D73). A `Palette` holds every role pi's schema defines, so a pi theme
-//! file or a pasted pi colour table is understood whole; [`Palette::to_theme`] narrows it to the
-//! roles this interface actually paints.
-//!
-//! The names, the optional fallbacks and the colour forms are pi's, from its published schema:
-//! fifty required roles, five that fall back when omitted, `vars`, and colours written as hex,
-//! OKLCH, OKHSL, a palette index, a var, or the terminal default.
-
 use anyhow::{Context, Result, bail};
 use ratatui::style::Color;
 use std::collections::BTreeMap;
@@ -13,7 +5,6 @@ use std::collections::BTreeMap;
 use super::terminal;
 use super::theme::{Appearance, Theme, builtin_palette, colour_value, palette};
 
-/// Every role pi requires.
 pub const REQUIRED: &[&str] = &[
     "accent",
     "border",
@@ -68,7 +59,6 @@ pub const REQUIRED: &[&str] = &[
     "bashMode",
 ];
 
-/// The roles pi lets a theme omit, and what they fall back to.
 pub const OPTIONAL: &[(&str, &str)] = &[
     ("scrollbarTrack", "muted"),
     ("scrollbarThumb", "text"),
@@ -77,7 +67,6 @@ pub const OPTIONAL: &[(&str, &str)] = &[
     ("thinkingMax", "thinkingXhigh"),
 ];
 
-/// Every role a theme may name, required first.
 pub fn all_roles() -> Vec<&'static str> {
     REQUIRED
         .iter()
@@ -86,7 +75,6 @@ pub fn all_roles() -> Vec<&'static str> {
         .collect()
 }
 
-/// pi's role set, as a table of colours.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Palette {
     pub accent: Color,
@@ -140,7 +128,6 @@ pub struct Palette {
     pub thinking_high: Color,
     pub thinking_xhigh: Color,
     pub bash_mode: Color,
-    // Optional, resolved when the palette is built.
     pub scrollbar_track: Color,
     pub scrollbar_thumb: Color,
     pub search_match_bg: Color,
@@ -149,7 +136,6 @@ pub struct Palette {
 }
 
 impl Default for Palette {
-    /// pi's `dark` theme, which is also what this harness drew before themes existed.
     fn default() -> Self {
         Self {
             accent: Color::Cyan,
@@ -213,7 +199,6 @@ impl Default for Palette {
 }
 
 impl Palette {
-    /// Sets one role by pi's name, including the optional ones.
     pub fn set(&mut self, role: &str, colour: Color) -> Result<()> {
         let mut applied = true;
         match role {
@@ -273,15 +258,12 @@ impl Palette {
             "searchMatchBg" => self.search_match_bg = colour,
             "searchMatchText" => self.search_match_text = colour,
             "thinkingMax" => self.thinking_max = colour,
-            // D71's kebab-case spellings, accepted so a config written in the minutes they existed
-            // still loads.
             other => {
                 applied = false;
                 let _ = other;
             }
         }
         if !applied {
-            // Aliases for the roles D71 named differently.
             if let Some(role) = alias(role) {
                 return self.set(role, colour);
             }
@@ -293,7 +275,6 @@ impl Palette {
         Ok(())
     }
 
-    /// Resolves the optional roles' fallbacks, which pi applies when a theme omits them.
     fn fill_fallbacks(&mut self, given: &[String]) {
         let has = |name: &str| given.iter().any(|g| g == name);
         if !has("scrollbarTrack") {
@@ -313,10 +294,6 @@ impl Palette {
         }
     }
 
-    /// Narrows a palette to the roles this interface paints (D73).
-    ///
-    /// Everything pi defines is kept in the palette; the renderer is handed only what it draws, so a
-    /// role with no element behind it is carried rather than mistaken for a mistake.
     pub fn to_theme(&self, name: &str, appearance: Appearance) -> Theme {
         Theme {
             name: name.to_owned(),
@@ -360,7 +337,6 @@ impl Palette {
         }
     }
 
-    /// The palette a `[themes.<name>]` table describes, starting from `base`.
     pub fn from_table(table: &toml::Table, base: Palette) -> Result<Self> {
         let mut palette = base;
         let mut given = Vec::new();
@@ -404,7 +380,6 @@ fn palette_index(index: i64) -> Result<Color> {
     palette(index)
 }
 
-/// The roles D71 spelled differently.
 fn alias(role: &str) -> Option<&'static str> {
     Some(match role {
         "border-accent" => "borderAccent",
@@ -441,16 +416,8 @@ fn alias(role: &str) -> Option<&'static str> {
     })
 }
 
-/// A text colour that reads on `background` (D73).
-///
-/// The theme names the background but not what sits on it, so the foreground is chosen by measured
-/// contrast: the theme's own text colour when it clears the WCAG ratio, otherwise black or white,
-/// whichever contrasts more. A selection that is unreadable because the theme picked a pale
-/// background and a pale text colour is the one failure a derived theme must not have.
 fn contrast_on(background: Color, preferred: Color) -> Color {
     let Some(bg) = rgb(background) else {
-        // A terminal default or a palette index is not a colour this can measure, so the theme's
-        // preference stands.
         return preferred;
     };
     let ratio = |fg: (f64, f64, f64)| {
@@ -470,15 +437,12 @@ fn contrast_on(background: Color, preferred: Color) -> Color {
     }
 }
 
-/// sRGB components in 0..=1, for the colours this can measure.
 pub fn rgb(colour: Color) -> Option<(f64, f64, f64)> {
     let channel = |v: u8| f64::from(v) / 255.0;
     match colour {
         Color::Rgb(r, g, b) => Some((channel(r), channel(g), channel(b))),
         Color::Black => Some((0.0, 0.0, 0.0)),
         Color::White => Some((1.0, 1.0, 1.0)),
-        // The eight ANSI colours are whatever the terminal says; the standard values are what a
-        // contrast calculation can use, and being wrong by a shade only moves a threshold.
         Color::Red => Some((0.80, 0.0, 0.0)),
         Color::Green => Some((0.0, 0.80, 0.0)),
         Color::Yellow => Some((0.80, 0.80, 0.0)),
@@ -491,7 +455,6 @@ pub fn rgb(colour: Color) -> Option<(f64, f64, f64)> {
     }
 }
 
-/// WCAG relative luminance.
 pub fn luminance((r, g, b): (f64, f64, f64)) -> f64 {
     let lin = |v: f64| {
         if v <= 0.039_28 {
@@ -503,12 +466,6 @@ pub fn luminance((r, g, b): (f64, f64, f64)) -> f64 {
     0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
 }
 
-/// One colour moved `fraction` of the way to another (D76).
-///
-/// A palette defines surfaces as greys, not as tints, so a panel that has to say pass or fail has no
-/// colour of its own to use. Blending the flavour's own base towards its green or red keeps the hue
-/// of the theme instead of importing a background from nowhere — which is how the terminal ports of
-/// this palette do the same thing.
 pub fn blend(from: Color, to: Color, fraction: f64) -> Color {
     let (Some(a), Some(b)) = (rgb(from), rgb(to)) else {
         return from;
@@ -520,7 +477,6 @@ pub fn blend(from: Color, to: Color, fraction: f64) -> Color {
     ))
 }
 
-/// The syntax colours, taken from a palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SyntaxColours {
     pub comment: Color,
@@ -550,11 +506,6 @@ impl SyntaxColours {
     }
 }
 
-/// pi's JSON theme file, which is what a theme copied from pi is (D73).
-///
-/// Nothing reads this at runtime yet — themes come from `[themes]` in `config.toml` (D72) — so it is
-/// built only where it is checked: the parity test below, which pins that a file pi accepts is
-/// understood whole, so accepting one later is a matter of a path, not of the parser.
 #[cfg(test)]
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -572,7 +523,6 @@ pub struct PiTheme {
 
 #[cfg(test)]
 impl PiTheme {
-    /// The palette file describes, starting from `base`.
     pub fn palette(&self, base: Palette) -> Result<Palette> {
         let mut palette = base;
         let mut vars = BTreeMap::new();
@@ -610,13 +560,10 @@ impl PiTheme {
     }
 }
 
-/// What the terminal reported about itself (D73).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reported {
-    /// The default foreground and background, if the terminal answered.
     pub foreground: Option<Color>,
     pub background: Option<Color>,
-    /// The sixteen ANSI colours, in order, where the terminal answered for them.
     pub ansi: [Option<Color>; 16],
 }
 
@@ -636,20 +583,12 @@ impl Reported {
     }
 }
 
-/// A palette derived from a terminal's own colours, with the appearance it was built for (D73).
 pub struct Derived {
     pub palette: Palette,
     pub appearance: Appearance,
 }
 
 impl Palette {
-    /// The palette derived from what the terminal reports (D73).
-    ///
-    /// This is pi's `system` theme: each role takes its hue from a terminal colour — errors from
-    /// red, links from blue, and so on — and its lightness is placed so it stands out from the
-    /// reported background. With nothing reported it is the ANSI-only fallback: terminal colours and
-    /// default, and no block backgrounds, since a background nobody reported cannot be contrasted
-    /// against.
     pub fn from_report(report: &Reported) -> Derived {
         let background = report.background;
         let appearance = match background.and_then(rgb) {
@@ -668,8 +607,6 @@ impl Palette {
                 appearance,
             };
         }
-        // A hue from the terminal where it reported one, else this harness's own choice for that
-        // role. `place` then puts it at a lightness that reads against the background.
         let base = match appearance {
             Appearance::Dark => Palette::default(),
             Appearance::Light => builtin_palette("light").unwrap_or_default(),
@@ -699,7 +636,6 @@ impl Palette {
         palette.tool_diff_removed =
             hue_or(report, 1, base.tool_diff_removed, background, appearance);
         palette.tool_diff_context = palette.muted;
-        // The syntax roles follow the same hues, so a highlighted block reads as part of the theme.
         palette.syntax_comment = palette.muted;
         palette.syntax_keyword = palette.error;
         palette.syntax_function = hue_or(report, 5, base.syntax_function, background, appearance);
@@ -709,7 +645,6 @@ impl Palette {
         palette.syntax_type = hue_or(report, 6, base.syntax_type, background, appearance);
         palette.syntax_operator = palette.error;
         palette.syntax_punctuation = palette.muted;
-        // Block backgrounds are mixed from the reported background, so they work on any terminal.
         let shade = |toward: f64| mix(background.unwrap_or(Color::Reset), appearance, toward);
         palette.tool_pending_bg = shade(0.06);
         palette.tool_success_bg = shade(0.06);
@@ -727,10 +662,6 @@ impl Palette {
         }
     }
 
-    /// The ANSI-only fallback, for a terminal that answered nothing (D73).
-    ///
-    /// pi's behaviour: ANSI indices and the terminal's default colours, faint secondary text, and no
-    /// panel backgrounds, because a background nobody reported cannot be contrasted against.
     fn fallback(_appearance: Appearance) -> Palette {
         Palette {
             accent: Color::Cyan,
@@ -782,16 +713,11 @@ impl Palette {
         }
     }
 
-    /// Derives from what this process's terminal reported (D73).
-    ///
-    /// The answer is fetched once, before the interface starts (see [`super::terminal::prime`]); a
-    /// theme rebuilt mid-session reuses it, so a light/dark switch is the one thing that re-derives.
     pub fn from_terminal() -> Derived {
         Self::from_report(&terminal::prime())
     }
 }
 
-/// The terminal's colour `index`, if it reported one, otherwise `fallback`'s hue.
 fn hue_or(
     report: &Reported,
     index: usize,
@@ -805,11 +731,6 @@ fn hue_or(
     }
 }
 
-/// `colour` moved towards or away from the background until it clears `ratio` (D73).
-///
-/// This is pi's contrast rule without the full colour science: a terminal palette is chosen for the
-/// terminal's own background, so a role usually clears the floor untouched, and the cases that do not
-/// are one that is nearly the background's own lightness.
 fn place(colour: Color, background: Option<Color>, appearance: Appearance, ratio: f64) -> Color {
     let (Some(bg), Some(fg)) = (background.and_then(rgb), rgb(colour)) else {
         return colour;
@@ -819,16 +740,11 @@ fn place(colour: Color, background: Option<Color>, appearance: Appearance, ratio
         let (hi, lo) = if a > b { (a, b) } else { (b, a) };
         (hi + 0.05) / (lo + 0.05)
     };
-    // Headroom for the rounding to eight bits a terminal takes, so a role that just clears the
-    // floor does not land a shade under it.
     let ratio = ratio * 1.02;
     if ratio_of(fg) >= ratio {
-        // A named ANSI colour becomes the value it stands for, so a derived palette does not depend
-        // on the terminal's palette a second time — which is what makes the ratio a fact.
         return srgb(fg);
     }
     let target = match appearance {
-        // On a dark background move towards white, on a light one towards black.
         Appearance::Dark => 1.0,
         Appearance::Light => 0.0,
     };
@@ -855,7 +771,6 @@ fn lerp(from: f64, to: f64, t: f64) -> f64 {
     from + (to - from) * t
 }
 
-/// A background a little lighter or darker than the reported one, for a panel (D73).
 fn mix(background: Color, appearance: Appearance, amount: f64) -> Color {
     let Some(bg) = rgb(background) else {
         return background;
@@ -904,8 +819,6 @@ mod tests {
 
     #[test]
     fn every_role_in_the_list_can_be_set_on_a_palette() {
-        // The list is what the error message offers and what a pi theme may name, so a name in it
-        // that does not set anything would be a false promise.
         for role in all_roles() {
             let mut p = Palette::default();
             p.set(role, Color::Cyan)
@@ -930,7 +843,6 @@ mod tests {
         assert_eq!(p.search_match_bg, Color::Rgb(7, 8, 9), "from selectedBg");
         assert_eq!(p.search_match_text, Color::Rgb(4, 5, 6), "from text");
         assert_eq!(p.thinking_max, Color::Rgb(10, 11, 12), "from thinkingXhigh");
-        // A role that was given is not overwritten.
         p.fill_fallbacks(&["scrollbarTrack".into()]);
         assert_eq!(p.scrollbar_track, Color::Rgb(1, 2, 3));
     }
@@ -962,7 +874,6 @@ mod tests {
         );
         assert!(matches!(palette.error, Color::Rgb(r, _, _) if r > 150));
         assert_eq!(theme.appearance(), Some(Appearance::Dark));
-        // Unknown keys are refused, since pi's schema rejects them too.
         let bad = r##"{"colors": {"nonsense": "#fff"}}"##;
         let theme: PiTheme = serde_json::from_str(bad).unwrap();
         assert!(theme.palette(Palette::default()).is_err());
@@ -970,8 +881,6 @@ mod tests {
         assert!(serde_json::from_str::<PiTheme>(unknown).is_err());
     }
 
-    /// The WCAG contrast ratio between two colours, written out so the test does not lean on the
-    /// code it is checking.
     fn contrast(a: Color, b: Color) -> f64 {
         let lum = |c: Color| {
             let Color::Rgb(r, g, b) = c else {
@@ -1000,9 +909,6 @@ mod tests {
         }
     }
 
-    /// Every role that paints text, with the ratio it must clear: 4.5 for what a person reads, and a
-    /// fainter floor for the two roles whose job is to be secondary (`muted`, and `dim` for text that
-    /// is already known).
     fn text_roles(p: &Palette) -> Vec<(&'static str, Color, f64)> {
         vec![
             ("text", p.text, 4.5),
@@ -1024,8 +930,6 @@ mod tests {
 
     #[test]
     fn the_derived_roles_clear_the_contrast_floor_on_a_terminal_background() {
-        // pi's rule: derived text clears 4.5:1 against the reported background (D73). Two very
-        // different backgrounds, because the derivation walks towards white or black.
         for (bg, fg) in [
             (Color::Rgb(0x1e, 0x1e, 0x1e), Color::Rgb(0xd4, 0xd4, 0xd4)),
             (Color::Rgb(0xfd, 0xfd, 0xfd), Color::Rgb(0x1a, 0x1a, 0x1a)),
@@ -1033,7 +937,7 @@ mod tests {
             let derived = Palette::from_report(&report(bg, fg));
             for (role, colour, floor) in text_roles(&derived.palette) {
                 if colour == Color::Reset {
-                    continue; // the terminal's own foreground, which is already on its background
+                    continue;
                 }
                 let ratio = contrast(colour, bg);
                 assert!(
@@ -1046,7 +950,6 @@ mod tests {
 
     #[test]
     fn a_nearly_invisible_terminal_colour_is_moved_until_it_reads() {
-        // A muted role that is the background's own lightness is the case the floor exists for.
         let bg = Color::Rgb(0x28, 0x28, 0x28);
         let derived = Palette::from_report(&report(bg, Color::Rgb(0xff, 0xff, 0xff)));
         assert!(
@@ -1059,7 +962,6 @@ mod tests {
             "dim is faint on purpose, but not invisible: {:?}",
             derived.palette.dim
         );
-        // And a colour that already reads is left alone.
         assert_eq!(
             derived.palette.text,
             Color::Rgb(0xff, 0xff, 0xff),
@@ -1077,15 +979,12 @@ mod tests {
         let light =
             Palette::from_report(&report(Color::Rgb(0xfa, 0xfa, 0xfa), Color::Rgb(0, 0, 0)));
         assert_eq!(light.appearance, Appearance::Light);
-        // A panel background moves away from the reported one, so it is visible on either.
         assert!(contrast(dark.palette.selected_bg, Color::Rgb(0x10, 0x10, 0x10)) > 1.1);
         assert!(contrast(light.palette.selected_bg, Color::Rgb(0xfa, 0xfa, 0xfa)) > 1.1);
     }
 
     #[test]
     fn a_terminal_that_reports_a_palette_colours_the_roles_from_it() {
-        // Blue for links and red for errors come from the terminal's own ANSI colours when it has
-        // them, so the theme looks like the rest of the session (D73).
         let mut r = report(Color::Rgb(0x18, 0x18, 0x18), Color::Rgb(0xee, 0xee, 0xee));
         r.ansi[1] = Some(Color::Rgb(0xff, 0x55, 0x55));
         r.ansi[4] = Some(Color::Rgb(0x55, 0x88, 0xff));
@@ -1106,7 +1005,6 @@ mod tests {
 
     #[test]
     fn a_silent_terminal_gets_the_ansi_fallback() {
-        // pi's behaviour when nothing answers: ANSI colours, no panel backgrounds (D73).
         let derived = Palette::from_report(&Reported::nothing());
         let p = &derived.palette;
         assert_eq!(p.accent, Color::Cyan);
@@ -1123,7 +1021,6 @@ mod tests {
 
     #[test]
     fn a_derived_palette_builds_a_theme_that_paints_syntax() {
-        // The whole point of the derivation is that the renderer gets a complete theme out of it.
         let derived = Palette::from_report(&report(
             Color::Rgb(0x10, 0x10, 0x10),
             Color::Rgb(0xee, 0xee, 0xee),
@@ -1136,15 +1033,11 @@ mod tests {
 
     #[test]
     fn a_selection_foreground_is_chosen_by_contrast() {
-        // A pale background with a pale preferred colour: neither white nor pale reads, so the
-        // darker one is chosen.
         let pale_bg = Color::Rgb(240, 240, 240);
         assert_eq!(contrast_on(pale_bg, Color::White), Color::Black);
         let dark_bg = Color::Rgb(20, 20, 30);
         assert_eq!(contrast_on(dark_bg, Color::Black), Color::White);
-        // A preferred colour that already clears 4.5:1 is kept.
         assert_eq!(contrast_on(dark_bg, Color::White), Color::White);
-        // An unmeasurable background keeps the preference.
         assert_eq!(contrast_on(Color::Reset, Color::White), Color::White);
     }
 }

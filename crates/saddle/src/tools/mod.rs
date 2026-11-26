@@ -1,5 +1,3 @@
-//! standard/third-party component dispatch and host MCP discovery, never native tool fallbacks (D17, D147).
-
 use crate::mcp::registry;
 use crate::plugins;
 use crate::plugins::hooks;
@@ -21,20 +19,16 @@ use serde_json::{Value, json};
 use crate::provider::{Provenance, ToolDef, visible_tool_text};
 use crate::session::Session;
 
-/// What the model sees. A denial is an ordinary result with `ok: false`, not a host error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutput {
     pub provenance: Option<Box<Provenance>>,
     pub ok: bool,
     pub content: String,
-    /// For the transcript only: a line diff of the file the call changed.
     pub diff: Option<String>,
-    /// Pictures the call produced, such as a screenshot `read` was asked for (D58).
     pub images: Vec<Image>,
 }
 
 impl ToolOutput {
-    /// human rendering only; providers/store always retain the original content and provenance.
     pub fn visible_content(&self) -> &str {
         visible_tool_text(&self.content, self.provenance.as_deref())
     }
@@ -85,7 +79,6 @@ pub const NAMES: &[&str] = &[
     "ask",
 ];
 
-/// The tools as the model sees them. The descriptions say when to use each one.
 pub fn definitions() -> Vec<ToolDef> {
     vec![timeout::definition(ToolDef {
         name: "tool_search".into(),
@@ -109,8 +102,6 @@ pub fn definitions() -> Vec<ToolDef> {
     })]
 }
 
-/// Runs one tool as the agent. `Err` means the host itself failed (for example, the audit log
-/// could not be written) and the session must stop.
 pub fn call(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutput> {
     let limits = session.setup.tool_limits.clone();
     let deadline = match timeout::parse(input) {
@@ -138,7 +129,6 @@ pub fn call(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutp
                 HarnessKind::ToolEnd,
                 json!({"tool":name,"ok":output.ok,"content":output.content,"provenance":output.provenance}),
             )?;
-            // Never downgrade a fatal host/audit error to a timeout.
             if timeout::expired() && output.provenance.is_none() {
                 Ok(ToolOutput {
                     ok: false,
@@ -157,8 +147,6 @@ pub fn call(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutp
 
 fn call_inner(session: &mut Session, name: &str, input: &Value) -> Result<ToolOutput> {
     match name {
-        // `tool_search` is the one name that is the host's rather than a component's: it declares
-        // what a granted MCP server offers, and decides nothing (D108).
         "tool_search" => tool_search::search(session, input),
         name if NAMES.contains(&name) => {
             let mut registry = mem::take(&mut session.plugins);
@@ -173,7 +161,6 @@ fn call_inner(session: &mut Session, name: &str, input: &Value) -> Result<ToolOu
             out
         }
         _ if name.starts_with(registry::PREFIX) => {
-            // Same reason as `tool_search`: the registry is a field of the session it has to ask.
             let mut registry = mem::take(&mut session.mcp);
             let out = registry.call(name, input, session);
             session.mcp = registry;

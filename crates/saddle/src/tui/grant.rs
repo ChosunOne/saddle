@@ -1,14 +1,3 @@
-//! Writing one change into a workspace's grants (D45).
-//!
-//! The edit is made on the parsed TOML document, and the result is reduced to the policy a session
-//! would read and then validated, so a change from the menu either lands as grants that load or
-//! does not land at all. Only this workspace's own file under `policies/` is touched: `[agent]` in
-//! `config.toml` is the base, and a change made while working in a project is a change to that
-//! project (D63).
-//!
-//! A line typed into the add prompt is checked by the same code that writes it (D173), so the entry
-//! the prompt shows and the entry the file gets are one thing.
-
 use std::fs;
 use std::path::Path;
 
@@ -21,35 +10,23 @@ use toml_edit::{DocumentMut, Item, Table, Value, value};
 
 use super::permissions::Change;
 
-/// What one typed line asks for, checked against the file as it will be (D173). The add prompt
-/// draws both halves as the line is typed, and `add` writes exactly this.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preview {
-    /// One sentence naming what the grant reaches, repeated once it has landed.
     pub summary: String,
-    /// The entry it becomes, so what is on screen is what will be in the file.
     pub line: String,
-    /// Something the entry itself does not say, such as a base list this project's own will
-    /// replace.
     pub note: Option<String>,
 }
 
-/// Applies `change` to the grants file at `path`, refusing anything that would not load afterwards.
-/// `roots` is the set the session would resolve, so the check is the session's own.
 pub fn edit(path: &Path, change: &Change, roots: &Roots) -> Result<()> {
     let mut doc = read(path)?;
     match change {
         Change::Exclude { rule, patterns } => exclude(&mut doc, rule, patterns)?,
         Change::Toggle { rule, on } => toggle(&mut doc, rule, *on)?,
-        // Adding goes through its own entry point, which answers with what it added.
         Change::Add(what) => bail!("`{what}` is added with `grant::add`"),
     }
     publish(path, &doc, roots)
 }
 
-/// Adds one grant to this workspace's policy (D46). `what` is what a person typed, one line:
-/// `net https://api.example.com/v2`, `net api.example.com:8443`, `root scratch`, `exec`,
-/// `tokens 200000`.
 pub fn add(path: &Path, what: &str, roots: &Roots) -> Result<Preview> {
     let mut doc = read(path)?;
     let preview = append(&mut doc, what, roots, None)?;
@@ -57,13 +34,6 @@ pub fn add(path: &Path, what: &str, roots: &Roots) -> Result<Preview> {
     Ok(preview)
 }
 
-/// What `add` would write for `what`, from this project's file as it reads now and the base it is
-/// laid over (D173): the add prompt checks the line as it is typed, so a mistake is a message
-/// beside the line rather than a refusal after it, and a line that reads well is already known to
-/// be one that lands.
-///
-/// Nothing is written, and the check is the one `add` makes, so the two cannot disagree about a
-/// line that parses.
 pub fn draft(text: &str, base: &str, what: &str, roots: &Roots) -> Result<Preview> {
     let mut doc = document(text).context("this project's grants file")?;
     let preview = append(&mut doc, what, roots, Some(base))?;
@@ -71,8 +41,6 @@ pub fn draft(text: &str, base: &str, what: &str, roots: &Roots) -> Result<Previe
     Ok(preview)
 }
 
-/// The file as a document a change can be made on, with the `version` line a policy needs if it has
-/// none yet: a file of nothing but comments becomes usable with its first grant (D43).
 fn document(text: &str) -> Result<DocumentMut> {
     let mut doc: DocumentMut = text.parse().context("the file is not TOML")?;
     if doc.get("version").is_none() {
@@ -81,14 +49,11 @@ fn document(text: &str) -> Result<DocumentMut> {
     Ok(doc)
 }
 
-/// The grants file as it reads now, ready for a change to be made on it.
 fn read(path: &Path) -> Result<DocumentMut> {
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     document(&text).with_context(|| format!("{}", path.display()))
 }
 
-/// Validates the document the way a session would, then writes it, so a change either lands as
-/// grants that load or leaves the file as it was (D45).
 fn publish(path: &Path, doc: &DocumentMut, roots: &Roots) -> Result<()> {
     let out = doc.to_string();
     validate(&out, roots)
@@ -96,12 +61,6 @@ fn publish(path: &Path, doc: &DocumentMut, roots: &Roots) -> Result<()> {
     fs::write(path, out).with_context(|| format!("writing {}", path.display()))
 }
 
-/// The check a session makes: the file still parses as TOML, and the grants in it still lower to a
-/// policy (D43, D45, D63).
-///
-/// A session reads a workspace file by keeping `version`, `agent` and `plugin` and dropping the
-/// rest — the `workspace` line that names the directory, and the `[sandbox]` lists — so this does
-/// the same. Parsing the file whole would fail on the very line that makes it a workspace's.
 fn validate(out: &str, roots: &Roots) -> Result<()> {
     let doc: TomlTable = toml::from_str(out).context("the file is not TOML")?;
     let version = doc
@@ -122,7 +81,6 @@ fn validate(out: &str, roots: &Roots) -> Result<()> {
     Ok(())
 }
 
-/// The `[agent]` table a change belongs in, created if the file has none yet (D63).
 fn agent(doc: &mut DocumentMut) -> Result<&mut Table> {
     if doc.get("agent").is_none() {
         doc.insert("agent", Item::Table(Table::new()));
@@ -132,7 +90,6 @@ fn agent(doc: &mut DocumentMut) -> Result<&mut Table> {
         .context("`agent` is not a table")
 }
 
-/// `agent.fs-read[0]` names the first entry of the `fs-read` list.
 fn fs_key(rule: &str) -> Result<(&'static str, usize)> {
     let (scope, rest) = if let Some(rest) = rule.strip_prefix("agent.fs-read[") {
         ("fs-read", rest)
@@ -151,8 +108,6 @@ fn fs_key(rule: &str) -> Result<(&'static str, usize)> {
 fn exclude(doc: &mut DocumentMut, rule: &str, patterns: &[String]) -> Result<()> {
     let (scope, index) = fs_key(rule)?;
     let table = agent(doc)?;
-    // A policy can write a list either as `[[fs-read]]` sections or inline as `[{ root = "…" }]`,
-    // and both have to be editable.
     let item = table
         .get_mut(scope)
         .with_context(|| format!("`{rule}` is not in the policy file"))?;
@@ -197,7 +152,6 @@ fn set_exclude(entry: &mut Table, patterns: &[String]) {
     }
 }
 
-/// The form a typed line starts with, and the rest of it (D46).
 fn split_what(what: &str) -> (String, String) {
     let what = what.trim();
     match what.split_once(char::is_whitespace) {
@@ -206,9 +160,6 @@ fn split_what(what: &str) -> (String, String) {
     }
 }
 
-/// Appends the grant `what` describes, and answers with what it will be. `base` is `[agent]` in
-/// `config.toml`, which is what a note about a replaced list is about; `add` passes none, since a
-/// note is for the prompt rather than for the file.
 fn append(doc: &mut DocumentMut, what: &str, roots: &Roots, base: Option<&str>) -> Result<Preview> {
     let (kind, argument) = split_what(what);
     match kind.as_str() {
@@ -303,7 +254,6 @@ fn append(doc: &mut DocumentMut, what: &str, roots: &Roots, base: Option<&str>) 
     }
 }
 
-/// The roots this session has, for the message that says a name is not one of them (D30).
 fn root_names(roots: &Roots) -> String {
     roots
         .iter()
@@ -312,11 +262,6 @@ fn root_names(roots: &Roots) -> String {
         .join(", ")
 }
 
-/// One `net` grant as a person typed it (D173).
-///
-/// The host pattern, the scheme and the port are all written into the entry, so what a grant
-/// reaches is in the file rather than in a default the reader has to know: a grant with no `port`
-/// allows only the scheme's own, which is the mistake that reads as "I granted that host".
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Net {
     host: HostPattern,
@@ -325,7 +270,6 @@ struct Net {
 }
 
 impl Net {
-    /// One sentence naming what the grant reaches, in the form a request names it.
     fn summary(&self) -> String {
         let url = format!("{}://{}:{}", self.scheme.as_str(), self.host, self.port);
         if matches!(self.host, HostPattern::Any) {
@@ -335,7 +279,6 @@ impl Net {
         }
     }
 
-    /// The entry as it will be written.
     fn line(&self) -> String {
         format!(
             "[[agent.net]]  host = \"{}\"  scheme = \"{}\"  port = {}",
@@ -346,13 +289,7 @@ impl Net {
     }
 }
 
-/// `net` accepts what a request names: a URL — `https://api.example.com/v2/catalogue?q=1` — or the
-/// address alone, `api.example.com`, `api.example.com:8443`, `*.example.com`, `*`, `127.0.0.1:8080`
-/// (D173). A scheme typed as part of the address decides http or https, and the port defaults to
-/// that scheme's.
 fn parse_net(argument: &str) -> Result<Net> {
-    // A `#` starts the grant's reason, and a path, query or fragment names no host, so neither is
-    // part of the grant.
     let address = argument.split('#').next().unwrap_or_default().trim();
     let (scheme, rest) = match address.split_once("://") {
         Some((scheme, rest)) => match scheme.to_ascii_lowercase().as_str() {
@@ -366,7 +303,6 @@ fn parse_net(argument: &str) -> Result<Net> {
         None => (UrlScheme::Https, address),
     };
     let authority = rest.split(['/', '?']).next().unwrap_or_default();
-    // `user:password@host` names a host after the `@`; the credentials are not part of a grant.
     let authority = match authority.rsplit_once('@') {
         Some((_, host)) => host,
         None => authority,
@@ -384,8 +320,6 @@ fn parse_net(argument: &str) -> Result<Net> {
     Ok(Net { host, scheme, port })
 }
 
-/// `host:port` or the host alone. An IPv6 literal may be bracketed, and a bare one must not have
-/// its last group read as a port.
 fn host_and_port(authority: &str) -> Result<(String, Option<u16>)> {
     if let Some(rest) = authority.strip_prefix('[') {
         let (host, after) = rest
@@ -397,7 +331,6 @@ fn host_and_port(authority: &str) -> Result<(String, Option<u16>)> {
         };
         return Ok((host.to_owned(), port));
     }
-    // More than one colon is an address, not an address and a port.
     if authority.matches(':').count() > 1 {
         return Ok((authority.to_owned(), None));
     }
@@ -412,9 +345,6 @@ fn port_of(port: &str) -> Result<u16> {
         .with_context(|| format!("`{port}` is not a port"))
 }
 
-/// What the prompt should say about the change besides the entry: `config.toml`'s base grants this
-/// scope and the file does not, and a list written here replaces the base's rather than adding to
-/// it (D63, D173).
 fn note_for(doc: &DocumentMut, base: Option<&str>, scope: &str) -> Option<String> {
     let base = base?;
     let own = doc
@@ -434,7 +364,6 @@ fn note_for(doc: &DocumentMut, base: Option<&str>, scope: &str) -> Option<String
     })
 }
 
-/// How many entries `[agent]` in `config.toml` grants for `scope`.
 fn base_grants(base: &str, scope: &str) -> usize {
     let Ok(doc) = base.parse::<TomlTable>() else {
         return 0;
@@ -445,7 +374,6 @@ fn base_grants(base: &str, scope: &str) -> usize {
         .map_or(0, Vec::len)
 }
 
-/// A `why` the person typed after a `#`, which is optional (D41).
 fn why_of(what: &str) -> toml_edit::Value {
     match what.split_once('#') {
         Some((_, why)) if !why.trim().is_empty() => Value::from(why.trim()),
@@ -453,7 +381,6 @@ fn why_of(what: &str) -> toml_edit::Value {
     }
 }
 
-/// Appends a table to a list of tables, creating the list if this policy has none.
 fn push_table(table: &mut Table, scope: &str, fields: &[(&str, toml_edit::Value)]) -> Result<()> {
     let mut entry = Table::new();
     for (k, v) in fields {
@@ -479,8 +406,6 @@ fn push_table(table: &mut Table, scope: &str, fields: &[(&str, toml_edit::Value)
 }
 
 fn toggle(doc: &mut DocumentMut, rule: &str, on: bool) -> Result<()> {
-    // Only scopes with no parameters can be switched from here; everything else is a table or a
-    // list that needs arguments, which is what the file is for.
     let scope = rule
         .strip_prefix("agent.")
         .with_context(|| format!("`{rule}` is not an agent scope"))?;
@@ -534,13 +459,11 @@ mod tests {
             text.contains(r#"exclude = [".env*", "/secrets"]"#),
             "{text}"
         );
-        // The other grant is untouched.
         assert!(
             text.contains(r#"fs-write = [{ root = "workspace" }]"#),
             "{text}"
         );
 
-        // Emptying it removes the key rather than writing `exclude = []`.
         edit(
             &path,
             &Change::Exclude {
@@ -569,16 +492,12 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("past the end"), "{e}");
-        // Nothing was written.
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "version = 1\n\n[agent]\nfs-read = [{ root = \"workspace\" }]\n"
         );
     }
 
-    /// The file a session actually keeps is the one `session` writes: a `workspace` line and a
-    /// comment header, with no `version` and no `[agent]` yet (D43). The edit has to see past that
-    /// line — an edit that failed here would fail in every workspace there is.
     #[test]
     fn the_file_a_session_creates_can_be_edited() {
         let text = workspace_header(Path::new("/home/me/proj"));
@@ -588,8 +507,6 @@ mod tests {
         assert!(text.contains("version = 1"), "{text}");
         assert!(text.contains(r#"host = "api.example.com""#), "{text}");
         assert!(text.contains(r#"workspace = "/home/me/proj""#), "{text}");
-        // And a session can read the result: the line it names its directory with is still there,
-        // and the grants layer over the base.
         let session_shape = text
             .parse::<TomlTable>()
             .unwrap()
@@ -616,19 +533,14 @@ mod tests {
         .unwrap();
         assert_eq!(added.summary, "net grant for https://api.example.com:8443");
         let text = fs::read_to_string(&path).unwrap();
-        // The version line a policy needs is added, since the file had none.
         assert!(text.contains("version = 1"), "{text}");
         assert!(text.contains("[[agent.net]]"), "{text}");
         assert!(text.contains(r#"host = "api.example.com""#), "{text}");
-        // The scheme and the port are written out: a grant that named neither would reach https on
-        // 443 only, which is not what a person typing `:8443` is asking for.
         assert!(text.contains(r#"scheme = "https""#), "{text}");
         assert!(text.contains("port = 8443"), "{text}");
         assert!(text.contains(r#"why = "reads the catalogue""#), "{text}");
-        // And it loads layered on an empty global policy.
         Policy::parse(&text, &roots).unwrap();
 
-        // A second host appends rather than replacing.
         add(&path, "net *.other.test", &roots).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert_eq!(text.matches("[[agent.net]]").count(), 2, "{text}");
@@ -639,7 +551,6 @@ mod tests {
     #[test]
     fn a_url_names_the_host_the_scheme_and_the_port() {
         let (_d, path, roots) = temp("version = 1\n");
-        // A URL pasted whole: the path and query are not part of a grant, and https brings 443.
         let added = add(
             &path,
             "net https://api.example.com/v2/catalogue?q=1",
@@ -647,7 +558,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(added.summary, "net grant for https://api.example.com:443");
-        // http is a different grant from https, and the port follows the scheme.
         let added = add(&path, "net http://localhost", &roots).unwrap();
         assert_eq!(added.summary, "net grant for http://localhost:80");
         let text = fs::read_to_string(&path).unwrap();
@@ -655,7 +565,6 @@ mod tests {
         assert!(text.contains(r#"scheme = "http""#), "{text}");
         assert!(text.contains(r#"host = "api.example.com""#), "{text}");
         assert!(text.contains("port = 80"), "{text}");
-        // Any host says so, since that is the grant whose reach is widest (D40).
         let added = add(&path, "net *", &roots).unwrap();
         assert!(added.summary.contains("any public host"), "{added:?}");
     }
@@ -695,7 +604,6 @@ mod tests {
             let preview = draft("version = 1\n", "", what, &roots).unwrap();
             add(&path, what, &roots).unwrap();
             let text = fs::read_to_string(&path).unwrap();
-            // Every `key = value` the preview names is in the file, byte for byte.
             let mut fields = preview.line.split("  ");
             let head = fields.next().unwrap_or_default();
             assert!(text.contains(head), "`{what}`: {head} missing from {text}");
@@ -717,14 +625,12 @@ mod tests {
         assert!(note.contains("replaces"), "{note}");
         assert!(note.contains("1 `net` entry"), "{note}");
 
-        // Nothing is inherited, so there is nothing to say.
         assert!(
             draft("version = 1\n", "", "net api.example.com", &roots)
                 .unwrap()
                 .note
                 .is_none()
         );
-        // The project already has a list of its own, so this is not the first one.
         let own = "version = 1\n[agent]\nnet = [{ host = \"api.example.com\" }]\n";
         assert!(
             draft(own, base, "net other.example.com", &roots)
@@ -741,7 +647,6 @@ mod tests {
         assert!(e.contains("is not a root in this session"), "{e}");
         assert!(e.contains("workspace"), "the list is shown: {e}");
 
-        // A root the session does have is written as a grant.
         add(&path, "write workspace # scratch space", &roots).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("[[agent.fs-write]]"), "{text}");
@@ -756,15 +661,12 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("[agent.exec]"), "{text}");
         assert!(text.contains("tokens-per-session = 250000"), "{text}");
-        // Both would be a second grant of the same scope.
         assert!(add(&path, "exec", &roots).is_err());
         assert!(add(&path, "tokens 1", &roots).is_err());
     }
 
     #[test]
     fn a_budget_is_added_into_an_existing_grant_that_has_none() {
-        // A worker grant may be written as the capability alone; asking for a budget here fills
-        // the table in rather than refusing to touch it.
         let (_d, path, roots) = temp("version = 1\n[agent.model-invoke]\nwhy = \"workers\"\n");
         add(&path, "tokens 5000", &roots).unwrap();
         let text = fs::read_to_string(&path).unwrap();
@@ -806,7 +708,6 @@ mod tests {
 
     #[test]
     fn a_change_that_would_not_load_is_refused() {
-        // The exclusion is malformed as a glob once written, and a session could not read it.
         let (_d, path, roots) =
             temp("version = 1\n\n[agent]\nfs-read = [{ root = \"workspace\" }]\n");
         let before = fs::read_to_string(&path).unwrap();

@@ -1,8 +1,3 @@
-//! tiny compiled components shared by plugin CLI/model tests; no guest target is needed.
-//!
-//! Each test binary includes this file and uses a different subset, so a fixture no binary in this
-//! build happens to call is still live for the other one: the allow is scoped to this file and says
-//! why, rather than sitting on seven functions in two places.
 #![allow(dead_code)]
 
 use std::fs;

@@ -1,7 +1,3 @@
-//! The model loop end to end: `saddle run` against a mock provider that speaks either API. The mock
-//! asks for tool calls, and the test checks what the policy let through, what went back to the
-//! model, and what reached the audit log.
-
 #[path = "support/features.rs"]
 mod feature_tests;
 #[path = "support/hooks.rs"]
@@ -50,7 +46,6 @@ struct Seen {
     body: Value,
 }
 
-/// Answers catalogue probes without consuming a canned model response (D34).
 fn model_request(listener: &TcpListener) -> (TcpStream, BufReader<TcpStream>, String) {
     loop {
         let (mut stream, _) = listener.accept().unwrap();
@@ -81,7 +76,6 @@ fn model_request(listener: &TcpListener) -> (TcpStream, BufReader<TcpStream>, St
     }
 }
 
-/// Answers one model request per canned response, in order, and records it.
 fn serve(responses: Vec<String>) -> (String, Arc<Mutex<Vec<Seen>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -107,7 +101,6 @@ fn serve(responses: Vec<String>) -> (String, Arc<Mutex<Vec<Seen>>>) {
     (base, seen)
 }
 
-/// dynamic tool ids and deliberate provider stalls exercise background work during model I/O.
 fn serve_dynamic(
     count: usize,
     mut respond: impl FnMut(usize, &Value) -> String + Send + 'static,
@@ -190,7 +183,6 @@ impl Api {
         }
     }
 
-    /// A reply with optional text and tool calls `(id, name, input)`.
     fn reply(self, text: &str, calls: &[(&str, &str, Value)]) -> String {
         match self {
             Api::Anthropic => anthropic_sse(text, calls),
@@ -202,7 +194,6 @@ impl Api {
 fn anthropic_sse(text: &str, calls: &[(&str, &str, Value)]) -> String {
     let mut events = vec![
         json!({"type":"message_start","message":{"model":"mock-model","usage":{"input_tokens":100,"output_tokens":1}}}),
-        // Every reply starts with a thinking block, which must come back unchanged next request.
         json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
         json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":format!("sig-{}", calls.len())}}),
         json!({"type":"content_block_stop","index":0}),
@@ -243,7 +234,6 @@ fn openai_sse(text: &str, calls: &[(&str, &str, Value)]) -> String {
     openai_sse_usage(text, calls, 100, None)
 }
 
-/// The same, with the prompt usage stated, for the cache-miss test (D50).
 fn openai_sse_usage(
     text: &str,
     calls: &[(&str, &str, Value)],
@@ -332,7 +322,6 @@ impl Env {
         env
     }
 
-    /// This workspace's own policy, layered on the global one.
     fn write_override(&self, text: &str) {
         let ws = self.ws.path().canonicalize().unwrap();
         let key = ws
@@ -379,7 +368,6 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// Every string in a JSON value, for searching a request body.
 fn strings(v: &Value, out: &mut String) {
     match v {
         Value::String(s) => {
@@ -438,7 +426,6 @@ fn tool_loop(api: Api) {
         fs::read_to_string(ws.join("notes/hello.txt")).unwrap(),
         "hi"
     );
-    // D178: `.git` is inside the grant, so the refusal comes from the grant not covering `..`.
     assert!(!ws.parent().unwrap().join("outside-the-workspace").exists());
 
     let seen = seen.lock().unwrap();
@@ -496,7 +483,6 @@ fn tool_loop(api: Api) {
     assert!(second.contains("key=unset\nhi"), "{second}");
     assert!(!second.contains(KEY));
     if api == Api::Anthropic {
-        // The thinking block went back first in the assistant message, unchanged.
         let assistant = &seen[1].body["messages"][1];
         assert_eq!(assistant["role"], "assistant");
         assert_eq!(
@@ -615,7 +601,6 @@ fn background_network_is_attributed_or_fails_closed_during_model_and_input_waits
         assert!(fetched.is_empty());
     }
 
-    // An independent command from a separate Saddle process can overlap the task.
     let concurrent = env.saddle(&["tool", "bash", r#"{"command":"printf concurrent"}"#]);
     assert!(concurrent.status.success(), "{}", text(&concurrent.stderr));
     assert!(text(&concurrent.stdout).contains("concurrent"));
@@ -643,8 +628,6 @@ fn background_network_is_attributed_or_fails_closed_during_model_and_input_waits
 
 #[test]
 fn background_output_and_completed_task_retention_are_bounded_by_runtime_budgets() {
-    // Both starts decline a wake (D174), so the run ends with its turn: the budgets, not the
-    // resumption, are what this test is about.
     let (base, _) = serve_dynamic(5, |index, body| {
         let calls = match index {
             0 => vec![(
@@ -755,8 +738,6 @@ fn background_shell_overlaps_commands_and_preserves_task_isolation() {
                 vec![("cancel", "tasks", json!({"action":"cancel","task_id":id}))]
             }
             3 => {
-                // D180: the call that asked for the cancellation answers with the ending, rather
-                // than a snapshot taken before the process group was reaped.
                 let text = result_text(body, "cancel");
                 assert!(text.contains("finished"), "{text}");
                 assert!(text.contains("cancelled by the user"), "{text}");
@@ -776,8 +757,6 @@ fn background_shell_overlaps_commands_and_preserves_task_isolation() {
     let env = Env::new(Api::Openai, &base);
     fs::write(env.ws.path().join(".git/config"), "original").unwrap();
     let config = env.xdg.path().join("config/saddle/config.toml");
-    // The foreign principal is the tasks surface installed as a third-party plugin, so it asks the
-    // same host service under its own id and must still be refused (D182).
     plugin_fixture::configure(
         &config,
         &standard_component("tasks"),
@@ -792,7 +771,6 @@ fn background_shell_overlaps_commands_and_preserves_task_isolation() {
         text(&out.stderr)
     );
     assert_eq!(seen.lock().unwrap().len(), 5);
-    // D178: the task wrote `.git/config` inside the grant before it was cancelled, and that stays.
     assert_eq!(
         fs::read_to_string(env.ws.path().join(".git/config")).unwrap(),
         "changed"
@@ -942,7 +920,6 @@ fn background_completion_wakes_idle_sessions_once_without_new_input() {
         writeln!(child.stdin.as_mut().unwrap(), "start work").unwrap();
         wait_end();
         assert_eq!(seen.lock().unwrap().len(), 2, "no wakeup before completion");
-        // The first turn is over and stdin remains open, but no further prompt is sent.
         fs::write(env.ws.path().join("finish"), "go").unwrap();
         wait_end();
         thread::sleep(Duration::from_millis(200));
@@ -958,8 +935,6 @@ fn background_completion_wakes_idle_sessions_once_without_new_input() {
     }
 }
 
-/// D174: a background task the agent asked to be woken by keeps a one-shot run alive, so the work it
-/// started is not killed by the process leaving, and the completion arrives as its own turn.
 #[test]
 fn a_one_shot_run_waits_for_a_task_it_will_be_woken_by() {
     let (base, seen) = serve_dynamic(4, |index, body| match index {
@@ -974,7 +949,6 @@ fn a_one_shot_run_waits_for_a_task_it_will_be_woken_by() {
                 }),
             )],
         )),
-        // The turn ends here, with the task still running: only a run that waits reaches request 2.
         1 => {
             let started = result_text(body, "start");
             assert!(started.contains("will be resumed"), "{started}");
@@ -1006,8 +980,6 @@ fn a_one_shot_run_waits_for_a_task_it_will_be_woken_by() {
         }
     });
     let env = Env::new(Api::Openai, &base);
-    // The task is released only once the first turn is over, so the run has to wait for it rather
-    // than reading a completion that was already there.
     let released = seen.clone();
     let workspace = env.ws.path().to_path_buf();
     let release = thread::spawn(move || {
@@ -1027,8 +999,6 @@ fn a_one_shot_run_waits_for_a_task_it_will_be_woken_by() {
     assert_eq!(seen.lock().unwrap().len(), 4);
 }
 
-/// The other half of the same choice: a declined wake ends the run with its turn, and `wait` is how
-/// the agent arms one later (D174).
 #[test]
 fn a_declined_wake_ends_the_run_and_wait_arms_one_later() {
     let (base, seen) = serve_dynamic(2, |index, body| match index {
@@ -1065,7 +1035,6 @@ fn a_declined_wake_ends_the_run_and_wait_arms_one_later() {
         "no follow-up turn for a declined wake"
     );
 
-    // The same start, armed afterwards with `wait`, is waited for.
     let (base, seen) = serve_dynamic(5, |index, body| match index {
         0 => sse_response(&openai_sse(
             "",
@@ -1137,8 +1106,6 @@ fn a_declined_wake_ends_the_run_and_wait_arms_one_later() {
 
 #[test]
 fn a_finished_task_answers_a_later_poll_with_its_exit_status_and_output() {
-    // D179: a task's record outlives its command, so polling is how a launch that declined a wake
-    // is read afterwards — while it runs, before it is reaped and long after the turn that started it.
     let mut id = String::new();
     let (base, _seen) = serve_dynamic(8, move |index, body| {
         let calls = match index {
@@ -1149,7 +1116,6 @@ fn a_finished_task_answers_a_later_poll_with_its_exit_status_and_output() {
             )],
             1 => {
                 id = background_id(body);
-                // Still running: no claim about how it ended, and no output yet to show.
                 assert!(result_text(body, "start").contains("running"));
                 assert!(!result_text(body, "start").contains("exited"));
                 thread::sleep(Duration::from_millis(300));
@@ -1216,8 +1182,6 @@ fn a_finished_task_answers_a_later_poll_with_its_exit_status_and_output() {
 
 #[test]
 fn closing_a_session_cancels_background_work_before_the_audit_closes() {
-    // The task declines a wake (D174), so the run leaves while it is still running and closing the
-    // session is what stops it — which is what this test is about.
     let (base, _) = serve_dynamic(2, |index, _| {
         if index == 0 {
             sse_response(&openai_sse(
@@ -1241,7 +1205,6 @@ fn closing_a_session_cancels_background_work_before_the_audit_closes() {
     assert!(start.elapsed() < Duration::from_secs(5));
     assert!(env.ws.path().join("ready").exists());
     assert!(!env.ws.path().join("leaked").exists());
-    // D178: the write the command already made stays; only the work still running is stopped.
     assert_eq!(
         fs::read_to_string(env.ws.path().join(".git/config")).unwrap(),
         "changed"
@@ -1517,9 +1480,6 @@ fn ordinary_edit_and_patch_emit_minimal_hunks_keep_them_out_of_model_text_and_sa
 
 #[test]
 fn a_request_is_recorded_with_what_it_used_and_which_model_answered() {
-    // D94: the tool can see what each request cost and whether it hit the provider's cache, which
-    // is the question a poor hit rate is asked about. The mock states one request without a cached
-    // prompt and one with, so both columns are exercised.
     let sql =
         "SELECT kind, provider, model, input, cache_read, cached FROM requests ORDER BY ordinal";
     let calls = [("q1", "session_query", json!({"sql": sql}))];
@@ -1541,9 +1501,6 @@ fn a_request_is_recorded_with_what_it_used_and_which_model_answered() {
         .unwrap()
         .to_owned();
     let result: Value = serde_json::from_str(tool_text(&result)).unwrap();
-    // One row for the request that carried the call, which is the one that has happened so far.
-    // The provider states 100 prompt tokens of which 40 were cached, and the uncached 60 is what
-    // `input` holds, so a hit rate is read as cache_read over input + cache_read.
     assert_eq!(
         result["rows"],
         json!([["reply", "mock", "mock-model", 60, 40, 1]]),
@@ -1598,7 +1555,6 @@ fn session_queries_are_scoped_read_only_and_audited() {
     );
 }
 
-/// The first conversation this workspace saved, as the store names it (D163).
 fn first_session(db: &Path) -> String {
     Connection::open(db)
         .unwrap()
@@ -1610,9 +1566,6 @@ fn first_session(db: &Path) -> String {
         .unwrap()
 }
 
-/// A mock whose second request asks `session_query` a list of questions, the first conversation's
-/// id looked up in the database when the request arrives: it does not exist until the first run has
-/// saved it. A question marked `true` asks about that conversation rather than this one (D163).
 fn reading_the_first_conversation(
     db: Arc<Mutex<PathBuf>>,
     asked: &'static [(&'static str, bool)],
@@ -1647,8 +1600,6 @@ fn reading_the_first_conversation(
 
 #[test]
 fn a_worker_can_be_started_on_a_model_of_its_own() {
-    // D195: `agent start` can name the model the worker runs on, and the worker's own requests
-    // carry it while the lead's stay on the lead's model.
     let (base, seen) = serve_dynamic(10, |_, body| {
         let text = body.to_string();
         if text.contains("You are the worker `runtime`") {
@@ -1693,8 +1644,6 @@ fn a_worker_can_be_started_on_a_model_of_its_own() {
 }
 #[test]
 fn a_worker_started_on_an_unknown_provider_is_refused() {
-    // D195: provider and model are separate choices, and a provider this run does not know is a
-    // failed call rather than a worker on some fallback.
     let (base, seen) = serve_dynamic(8, |_, body| {
         let text = body.to_string();
         if text.contains("could not give a worker") {
@@ -1732,17 +1681,11 @@ fn a_worker_started_on_an_unknown_provider_is_refused() {
 }
 #[test]
 fn a_worker_at_rest_wakes_the_lead_without_a_poll() {
-    // D195: the lead starts a worker and then says nothing. When the worker's turn ends the run is
-    // woken by that event, and the lead's next request carries a notice naming it — no `status`
-    // call is needed for the lead to learn that it stopped, and the notice carries no words the
-    // worker itself wrote.
     let (base, seen) = serve_dynamic(12, |_, body| {
         let text = body.to_string();
         if text.contains("You are the worker `runtime`") {
             sse_response(&openai_sse("the reload path is in session.rs", &[]))
         } else if text.contains("[saddle worker notification]") {
-            // A lead that has read the notice and needs nothing further must not be woken again:
-            // answering a worker with a message is what starts another turn, not silence.
             sse_response(&openai_sse("noted", &[]))
         } else if text.contains("started runtime") {
             sse_response(&openai_sse("done", &[]))
@@ -1780,16 +1723,12 @@ fn a_worker_at_rest_wakes_the_lead_without_a_poll() {
 }
 #[test]
 fn a_one_shot_run_waits_for_a_worker_that_is_still_mid_turn() {
-    // D195: a worker's thread is the session's, so a `saddle run` that left while it was mid-turn
-    // would close the session out from under it. The run waits for the worker, then acts on the
-    // completion it records — no polling by the lead, and no work lost.
     let (base, seen) = serve_dynamic(12, |_, body| {
         let text = body.to_string();
         if text.contains("You are the worker `runtime`") {
             if text.contains("\"role\":\"tool\"") {
                 sse_response(&openai_sse("the reload path is in session.rs", &[]))
             } else {
-                // Keep the worker mid-turn after the lead's own turn has ended.
                 sse_response(&openai_sse(
                     "",
                     &[("s", "bash", serde_json::json!({"command":"sleep 1"}))],
@@ -1834,12 +1773,9 @@ fn a_one_shot_run_waits_for_a_worker_that_is_still_mid_turn() {
 }
 #[test]
 fn a_live_worker_is_started_and_addressed_by_the_shipped_team_tool() {
-    // D195: the lead's tool starts a real session on its own thread. The mock answers both
-    // conversations, and a worker request carrying the brief proves the second session exists.
     let (base, seen) = serve_dynamic(10, |_, body| {
         let text = body.to_string();
         if text.contains("find the reload path") {
-            // The worker's own first turn.
             sse_response(&openai_sse("worker finished", &[]))
         } else if text.contains("started runtime") {
             sse_response(&openai_sse(
@@ -1887,8 +1823,6 @@ fn a_live_worker_is_started_and_addressed_by_the_shipped_team_tool() {
         .expect("the tool result is in the next request");
     let result = tool_text(&started);
     assert!(result.contains("started runtime"), "{result}");
-    // The conversation the tool names is the one that holds the worker's messages: a worker that
-    // began a second, empty conversation would leave the printed id unresumable.
     let id = result
         .split("conversation ")
         .nth(1)
@@ -1912,8 +1846,6 @@ fn a_live_worker_is_started_and_addressed_by_the_shipped_team_tool() {
         )
         .unwrap();
     assert!(stored > 0, "conversation {id} holds the worker's messages");
-    // The conversation's own audit log names it a worker, which is what lets an older transcript
-    // be recognised as one without the marker column (D195).
     let body: String = db
         .query_row(
             "SELECT body FROM nodes WHERE session = ?1 AND kind = 'turn' ORDER BY id LIMIT 1",
@@ -1933,12 +1865,8 @@ fn a_live_worker_is_started_and_addressed_by_the_shipped_team_tool() {
     )
     .unwrap();
     let first: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
-    // The record names the worker by the id it was derived with, and the presence of that field
-    // is the fact adoption relies on (D195).
     assert!(first["args"].get("worker").is_some(), "{first}");
     assert!(first["args"].get("parent").is_some(), "{first}");
-    // The audit names the brief by hash, never its words.
-    // The lead's log and each worker's are separate files, so the whole audit directory is read.
     let dir = env.xdg.path().join("state/saddle/audit");
     let all: Vec<Value> = fs::read_dir(&dir)
         .unwrap()
@@ -2009,8 +1937,6 @@ fn swarm_peers_discover_and_read_attributed_posts_without_relaying_user_prompts(
 
 #[test]
 fn another_conversation_of_this_workspace_is_readable_and_listed() {
-    // D163: the workspace's conversations are one person's work, so a bare `transcript-read`
-    // covers them; the second call in the same turn shows what the `sessions` view says.
     let db = Arc::new(Mutex::new(PathBuf::new()));
     let (base, seen) = reading_the_first_conversation(
         db.clone(),
@@ -2035,7 +1961,6 @@ fn another_conversation_of_this_workspace_is_readable_and_listed() {
     let quoted: Value =
         serde_json::from_str(tool_text(results[0]["content"].as_str().unwrap())).unwrap();
     assert_eq!(quoted["rows"], json!([["remember teal"]]), "{quoted}");
-    // The other conversation is listed as well, so an id can be found rather than guessed.
     let listed: Value =
         serde_json::from_str(tool_text(results[1]["content"].as_str().unwrap())).unwrap();
     let rows = listed["rows"].as_array().unwrap();
@@ -2045,7 +1970,6 @@ fn another_conversation_of_this_workspace_is_readable_and_listed() {
         "the other conversation is named: {listed}"
     );
 
-    // The same decision, audited against the conversation it read, not just the one it ran in.
     let records = records(&env.audit_log());
     let decisions: Vec<_> = records
         .iter()
@@ -2066,8 +1990,6 @@ fn another_conversation_of_this_workspace_is_readable_and_listed() {
 
 #[test]
 fn a_transcript_grant_that_names_this_session_only_refuses_another_one() {
-    // D163: `sessions = "self"` is the narrowing, and it is enforced before anything is resolved
-    // or listed, so a refused query says nothing about which conversations exist.
     let db = Arc::new(Mutex::new(PathBuf::new()));
     let (base, seen) = reading_the_first_conversation(db.clone(), &[("SELECT 1", true)]);
     let env = Env::new(Api::Openai, &base);
@@ -2272,7 +2194,6 @@ fn a_workspace_with_no_override_uses_the_global_policy() {
         sse_response(&anthropic_sse("Done.", &[])),
     ]);
     let env = Env::new(Api::Anthropic, &base);
-    // No workspace override: the global policy applies as it is (D43).
     fs::write(env.ws.path().join(".env"), "TOKEN=1\n").unwrap();
 
     let out = env.saddle(&["run", "go"]);
@@ -2294,7 +2215,6 @@ fn a_workspace_with_no_override_uses_the_global_policy() {
         stdout.contains("grants     ") && stdout.contains("config.toml"),
         "{stdout}"
     );
-    // The override is created on first use, and adds nothing of its own.
     assert!(
         stdout.contains("has no grants for this directory: it inherits the base"),
         "{stdout}"
@@ -2312,7 +2232,6 @@ fn sigint_cancels_a_running_command_in_line_mode() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // Long enough for the mock reply and the sandbox to start the sleep.
     thread::sleep(Duration::from_millis(1500));
     let start = Instant::now();
     let killed = Command::new("kill")
@@ -2325,7 +2244,6 @@ fn sigint_cancels_a_running_command_in_line_mode() {
     assert!(start.elapsed() < Duration::from_secs(5), "{stderr}");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("cancelled"), "{stderr}");
-    // The model was not asked again, and the session closed normally.
     assert_eq!(seen.lock().unwrap().len(), 1);
     let index = fs::read_to_string(env.xdg.path().join("state/saddle/sessions.jsonl")).unwrap();
     assert_eq!(index.lines().count(), 1);
@@ -2358,7 +2276,6 @@ fn continue_picks_up_the_last_session_in_this_workspace() {
     );
     assert_eq!(seen[1].body["messages"][2]["content"], "First answer.");
 
-    // One saved conversation, two turns, each naming the audit log of the run that made it (D53).
     let db = env.xdg.path().join("state/saddle/sessions.db");
     let conn = rusqlite::Connection::open(&db).unwrap();
     let sessions: Vec<String> = conn
@@ -2389,7 +2306,6 @@ fn continue_picks_up_the_last_session_in_this_workspace() {
 
 #[test]
 fn cancel_is_immediate_while_the_server_is_silent() {
-    // Accepts the request and never answers, like a server still reading a long prompt.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let (ready, accepted) = mpsc::channel();
@@ -3059,7 +2975,6 @@ fn one_writer_artifact_changes_resource_budgets_on_reload_without_changing_autho
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // Tool-call events include the large arguments: drain pipes while waiting for model POSTs.
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let output_reader = thread::spawn(move || {
@@ -3496,8 +3411,6 @@ fn reloading_revokes_plugin_catalogues_and_denies_stale_model_calls() {
 
 #[test]
 fn the_prompt_and_tool_descriptions_explain_policy_checked_command_networking() {
-    // D79: a prompt that still claims D19's unconditional no-network boundary prevents builds
-    // from even trying an allowed download. Check the actual request, not just the source strings.
     let (base, seen) = serve(vec![sse_response(&openai_sse("ok", &[]))]);
     let env = Env::new(Api::Openai, &base);
     env.write_override("\n[agent]\nnet = [{ host = \"registry.example\" }]\n");
@@ -3568,9 +3481,6 @@ fn the_prompt_and_tool_descriptions_explain_policy_checked_command_networking() 
 
 #[test]
 fn the_prompt_names_the_servers_and_says_whose_words_a_result_is() {
-    // D120: the model cannot search for what it does not know exists, so a granted server is one
-    // line in the prompt — the person's description, never the server's — and a result is labelled
-    // as the server's text rather than the user's.
     let (base, seen) = serve(vec![sse_response(&openai_sse("ok", &[]))]);
     let env = Env::new(Api::Openai, &base);
     let config_path = env.xdg.path().join("config/saddle/config.toml");
@@ -3620,13 +3530,11 @@ fn instruction_files_prefer_agents_md_and_stay_inside_the_workspace() {
     let (base, seen) = serve(vec![sse_response(&openai_sse("ok", &[]))]);
     let env = Env::new(Api::Openai, &base);
     let ws = env.ws.path();
-    // Root: both files, so AGENTS.md wins. A subdirectory: CLAUDE.md only, plus a local file.
     fs::write(ws.join("AGENTS.md"), "root agents rules").unwrap();
     fs::write(ws.join("CLAUDE.md"), "root claude rules").unwrap();
     fs::create_dir_all(ws.join("sub/deeper")).unwrap();
     fs::write(ws.join("sub/CLAUDE.md"), "sub claude rules").unwrap();
     fs::write(ws.join("sub/AGENTS.local.md"), "my local rules").unwrap();
-    // A symlink out of the workspace must not leak into the prompt.
     let outside = tempfile::tempdir().unwrap();
     fs::write(outside.path().join("secret"), "aws secret key").unwrap();
     unix_fs::symlink(
@@ -3690,8 +3598,6 @@ fn instruction_files_prefer_agents_md_and_stay_inside_the_workspace() {
 
 #[test]
 fn json_mode_is_one_object_per_line_on_stdout_and_usable_without_prose() {
-    // The contract a program depends on (D52): every stdout line parses, the events name what
-    // happened, and nothing else is mixed in.
     let (base, _seen) = serve(vec![
         sse_response(&openai_sse("Looking.", &[("t1", "ls", json!({}))])),
         sse_response(&openai_sse("Done.", &[])),
@@ -3710,8 +3616,6 @@ fn json_mode_is_one_object_per_line_on_stdout_and_usable_without_prose() {
         })
         .collect();
     let kinds: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
-    // The session comes first, then the answer streams, then the call and its result, and the
-    // turn ends with a word a program can switch on.
     assert_eq!(kinds.first(), Some(&"session"), "{kinds:?}");
     assert!(kinds.contains(&"text"), "{kinds:?}");
     assert!(kinds.contains(&"call"), "{kinds:?}");
@@ -3724,7 +3628,6 @@ fn json_mode_is_one_object_per_line_on_stdout_and_usable_without_prose() {
     let result = events.iter().find(|e| e["type"] == "result").unwrap();
     assert_eq!(result["ok"], true);
     assert!(result["content"].as_str().unwrap().contains("note.txt"));
-    // The arguments travel as the model sent them, so a caller need not parse the detail line.
     assert_eq!(call["input"], json!({}));
     let end = events.last().unwrap();
     assert_eq!(end["end"], "answered");
@@ -3732,18 +3635,13 @@ fn json_mode_is_one_object_per_line_on_stdout_and_usable_without_prose() {
 
 #[test]
 fn a_cache_miss_is_told_to_the_user_and_never_to_the_model() {
-    // A request whose prompt is read fresh after the cache has been working costs several times
-    // what it should, and no token count shows it (D50). The line is for the person at the
-    // terminal: what goes back to the model is the conversation, and a notice is not part of it.
     let (base, seen) = serve(vec![
-        // Caching is working: 50 of the prompt came from the cache.
         sse_response(&openai_sse_usage(
             "",
             &[("t1", "ls", json!({}))],
             100,
             Some(50),
         )),
-        // Then the prefix changed, and the whole 10k prompt is billed at full price.
         sse_response(&openai_sse_usage("Done.", &[], 10_000, Some(0))),
     ]);
     let env = Env::new(Api::Openai, &base);
@@ -3754,7 +3652,6 @@ fn a_cache_miss_is_told_to_the_user_and_never_to_the_model() {
         stderr.contains("cache miss: 10.0k tokens read at full price"),
         "the user is told: {stderr}"
     );
-    // The second request is the whole conversation as the model sees it. A notice is not in it.
     let sent = seen.lock().unwrap()[1].body.to_string();
     assert!(
         !sent.contains("cache miss"),
@@ -3780,7 +3677,6 @@ fn search_tools_follow_the_policy_and_edits_keep_their_diff_out_of_the_request()
     ]);
     let env = Env::new(Api::Openai, &base);
     let ws = env.ws.path();
-    // Narrow one scope in this workspace's own policy; the rest is inherited (D43).
     env.write_override(
         r#"version = 1
 
@@ -3823,7 +3719,6 @@ fs-read = [{ root = "workspace", exclude = [".env*"], why = "reads the repo" }]
     assert_eq!(edit, "edited src/main.rs at line 1");
     assert!(!seen[1].body.to_string().contains("\"diff\""));
 
-    // The diff is kept for the transcript, in the saved conversation (D53).
     let db = env.xdg.path().join("state/saddle/sessions.db");
     let conn = rusqlite::Connection::open(&db).unwrap();
     let saved: String = conn
@@ -3841,9 +3736,6 @@ fs-read = [{ root = "workspace", exclude = [".env*"], why = "reads the repo" }]
     );
 }
 
-/// D170: `!cmd` shares the command and its output as one user message. It goes to the model and to
-/// the saved conversation without the host's `plugin-output` frame, which belongs on a tool result
-/// rather than on a prompt, and a resumed transcript reads the shape back as the block the run drew.
 #[test]
 fn a_shared_bang_command_carries_no_plugin_frame() {
     let api = Api::Openai;
@@ -3865,12 +3757,10 @@ fn a_shared_bang_command_carries_no_plugin_frame() {
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
 
-    // What the model was sent: the command on its `$ ` line, its output, and no delimiter.
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
     let mut sent = String::new();
     strings(&seen[0].body, &mut sent);
-    // The tool descriptions are framed, so the frame's absence is checked on the user turn itself.
     let start = sent
         .find("I ran a command in the workspace:")
         .unwrap_or_else(|| panic!("{sent}"));
@@ -3882,7 +3772,6 @@ fn a_shared_bang_command_carries_no_plugin_frame() {
     assert!(turn[..end].contains("shared-marker"), "{turn}");
     assert!(!turn[..end].contains("<plugin-output-"), "{}", &turn[..end]);
 
-    // What was saved: the same message, which is what a resume reads back.
     let conn = Connection::open(env.xdg.path().join("state/saddle/sessions.db")).unwrap();
     let saved: Vec<String> = conn
         .prepare("SELECT body FROM nodes WHERE kind = 'item'")
@@ -3900,6 +3789,5 @@ fn a_shared_bang_command_carries_no_plugin_frame() {
         "{shared}"
     );
     assert!(!shared.contains("<plugin-output-"), "{shared}");
-    // It is a prompt, not a tool result: the model sees a user turn (D170).
     assert!(shared.starts_with("{\"user\":"), "{shared}");
 }

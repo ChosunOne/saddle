@@ -1,5 +1,3 @@
-//! a read-only guest; filesystem access goes through the SDK, never `std::fs` (D12, D127).
-
 #![cfg(target_arch = "wasm32")]
 
 use saddle_sdk::{self as bindings, Definition, FilePath, Output, Tool, export, read_file};

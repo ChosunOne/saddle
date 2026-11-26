@@ -1,6 +1,3 @@
-//! The audit log (D24): JSON Lines, one record per decision or host event, each record carrying
-//! the SHA-256 of the line before it.
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -18,21 +15,12 @@ pub const GENESIS: &str = "00000000000000000000000000000000000000000000000000000
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
-    /// The session opened: resolved roots, policy hash, sandbox status.
     SessionStart,
-    /// A policy decision.
     Decision,
-    /// The host restored a reserved path that a sandboxed command changed. Nothing writes this any
-    /// more (D178), and it stays so a chain written before that still verifies.
     Restore,
-    /// Instruction files added to the system prompt (D32), with their hashes.
     Context,
-    /// A skill (D64): the ones advertised at startup, and each body loaded into the conversation.
     Skill,
-    /// The policy changed during the session (D47): its path, and the hash before and after.
     Policy,
-    /// A request to the session's model provider: model, stop reason and token usage, or the
-    /// error.
     Model,
     SessionEnd,
 }
@@ -72,7 +60,6 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 impl AuditLog {
-    /// Creates `<dir>/<session>.jsonl`. Fails if it already exists.
     pub fn create(dir: &Path, session: &str) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let path = dir.join(format!("{session}.jsonl"));
@@ -105,7 +92,6 @@ impl AuditLog {
         self.call_decision(who, req, d, None, None, None)
     }
 
-    /// correlates a plugin host operation without replacing its resolved arguments (D129).
     pub fn decision_for_call(
         &mut self,
         who: &Principal,
@@ -116,7 +102,6 @@ impl AuditLog {
         self.call_decision(who, req, d, Some(call), None, None)
     }
 
-    /// records a bounded byte read with its resolved path and host-assigned call identity (D131).
     pub fn decision_for_read_range(
         &mut self,
         who: &Principal,
@@ -128,7 +113,6 @@ impl AuditLog {
         self.call_decision(who, req, d, Some(call), Some(range), None)
     }
 
-    /// supplements resolved arguments without allowing details to replace them (D132).
     pub fn decision_for_call_details(
         &mut self,
         who: &Principal,
@@ -174,8 +158,6 @@ impl AuditLog {
         })
     }
 
-    /// A host event that is not a decision. `allow` is set for events that act as one, such as a
-    /// restore (a denial after the fact).
     pub fn event(
         &mut self,
         kind: Kind,
@@ -222,7 +204,6 @@ impl AuditLog {
         Ok(())
     }
 
-    /// Writes the end record and appends the final hash to the sessions index.
     pub fn close(mut self, sessions_index: &Path) -> io::Result<String> {
         self.event(
             Kind::SessionEnd,
@@ -278,8 +259,6 @@ pub enum VerifyError {
     },
 }
 
-/// Walks the chain. Detects edited, inserted, reordered and removed lines; truncation of the tail
-/// shows up as a head that differs from the one in `sessions.jsonl`.
 pub fn verify(path: &Path) -> Result<Verified, VerifyError> {
     let reader = BufReader::new(File::open(path)?);
     let mut prev = GENESIS.to_owned();

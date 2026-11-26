@@ -1,5 +1,3 @@
-//! core-owned filesystem resolution and per-plugin runtime path authority (D132, D138, D139).
-
 use saddle_limits as budgets;
 use std::collections::BTreeMap;
 use std::env;
@@ -23,7 +21,6 @@ use crate::{cancel, fs_access};
 
 const TOOL_PATH_PREFIX: &str = "@tool:";
 
-/// opaque path routing is core-owned, not selected by guest SDK features (D139).
 pub(crate) fn decode_path(mut path: Path, legacy_managed: bool) -> (Path, bool) {
     if let Some(root) = path.root.strip_prefix(TOOL_PATH_PREFIX) {
         path.root = root.to_owned();
@@ -191,7 +188,6 @@ pub(crate) fn open_read_path(
     Ok(Ok((dir, real)))
 }
 
-/// labels describe resource identity only after the caller's read gate, not a new authority (D144).
 pub fn label_root(
     session: &mut Session,
     who: &Principal,
@@ -391,8 +387,6 @@ pub fn read_directory(
                 skipped += 1;
                 continue;
             }
-            // Apply both the requested alias and resolved directory's exclusions, without one
-            // audit record per filtered child. A symlink is listed as a symlink, never followed.
             let allowed = [&loc, &real].into_iter().all(|base| {
                 let Ok(relative) = RelPath::new(base.rel.to_path().join(&name)) else {
                     return false;

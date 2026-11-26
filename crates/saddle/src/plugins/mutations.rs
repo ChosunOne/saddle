@@ -1,5 +1,3 @@
-//! bounded, attributed mutation batches; guests supply plans, never authority (D140).
-
 use saddle_limits as budgets;
 use std::env;
 use std::io::{self, ErrorKind, Read, Write};
@@ -232,7 +230,6 @@ fn stage(plan: &Planned, deadline: Instant) -> Result<Staged> {
     Ok(staged)
 }
 
-/// preflights the entire batch before staging or publishing any requested file effects.
 pub fn apply(
     session: &mut Session,
     who: &Principal,
@@ -331,7 +328,6 @@ pub fn apply(
         }
         let mut staged = Vec::new();
         for plan in &plans {
-            // Missing deletes are idempotent and need no parent creation.
             if plan.change.content.is_none() && !plan.root.try_exists(plan.loc.rel.to_path())? {
                 staged.push(None);
             } else {
@@ -357,7 +353,6 @@ pub fn apply(
             return Ok(Err(format!("{error}; no target files were changed")));
         }
     };
-    // Each publish is atomic for that entry. This is not a filesystem-wide transaction.
     let mut committed = 0;
     for entry in &mut staged {
         let result = (|| -> io::Result<()> {

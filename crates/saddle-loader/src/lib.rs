@@ -1,5 +1,3 @@
-//! bounded, grant-shaped component loading (D11, D13, D126, D127, D150).
-
 mod ambient;
 
 use std::sync::Arc;
@@ -64,7 +62,6 @@ use wasmtime::component::{
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
-/// native I/O must enforce this cap before allocating or reading the entire source.
 pub const MAX_FILE_BYTES: usize = budgets::DEFAULTS.range_bytes;
 pub const MAX_MUTATION_BYTES: usize = budgets::DEFAULTS.mutation_bytes;
 pub const MAX_MUTATIONS: usize = budgets::DEFAULTS.mutation_changes;
@@ -97,7 +94,6 @@ fn runtime(stage: &'static str) -> impl FnOnce(anyhow::Error) -> Error {
     }
 }
 
-/// host-chosen bounds; callers may lower them, never let the guest choose them.
 #[derive(Clone, Debug)]
 pub struct Limits {
     pub budgets: Budgets,
@@ -115,7 +111,6 @@ impl Default for Limits {
 }
 
 impl Limits {
-    /// construct an envelope and its SDK-visible profile from one configuration.
     pub fn from_budgets(budgets: Budgets) -> Self {
         Self {
             memory_bytes: budgets.plugin_memory_bytes,
@@ -128,7 +123,6 @@ impl Limits {
     }
 }
 
-/// identity and effective reach assigned by the host, never by guest arguments.
 pub struct Invocation {
     principal: Principal,
     budgets: Budgets,
@@ -157,17 +151,14 @@ impl Invocation {
     }
 }
 
-/// a typed task effect, independent of shell workflow or UI presentation (D153).
 pub enum TaskOperation {
     Start(Command),
     Inspect(String),
     List,
     Cancel(String),
-    /// Whether finishing this task should resume the agent (D174).
     Wake(String, bool),
 }
 
-/// typed effects, never an arbitrary host command or JSON protocol (D156).
 pub enum Service {
     Contribute(Contribution),
     PersistGet(String),
@@ -186,13 +177,6 @@ pub enum ServiceReply {
     Unit,
 }
 
-/// the binary supplies policy/audit/file operations; the loader never depends on its session.
-///
-/// Implementations must decide and audit using `call.principal()` and `call.grants()`, validate
-/// root-relative paths and symlinks, and bound/cancel I/O independently of Wasm's epoch deadline.
-/// `Err` is a host failure (including audit failure), not a guest-visible policy denial.
-/// filesystem callbacks may hold any filesystem capability; determine authority per operation/path,
-/// never from the existence of a linked interface (D139, D140).
 pub trait HostServices: Send + 'static {
     fn service(
         &mut self,
@@ -202,7 +186,6 @@ pub trait HostServices: Send + 'static {
         Ok(Err("host does not implement extension services".into()))
     }
 
-    /// enqueue a custom event; the host attaches the publishing principal (D155).
     fn emit_event(
         &mut self,
         _call: &Invocation,
@@ -259,7 +242,6 @@ pub trait HostServices: Send + 'static {
     ) -> anyhow::Result<Result<ExecReply, String>> {
         Ok(Err("host does not implement execution".into()))
     }
-    /// run the exact named profile through the session policy gate (D184).
     fn run_binary(
         &mut self,
         _call: &Invocation,
@@ -283,10 +265,6 @@ pub trait HostServices: Send + 'static {
     ) -> anyhow::Result<Result<(), String>> {
         Ok(Err("host does not implement diff presentation".into()))
     }
-    /// Ask the person this session is attached to. `allowance` bounds the wait only when the person
-    /// configured one or the caller set a deadline of its own; `None` waits for them however long
-    /// they take. A cancelled turn always ends it, and a session with nobody in front of it answers
-    /// `unavailable` (D197).
     fn ask(
         &mut self,
         _call: &Invocation,
@@ -377,7 +355,6 @@ pub trait HostServices: Send + 'static {
         )))
     }
 
-    /// serves a bounded range under the same grants; hosts without this service fail closed.
     fn read_range(
         &mut self,
         _call: &Invocation,
@@ -448,9 +425,6 @@ impl<H: HostServices> State<H> {
 }
 
 impl<H: HostServices> State<H> {
-    /// A host call that waits for a person rather than for a machine (D197): the guards are
-    /// `host_wait`'s, but the wait spends neither the guest's deadline nor the host-wait budget,
-    /// because nothing the guest or the host does is happening while a person reads.
     fn host_question<T>(
         &mut self,
         operation: impl FnOnce(&mut H, &Invocation, Option<Duration>) -> anyhow::Result<T>,
@@ -481,8 +455,6 @@ impl<H: HostServices> State<H> {
         let old = self.call.deadline;
         let start = Instant::now();
         let result = operation(&mut self.host, &self.call, allowance);
-        // The guest was not running while the person read, so it gets that time back rather than
-        // resuming into a deadline the wait had already passed.
         self.call.deadline = old
             .checked_add(start.elapsed())
             .ok_or_else(|| anyhow!("plugin deadline overflow"))?;
@@ -576,9 +548,6 @@ impl<H: HostServices> AskHost for State<H> {
                 "question or its choices exceed the configured limits".into()
             ));
         }
-        // D197: a question waits for the person, so its wait is not the host-wait budget and not the
-        // guest's CPU ceiling either. What bounds it is `ask-wait-seconds` when the person set one,
-        // a deadline the caller itself set, or a cancelled turn.
         self.host_question(|host, call, allowance| host.ask(call, question, allowance))
     }
 }
@@ -1141,7 +1110,6 @@ impl Drop for Runtime {
     }
 }
 
-/// shared compiler and epoch clock; prepared plugins keep both alive.
 #[derive(Clone)]
 pub struct Loader(Arc<Runtime>);
 
@@ -1159,7 +1127,6 @@ fn compiler_config(budgets: &Budgets, target: &str) -> Result<Config, Error> {
 }
 
 impl Loader {
-    /// package-build compilation, not a runtime native-code cache or tool entry point (D147).
     pub fn precompile_for_target(bytes: &[u8], target: &str) -> Result<Vec<u8>, Error> {
         let engine = Engine::new(&compiler_config(&Budgets::default(), target)?)
             .map_err(runtime("creating package compiler"))?;
@@ -1168,12 +1135,6 @@ impl Loader {
             .map_err(runtime("compiling bundled component"))
     }
 
-    /// prepare an immutable component shipped as part of the trusted executable (D147).
-    ///
-    /// # Safety
-    /// `native` must be produced by this Wasmtime version from exactly `bytes`, embedded with
-    /// the executable by its trusted build pipeline, never read from a runtime-writable source.
-    /// both sources still undergo scope, signature and grant-shaped pre-link checks before init.
     pub unsafe fn prepare_embedded<H: HostServices>(
         &self,
         manifest: &Manifest,
@@ -1186,7 +1147,6 @@ impl Loader {
         if bytes.len() > limits.budgets.plugin_component_bytes {
             return Err(Error::Size(limits.budgets.plugin_component_bytes));
         }
-        // SAFETY: the caller guarantees immutable build-produced native code, not plugin input.
         let component = unsafe { Component::deserialize(&self.0.engine, native) }
             .map_err(runtime("loading bundled component"))?;
         self.prepare_component(manifest, agent, requested, bytes, limits, Some(component))
@@ -1196,7 +1156,6 @@ impl Loader {
         Self::with_budgets(&Budgets::default())
     }
 
-    /// construct the engine with a protected stack budget; callers must provide sufficient native stack.
     pub fn with_budgets(budgets: &Budgets) -> Result<Self, Error> {
         budgets.validate().map_err(Error::Refused)?;
         let config = compiler_config(budgets, env!("SADDLE_BUILD_TARGET"))?;
@@ -1225,10 +1184,6 @@ impl Loader {
         })))
     }
 
-    /// checks the actual compiled type and pre-links it without running initialization.
-    ///
-    /// Bytes come from an explicit host choice, not a guest-selected path. This API neither
-    /// installs plugins nor reads repository manifests or serialized native code.
     pub fn prepare<H: HostServices>(
         &self,
         manifest: &Manifest,
@@ -1249,7 +1204,6 @@ impl Loader {
         mut limits: Limits,
         compiled: Option<Component>,
     ) -> Result<Prepared<H>, Error> {
-        // Compatibility envelope fields are normalized into the public per-call snapshot.
         limits.budgets.plugin_memory_bytes = limits.memory_bytes;
         limits.budgets.plugin_fuel = limits.fuel;
         limits.budgets.plugin_timeout_ms = usize::try_from(limits.timeout.as_millis())
@@ -1384,7 +1338,6 @@ impl Loader {
     }
 }
 
-/// adapter dispatch contains no names or permission expressions; those live in the catalogue (D150).
 fn bind_host<H: HostServices>(
     linker: &mut Linker<State<H>>,
     interface: HostInterface,
@@ -1442,8 +1395,6 @@ fn bind_host<H: HostServices>(
     }
 }
 
-/// the generated `Pre::new` checks export names, not their signatures. Check the canonical
-/// generated record types before instantiation too, rather than discovering a mismatch after start.
 fn check_function<P, R>(
     engine: &Engine,
     ty: &ComponentType,
@@ -1482,7 +1433,6 @@ fn check_tool_types(engine: &Engine, ty: &ComponentType) -> Result<(), Error> {
     let Some(ComponentItem::ComponentFunc(invoke)) = tool.get_export(engine, "invoke") else {
         return Err(Error::Refused("missing tool invoke function".into()));
     };
-    // This pre-instantiation typecheck API is supplied by the deliberately pinned Wasmtime.
     describe
         .typecheck::<(), (Definition,)>(&ty.instance_type())
         .map_err(runtime("checking tool export types"))?;
@@ -1515,7 +1465,6 @@ fn interfaces(
         .collect()
 }
 
-/// one pre-linked plugin; every public call creates a fresh instance, even `describe`.
 pub struct Prepared<H: HostServices> {
     runtime: Arc<Runtime>,
     pre: InstancePre<State<H>>,
@@ -1736,7 +1685,6 @@ impl<H: HostServices> Prepared<H> {
         Ok(())
     }
 
-    /// native stack the caller must reserve in addition to its own host frame allowance.
     pub fn stack_bytes(&self) -> usize {
         self.limits.budgets.plugin_stack_bytes
     }
@@ -1853,7 +1801,6 @@ impl<H: HostServices> Prepared<H> {
         self.invoke_until(host, arguments, cancelled, None)
     }
 
-    /// apply an absolute caller deadline in addition to CPU and host-wait budgets (D152).
     pub fn invoke_until(
         &self,
         host: H,
@@ -2590,7 +2537,6 @@ mod tests {
             .to_string();
         assert!(why.contains("timed out"), "{why}");
         assert!(start.elapsed() < Duration::from_secs(2));
-        // A later caller deadline cannot replace the independent guest CPU deadline.
         let mut store = prepared
             .store_until(
                 NoHost,
@@ -2637,7 +2583,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(why.contains("timed out"), "{why}");
-        // Same prepared artifact, ordinary call after expiry, fresh deadline.
         assert!(prepared.store(NoHost, cancelled()).is_ok());
         assert!(prepared.describe(NoHost, cancelled()).is_ok());
     }
@@ -2661,7 +2606,6 @@ mod tests {
                 },
             )
             .unwrap();
-        // A prepared plugin must keep its epoch clock alive even after the loader is dropped.
         drop(loader);
         let start = Instant::now();
         let why = prepared

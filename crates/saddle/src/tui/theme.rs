@@ -1,17 +1,3 @@
-//! Colours (D71, D72). One place that says what each part of the screen is painted with, so a person
-//! can change it without patching the renderer, and so the renderer never names a colour directly.
-//!
-//! The role names are pi's, and the palette carries pi's whole vocabulary, so a palette copied from a
-//! pi theme pastes in and is understood. Every role this interface has an element for is wired to it
-//! (D72); a role for something it does not draw — HTML export, hook-injected messages — is carried
-//! and paints nothing, which is the honest outcome for a table that is a palette rather than a
-//! checklist (D73).
-//!
-//! A theme is a table of roles. The built-in `default` is what this binary has always drawn, so a
-//! configuration that says nothing changes nothing; a `[themes.<name>]` table in `config.toml`
-//! starts from the role set it names in `extends` and overrides only the roles it lists, with `vars`
-//! for values several roles share.
-
 use std::collections::BTreeMap;
 use std::env;
 
@@ -22,12 +8,9 @@ use super::catppuccin;
 use super::palette::{self, Palette, SyntaxColours};
 use super::terminal;
 
-/// The roles the renderer paints with, named as pi names them.
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
     pub name: String,
-    /// The background this palette is designed for, for a light/dark pair (D72).
     pub appearance: Appearance,
     pub accent: Color,
     pub border: Color,
@@ -37,7 +20,6 @@ pub struct Theme {
     pub error: Color,
     pub warning: Color,
     pub muted: Color,
-    /// More subtle than `muted`: the quietest hints.
     pub dim: Color,
     pub text: Color,
     pub thinking_text: Color,
@@ -64,13 +46,10 @@ pub struct Theme {
     pub tool_diff_added: Color,
     pub tool_diff_removed: Color,
     pub tool_diff_context: Color,
-    /// The editor border while a command is being typed (D72).
     pub bash_mode: Color,
-    /// Colours for a highlighted code block (D73).
     pub syntax: SyntaxColours,
 }
 
-/// The background a palette was designed for (D72).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Appearance {
     #[default]
@@ -89,25 +68,17 @@ impl Appearance {
 }
 
 impl Default for Theme {
-    /// pi's `dark` palette, which is also what this interface drew before themes existed.
     fn default() -> Self {
         Palette::default().to_theme("default", Appearance::Dark)
     }
 }
 
-/// The palettes a build ships with, by name (D73).
-///
-/// `system` is not here: it is derived from what the terminal reports, at startup, by
-/// [`Palette::from_terminal`](crate::tui::palette::Palette::from_terminal).
 pub fn builtin_palette(name: &str) -> Option<Palette> {
-    // The four Catppuccin flavours, whose 26 colours each are the palette's own (D76).
     if let Some(flavour) = catppuccin::flavour(name) {
         return Some(flavour.palette());
     }
     match name {
         "default" | "dark" => Some(Palette::default()),
-        // For a light terminal: the ANSI defaults are chosen to read on white, and the block
-        // backgrounds are pale rather than dark so the tool text stays legible.
         "light" => Some(Palette {
             accent: Color::Blue,
             border: Color::Blue,
@@ -151,8 +122,6 @@ pub fn builtin_palette(name: &str) -> Option<Palette> {
             bash_mode: Color::Rgb(160, 100, 0),
             ..Palette::default()
         }),
-        // Colour only where colour carries meaning; no block backgrounds, no syntax colours beyond
-        // the terminal's own.
         "mono" => Some(Palette {
             accent: Color::Reset,
             border: Color::Reset,
@@ -199,7 +168,6 @@ pub fn builtin_palette(name: &str) -> Option<Palette> {
     }
 }
 
-/// Every built-in theme name, for a message that has to list them.
 pub fn builtin_names() -> Vec<&'static str> {
     let mut names = vec!["default", "dark", "light", "mono"];
     names.extend(catppuccin::NAMES);
@@ -207,19 +175,12 @@ pub fn builtin_names() -> Vec<&'static str> {
     names
 }
 
-/// The themes a config defines, before the selected one is built.
 pub type ThemeTables = BTreeMap<String, toml::Value>;
 
-/// Builds the selected theme (D71).
-///
-/// A name may be a pair, `light/dark`, which is pi's spelling for "one for each terminal": the first
-/// is used on a light terminal and the second on a dark one. That is resolved here so nothing
-/// downstream has to know about it (D72).
 pub fn build(selected: &str, tables: &ThemeTables) -> Result<Theme> {
     build_for(selected, tables, terminal_appearance())
 }
 
-/// [`build`] for a given appearance, so the light/dark choice can be tested without a terminal.
 pub fn build_for(selected: &str, tables: &ThemeTables, appearance: Appearance) -> Result<Theme> {
     match selected.split_once('/') {
         Some((light, dark)) if !light.is_empty() && !dark.is_empty() => {
@@ -241,7 +202,6 @@ fn build_one(selected: &str, tables: &ThemeTables) -> Result<Theme> {
     Ok(palette.to_theme(selected, appearance))
 }
 
-/// Resolves a name to a palette: its `extends` chain, applied from the base outwards (D73).
 fn resolve(
     name: &str,
     tables: &ThemeTables,
@@ -261,7 +221,6 @@ fn resolve(
     let (mut palette, mut appearance) = match extends {
         Some(base) => resolve(base, tables, seen)?,
         None if name == "system" => {
-            // Derived from the terminal, so it depends on an answer that may never come (D73).
             let terminal = Palette::from_terminal();
             (terminal.palette, terminal.appearance)
         }
@@ -294,7 +253,6 @@ fn resolve(
     Ok((palette, appearance))
 }
 
-/// The appearance a built-in name implies.
 fn appearance_of(name: &str) -> Appearance {
     if let Some(flavour) = catppuccin::flavour(name) {
         return flavour.appearance;
@@ -305,14 +263,7 @@ fn appearance_of(name: &str) -> Appearance {
     }
 }
 
-/// Whether the terminal is light or dark (D72).
-///
-/// pi asks the terminal and falls back to `COLORFGBG`, then to dark. Asking needs a terminal to
-/// answer, which is a separate piece of work; `COLORFGBG` is what a terminal exports for exactly this
-/// question, and dark is what an unset value has always meant here.
 pub fn terminal_appearance() -> Appearance {
-    // The terminal's own answer first, since it is the truth; `COLORFGBG` is a guess for terminals
-    // that were asked nothing (D73).
     if let Some(colour) = terminal::reported().and_then(|r| r.background)
         && let Some(rgb) = palette::rgb(colour)
     {
@@ -323,7 +274,6 @@ pub fn terminal_appearance() -> Appearance {
         };
     }
     if let Ok(value) = env::var("COLORFGBG") {
-        // `fg;bg`, where either may be a 0–15 index. A white or bright background is light.
         if let Some(bg) = value.rsplit(';').next()
             && let Ok(index) = bg.trim().parse::<u8>()
         {
@@ -337,7 +287,6 @@ pub fn terminal_appearance() -> Appearance {
     Appearance::Dark
 }
 
-/// A palette index as a TOML integer.
 pub fn palette(index: i64) -> Result<Color> {
     if !(0..=255).contains(&index) {
         bail!("a palette index is 0 to 255, not {index}");
@@ -345,10 +294,8 @@ pub fn palette(index: i64) -> Result<Color> {
     Ok(Color::Indexed(index as u8))
 }
 
-/// One colour as written, resolving a `vars` reference (D72).
 pub fn colour_value(text: &str, vars: &BTreeMap<String, String>) -> Result<Color> {
     let value = text.trim();
-    // An empty string is the terminal's default foreground, which is pi's spelling for it too.
     if value.is_empty() {
         return Ok(Color::Reset);
     }
@@ -373,7 +320,6 @@ pub fn colour_value(text: &str, vars: &BTreeMap<String, String>) -> Result<Color
     if let Some(ansi) = ansi(value) {
         return Ok(ansi);
     }
-    // Anything left is a variable reference, chained; a cycle is a mistake worth naming.
     let mut name = value.to_owned();
     let mut hops = 0;
     while let Some(next) = vars.get(&name) {
@@ -403,7 +349,6 @@ fn parse_hex(hex: &str, whole: &str) -> Result<Color> {
         u8::from_str_radix(s, 16).map_err(|_| anyhow::anyhow!("`{s}` is not hex"))
     };
     match hex.len() {
-        // `#abc` is `#aabbcc`, as in CSS and as pi accepts.
         3 => {
             let r = digits(&hex[0..1])?;
             let g = digits(&hex[1..2])?;
@@ -442,7 +387,6 @@ fn ansi(value: &str) -> Option<Color> {
     })
 }
 
-/// `oklch(62% 0.1 200)`, or the same with the lightness as `0.62`.
 fn parse_oklch(args: &str) -> Result<Color> {
     let (lightness, chroma, hue) = three(args, "oklch")?;
     let lightness = if lightness.ends_with('%') {
@@ -456,10 +400,6 @@ fn parse_oklch(args: &str) -> Result<Color> {
     Ok(srgb_colour(srgb))
 }
 
-/// `okhsl(250 60% 55%)`, pi's spelling: hue, saturation and lightness.
-///
-/// Saturation is relative to the most chroma the sRGB gamut allows at that hue and lightness, which
-/// is what makes equal saturation look equally colourful.
 fn parse_okhsl(args: &str) -> Result<Color> {
     let (hue, saturation, lightness) = three(args, "okhsl")?;
     let hue = number(hue.trim_end_matches("deg"))?;
@@ -471,7 +411,6 @@ fn parse_okhsl(args: &str) -> Result<Color> {
 }
 
 fn three(args: &str, form: &str) -> Result<(String, String, String)> {
-    // Components may be separated by spaces, commas or a mixture, as CSS allows.
     let parts: Vec<String> = args
         .replace(',', " ")
         .split_whitespace()
@@ -497,7 +436,6 @@ fn percent_or_number(text: &str) -> Result<f64> {
     }
 }
 
-/// Linear sRGB for an OKLCH colour, which may be out of gamut.
 fn oklch_to_srgb(lightness: f64, chroma: f64, hue: f64) -> [f64; 3] {
     let hue = hue.to_radians();
     let a = chroma * hue.cos();
@@ -513,7 +451,6 @@ fn oklch_to_srgb(lightness: f64, chroma: f64, hue: f64) -> [f64; 3] {
     ]
 }
 
-/// The most chroma the sRGB gamut holds at this lightness and hue, by bisection (D72).
 fn max_chroma(lightness: f64, hue: f64) -> f64 {
     let in_gamut = |c: f64| {
         let rgb = oklch_to_srgb(lightness, c, hue);
@@ -534,7 +471,6 @@ fn max_chroma(lightness: f64, hue: f64) -> f64 {
     low
 }
 
-/// A linear-sRGB triple as a terminal colour, gamut-mapped and gamma encoded.
 fn srgb_colour(linear: [f64; 3]) -> Color {
     let encode = |v: f64| -> u8 {
         let v = v.clamp(0.0, 1.0);
@@ -577,13 +513,11 @@ mod tests {
             colour_value("#00aaff", &no_vars).unwrap(),
             Color::Rgb(0, 0xaa, 0xff)
         );
-        // Three digits are expanded, as CSS and pi do.
         assert_eq!(
             colour_value("#0af", &no_vars).unwrap(),
             Color::Rgb(0, 0xaa, 0xff)
         );
         assert_eq!(colour_value("240", &no_vars).unwrap(), Color::Indexed(240));
-        // The terminal's own colour.
         assert_eq!(colour_value("", &no_vars).unwrap(), Color::Reset);
         assert_eq!(colour_value("  ", &no_vars).unwrap(), Color::Reset);
         for bad in ["#12", "chartreuse", "300"] {
@@ -596,26 +530,21 @@ mod tests {
 
     #[test]
     fn oklch_produces_the_colour_it_names() {
-        // White and black are the anchors: no chroma, full and zero lightness.
         assert_eq!(parse_oklch("100% 0 0").unwrap(), Color::Rgb(255, 255, 255));
         assert_eq!(parse_oklch("0% 0 0").unwrap(), Color::Rgb(0, 0, 0));
-        // A mid blue: hue 264° is blue in OKLCH, so blue must dominate.
         let Color::Rgb(r, g, b) = parse_oklch("62% 0.1 264").unwrap() else {
             panic!("rgb");
         };
         assert!(b > r && b > g, "expected blue, got {r},{g},{b}");
-        // A mid red.
         let Color::Rgb(r, _, _) = parse_oklch("62% 0.2 29").unwrap() else {
             panic!("rgb");
         };
         assert!(r > 150, "expected red-dominant, got r={r}");
-        // The lightness may be a bare fraction, which is the other spelling.
         assert_eq!(parse_oklch("1 0 0").unwrap(), Color::Rgb(255, 255, 255));
     }
 
     #[test]
     fn okhsl_saturation_is_relative_to_the_gamut() {
-        // Zero saturation is a grey at that lightness, whatever the hue.
         let light = parse_okhsl("250 0% 55%").unwrap();
         let Color::Rgb(r, g, b) = light else {
             panic!("rgb")
@@ -624,7 +553,6 @@ mod tests {
             r.abs_diff(g) <= 1 && g.abs_diff(b) <= 1,
             "grey, got {r},{g},{b}"
         );
-        // Full saturation is the edge of the gamut: some channel is at an extreme.
         let Color::Rgb(r, g, b) = parse_okhsl("250 100% 55%").unwrap() else {
             panic!("rgb");
         };
@@ -632,7 +560,6 @@ mod tests {
             r == 0 || r == 255 || g == 0 || g == 255 || b == 0 || b == 255,
             "expected a gamut edge, got {r},{g},{b}"
         );
-        // Every saturation in between stays inside the gamut by construction.
         for s in [10, 30, 50, 70, 90] {
             assert!(parse_okhsl(&format!("250 {s}% 55%")).is_ok());
         }
@@ -643,12 +570,10 @@ mod tests {
         let v = vars(&[("base", "cyan"), ("accent2", "base")]);
         assert_eq!(colour_value("accent2", &v).unwrap(), Color::Cyan);
         assert_eq!(colour_value("base", &v).unwrap(), Color::Cyan);
-        // A var that points at itself, and a two-step cycle.
         let v = vars(&[("a", "a")]);
         assert!(format!("{:#}", colour_value("a", &v).unwrap_err()).contains("itself"));
         let v = vars(&[("a", "b"), ("b", "a")]);
         assert!(colour_value("a", &v).is_err(), "a cycle must not loop");
-        // A missing var says what a colour is.
         let err = colour_value("nope", &BTreeMap::new())
             .unwrap_err()
             .to_string();
@@ -669,7 +594,6 @@ mod tests {
         let t = tables(
             "[mine]\naccent = \"magenta\"\nerror = \"#f00\"\n[mine.vars]\nshared = \"#0af\"\n",
         );
-        // Vars live under the theme table and are read before the roles.
         let t = match t.get("mine").and_then(|v| v.as_table()) {
             Some(_) => {
                 let mut parsed: ThemeTables = toml::from_str(
@@ -717,13 +641,11 @@ mod tests {
 
     #[test]
     fn every_built_in_theme_builds_and_the_catppuccin_flavours_are_themselves() {
-        // A name in the list that does not build is a broken promise in the /theme picker (D76).
         for name in builtin_names() {
             let theme = build(name, &ThemeTables::new())
                 .unwrap_or_else(|e| panic!("{name} does not build: {e:#}"));
             assert_eq!(theme.name, name);
         }
-        // Each flavour is its own palette, and says which kind of terminal it is for.
         let mocha = build("catppuccin-mocha", &ThemeTables::new()).unwrap();
         assert_eq!(mocha.text, Color::Rgb(0xcd, 0xd6, 0xf4), "Mocha's own text");
         assert_eq!(mocha.accent, Color::Rgb(0xcb, 0xa6, 0xf7), "Mocha's mauve");
@@ -731,7 +653,6 @@ mod tests {
         let latte = build("catppuccin-latte", &ThemeTables::new()).unwrap();
         assert_eq!(latte.text, Color::Rgb(0x4c, 0x4f, 0x69), "Latte's own text");
         assert_eq!(latte.appearance, Appearance::Light);
-        // Four flavours, four different themes: not the same palette under four names.
         let accents: Vec<String> = catppuccin::NAMES
             .iter()
             .map(|n| format!("{:?}", build(n, &ThemeTables::new()).unwrap().accent))
@@ -742,8 +663,6 @@ mod tests {
 
     #[test]
     fn a_config_table_can_have_the_last_word_over_a_flavour() {
-        // A built-in is a starting point, not a locked door: `[themes.catppuccin-mocha]` overrides
-        // the roles it names and keeps the rest of the flavour (D72, D76).
         let t = tables("[catppuccin-mocha]\naccent = \"#00ff00\"\n");
         let theme = build("catppuccin-mocha", &t).unwrap();
         assert_eq!(theme.accent, Color::Rgb(0, 255, 0), "the table wins");
@@ -765,16 +684,12 @@ mod tests {
         let err = format!("{:#}", build("mine", &t).unwrap_err());
         assert!(err.contains("not a colour role"), "{err}");
 
-        // A role pi has and we do not paint says why rather than "you typed it wrong".
-        // A role pi has and this interface does not paint is accepted: the palette carries it for
-        // the day an element exists (D73).
         let t = tables("[mine]\nsyntaxKeyword = \"#f00\"\n");
         assert!(build("mine", &t).is_ok());
     }
 
     #[test]
     fn a_light_dark_pair_picks_the_right_half() {
-        // D72: pi's spelling for "one theme per terminal", with the light theme first.
         let t = tables("[l]\naccent = \"red\"\n\n[d]\naccent = \"blue\"\n");
         let light = build_for("l/d", &t, Appearance::Light).unwrap();
         assert_eq!(light.name, "l");
@@ -784,16 +699,13 @@ mod tests {
         assert_eq!(dark.name, "d");
         assert_eq!(dark.accent, Color::Blue);
         assert_eq!(dark.appearance, Appearance::Dark);
-        // A single name with no slash is unaffected by the appearance.
         assert_eq!(build_for("l", &t, Appearance::Light).unwrap().name, "l");
-        // Half a pair is not a pair: it is a name, and an unknown name is an error.
         assert!(build_for("/d", &t, Appearance::Light).is_err());
         assert!(build_for("l/", &t, Appearance::Light).is_err());
     }
 
     #[test]
     fn colorfgbg_decides_the_appearance() {
-        // The variable is process-wide, so this only asserts the rule on the values pi documents.
         let decide = |value: &str| match value.rsplit(';').next().unwrap().parse::<u8>() {
             Ok(7) | Ok(9..=15) => Appearance::Light,
             _ => Appearance::Dark,

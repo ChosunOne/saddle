@@ -1,10 +1,3 @@
-//! Named filesystem roots (D16).
-//!
-//! Policy refers to roots by name. The host resolves each name to a canonical path once per session,
-//! and callers address files as a [`Location`]: a root name plus a relative path that cannot climb
-//! out of the root. Opening the file without following a symlink out of the root is the job of the
-//! code that does the I/O (cap-std in the host); this module only does the lexical part.
-
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Error;
@@ -15,10 +8,8 @@ use serde::{Deserialize, Serialize};
 pub const WORKSPACE: &str = "workspace";
 pub const TMP: &str = "tmp";
 
-/// Names the host defines itself. User config cannot redefine them.
 pub const BUILTIN: [&str; 4] = [WORKSPACE, TMP, "config", "data"];
 
-/// A lowercase identifier: `[a-z][a-z0-9-]*`, at most 64 bytes. Used for root names and plugin ids.
 pub fn is_ident(s: &str) -> bool {
     let mut chars = s.chars();
     matches!(chars.next(), Some('a'..='z'))
@@ -75,7 +66,6 @@ impl fmt::Display for RootName {
     }
 }
 
-/// A path relative to a root: no leading `/`, no `..`, UTF-8. The empty path is the root itself.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct RelPath(Vec<String>);
 
@@ -102,7 +92,6 @@ impl RelPath {
         self.0.is_empty()
     }
 
-    /// `/`-separated form, used for glob matching and logs. The root itself is `.`.
     pub fn as_slash(&self) -> String {
         if self.0.is_empty() {
             ".".to_owned()
@@ -141,7 +130,6 @@ impl fmt::Display for RelPath {
     }
 }
 
-/// A file addressed the way policy sees it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Location {
     pub root: RootName,
@@ -188,15 +176,12 @@ pub enum RootError {
     NotUtf8(PathBuf),
 }
 
-/// The session's name→path table. Every path is canonical and absolute.
 #[derive(Debug, Clone, Default)]
 pub struct Roots {
     entries: BTreeMap<RootName, PathBuf>,
 }
 
 impl Roots {
-    /// Resolves every root and refuses any root that contains one of `protected` (the saddle state
-    /// and config directories). Protected paths need not exist yet.
     pub fn resolve(
         entries: impl IntoIterator<Item = (RootName, PathBuf)>,
         protected: &[PathBuf],
@@ -247,7 +232,6 @@ impl Roots {
         self.entries.iter().map(|(n, p)| (n, p.as_path()))
     }
 
-    /// Lexical absolute path of a location. The caller must still open it beneath the root.
     pub fn path_of(&self, loc: &Location) -> Option<PathBuf> {
         let base = self.get(&loc.root)?;
         Some(if loc.rel.is_root() {
@@ -257,8 +241,6 @@ impl Roots {
         })
     }
 
-    /// Maps an absolute path to the innermost root containing it, after resolving `.` and `..`
-    /// lexically. Returns `None` for relative paths and paths outside every root.
     pub fn locate(&self, path: &Path) -> Option<Location> {
         if !path.is_absolute() {
             return None;
@@ -275,7 +257,6 @@ impl Roots {
     }
 }
 
-/// Resolves `.` and `..` without touching the filesystem. `..` at `/` stays at `/`.
 pub fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {

@@ -91,7 +91,5 @@ memchr = "2"
 # The session store (D53). Bundled, so no system SQLite is required to build or run.
 rusqlite = { version = "0.41", features = ["bundled", "hooks", "limits"] }
 
-# D148: the lint no rustc or Clippy lint can express, in `lints/`. It needs the nightly its
-# `rust-toolchain.toml` pins, and is run with `cargo dylint --all`, never as part of `cargo clippy`.
 [workspace.metadata.dylint]
 libraries = [{ path = "lints/qualified-paths" }]

@@ -1,13 +1,3 @@
-//! D110: the streamable HTTP transport. An HTTP server has no child process, so the host makes each
-//! request itself — but every one of them is decided against the *server's* narrowed reach (D105)
-//! before it is sent, and audited with the server named. That is the same authority the child's
-//! sandbox is derived from, asked at the one moment a request is made rather than once at exec.
-//!
-//! A reply arrives either as one JSON object or as an event stream, so both are read here and
-//! neither is a protocol the rest of the crate knows about (D107's framing, on a socket instead of
-//! a pipe). A 401 is not retried: without OAuth there is nothing to retry with, and a loop of
-//! refusals would spend the person's quota to learn the same thing twice.
-
 use crate::auth::AuthStore;
 use crate::mcp::oauth::{self, Flow};
 use crate::net::client as fetch;
@@ -31,32 +21,23 @@ use crate::net::client::{Target, authority, resolve_public};
 use crate::session::Session;
 use crate::tools::timeout;
 
-/// What the server said about one call, once it answered.
 pub enum Outcome {
     Answered(String),
     Failed(String),
     Denied(String),
 }
 
-/// The protocol this client speaks, and the one header the spec requires on every request after
-/// the handshake.
 const PROTOCOL: &str = "2025-06-18";
 
-/// How much of a body is read: a tool result is text, and a server that streams forever must not be
-/// able to fill the process.
 const MAX_BODY: u64 = 4 * 1024 * 1024;
 
-/// One remote server.
 pub struct Client {
     server: String,
-    /// The URL as the table spells it, for the discovery a refresh has to do (D116).
     url: String,
     target: Target,
-    /// The server's own net grants, narrowed from the agent's (D105).
     reach: Vec<NetGrant>,
     session_id: Option<String>,
     next: u64,
-    /// The entry's `timeout`: the deadline every request of this server gets (D113).
     timeout: Duration,
 }
 
@@ -84,8 +65,6 @@ impl Client {
             },
         });
         let result = self.request(session, "initialize", params)?;
-        // The spec has the client confirm before it asks for anything else; a server that is
-        // strict about it will not answer a second request until this arrives.
         self.send(
             session,
             &notification("notifications/initialized", json!({})),
@@ -93,18 +72,14 @@ impl Client {
         if let Some(version) = result.get("protocolVersion").and_then(Value::as_str)
             && version != PROTOCOL
         {
-            // Not fatal: the spec has the client accept what the server picked, and every method
-            // used here exists in both.
             let _ = version;
         }
         Ok(())
     }
 
-    /// Every tool the server lists, following `nextCursor` so a paginated catalogue is complete.
     pub fn tools(&mut self, session: &mut Session) -> Result<Vec<Tool>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
-        // A server that keeps handing back a cursor could otherwise make this loop forever.
         for _ in 0..32 {
             let params = match &cursor {
                 Some(c) => json!({ "cursor": c }),
@@ -154,7 +129,6 @@ impl Client {
         let result = match self.request(session, "tools/call", params) {
             Ok(result) => result,
             Err(e) => {
-                // A denial is the model's to see as a denial, not the host's to report as a fault.
                 if let Some(denied) = e.downcast_ref::<Denied>() {
                     return Ok(Outcome::Denied(denied.0.clone()));
                 }
@@ -173,7 +147,6 @@ impl Client {
         })
     }
 
-    /// One request and its reply, on a deadline, decided before it is sent.
     fn request(&mut self, session: &mut Session, method: &str, params: Value) -> Result<Value> {
         self.next += 1;
         let id = self.next;
@@ -192,8 +165,6 @@ impl Client {
         reply.result.map_err(|why| anyhow!("{why}"))
     }
 
-    /// Sends one JSON-RPC message and returns the reply that carries its id, whether it arrived as
-    /// a JSON body or as one event of a stream.
     fn exchange(&mut self, session: &mut Session, payload: &str) -> Result<Option<Reply>> {
         let (status, content_type, session_id, body) = self.post(session, payload)?;
         if let Some(id) = session_id {
@@ -211,7 +182,6 @@ impl Client {
             let head: String = body.chars().take(400).collect();
             bail!("`{}` answered {status}: {head}", self.server);
         }
-        // A notification gets no reply: 202 with no body is the spec's answer to one.
         if body.trim().is_empty() {
             return Ok(None);
         }
@@ -229,7 +199,6 @@ impl Client {
         Ok(reply(&body))
     }
 
-    /// One POST, decided and then sent.
     fn post(
         &mut self,
         session: &mut Session,
@@ -243,8 +212,6 @@ impl Client {
         if let Some(id) = &self.session_id {
             headers.push(("mcp-session-id", id.clone()));
         }
-        // A token the person stored is sent; there is no path here that asks for one by itself,
-        // because obtaining one is a person's act at a terminal (D115).
         let store_path = session.setup.paths.auth_store();
         let held = AuthStore::load(&store_path)
             .ok()
@@ -254,9 +221,6 @@ impl Client {
         }
         let mut answer = self.attempt(session, &headers, payload)?;
         let refused = answer.status == 401 || answer.status == 403;
-        // One refresh and one retry: a loop here would spend the person's account on a server that
-        // will never accept it (D116). A token with no refresh is left alone — the error below
-        // names `saddle mcp auth`, which is the only thing that can fix it.
         if refused && let Some(held) = held.clone().filter(|t| !t.refresh.is_empty()) {
             let mut flow = Flow {
                 session,
@@ -283,8 +247,6 @@ impl Client {
         ))
     }
 
-    /// One decided POST with these headers, so a retry after a refresh sends the new token through
-    /// exactly the same gate as the first attempt (D116).
     fn attempt(
         &self,
         session: &mut Session,
@@ -309,7 +271,6 @@ impl Client {
     }
 }
 
-/// A refusal the model should read as one.
 #[derive(Debug)]
 pub struct Denied(pub String);
 
@@ -321,7 +282,6 @@ impl Display for Denied {
 
 impl Error for Denied {}
 
-/// The text of a `CallToolResult`, with anything that is not text named rather than dropped.
 fn content_text(result: &Value) -> String {
     let blocks = result
         .get("content")
@@ -362,10 +322,6 @@ fn content_text(result: &Value) -> String {
     out.join("\n")
 }
 
-/// One request the host makes for a server, decided against that server's reach before it is sent
-/// (D110) and recorded whatever the answer. It is shared with OAuth discovery, because a metadata
-/// document fetched from a URL a server named is exactly as much of an egress as a tool call is
-/// (D115).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn send(
     session: &mut Session,
@@ -386,7 +342,6 @@ pub(crate) fn send(
         path: target.request_path(),
         headers: &names,
     };
-    // A private address is reachable only when the reach spells it out (D40).
     let named = Session::mcp_names_host(reach, &target.host);
     let decision = session.decide_mcp_net(label, reach, &request)?;
     if !decision.allow {
@@ -403,7 +358,6 @@ pub(crate) fn send(
     );
     let timeout = timeout::remaining(timeout)?;
     let agent = fetch::agent_for(named, timeout);
-    // ureq types a request by whether it carries a body, so the two are built apart.
     let outcome = if method == "GET" {
         let mut request = agent.get(&url);
         for (name, value) in headers {
@@ -456,7 +410,6 @@ pub(crate) fn send(
     })
 }
 
-/// What one request came back with.
 pub(crate) struct Answer {
     pub status: u16,
     pub content_type: String,

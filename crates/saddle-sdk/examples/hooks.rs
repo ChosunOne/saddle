@@ -1,5 +1,3 @@
-//! hook-only SDK fixture: distinct harness registration, custom publication and subscription (D155).
-
 #![cfg(target_arch = "wasm32")]
 
 use saddle_sdk::events::{
@@ -32,7 +30,6 @@ impl Hooks for Example {
             String::from_utf8(read_file(&path).map_err(|error| format!("{error:?}"))?)
                 .map_err(|error| error.to_string())?
         };
-        // Matching a harness event's spelling does not put this on the harness channel.
         emit("turn-start", &text)
     }
 }

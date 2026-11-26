@@ -1,9 +1,3 @@
-//! background task inspection as a tool of its own (D182): the shell launches, this reads.
-//!
-//! A task belongs to the principal that ran the command, and knowing its id is not enough to read
-//! or cancel it — the host decides that under the same `exec` grant, with the same audit record
-//! (D153). Nothing here decides anything: it asks, and renders what the host answered.
-
 #[cfg(target_arch = "wasm32")]
 use saddle_sdk::{Definition, Output, Tool, cancel_task, inspect_task, list_tasks, wake_task};
 use serde::Deserialize;
@@ -52,8 +46,6 @@ fn invoke_task(args: Arguments) -> Result<(String, bool), String> {
         }
         Action::Wait => {
             let id = args.task_id.ok_or("wait requires task_id")?;
-            // D174: arming the wake answers at once, because the wait belongs to the session
-            // rather than to this call.
             let task = wake_task(&id, true)?;
             let mut text = format_task(&task);
             text.push_str(if task.running {

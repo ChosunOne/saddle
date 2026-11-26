@@ -1,14 +1,3 @@
-//! The ChatGPT backend's WebSocket transport, and the delta a kept connection allows (D101).
-//!
-//! The backend Codex talks to refuses `store: true`, so it keeps no conversation of its own; over a
-//! WebSocket it can still be continued, because `previous_response_id` refers to state that lives on
-//! that connection. That is what makes sending only the newest items legal, and it is why the socket
-//! is kept between requests: a new connection starts from the whole history, because the state a
-//! delta refers to was left behind on the old one.
-//!
-//! D125: opening or sending failures fall back to HTTP, and a read-time failure can be retried
-//! there before any reply text or reasoning is shown. Partial replies are never silently replayed.
-
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::TcpStream;
@@ -31,38 +20,26 @@ use super::retry::Transient;
 use super::sse;
 use super::{ProviderConfig, codex_backend};
 
-/// One kept connection, and what it has already been told.
 struct Link {
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
     continuation: Option<Continuation>,
-    /// D102: a kept socket belongs to its endpoint and authentication context as well as its session.
     affinity: [u8; 32],
 }
 
-/// What makes the next request on this connection a delta rather than a whole history.
 struct Continuation {
-    /// The body the last request sent, with the fields a continuation changes left out, as JSON.
     body: String,
-    /// The response the next request continues from.
     response_id: String,
-    /// What the server has: the input sent so far and the items the replies produced. The next
-    /// request must extend exactly this, or the delta would describe a conversation the server
-    /// does not have.
     baseline: Vec<Value>,
 }
 
-/// The kept connections, one per conversation.
 fn links() -> MutexGuard<'static, HashMap<String, Link>> {
     static LINKS: OnceLock<Mutex<HashMap<String, Link>>> = OnceLock::new();
-    // A poisoned lock here means another thread panicked holding it; the map is a cache of sockets
-    // and holding a stale one costs a reconnect, so recovering it is right.
     LINKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The URL to open for this provider, or `None` when it is not the backend that speaks it.
 pub fn websocket_url(config: &ProviderConfig, url: &str) -> Option<String> {
     if !codex_backend(&config.base_url) {
         return None;
@@ -74,30 +51,20 @@ pub fn websocket_url(config: &ProviderConfig, url: &str) -> Option<String> {
         .map(|rest| format!("ws://{rest}"))
 }
 
-/// What the caller keeps until the reply has been parsed, so the connection can be left ready for
-/// the next request (D101).
 pub struct Pending {
     handed: Arc<Mutex<Option<Handed>>>,
     session: String,
-    /// The body as sent, minus the fields a continuation changes: the next request must match it.
     body: String,
-    /// Everything the server holds once this request has been answered.
     baseline: Vec<Value>,
     affinity: [u8; 32],
 }
 
-/// The socket a finished stream gives back, and the response it ended on.
 struct Handed {
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
     response_id: Option<String>,
 }
 
 impl Pending {
-    /// Keeps the connection, ready for a delta, once the reply is known.
-    ///
-    /// `produced` is the reply rendered as the input items the next request will send, so the
-    /// baseline is what the server has rather than what it said it had: the two differ, because a
-    /// response's own `output` items are not the shape saddle sends back.
     pub fn finish(self, produced: Vec<Value>) {
         let Some(handed) = self.handed.lock().ok().and_then(|mut slot| slot.take()) else {
             return;
@@ -108,8 +75,6 @@ impl Pending {
         let mut baseline = self.baseline;
         baseline.extend(produced);
         let mut map = links();
-        // A concurrent request may have kept a connection of its own meanwhile; dropping this one
-        // is right, and taking its place would close a stream still being read.
         if map.contains_key(&self.session) {
             return;
         }
@@ -128,17 +93,12 @@ impl Pending {
     }
 }
 
-/// Opens the connection for one request and returns its event stream.
-///
-/// The error is the caller's cue to send the same request over HTTP: nothing has been written to
-/// the reply yet, so nothing is lost by trying again the old way.
 pub fn stream(
     session: &str,
     url: &str,
     headers: &[(String, String)],
     body: &Value,
 ) -> Result<(http::EventStream, Pending)> {
-    // Hash the full headers, never retaining another copy of credentials in the socket cache.
     let affinity: [u8; 32] = Sha256::digest(serde_json::to_vec(&(url, headers))?).into();
     let kept = links()
         .remove(session)
@@ -150,8 +110,6 @@ pub fn stream(
     };
     let (frame, baseline) = prepare(body, continuation.as_ref());
     if let Err(error) = socket.send(Message::Text(frame.to_string().into())) {
-        // A kept socket the far side has since closed is the ordinary case: an idle timeout ends
-        // it. A new connection cannot continue what the old one knew, so this is a whole history.
         if !reused {
             return Err(error).context("sending the first frame");
         }
@@ -211,8 +169,6 @@ fn run(
 fn open(url: &str, headers: &[(String, String)]) -> Result<WebSocket<MaybeTlsStream<TcpStream>>> {
     let uri: Uri = url.parse().with_context(|| format!("not a URL: {url}"))?;
     let mut request = ClientRequestBuilder::new(uri);
-    // D102: HTTP's responses=experimental is not the WebSocket v2 protocol. Replace it
-    // case-insensitively rather than appending a second, conflicting beta header.
     for (name, value) in headers
         .iter()
         .filter(|(name, _)| !name.eq_ignore_ascii_case("openai-beta"))
@@ -221,7 +177,6 @@ fn open(url: &str, headers: &[(String, String)]) -> Result<WebSocket<MaybeTlsStr
     }
     request = request.with_header("OpenAI-Beta", "responses_websockets=2026-02-06");
     let (socket, _) = connect(request).context("opening the websocket")?;
-    // Match the HTTP stream's idle-read bound; an unresponsive peer must eventually recover too.
     let tcp = match socket.get_ref() {
         MaybeTlsStream::Plain(tcp) => Some(tcp),
         MaybeTlsStream::Rustls(tls) => Some(&tls.sock),
@@ -234,11 +189,6 @@ fn open(url: &str, headers: &[(String, String)]) -> Result<WebSocket<MaybeTlsStr
     Ok(socket)
 }
 
-/// Reads the connection until the response is complete, handing each frame on as an event.
-///
-/// The socket goes back to the caller only when the stream ended by itself on a completed response:
-/// anything else — a cancel, a closed connection, an error frame — leaves a connection nothing can
-/// be continued from.
 fn pump(
     mut socket: WebSocket<MaybeTlsStream<TcpStream>>,
     tx: &Sender<Msg>,
@@ -246,9 +196,6 @@ fn pump(
     handed: &Mutex<Option<Handed>>,
     whole: Value,
 ) {
-    // A continuation the backend no longer has is answered with an error rather than a reply. It
-    // costs one frame to find out, and resending the whole history is what turns a stale
-    // connection into the request that would have been made anyway (D101).
     let mut retried = false;
     let mut saw_output = false;
     loop {
@@ -287,8 +234,6 @@ fn pump(
                     .then(|| event["response"]["id"].as_str().map(str::to_owned))
                     .flatten();
                 if done {
-                    // D102: publish the socket before the terminal event. The parser may finish
-                    // immediately on that event, and only a completed response seeds a delta.
                     if completed && let Ok(mut slot) = handed.lock() {
                         *slot = Some(Handed {
                             socket,
@@ -325,8 +270,6 @@ fn pump(
                 ));
                 return;
             }
-            // tungstenite answers a ping itself while reading; a pong it does not answer is ours
-            // to ignore, and a binary frame is not part of this API.
             Ok(_) => {}
             Err(error) => {
                 let _ = tx.send(Msg::Failed(
@@ -355,7 +298,6 @@ fn read_failure_reason(error: &WsError) -> &'static str {
     }
 }
 
-/// Whether an error frame says the connection no longer has the response being continued from.
 fn continuation_lost(event: &Value) -> bool {
     let code = |value: &Value| {
         value["code"]
@@ -376,7 +318,6 @@ fn continuation_lost(event: &Value) -> bool {
         .any(|said| said.contains("previous_response_not_found"))
 }
 
-/// The frame to send, and everything the server holds afterwards.
 fn prepare(body: &Value, continuation: Option<&Continuation>) -> (Value, Vec<Value>) {
     let input: Vec<Value> = body["input"].as_array().cloned().unwrap_or_default();
     let mut frame = body.clone();
@@ -396,7 +337,6 @@ fn prepare(body: &Value, continuation: Option<&Continuation>) -> (Value, Vec<Val
     (frame, input)
 }
 
-/// The body with the fields a continuation rewrites left out, as canonical JSON to compare against.
 fn stripped(body: &Value) -> String {
     let mut bare = body.clone();
     if let Value::Object(map) = &mut bare {
@@ -447,10 +387,6 @@ mod tests {
         }
     }
 
-    /// A server that answers every frame on one kept connection, and reports what it was asked.
-    ///
-    /// It reads with a timeout so the thread ends when the client goes quiet, which is what lets
-    /// the test join it while the client still holds the socket.
     fn server(answer: fn(&Value) -> Vec<Value>) -> (String, thread::JoinHandle<Vec<Value>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -502,7 +438,6 @@ mod tests {
         ]
     }
 
-    /// Reads a whole stream the way the reply parser does.
     fn drain(events: http::EventStream) -> Vec<String> {
         let mut events = events;
         let mut out = Vec::new();
@@ -525,8 +460,6 @@ mod tests {
 
     #[test]
     fn only_the_backend_that_speaks_it_gets_a_websocket() {
-        // D101: the subscription backend, and nothing else. OpenAI's API-key endpoint is a
-        // different host with a different transport.
         assert_eq!(
             websocket_url(
                 &config("chatgpt.com"),
@@ -559,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::result_large_err)] // tungstenite fixes the handshake callback's error type.
+    #[allow(clippy::result_large_err)]
     fn the_upgrade_uses_v2_even_when_http_headers_supply_a_different_beta() {
         for name in ["OpenAI-Beta", "openai-beta", "oPeNaI-bEtA"] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -604,9 +537,6 @@ mod tests {
 
     #[test]
     fn a_second_request_sends_only_what_the_connection_has_not_seen() {
-        // D101: the point of keeping the socket. The first request carries the whole history; the
-        // second carries the new items and names the response it continues from, which is what
-        // makes a turn cost a delta rather than the conversation again.
         let (url, handle) = server(|_| reply("resp_1", "one"));
         let first = body(json!([{"role":"user","content":"hello"}]));
 
@@ -628,7 +558,6 @@ mod tests {
         assert_eq!(received[0]["type"], "response.create");
         assert_eq!(received[0]["input"].as_array().unwrap().len(), 1);
         assert!(received[0].get("previous_response_id").is_none());
-        // The delta: one new item, and the response it follows.
         assert_eq!(received[1]["previous_response_id"], "resp_1");
         assert_eq!(
             received[1]["input"],
@@ -638,8 +567,6 @@ mod tests {
 
     #[test]
     fn a_body_that_changed_sends_the_whole_history_again() {
-        // A continuation is only legal while the conversation is the one the connection has. A
-        // changed instruction, or an input that is not an extension, goes back in full.
         let (url, handle) = server(|_| reply("resp_1", "one"));
         let first = body(json!([{"role":"user","content":"hello"}]));
         let (events, pending) = stream("s2", &url, &[], &first).unwrap();
@@ -663,9 +590,6 @@ mod tests {
 
     #[test]
     fn a_continuation_the_backend_lost_is_resent_in_full() {
-        // D101: a connection the far side has dropped its state for answers the delta with an
-        // error, not a reply. Resending the whole history is what keeps that from being a failed
-        // turn, and it is cheap: one frame to find out.
         let (url, handle) = server(|frame| {
             if frame.get("previous_response_id").is_some() {
                 return vec![json!({"type":"error","code":"previous_response_not_found",
@@ -684,7 +608,6 @@ mod tests {
             {"role":"user","content":"again"}
         ]));
         let (events, pending) = stream("s4", &url, &[], &next).unwrap();
-        // The reply, not the error: the error frame is not forwarded.
         assert_eq!(drain(events).len(), 2);
         pending.finish(vec![json!({"role":"assistant","content":"one"})]);
         assert!(
@@ -701,8 +624,6 @@ mod tests {
 
     #[test]
     fn a_reply_that_did_not_finish_keeps_no_connection() {
-        // The socket goes back only on a completed response: a failed stream has nothing the next
-        // request could be continued from.
         let (url, _handle) = server(|_| vec![json!({"type":"error","error":{"message":"no"}})]);
         let (events, pending) = stream("s3", &url, &[], &body(json!([]))).unwrap();
         drain(events);
@@ -805,8 +726,6 @@ mod tests {
                         .send(Message::Text(event.to_string().into()))
                         .unwrap();
                 }
-                // Keep both server sockets alive: a reconnect must be caused by the changed
-                // identity, not a server-side close that would repair a wrong reuse by accident.
                 sockets.push(socket);
             }
             received

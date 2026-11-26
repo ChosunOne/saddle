@@ -1,5 +1,3 @@
-//! protected plugins and shipped tools share bounded dispatch, provenance and audit (D25, D128, D129, D147).
-
 mod filesystem;
 pub mod hooks;
 mod host;
@@ -102,7 +100,6 @@ impl Registry {
             .collect()
     }
 
-    /// requests a branch snapshot only for a loaded tool holding the transcript service.
     pub fn reads_transcript(&self, name: &str) -> bool {
         self.loaded.values().any(|loaded| {
             loaded
@@ -117,7 +114,6 @@ impl Registry {
         })
     }
 
-    /// hook callbacks query only the active branch snapshot supplied by the agent (D155).
     pub fn hooks_read_transcript(&self) -> bool {
         self.loaded.values().any(|loaded| {
             (!loaded.harness.is_empty()
@@ -161,8 +157,6 @@ impl Registry {
                 continue;
             }
             let who = Principal::Plugin(id.clone());
-            // A trap or bad artifact makes only that component unavailable, not the other tools.
-            // Host/audit failure retains a fatal marker, even if a later write could succeed.
             match self.load_one(session, &id, &entry) {
                 Ok(loaded) => {
                     self.status.insert(
@@ -349,8 +343,6 @@ impl Registry {
             if artifact.wasm != bytes {
                 bail!("bundled code does not match the raw component");
             }
-            // SAFETY: both byte arrays are immutable includes generated together by the package
-            // compiler, not selected from runtime files or supplied by configuration/plugin input.
             unsafe {
                 loader.prepare_embedded::<Host>(
                     &manifest,
@@ -364,8 +356,6 @@ impl Registry {
         } else {
             loader.prepare::<Host>(&manifest, &agent, requested, bytes, limits)?
         });
-        // There is only one engine. Its operational grants are the same bounded grants the
-        // prepared component carries; the raw request is never used by a plugin host operation.
         let mut policy = session.engine.policy().clone();
         policy
             .principals
@@ -504,8 +494,6 @@ impl Registry {
             })
             .map(|(_, c)| c)
             .collect();
-        // A separator, not deletion: deleting a nested prefix could join two fragments into a
-        // fresh closing delimiter after the replacement pass (D25).
         let clean = clean
             .replace(&open, "[plugin delimiter removed]")
             .replace(&close, "[plugin delimiter removed]");
@@ -520,8 +508,6 @@ impl Registry {
     }
 
     pub fn call(&mut self, session: &mut Session, name: &str, input: &Value) -> Result<ToolOutput> {
-        // Guest failures are successful host replies containing an error ToolOutput. Any error
-        // escaping this boundary is a host failure (including invocation audit writes).
         self.call_inner(session, name, input).map_err(|error| {
             if error.is::<HostFailure>() {
                 error
@@ -553,9 +539,6 @@ impl Registry {
                 .clone()
                 .and_then(|id| self.status.get(&id))
                 .map(String::as_str);
-            // A shipped tool that nothing selected is the one migration an existing config has to
-            // make, so the refusal names the row to add rather than only the mechanism that refused
-            // (D182). A tool that has an entry and did not load keeps its own reason.
             let why = match (shipped, status, standard::default_entry(name)) {
                 (Some(_), None, Some(entry)) => format!(
                     "tool {name:?} is not selected: add {entry} under [standard-tools] in the protected config (saddle tools --config prints the table; no native fallback)"
@@ -652,7 +635,6 @@ fn read_bounded(root: &Dir, rel: &RelPath, limit: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// installs artifacts only; enablement and grants remain a person's separate decisions.
 pub fn install(manifest_path: &Path, paths: &Paths) -> Result<String> {
     let limits = UserConfig::load(&paths.user_config())?.tool_limits;
     let parent = manifest_path
@@ -719,12 +701,6 @@ mod tests {
     use crate::session::Session;
     use std::env;
 
-    /// D183: Esc leaves the turn's flag set, and a `/reload` right after it must still register the
-    /// session's tools. The reported failure was every standard tool answering
-    /// `standard tool unavailable: plugin call cancelled` until the session was restarted.
-    ///
-    /// nextest runs one test per process, so setting the directories this session reads is not a
-    /// race with another test; `cargo test` would share them between threads and must not be used.
     #[test]
     fn a_cancelled_turn_does_not_stop_a_reload_from_registering_its_tools() {
         let ws = tempfile::tempdir().unwrap();
@@ -737,7 +713,6 @@ mod tests {
              [standard-tools]\nbash = [\"exec\"]\ntasks = [\"exec\"]\n",
         )
         .unwrap();
-        // SAFETY: one process per test (nextest), and nothing else reads these.
         unsafe {
             env::set_var("XDG_CONFIG_HOME", &config);
             env::set_var("XDG_STATE_HOME", xdg.path().join("state"));

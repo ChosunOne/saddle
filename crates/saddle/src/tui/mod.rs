@@ -1,7 +1,3 @@
-//! The full-screen terminal UI. The agent and the session run on a worker thread; this thread
-//! reads keys and draws. They talk over two channels, and cancelling goes through the process-wide
-//! flag in [`crate::cancel`].
-
 use crate::compact::Event as CompactEvent;
 use crate::compact::Settings;
 use crate::config::Overrides;
@@ -107,81 +103,45 @@ use settings::{Change, SettingsDialog, Values};
 use status::Template;
 
 enum Command {
-    /// A prompt, and the skill it came from when it was a `/skill:` command (D69).
-    Prompt {
-        text: String,
-        skill: Option<String>,
-    },
+    Prompt { text: String, skill: Option<String> },
     BackgroundTurn,
     Clear,
-    /// Applied between turns: the commands queue behind a running turn.
     SetProvider(Box<Provider>),
-    /// `None` lifts the limit on model requests per prompt (D37).
     SetMaxSteps(Option<usize>),
-    /// A window the endpoint stated after the session opened (D34).
     SetWindow(u64),
-    /// A price the endpoint stated after the session opened (D36).
     SetPrice(Price),
-    /// Read the policy again after a grant changed, so the session acts on it and the model's next
-    /// request carries the new grants (D47).
     ReloadPolicy,
-    /// Read the skills and instruction files again and rebuild the prompt (D70).
     Reload,
     SetCompaction(Settings),
-    /// Continue a saved conversation, by its id in the session store (D53).
     Resume(String),
-    /// Read the prompts on the branch, to offer them in `/tree` (D53).
     OpenTree,
-    /// Move the conversation to a point without deleting what came after it (D54), and summarize
-    /// the branch left behind when asked to (D167).
-    Rewind {
-        node: Option<i64>,
-        summarize: bool,
-    },
-    /// Copy the branch into a new conversation and continue that one (D53).
+    Rewind { node: Option<i64>, summarize: bool },
     Clone,
-    /// Name this conversation, or clear the name (D55).
     Name(Option<String>),
-    /// Report what this conversation has done (D55).
     SessionInfo,
-    /// `/mcp`: report the servers, or start one again (D118).
     Mcp(String),
     Tasks(String),
     Workers,
     OpenWorker(String),
     WorkerBack,
-    /// `/profile`: report the base grants in force, or switch this session to another one (D175).
     Profile(String),
-    /// Remove a saved conversation (D55).
     Delete(String),
-    /// Change the reasoning effort (D57).
     Effort(Effort),
-    Shell {
-        command: String,
-        share: bool,
-    },
+    Shell { command: String, share: bool },
     Compact(Option<String>),
     Quit,
 }
 
-/// How long to wait for the agent thread to close the session after the UI exits.
 const SHUTDOWN: Duration = Duration::from_secs(3);
-/// How often the agent thread wakes with nothing to do, to notice that the session has gone idle
-/// (D77). Short enough that a two-minute idle threshold is honoured within a second of it.
 const IDLE_TICK: Duration = Duration::from_millis(500);
-/// Redraw interval for the spinner while the agent works.
 const TICK: Duration = Duration::from_millis(80);
 
-/// How the TUI opens.
 pub enum Start {
     Ready,
-    /// No provider is chosen: open the provider list.
     ChooseProvider,
-    /// The provider lacks a key or a model: open the login dialog at it.
     LogIn(String),
 }
 
-/// `resume` continues a saved session as soon as the TUI opens.
 pub fn run(
     agent: Agent,
     session: Session,
@@ -190,16 +150,11 @@ pub fn run(
     start: Start,
     resume: Option<String>,
 ) -> Result<()> {
-    // What discovery offered, kept here so `/skill:name` can expand without the agent thread: the
-    // bodies were read and recorded when the session opened (D69).
     let skills = session.skills.clone();
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (ev_tx, ev_rx) = mpsc::channel();
     let ev_tx_ui = ev_tx.clone();
-    // Before the agent moves to its thread: the turn running there reads this (D149).
     let steering = agent.steering();
-    // The worker handles belong to the session, which moves to the agent thread; the interface
-    // keeps a shared one so a message or an interrupt reaches a worker mid-turn (D195).
     let team = session.team.steering();
     let worker = thread::Builder::new()
         .name("saddle-agent".into())
@@ -209,18 +164,10 @@ pub fn run(
     let store = store::Store::open(&paths.session_db(), header.workspace.clone())?;
     let mut app = App::new(header);
     app.skills = skills;
-    // What this terminal can draw is decided once, from the setting and the environment (D59).
     app.protocol = image::detect(app.header.images.as_deref(), &|k| env::var(k).ok());
-    // How big a cell is decides how many rows a picture needs and whether it is drawn at its own
-    // size, and the window size does not carry it, so the terminal is asked once before the screen
-    // is taken over — the same question the theme asks about colours, and asked there for the same
-    // reason (D59, D75). A terminal that does not answer keeps the assumption.
     if app.protocol != image::Protocol::Text {
         image::set_cell_px(terminal::cell_px());
     }
-    // The colours, from config.toml (D71). A theme that does not build is reported and the default
-    // is drawn: a bad colour must not stop a session from opening, and the person has to be told
-    // rather than quietly shown the wrong thing.
     match theme_from_config(&paths, &app.header.theme) {
         Ok(theme) => app.theme = theme,
         Err(e) => app.note(NoteKind::Error, &format!("{e:#}")),
@@ -249,12 +196,9 @@ pub fn run(
     if let Err(e) = opened {
         app.note(NoteKind::Error, &format!("{e:#}"));
     }
-    // Opening a session has not listed models, so the window it starts with may be a guess; ask
-    // the endpoint in the background and settle it when the answer arrives (D34).
     if ready && let Err(e) = control.ask_window(&mut app) {
         app.note(NoteKind::Error, &format!("{e:#}"));
     }
-    // A provider with a usage endpoint can say what is left before anything is sent (D36).
     if ready && let Err(e) = control.refresh_usage(&mut app) {
         app.note(NoteKind::Error, &format!("{e:#}"));
     }
@@ -268,8 +212,6 @@ pub fn run(
     }
     let _ = control.commands.send(Command::Quit);
     drop(control);
-    // The deadline is checked on every pass: an agent still streaming would otherwise keep
-    // this loop fed with events and never reach the timeout.
     let deadline = Instant::now() + SHUTDOWN;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -294,19 +236,12 @@ pub fn run(
     worker_result
 }
 
-/// The agent thread: runs one turn per prompt and closes the session at the end.
-/// The theme the config selects, or the default (D71). Reads the file again, so `/reload` after a
-/// hand edit picks it up without a restart.
-/// The theme `[ui] theme` selects, for a caller that only wants to know it builds (D71).
 pub fn theme_selected(user: &UserConfig) -> Result<Theme> {
     let name = user
         .ui
         .theme
         .clone()
         .unwrap_or_else(|| "default".to_owned());
-    // Ask the terminal about its colours once, here, before the screen is taken over (D73, D75).
-    // Not only when the chosen theme needs an answer: `/theme` can choose `system` mid-session, and
-    // there is no safe moment to ask after this one.
     terminal::prime();
     theme::build(&name, &user.themes)
 }
@@ -327,15 +262,12 @@ fn work(
     events: Sender<AgentEvent>,
 ) -> Result<()> {
     let mut ui = ChannelUi(events.clone());
-    // The person in front of this interface is who a tool's question reaches (D197).
     session.questions = Some(Box::new(ChannelQuestions {
         events: events.clone(),
     }));
     let mut fatal = None;
     let mut shown_tasks = Vec::new();
     let mut completion_requested = false;
-    // How long the agent waits for a command before it looks at the clock itself. A session that
-    // stays open is idle most of the time, and idle is when a compaction is cheapest (D77).
     let tick = IDLE_TICK;
     let mut last_activity = Instant::now();
     loop {
@@ -364,8 +296,6 @@ fn work(
         let command = match commands.recv_timeout(tick) {
             Ok(command) => command,
             Err(RecvTimeoutError::Timeout) => {
-                // A background summary that finished while nobody was looking lands here, within a
-                // tick of finishing (D78).
                 if let Err(e) = agent.poll_background(&mut session, &mut ui) {
                     let msg = format!("{e:#}");
                     let _ = events.send(AgentEvent::Fatal(msg.clone()));
@@ -373,16 +303,11 @@ fn work(
                     break;
                 }
                 if (session.tasks.pending() || session.team.pending()) && !completion_requested {
-                    // Let the UI arbitrate with a prompt typed at the same instant. The worker
-                    // must not start a turn behind an editor that still thinks it is idle.
                     let _ = events.send(AgentEvent::BackgroundReady);
                     completion_requested = true;
                     last_activity = Instant::now();
                     continue;
                 }
-                // Nothing has happened for a while. Compacting here costs a request the user did
-                // not ask for, so it only happens when the conversation is half full and the
-                // session has been left alone (D77).
                 if agent.idle_compaction_due(last_activity.elapsed()) {
                     match agent.compact(&mut session, Reason::Idle, None, &mut ui) {
                         Ok(_) => {}
@@ -393,8 +318,6 @@ fn work(
                             break;
                         }
                     }
-                    // One attempt per idle stretch: the countdown starts again, so a session that
-                    // stays half full does not ask the model the same question every tick.
                     last_activity = Instant::now();
                 }
                 continue;
@@ -431,8 +354,6 @@ fn work(
                 }
                 Ok(_) => match agent.turn(&mut session, &text, &mut ui) {
                     Ok(end) => {
-                        // A background compaction started during the turn may have finished after
-                        // the last safe point; collect it before the turn is called done (D78).
                         if let Err(e) = agent.poll_background(&mut session, &mut ui) {
                             let msg = format!("{e:#}");
                             let _ = events.send(AgentEvent::Fatal(msg.clone()));
@@ -454,8 +375,6 @@ fn work(
                 session.mcp.restore(&[]);
                 agent.refresh_tools(session.declared_tools());
             }
-            // `/profile`: the report needs no policy change; a switch is one, applied the way any
-            // grant change is (D47, D175).
             Command::Profile(name) if name.is_empty() => {
                 let _ = events.send(AgentEvent::Note(session::profile_report(&session.setup)));
             }
@@ -487,8 +406,6 @@ fn work(
             Command::SetPrice(price) => agent.set_price(price),
             Command::ReloadPolicy => match session.reload_policy() {
                 Ok(()) => {
-                    // The prompt is sent with every request, so replacing its grants section is
-                    // what tells the model (D47).
                     agent.refresh_extensions(&session, &mut ChannelUi(events.clone()));
                     let _ = events.send(AgentEvent::Note(
                         "grants reloaded; the model is told on its next request".into(),
@@ -506,10 +423,6 @@ fn work(
                     )));
                 }
             },
-            // `/reload`: everything the prompt or the interface was built from, read again (D70).
-            // Skills and instruction files reach the model on its next request; a newly added
-            // instruction file is also handed to the conversation, so the transcript shows it
-            // arriving rather than the next reply simply obeying a rule that appeared from nowhere.
             Command::Reload => {
                 match session.reload_policy() {
                     Ok(()) => agent.refresh_extensions(&session, &mut ChannelUi(events.clone())),
@@ -551,8 +464,6 @@ fn work(
                         for note in said {
                             let _ = events.send(AgentEvent::Note(note));
                         }
-                        // Said plainly, because it is the one thing a reload cannot change: text
-                        // already in the conversation stays there.
                         let _ = events.send(AgentEvent::Note(
                             "a skill or instruction file already read into this conversation is \
                              unchanged"
@@ -624,8 +535,6 @@ fn work(
                 }
             },
             Command::Effort(change) => {
-                // A cycle starts from what is in force, so shift+tab walks the same list
-                // `/thinking` accepts (D57).
                 let next = match change {
                     Effort::Set(value) => value,
                     Effort::Cycle => provider::next_effort(agent.effort().as_deref()),
@@ -694,8 +603,6 @@ fn work(
                 }
             },
             Command::Mcp(arg) => {
-                // The registry lives on the session, and starting a server needs it, so it is
-                // taken out for the call and put back (D108, D118).
                 let mut registry = mem::take(&mut session.mcp);
                 let outcome = match arg.split_once(' ') {
                     Some(("restart", name)) => registry.restart(name.trim(), &mut session),
@@ -741,10 +648,6 @@ fn work(
             },
             Command::Rewind { node, summarize } => match agent.rewind(node) {
                 Ok(left) => {
-                    // The branch being left is worth a note on the one entered, so what it found
-                    // is not wasted — but that is a model request, so it happens only when the
-                    // person said yes to the question `/tree` asked (D167). A failure here does
-                    // not undo the move (D54).
                     let mut resumed = left.resumed;
                     session.mcp.restore(&resumed.declared);
                     agent.refresh_tools(session.declared_tools());
@@ -774,9 +677,6 @@ fn work(
             }
             Command::Quit => break,
         }
-        // Idle is measured from when the work finished, not from when it was asked for: a turn
-        // that took ten minutes has been busy for ten minutes, and the session is not "left alone"
-        // the instant it ends (D77).
         last_activity = Instant::now();
     }
     let closed = session.close();
@@ -870,8 +770,6 @@ impl Ui for ChannelUi {
     }
 }
 
-/// How a tool's question reaches the person (D197): the event carries the question and the answer
-/// travels back through it, because the agent thread is blocked inside the tool call.
 struct ChannelQuestions {
     events: Sender<AgentEvent>,
 }
@@ -884,38 +782,15 @@ impl Questioner for ChannelQuestions {
     }
 }
 
-/// What one frame has to do to the pictures on screen (D59). Pure, so the scrolling behaviour can
-/// be tested without a terminal.
 #[derive(Debug, Default)]
 struct Plan {
-    /// Ids whose data goes: the picture left the screen, or the transcript under it was replaced.
     free: Vec<u32>,
-    /// Placements to take off without freeing the data: a menu or dialog is over the picture, which
-    /// is still in the transcript (D161).
     hide: Vec<u32>,
-    /// A picture the terminal does not hold yet, sent once rather than once per frame.
     transmit: Vec<(u32, String)>,
-    /// Where to put a picture that is not already where it should be: its screen row, its column,
-    /// and the escape.
     place: Vec<(usize, u16, String)>,
-    /// What the next frame will find on the screen.
     drawn: Drawn,
 }
 
-/// Puts each attached picture on the screen, at the row its marker line was drawn on (D59).
-///
-/// The escapes are written after the frame, because the terminal position is a side effect the
-/// frame cannot express: the picture occupies cells the layout reserved as blanks, and the cursor
-/// is put back where the frame left it so the next draw starts from the same place.
-///
-/// A picture is treated like text: the rows that are scrolled off are simply not drawn. The old rule
-/// was that the whole picture had to fit, which meant two large screenshots could never both be
-/// visible, so one of them silently disappeared.
-///
-/// A picture the terminal already holds at the right place and showing the right band is left
-/// alone. One that only moved is re-placed, at its own id and placement id, which kitty replaces
-/// without the frame of nothing that erasing and redrawing produced. The file is only sent again
-/// when the terminal does not have it (D59).
 fn plan_images(
     protocol: image::Protocol,
     drawn: &Drawn,
@@ -925,24 +800,14 @@ fn plan_images(
     covered: &[Rect],
 ) -> Plan {
     let height = area.height as usize;
-    // The band each picture is drawn with is part of "what is on screen": scrolling changes which
-    // part of a picture is visible even when its row has not moved (D59).
     let mut visible: Vec<(usize, &Placed, u16, u16)> = Vec::new();
     for placed in images {
-        // The picture occupies the cells from its own row down; the screen shows [top, top +
-        // height), and what is left of that intersection is what gets drawn (D59).
         let Some((from, rows)) = image::band(placed.line, placed.box_.rows, top, height) else {
             continue;
         };
-        // The screen row of the picture's first visible line: its own row, plus the rows scrolled
-        // off its top, less what the screen has scrolled past.
         let row = placed.line + from as usize - top;
         visible.push((row, placed, from, rows));
     }
-    // A menu or a dialog is drawn over the transcript, and a picture placed after it would sit on
-    // top: only the rows above it are drawn, and a picture it reaches from its first row waits
-    // until the menu closes (D161). `cut` counts rows of the band from the top, which is the crop
-    // `image::draw` turns into a source rectangle.
     let clear_rows = |row: usize, rows: u16| -> Option<u16> {
         let top = area.y + row as u16;
         let mut cut = rows;
@@ -963,8 +828,6 @@ fn plan_images(
             clear_rows(*row, *rows).map(|cut| (*row, *placed, *from, cut))
         })
         .collect();
-    // The terminal clears its images when the screen is cleared, and ratatui clears it on every
-    // resize: what the terminal held is gone, and the parts that stay on screen are sent again.
     let resized = drawn
         .at
         .is_some_and(|at| (at.width, at.height) != (area.width, area.height));
@@ -972,9 +835,6 @@ fn plan_images(
     let moved = stale || drawn.at != Some(area);
     let kitty = protocol == image::Protocol::Kitty;
     let mut plan = Plan::default();
-    // What the terminal holds the data of. `stale` is the exception: the transcript was replaced
-    // under the pictures and the same id may name a different one, so every id it names is taken
-    // off — data too — and sent again.
     let mut held = if stale {
         Vec::new()
     } else {
@@ -983,8 +843,6 @@ fn plan_images(
     if kitty && stale {
         plan.free.extend(drawn.held.iter().copied());
     }
-    // A picture that left the screen entirely is one nothing will draw again soon, so its data goes
-    // with it rather than growing the terminal's store with every picture the transcript showed.
     held.retain(|id| {
         let keep = visible.iter().any(|(_, placed, _, _)| placed.id == *id);
         if kitty && !keep {
@@ -992,9 +850,6 @@ fn plan_images(
         }
         keep
     });
-    // A picture a menu or dialog reached from its first row keeps its data and loses only its
-    // placement: closing the dialog puts it back on the screen without the file travelling
-    // again (D161).
     if kitty && !stale {
         for (_, _, id, _, _) in &drawn.shown {
             let hidden = visible.iter().any(|(_, placed, _, _)| placed.id == *id)
@@ -1016,8 +871,6 @@ fn plan_images(
             .shown
             .iter()
             .find(|(_, _, drawn_id, _, _)| *drawn_id == id);
-        // The column is part of where the picture is: a formula inside a line moves with the words
-        // before it without the row it is on changing (D165).
         let unchanged = !moved
             && old.is_some_and(|(drawn_row, drawn_col, _, drawn_from, drawn_rows)| {
                 *drawn_row == *row
@@ -1049,32 +902,18 @@ fn plan_images(
     plan
 }
 
-/// The escapes for one frame's plan, in the order the terminal has to read them: forget what is
-/// gone, hand over what it does not hold, then put each picture where it belongs (D59).
 fn image_escapes(plan: &Plan, area: Rect) -> String {
-    // Placing a picture means moving to its row, so the cursor is saved first and put back at the
-    // end: a terminal draws its cursor wherever it was left, and a block sitting on the first row of
-    // a formula looked like the formula arriving selected.
     let mut out = String::from("\x1b7");
-    // Take off the pictures that left the screen, and forget their data so the terminal's store
-    // does not grow with every picture the transcript ever showed. Kitty keeps an image at the cell
-    // it was drawn on and ratatui only rewrites characters, so leaving it would smear (D59).
     for id in &plan.free {
         let _ = write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\");
     }
-    // A picture something is drawn over is taken off the cells it covers, and its data is kept
-    // (D161). Kitty only: iTerm2 has neither a store nor a delete, and a full repaint is what takes
-    // its picture off the screen.
     for id in &plan.hide {
         let _ = write!(out, "\x1b_Ga=d,d=i,i={id},q=2\x1b\\");
     }
-    // A picture is handed over once, here; from then on the terminal holds it under its id (D59).
     for (_, escape) in &plan.transmit {
         out.push_str(escape);
     }
     for (row, column, escape) in &plan.place {
-        // `row` is the picture's first visible line, counted from the top of the area, and `column`
-        // its first cell across it; terminal rows and columns are one-based.
         let _ = write!(
             out,
             "\x1b[{};{}H{}",
@@ -1091,12 +930,6 @@ fn image_escapes(plan: &Plan, area: Rect) -> String {
     out
 }
 
-/// Where `SADDLE_IMAGE_LOG` says to record what each frame told the terminal about its pictures.
-///
-/// A terminal that draws a picture the wrong size is indistinguishable from one that was sent the
-/// wrong escape, and the second is answerable from a file: every frame writes the area, the scroll
-/// position, and each picture's id, row and escape (D59). Off unless the variable is set, because a
-/// running interface should not write log files nobody asked for.
 fn image_log() -> Option<&'static Mutex<io::BufWriter<fs::File>>> {
     static LOG: OnceLock<Option<Mutex<io::BufWriter<fs::File>>>> = OnceLock::new();
     LOG.get_or_init(|| {
@@ -1111,7 +944,6 @@ fn image_log() -> Option<&'static Mutex<io::BufWriter<fs::File>>> {
     .as_ref()
 }
 
-/// One frame's line in that file, without the transmitted files.
 fn trace_line(plan: &Plan, area: Rect, top: usize) -> String {
     let mut line = format!(
         "frame x={} y={} {}x{} top={top} covered={}",
@@ -1131,8 +963,6 @@ fn trace_line(plan: &Plan, area: Rect, top: usize) -> String {
         let _ = write!(line, " transmit {id}");
     }
     for (row, column, escape) in &plan.place {
-        // The escape as bytes a person can read in a file, since it is written to a terminal with
-        // control characters that a text editor would swallow.
         let _ = write!(
             line,
             " place{row}.{column} {}",
@@ -1146,7 +976,6 @@ fn trace_line(plan: &Plan, area: Rect, top: usize) -> String {
     line
 }
 
-/// Appends that line to the log, if one was asked for.
 fn trace_frame(plan: &Plan, area: Rect, top: usize) {
     let Some(log) = image_log() else {
         return;
@@ -1158,12 +987,6 @@ fn trace_frame(plan: &Plan, area: Rect, top: usize) {
     }
 }
 
-/// Writes the frame ratatui has drawn, and the pictures on it, to the terminal in one write (D59).
-///
-/// Ratatui draws into a buffer rather than to the screen, so the escapes can follow the frame before
-/// anything is flushed. Written separately, a scrolled frame would be presented once with the text
-/// moved and the pictures still where they were, and again with them moved: that gap is the flicker
-/// a large picture made obvious, because it is the frame after the text that the eye sees first.
 fn flush_frame(frame: &FrameBuffer, app: &mut App) {
     let mut out = frame.take();
     if app.protocol != image::Protocol::Text
@@ -1180,8 +1003,6 @@ fn flush_frame(frame: &FrameBuffer, app: &mut App) {
         );
         out.extend_from_slice(image_escapes(&plan, area).as_bytes());
         trace_frame(&plan, area, top);
-        // A change in what covers the pictures is one iTerm2 cannot follow with an escape: it has
-        // no delete, so the next frame is painted over a cleared screen instead (D161).
         app.repaint |= app.drawn.covered != plan.drawn.covered;
         app.drawn = plan.drawn;
     }
@@ -1190,11 +1011,8 @@ fn flush_frame(frame: &FrameBuffer, app: &mut App) {
     let _ = stdout.flush();
 }
 
-/// How often the event loop checks that the terminal is still in raw mode.
 const MODE_CHECK: u64 = 500;
 
-/// Puts raw mode back if it was lost, so the interface cannot end up echoing every keystroke
-/// instead of receiving it (D75).
 fn keep_raw_mode() {
     if matches!(crossterm_terminal::is_raw_mode_enabled(), Ok(false)) {
         let _ = crossterm_terminal::enable_raw_mode();
@@ -1210,22 +1028,13 @@ fn event_loop(
     let mut dirty = true;
     let mut last_tick = Instant::now();
     let mut last_mode_check = Instant::now();
-    // Unknown until the terminal reports it, which some never do (D164).
     let mut focus = Focus::Unknown;
     loop {
-        // The interface is unusable without raw mode: keys are echoed instead of delivered, and the
-        // screen fills with what is typed. Whatever took it away — a child process, a terminal
-        // query that should never have run (D75) — it is put back rather than left to the person to
-        // recover by closing the terminal.
         if last_mode_check.elapsed() >= Duration::from_millis(MODE_CHECK) {
             last_mode_check = Instant::now();
             keep_raw_mode();
         }
         if app.repaint {
-            // The previous frame found a menu or dialog changed what covers the pictures. A
-            // repaint is the only way to take a picture off iTerm2, which has no delete; kitty's
-            // clear escape also deletes the images it holds, so there the placement is taken off
-            // instead and no repaint is wanted (D161).
             app.repaint = false;
             if app.protocol == image::Protocol::Iterm2 {
                 screen.terminal.clear()?;
@@ -1237,7 +1046,6 @@ fn event_loop(
             flush_frame(&screen.frame, app);
             dirty = false;
         }
-        // A short poll keeps streamed text flowing without a second wake-up mechanism.
         if event::poll(Duration::from_millis(30))? {
             loop {
                 let action = match event::read()? {
@@ -1274,7 +1082,6 @@ fn event_loop(
                         control.after_config_edit(app);
                     }
                     Some(Action::Apply(Change::EditPolicy)) => {
-                        // One base file: the grants are its `[agent]` table (D63).
                         let path = control.paths.user_config();
                         edit_file(&mut screen.terminal, &path, app)?;
                         control.after_policy_edit(app);
@@ -1289,7 +1096,6 @@ fn event_loop(
             }
         }
         while let Ok(ev) = events.try_recv() {
-            // A turn has just spent tokens, so what is left is worth asking about again (D36).
             let turn_ended = matches!(ev, AgentEvent::TurnEnd(_));
             let outcome = match &ev {
                 AgentEvent::TurnEnd(end) => notify::ended(*end),
@@ -1302,7 +1108,6 @@ fn event_loop(
             if turn_ended && let Err(e) = control.refresh_usage(app) {
                 app.note(NoteKind::Error, &format!("{e:#}"));
             }
-            // A queued prompt has already started the next turn, which is nothing to announce.
             if let Some(outcome) = outcome
                 && app.busy.is_none()
             {
@@ -1310,8 +1115,6 @@ fn event_loop(
             }
             dirty = true;
         }
-        // The team list and a worker's view read the shared handles directly, so what a worker is
-        // saying arrives here even while the lead's thread is finishing a turn (D195).
         if app.overview.is_some() || app.worker.is_some() {
             let views = control.team.views();
             if views != app.team {
@@ -1320,8 +1123,6 @@ fn event_loop(
                 }
                 dirty = true;
             }
-            // The page also shows what the team shares — its message bus and its command queue —
-            // read from the same handles rather than the session thread (D195).
             if app.overview.is_some() {
                 let bus = control.team.bus();
                 if bus != app.bus {
@@ -1335,9 +1136,6 @@ fn event_loop(
                 }
             }
         }
-        // A running worker that is on screen keeps the frame moving as well: its elapsed times
-        // and any spinner in a call it is waiting on advance with the clock, even though the
-        // lead is idle (D172, D195).
         let watching = app.overview.is_some() || app.worker.is_some();
         let working = app.busy.is_some()
             || app.background_running()
@@ -1347,7 +1145,6 @@ fn event_loop(
                     .iter()
                     .any(|worker| worker.state.starts_with("running")))
             || app.login.as_ref().is_some_and(|l| l.checking());
-        // The "copied" note is timed, so its redraws stop on their own once it has expired.
         let noting = app.copied.is_some_and(|at| at.elapsed() < app::COPY_NOTE);
         if (working || noting) && last_tick.elapsed() >= TICK {
             app.tick();
@@ -1360,22 +1157,13 @@ fn event_loop(
     }
 }
 
-/// Carries out actions on the UI thread: talks to the agent thread, and reads and writes the
-/// user's config and key store for /login, /logout and /model.
 struct Controller {
     commands: Sender<Command>,
-    /// For answers produced off the UI thread, such as a model list.
     events: Sender<AgentEvent>,
     paths: Paths,
-    /// This workspace's saved sessions, for /resume.
     store: store::Store,
-    /// The sign-in the login dialog is waiting on, so a cancel or a second attempt stops the poll
-    /// that is no longer wanted (D85).
     signing: Mutex<Option<Arc<AtomicBool>>>,
-    /// What a prompt typed during a turn is handed to (D149): the agent thread reads it between
-    /// requests, so it does not sit in the command channel the turn is blocking on.
     steering: Steer,
-    /// The live workers of this session, reached without the agent thread (D195).
     team: Steering,
 }
 
@@ -1383,14 +1171,11 @@ impl Controller {
     fn perform(&self, app: &mut App, action: Action) {
         let result = match action {
             Action::Send(text) => {
-                // Reset here, before the turn starts, so an Esc pressed right after Enter counts.
                 cancel::reset();
                 self.send(app, Command::Prompt { text, skill: None });
                 Ok(())
             }
             Action::Steer(text) => {
-                // Straight to the running turn, not through the command channel: that is what
-                // makes it arrive before the next request rather than after the turn (D149).
                 self.steering.push(text);
                 Ok(())
             }
@@ -1399,8 +1184,6 @@ impl Controller {
                 Ok(())
             }
             Action::Reload => {
-                // The settings side first, keeping the session-only choices a person made:
-                // `/thinking` and ctrl+t/ctrl+o are not in config.toml (D70).
                 self.reload_settings(app);
                 self.reload_theme(app);
                 self.send(app, Command::Reload);
@@ -1449,7 +1232,6 @@ impl Controller {
                 Ok(())
             }
             Action::SettleWindow => self.settle_window(app),
-            // The dialog asks for one change and stays open, so a person can do several.
             Action::Grant(change) => {
                 self.grant(app, change);
                 Ok(())
@@ -1515,8 +1297,6 @@ impl Controller {
                 Ok(())
             }
             Action::WorkerInput(text) => {
-                // Always through the worker's own handle: its thread is the only agent that may
-                // write its conversation, whether it is mid-turn or idle (D149, D195).
                 if let Some(name) = &app.worker {
                     self.team.say(name, text);
                 }
@@ -1531,8 +1311,6 @@ impl Controller {
                 Ok(())
             }
             Action::DeleteSession(id) => {
-                // The agent thread may hold it, so deleting goes through the same channel as
-                // everything else that touches the store (D55).
                 self.send(app, Command::Delete(id));
                 Ok(())
             }
@@ -1547,11 +1325,7 @@ impl Controller {
                 self.send(app, Command::Compact(focus));
                 Ok(())
             }
-            // The event loop handles it, since it needs the terminal.
             Action::OpenUrl(url) => {
-                // The opener answers twice: at once if nothing could be started, and from a thread
-                // if the program it started then failed, which is the silent case a person cannot
-                // see (D86).
                 let events = self.events.clone();
                 let say: browser::Report = Arc::new(move |why: String| {
                     let _ = events.send(AgentEvent::Unopened(why));
@@ -1572,10 +1346,6 @@ impl Controller {
         }
     }
 
-    /// The providers `/login` offers, with what each one's credential looks like from here.
-    ///
-    /// Built once, because two dialogs read it: `/login`, and the model picker, which needs the
-    /// provider's configured model and nothing else (D88).
     fn login_choices(&self) -> Result<(Vec<Choice>, Vec<String>)> {
         let user = UserConfig::load(&self.paths.user_config())?;
         let auth = AuthStore::load(&self.paths.auth_store())?;
@@ -1588,9 +1358,6 @@ impl Controller {
                     .clone()
                     .filter(|var| env::var(var).is_ok_and(|k| !k.is_empty()));
                 let stored = auth.key(&name).is_some();
-                // An OAuth provider's credential is the token a sign-in stored, and it is not a
-                // key: showing "not logged in" beside a key page would send a person looking for
-                // something that provider does not issue (D85).
                 let oauth = entry.auth == Some(provider::Auth::Oauth);
                 let signed_in = oauth && auth.oauth(&name).is_some();
                 let status = match (&env, stored, oauth, &entry.api_key_env) {
@@ -1640,8 +1407,6 @@ impl Controller {
         let (choices, builtin) = self.login_choices()?;
         let auth_path = render::home_relative(&self.paths.auth_store());
         let mut login = Login::new(choices, builtin, preselect.as_deref(), direct, auth_path);
-        // Opened straight at a provider, the dialog owes it something at once: a sign-in to start, or
-        // the model list to ask for, since neither is a key to type (D85).
         let pending = login.take_pending();
         app.open_login(login);
         match pending {
@@ -1652,16 +1417,7 @@ impl Controller {
         Ok(())
     }
 
-    /// Runs a device sign-in on its own thread: the code goes to the dialog, then the poll
-    /// continues until it is approved and the tokens are stored (D85).
-    ///
-    /// The poll belongs on a thread because it is a loop of requests with seconds between them; on
-    /// the interface thread the screen would freeze for as long as the person takes to fetch a
-    /// phone. The flag is what makes esc stop it, rather than leaving a poller talking to the server
-    /// for a sign-in nobody is watching.
     fn sign_in(&self, app: &mut App, id: u64, provider: &str) {
-        // Anything the config is missing is said in the dialog rather than as a note, because the
-        // dialog is where the person is looking and where esc is (D85).
         if let Err(e) = self.spawn_sign_in(id, provider)
             && let Some(login) = &mut app.login
         {
@@ -1681,7 +1437,6 @@ impl Controller {
         let provider = provider.to_owned();
         let stop = Arc::new(AtomicBool::new(false));
         if let Ok(mut current) = self.signing.lock() {
-            // A second sign-in replaces the first: the dialog has one on screen at a time.
             if let Some(previous) = current.replace(stop.clone()) {
                 previous.store(true, Ordering::Relaxed);
             }
@@ -1696,7 +1451,6 @@ impl Controller {
                     ));
                 };
                 let mut pause = |seconds: u64| {
-                    // In steps, so a cancel is noticed within a second of the flag going up.
                     for _ in 0..seconds {
                         if stop.load(Ordering::Relaxed) {
                             return;
@@ -1721,22 +1475,12 @@ impl Controller {
         Ok(())
     }
 
-    /// Opens the model list for the provider in force, searchable, with the current one selected
-    /// (D88).
-    ///
-    /// `/model <name>` is still there for someone who knows the name; this is for everyone else,
-    /// and for the case the name is not knowable — a subscription backend renames models, and a
-    /// gateway decides what it serves.
     fn open_models(&self, app: &mut App) -> Result<()> {
         let provider = app.header.provider.clone();
         if provider.is_empty() {
-            // No provider yet, so the question is really which one, and `/login` asks it.
             return self.open_login(app, None, false);
         }
         let auth_path = render::home_relative(&self.paths.auth_store());
-        // Whatever goes wrong is said inside the picker, never as a note: a note is a transcript
-        // entry, a dialog covers the transcript, and the person read the silence as nothing having
-        // happened at all (D88).
         let prepared = self.login_choices().and_then(|(choices, _)| {
             if choices.iter().any(|c| !c.custom && c.name == provider) {
                 Ok(choices)
@@ -1759,7 +1503,6 @@ impl Controller {
         Ok(())
     }
 
-    /// Lists the draft's models on a separate thread, so the dialog stays live meanwhile.
     fn check_models(&self, id: u64, draft: Draft) -> Result<()> {
         let config = match &draft.base_url {
             Some(url) => provider::ProviderConfig {
@@ -1796,8 +1539,6 @@ impl Controller {
         let events = self.events.clone();
         let cache = self.paths.reported_windows();
         let base_url = config.base_url.clone();
-        // Built before the thread so the headers are the ones a turn would send: a key just typed,
-        // or the token the sign-in stored a moment ago (D85).
         let p = Provider::new(
             &draft.provider,
             config,
@@ -1812,9 +1553,6 @@ impl Controller {
                     .refresh_tokens()
                     .map_err(|e| provider::ModelsError::Failed(format!("{e:#}")))
                     .and_then(|()| provider::list_models(&p));
-                // A listing is where the server states its real limits, so keep them for the
-                // sessions that never list anything (D34). Failing to cache costs nothing but the
-                // default window next time.
                 if let Ok(models) = &listed {
                     let mut reported = provider::Reported::stored(&cache);
                     reported.record(&base_url, models);
@@ -1837,16 +1575,8 @@ impl Controller {
         Ok(())
     }
 
-    /// Lists what every configured provider serves, one thread each, and answers once (D89).
-    ///
-    /// Concurrently because the list is the union: a provider that is down spends its whole timeout,
-    /// and doing that one after another would leave the dialog waiting for the sum of every failure.
-    /// A provider that cannot be asked is reported beside the list rather than left out silently —
-    /// "missing" and "serves nothing" look the same otherwise.
     fn list_all_models(&self, app: &mut App, id: u64) -> Result<()> {
         let (choices, _) = self.login_choices()?;
-        // A provider with no credential cannot be listed; it is not a failure, it is one the person
-        // has not set up, and `/login` is where that happens.
         let ready: Vec<Choice> = choices
             .into_iter()
             .filter(|c| !c.custom && (c.has_key || !c.needs_key))
@@ -1880,10 +1610,6 @@ impl Controller {
 
                 let mut picks: Vec<Pick> = Vec::new();
                 let mut failed = failed;
-                // One thread per provider, all of them joined: the answer is one list, so it can
-                // only be assembled once every provider has answered or given up. Each thread
-                // returns its models *and* its own name and base URL, so nothing has to be matched
-                // up afterwards.
                 let answers: Vec<Answer> = thread::scope(|scope| {
                     let handles: Vec<_> = built
                         .iter()
@@ -1913,8 +1639,6 @@ impl Controller {
                         })
                         .collect()
                 });
-                // Every window the servers state is kept, not just the one chosen (D34). Recorded
-                // here rather than in the threads: one file, one writer.
                 let mut reported = provider::Reported::stored(&cache);
                 let mut recorded = false;
                 for (name, base_url, answer) in answers {
@@ -1939,8 +1663,6 @@ impl Controller {
         Ok(())
     }
 
-    /// A provider for listing only: no model is needed, and the stored credential is used as a turn
-    /// would (D85).
     fn provider_for_listing(&self, name: &str) -> Result<Provider> {
         let user = UserConfig::load(&self.paths.user_config())?;
         let auth = AuthStore::load(&self.paths.auth_store())?;
@@ -1952,8 +1674,6 @@ impl Controller {
 
     fn open_resume(&self, app: &mut App) -> Result<()> {
         let mut listed = self.store.list()?;
-        // A conversation saved before the worker column existed is recognised by its own audit
-        // log and marked once, so the person's history does not keep a team's transcripts (D195).
         self.store
             .adopt_workers(&self.paths.audit_dir(), &mut listed)?;
         let sessions: Vec<_> = listed
@@ -1996,8 +1716,6 @@ impl Controller {
         })
     }
 
-    /// Writes one change into this workspace's own policy file (D45). The global policy is never
-    /// touched: a change made while working in a project is a change to that project.
     fn grant(&self, app: &mut App, change: permissions::Change) {
         let setup = Setup::load(
             &app.header.workspace,
@@ -2014,8 +1732,6 @@ impl Controller {
         if let Some(dialog) = &mut app.permissions {
             dialog.error = None;
         }
-        // Rows and the file's own text are rebuilt, so what is on screen is what the file now says
-        // and the prompt re-checks the line being typed against it (D173).
         match self.permissions_snapshot(&setup) {
             Ok((rows, text)) => {
                 if let Some(dialog) = &mut app.permissions {
@@ -2024,13 +1740,9 @@ impl Controller {
             }
             Err(e) => app.note(NoteKind::Error, &format!("{e:#}")),
         }
-        // The change takes effect now, and the agent thread tells the model on its next request
-        // (D47).
         self.send(app, Command::ReloadPolicy);
     }
 
-    /// A refused change is reported where the person is looking, with what was typed back in the
-    /// prompt so a typo is fixed rather than retyped (D173).
     fn grant_failed(app: &mut App, change: &permissions::Change, e: anyhow::Error) {
         if let Some(dialog) = &mut app.permissions {
             match change {
@@ -2050,12 +1762,9 @@ impl Controller {
         app: &mut App,
         change: &permissions::Change,
     ) -> Result<()> {
-        // The roots the session would resolve, so the write is validated as a session would.
         let roots = session::roots_for_validation()?;
         if let permissions::Change::Add(what) = change {
             let added = grant::add(&setup.workspace_policy_path, what, &roots)?;
-            // The policy is read again below and takes effect at once (D47), so this says what was
-            // added rather than promising when it applies.
             app.note(NoteKind::Info, &format!("added {}", added.summary));
             return Ok(());
         }
@@ -2067,7 +1776,6 @@ impl Controller {
         Ok(())
     }
 
-    /// Saves one change from /settings and applies it to the running session.
     fn apply(&self, app: &mut App, change: Change) -> Result<()> {
         let provider = app.header.provider.clone();
         let path = self.paths.user_config();
@@ -2121,8 +1829,6 @@ impl Controller {
                 self.switch(app, p);
             }
             Change::StatusLine(template) => {
-                // Checked before it is saved, so a typo is an error now rather than a line with
-                // `{costt}` in it later (D36).
                 let parsed = match &template {
                     None => Template::default(),
                     Some(text) => Template::parse(text).map_err(|e| anyhow!("{e}"))?,
@@ -2166,8 +1872,6 @@ impl Controller {
                 })?;
                 app.expand_tools = on;
             }
-            // Handled by the event loop, which owns the terminal.
-            // The event loop handles these: one needs the terminal, the other opens a dialog.
             Change::EditConfig | Change::EditPolicy => return Ok(()),
             Change::OpenPermissions => {
                 return self.open_permissions(app);
@@ -2180,14 +1884,8 @@ impl Controller {
         Ok(())
     }
 
-    /// `/theme`: open the list, or switch to the theme named and write it to config.toml (D71, D74).
-    ///
-    /// Writing the file is what `/model` does: a choice made once should not have to be made again.
-    /// The switch is applied here as well, so it takes effect without a reload.
     fn theme(&self, app: &mut App, name: Option<String>) {
         let Some(name) = name else {
-            // A theme is chosen by looking at it, so the list is a picker that previews rather than
-            // a printed set of names to choose from blind (D74).
             let user = match UserConfig::load(&self.paths.user_config()) {
                 Ok(user) => user,
                 Err(e) => return app.note(NoteKind::Error, &format!("{e:#}")),
@@ -2205,8 +1903,6 @@ impl Controller {
             Ok(user) => user,
             Err(e) => return app.note(NoteKind::Error, &format!("{e:#}")),
         };
-        // Built before it is written: a name that does not build must not be saved, or the next
-        // session would open on an error the person cannot see the cause of.
         let theme = match theme::build(&name, &user.themes) {
             Ok(theme) => theme,
             Err(e) => return app.note(NoteKind::Error, &format!("{e:#}")),
@@ -2228,7 +1924,6 @@ impl Controller {
         );
     }
 
-    /// Writes one `[compaction]` switch and applies the result to the running session (D77, D78).
     fn set_compaction(&self, app: &mut App, key: &str, on: bool) -> Result<()> {
         let path = self.paths.user_config();
         config::edit(&path, |doc| {
@@ -2241,10 +1936,6 @@ impl Controller {
         Ok(())
     }
 
-    /// The theme named by the config, or the default (D71).
-    ///
-    /// Built from the answer the terminal gave at startup. It is not asked again: the interface owns
-    /// stdin and raw mode by now, and reading a reply from there broke a session once (D75).
     pub fn reload_theme(&self, app: &mut App) {
         let selected = app.header.theme.clone();
         match theme_from_config(&self.paths, &selected) {
@@ -2257,13 +1948,6 @@ impl Controller {
         }
     }
 
-    /// `/reload`: the settings half, read from config.toml (D70).
-    ///
-    /// Not [`after_config_edit`], because that is for a dialog that just wrote the file: it resets
-    /// the session-only state a person set on purpose. `/thinking` and ctrl+t/ctrl+o change the
-    /// agent and are not written to config, so reloading over them would silently drop a choice
-    /// made minutes earlier in the same session. This keeps them; only what the file states is
-    /// taken again.
     fn reload_settings(&self, app: &mut App) {
         let user = match UserConfig::load(&self.paths.user_config()) {
             Ok(user) => user,
@@ -2277,20 +1961,13 @@ impl Controller {
             Some(Ok(template)) => app.header.status = template,
             Some(Err(e)) => app.note(NoteKind::Error, &format!("[ui] status: {e}")),
         }
-        // The theme is rebuilt from the answer the terminal gave at startup; it is not asked again
-        // here, because the interface owns the terminal by now (D75).
         self.reload_theme(app);
         app.header.notify = user.ui.notify.unwrap_or_default();
-        // The keys with no default are the file's to give, and the next tree opened takes them
-        // (D169).
         app.header.keys = user.keys.clone();
         app.max_steps = user.max_steps.filter(|n| *n > 0);
         self.send(app, Command::SetMaxSteps(app.max_steps));
         let compaction = Settings::from_config(&user.compaction);
         self.send(app, Command::SetCompaction(compaction));
-        // The provider and the model are this conversation's own (D91), so a file that now names
-        // another provider is what the next session starts with, not a command to move this one.
-        // Said out loud, because the file changed and nothing else will mention it.
         if let Some(name) = user.provider.clone().filter(|n| *n != app.header.provider) {
             app.note(
                 NoteKind::Info,
@@ -2304,7 +1981,6 @@ impl Controller {
         app.note(NoteKind::Info, "settings reloaded from config.toml");
     }
 
-    /// Picks up what can change mid-session after config.toml was edited by hand.
     fn after_config_edit(&self, app: &mut App) {
         let user = match UserConfig::load(&self.paths.user_config()) {
             Ok(user) => user,
@@ -2324,10 +2000,6 @@ impl Controller {
         self.send(app, Command::SetMaxSteps(app.max_steps));
         let compaction = Settings::from_config(&user.compaction);
         self.send(app, Command::SetCompaction(compaction));
-        // What the file says about the provider in force — effort, limits, the address — is what
-        // was just edited, so it is re-read; its model is the default for new sessions, so the
-        // model this conversation is working in is handed back in rather than taken from the file
-        // (D91). The file's `provider =` is the next session's default for the same reason.
         let name = app.header.provider.clone();
         if !name.is_empty() {
             let model = Some(app.header.model.clone()).filter(|m| !m.is_empty());
@@ -2360,8 +2032,6 @@ impl Controller {
         }
     }
 
-    /// Asks the provider's own endpoint what this model takes, off the UI thread, so the window a
-    /// session opens with is the server's word on it and not a default (D34).
     fn ask_window(&self, app: &mut App) -> Result<()> {
         let name = app.header.provider.clone();
         if name.is_empty() {
@@ -2381,9 +2051,6 @@ impl Controller {
         Ok(())
     }
 
-    /// The grants this session is running with, as editable rows (D45). What is not editable is
-    /// still listed: seeing that `exec` is on, and that it is not changed from a menu, is the point
-    /// of showing it.
     fn permission_rows(&self, setup: &Setup) -> Result<Vec<Row>> {
         let policy = setup.parse_policy()?;
         let Some(grants) = policy.grants(&saddle_cap::Principal::Agent) else {
@@ -2422,8 +2089,6 @@ impl Controller {
             });
         }
         for n in &grants.net {
-            // The URL rather than the host alone: a grant allows one scheme and one port, and a
-            // host that names neither reaches https on 443 only (D40, D173).
             let port = n.port.unwrap_or(n.scheme.default_port());
             rows.push(Row {
                 rule: n.rule.to_string(),
@@ -2454,8 +2119,6 @@ impl Controller {
             });
         }
         for (scope, g) in &grants.plain {
-            // A transcript grant covers this conversation or the workspace's, and which is worth
-            // saying where the grant is listed (D163).
             let root = if *scope == Scope::TranscriptRead {
                 format!("{scope} · {}", g.sessions)
             } else {
@@ -2474,8 +2137,6 @@ impl Controller {
         Ok(rows)
     }
 
-    /// The rows the editor lists and this project's grants file as it reads now, so the add prompt
-    /// can check a line against the file the write would land in (D173).
     fn permissions_snapshot(&self, setup: &Setup) -> Result<(Vec<Row>, String)> {
         let text = fs::read_to_string(&setup.workspace_policy_path)
             .with_context(|| format!("reading {}", setup.workspace_policy_path.display()))?;
@@ -2497,15 +2158,11 @@ impl Controller {
                 text,
                 base: setup.global_text.clone(),
             },
-            // The set a write is validated against, so what the prompt says will land is what
-            // lands (D45, D173).
             session::roots_for_validation()?,
         ));
         Ok(())
     }
 
-    /// Asks the provider's usage endpoint, off the UI thread, and shows the answer as `{quota}`.
-    /// A provider without one costs nothing here: there is no request to make (D36).
     fn refresh_usage(&self, app: &mut App) -> Result<()> {
         let name = app.header.provider.clone();
         if name.is_empty() {
@@ -2532,9 +2189,6 @@ impl Controller {
         Ok(())
     }
 
-    /// The endpoint has answered, so the window is settled again the way it is settled at build
-    /// time: `context-window` in config.toml still wins, else what the endpoint just stated. The
-    /// header and the loop move together, so they cannot disagree (D34).
     fn settle_window(&self, app: &mut App) -> Result<()> {
         let name = app.header.provider.clone();
         if name.is_empty() {
@@ -2548,7 +2202,6 @@ impl Controller {
             app.header.context_window = window;
             self.send(app, Command::SetWindow(window));
         }
-        // The same listing that states the window may state the price (D36).
         if config.price.is_none()
             && let Some(price) = reported.price(&config.base_url, &config.model)
         {
@@ -2558,13 +2211,10 @@ impl Controller {
         Ok(())
     }
 
-    /// The provider as the config, the key store and the model cache now describe it.
     fn build(&self, name: &str) -> Result<Provider> {
         self.build_model(name, None)
     }
 
-    /// A provider as config.toml has it, except for the model: a model chosen for one conversation
-    /// is not in the file, so it is handed in rather than read back (D91).
     fn build_model(&self, name: &str, model: Option<&str>) -> Result<Provider> {
         session::provider_for(&self.paths, name, model)
     }
@@ -2584,11 +2234,6 @@ impl Controller {
             auth.set(&req.provider, key.clone());
             auth.save(&path)?;
         }
-        // What the file gets is only what makes this provider exist: a server added here has no
-        // entry until its address is written. The provider and model in force are this
-        // conversation's, and only ctrl+s in the model list writes a default (D91). Writing a
-        // provider's `model` here would be writing that default by another name, since a new
-        // session reads it.
         if let Some(url) = &req.base_url {
             config::edit(&self.paths.user_config(), |doc| {
                 let table = config::provider_table(doc, &req.provider)?;
@@ -2597,7 +2242,6 @@ impl Controller {
                 Ok(())
             })?;
         }
-        // The model is the one just chosen, not the file's: there need not be one there (D91).
         let provider = self.build_model(&req.provider, Some(&req.model))?;
         if let Some(why) = provider.missing_key() {
             bail!(why);
@@ -2645,16 +2289,11 @@ impl Controller {
 
     fn model(&self, app: &mut App, name: Option<String>) -> Result<()> {
         let Some(model) = name else {
-            // No name: the list, filtered by typing, rather than a name to remember (D88).
             return self.open_models(app);
         };
-        // No provider in force yet, so there is nothing to name a model against: the list asks
-        // which provider first, which is what `/model` with no provider has always done.
         if app.header.provider.is_empty() {
             return self.open_models(app);
         }
-        // A name is a choice about this conversation, like picking one from the list: it is not
-        // written to config.toml, so it cannot move the next session too (D91).
         self.use_model(
             app,
             Pick {
@@ -2664,7 +2303,6 @@ impl Controller {
         )
     }
 
-    /// Switches this conversation to a provider and model (D91).
     fn use_model(&self, app: &mut App, pick: Pick) -> Result<()> {
         let (provider, model) = self.switch_to(app, &pick)?;
         app.note(
@@ -2677,8 +2315,6 @@ impl Controller {
         Ok(())
     }
 
-    /// Switches to a provider and model and writes both to config.toml, which is what a new session
-    /// starts with (D91).
     fn save_default(&self, app: &mut App, pick: Pick) -> Result<()> {
         config::edit(&self.paths.user_config(), |doc| {
             doc["provider"] = toml_edit::value(pick.provider.as_str());
@@ -2694,11 +2330,6 @@ impl Controller {
         Ok(())
     }
 
-    /// Puts a resumed conversation back on the model it was working in (D91).
-    ///
-    /// Quiet when it works: the resume note has already said which conversation came back. Loud
-    /// when it does not, because a conversation quietly continuing on a model it was not using is
-    /// exactly the surprise this is here to prevent.
     fn restore_model(&self, app: &mut App, pick: &Pick) {
         let Err(e) = self.switch_to(app, pick) else {
             return;
@@ -2713,7 +2344,6 @@ impl Controller {
         );
     }
 
-    /// Builds the provider for a choice and switches to it, answering with what was chosen.
     fn switch_to(&self, app: &mut App, pick: &Pick) -> Result<(String, String)> {
         let provider = self.build_model(&pick.provider, Some(&pick.model))?;
         let model = provider.config.model.clone();
@@ -2722,17 +2352,10 @@ impl Controller {
     }
 }
 
-/// The bytes ratatui has drawn but not yet handed to the terminal.
-///
-/// Ratatui flushes at the end of a draw, and a picture placed afterwards would arrive in a second
-/// write — a frame in which the text has scrolled and the picture has not. A writer whose flush
-/// keeps the bytes lets the picture escapes be appended to the frame, so one write is one frame
-/// with its pictures on it (D59).
 #[derive(Clone, Default)]
 struct FrameBuffer(Rc<RefCell<Vec<u8>>>);
 
 impl FrameBuffer {
-    /// Everything drawn since the last write.
     fn take(&self) -> Vec<u8> {
         mem::take(&mut *self.0.borrow_mut())
     }
@@ -2745,23 +2368,17 @@ impl io::Write for FrameBuffer {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        // Kept for the caller, which appends the frame's pictures before writing any of it.
         Ok(())
     }
 }
 
 type ScreenTerminal = Terminal<CrosstermBackend<FrameBuffer>>;
 
-/// Raw mode, the alternate screen, mouse wheel, bracketed paste and, where the terminal supports
-/// it, unambiguous keys (so shift+enter differs from enter). Dropping it restores the terminal.
 struct Screen {
     terminal: ScreenTerminal,
-    /// The terminal's writer, shared with `terminal`, so a frame can be completed and written once.
     frame: FrameBuffer,
 }
 
-/// Ctrl+G: the prompt goes to a private file, `$EDITOR` edits it, and the result comes back into
-/// the editor.
 fn edit_prompt(terminal: &mut ScreenTerminal, app: &mut App, paths: &Paths) -> Result<()> {
     fs::create_dir_all(&paths.state)?;
     let path = paths.state.join(format!("prompt-{}.md", process::id()));
@@ -2783,10 +2400,6 @@ fn edit_prompt(terminal: &mut ScreenTerminal, app: &mut App, paths: &Paths) -> R
     Ok(())
 }
 
-/// Hands the terminal to `$VISUAL` or `$EDITOR` (or vi) for `path`, then takes it back.
-///
-/// Leaving and re-entering the alternate screen clears the screen, and with it the pictures the
-/// terminal was holding (D59, D161), so the next frame sends them again.
 fn edit_file(terminal: &mut ScreenTerminal, path: &Path, app: &mut App) -> Result<()> {
     leave_modes();
     ratatui::restore();
@@ -2807,8 +2420,6 @@ fn edit_file(terminal: &mut ScreenTerminal, path: &Path, app: &mut App) -> Resul
     Ok(())
 }
 
-/// Announces the end of a turn the person may not be watching, as `[ui] notify` says (D164). The
-/// title names the workspace, so two sessions in two windows can be told apart.
 fn announce(app: &App, focus: Focus, outcome: &str) {
     let tmux = env::var_os("TMUX").is_some_and(|v| !v.is_empty());
     let title = match app.header.workspace.file_name() {
@@ -2822,12 +2433,6 @@ fn announce(app: &App, focus: Focus, outcome: &str) {
     }
 }
 
-/// Copies `text` to the terminal's clipboard with OSC 52.
-///
-/// Once saddle owns the mouse a drag no longer reaches the terminal's own selection, so this is how
-/// selected text leaves the UI, and it needs no X or Wayland connection. A terminal that refuses the
-/// sequence leaves the highlight as the only feedback; shift+drag still reaches the terminal in most
-/// of them (D35).
 fn copy_to_clipboard(text: &str) -> Result<()> {
     let tmux = env::var_os("TMUX").is_some_and(|v| !v.is_empty());
     let mut stdout = stdout();
@@ -2836,17 +2441,11 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
-/// The bytes that put `text` on the terminal's clipboard: OSC 52 with the text base64-encoded,
-/// wrapped for tmux when saddle runs inside it.
 fn clipboard_sequence(text: &str, tmux: bool) -> String {
     let payload = general_purpose::STANDARD.encode(text);
     notify::passthrough(&format!("\x1b]52;c;{payload}\x07"), tmux)
 }
 
-/// Enables the modes the UI runs in. Mouse reporting is on unless `[ui] mouse = false` (D35): while
-/// it is on, the terminal sends drags to saddle rather than selecting them itself, and saddle does
-/// its own selection, highlight and copy. Focus reporting tells the end of a turn whether anyone is
-/// looking (D164).
 fn enter_modes(mouse: bool) -> Result<()> {
     let mut out = stdout();
     execute!(out, EnableBracketedPaste, EnableFocusChange)?;
@@ -2875,19 +2474,13 @@ fn leave_modes() {
 
 impl Screen {
     fn enter(mouse: bool) -> Result<Self> {
-        // The three steps `ratatui::try_init` takes, with a writer of our own: the frame and the
-        // pictures on it then leave in one write (D59).
         enable_raw_mode().context("starting the terminal UI")?;
         execute!(stdout(), EnterAlternateScreen).context("starting the terminal UI")?;
         let frame = FrameBuffer::default();
         let terminal = Terminal::new(CrosstermBackend::new(frame.clone()))
             .context("starting the terminal UI")?;
-        // A reply to the startup's colour query that arrived after its deadline is a keystroke as
-        // far as this loop is concerned, and would be typed into the prompt (D75).
         terminal::discard_pending();
         enter_modes(mouse)?;
-        // A panic is printed on the screen the person can read, and raw mode, the alternate screen
-        // and the modes above are all put back before it is.
         let previous = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
             leave_modes();
@@ -2925,8 +2518,6 @@ mod tests {
     use crate::tui::app::Entry;
     use crate::tui::keys::Keys;
 
-    /// A controller over a throwaway config, so a slash command can be followed all the way to
-    /// what it does (D74).
     fn controller(dir: &Path, config: &str) -> Controller {
         let paths = Paths {
             state: dir.join("state"),
@@ -2971,10 +2562,6 @@ mod tests {
 
     #[test]
     fn a_sign_in_runs_off_the_interface_thread_and_answers_on_the_events_channel() {
-        // D85: the poll is a loop of requests with seconds between them, so it cannot run on the
-        // thread that draws the screen. This checks the seam — the dialogs's request starts a
-        // thread, and what that thread finds arrives as an event the interface reads — with the
-        // endpoints pointed at a port nothing is listening on, so no code is ever issued.
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths {
             state: dir.path().join("state"),
@@ -3005,8 +2592,6 @@ mod tests {
             team: Steering::default(),
         };
         let mut app = an_app();
-        // An unreachable endpoint is a failure the dialog has to be told about, not a hang: nothing
-        // is left waiting for a code that will never come.
         c.perform(&mut app, Action::SignIn(7, "mine".into()));
         let answer = answers
             .recv_timeout(Duration::from_secs(20))
@@ -3018,7 +2603,6 @@ mod tests {
             }
             other => panic!("expected a failed sign-in, got {other:?}"),
         }
-        // Nothing was stored, so the provider is still not signed in.
         assert!(
             !c.paths.auth_store().exists()
                 || AuthStore::load(&c.paths.auth_store())
@@ -3030,9 +2614,6 @@ mod tests {
 
     #[test]
     fn a_sign_in_that_cannot_start_says_so_in_the_dialog() {
-        // D85: a provider the config cannot sign in to must not leave the dialog waiting for a code
-        // that is never coming. The reason belongs on the screen the person is looking at, with esc
-        // right there to leave it.
         let dir = tempfile::tempdir().unwrap();
         let c = controller(dir.path(), "provider = \"openai\"\n");
         let mut app = an_app();
@@ -3046,7 +2627,6 @@ mod tests {
             custom: false,
             oauth,
         };
-        // A name the config does not define, which is what a typo in a provider table looks like.
         let mut login = Login::new(
             vec![choice("kimi", true)],
             vec![],
@@ -3063,25 +2643,20 @@ mod tests {
         let why = login.device.error.as_deref().unwrap_or_default();
         assert!(why.contains("kimi"), "{why}");
         assert!(login.device.code.is_none(), "no code was issued");
-        // Still on the sign-in screen, so a key press cannot index an empty field list.
         app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     }
 
     #[test]
     fn slash_model_with_no_name_opens_the_list_for_the_provider_in_force() {
-        // D88: `/model` on its own is the picker. This walks the whole way — the command, the
-        // dialog, the listing it asks for — because the point is what happens when it is typed.
         let dir = tempfile::tempdir().unwrap();
         let c = controller(
             dir.path(),
             "provider = \"synthetic\"\n[providers.synthetic]\nmodel = \"hf:zai-org/GLM-5.3\"\n",
         );
-        // A stored key, so choosing a model is the only thing that could fail.
         let mut auth = AuthStore::load(&c.paths.auth_store()).unwrap();
         auth.set("synthetic", "sk-test".into());
         auth.save(&c.paths.auth_store()).unwrap();
         let mut app = an_app();
-        // The dialog is opened for the provider in force, and it owes the host a listing.
         app.header.provider = "synthetic".into();
         c.perform(&mut app, Action::Model(None));
         let login = app.login.as_ref().expect("the picker is open");
@@ -3091,7 +2666,6 @@ mod tests {
             matches!(login.stage, login::Stage::Checking { .. }),
             "the list is being asked for"
         );
-        // Choosing writes the model and switches to it, exactly as `/model <name>` does.
         let id = match login.stage {
             login::Stage::Checking { id } => id,
             _ => unreachable!(),
@@ -3117,8 +2691,6 @@ mod tests {
             login.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
             login.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         };
-        // D91: choosing a model is a choice about this conversation, so it does not write the file
-        // a new session starts from.
         let login::Outcome::Use(pick) = action else {
             panic!("expected a choice for this conversation, got {action:?}");
         };
@@ -3136,9 +2708,6 @@ mod tests {
 
     #[test]
     fn reloading_the_settings_does_not_move_a_session_to_the_files_provider() {
-        // D91: `/reload` reads the settings again, and the default in the file is what the next
-        // session starts with. This one keeps the provider and model it is working in — a reload
-        // in the middle of a task must not quietly start spending on another account.
         let dir = tempfile::tempdir().unwrap();
         let c = controller(
             dir.path(),
@@ -3162,9 +2731,6 @@ mod tests {
 
     #[test]
     fn logging_in_does_not_change_the_default_provider_or_model() {
-        // D91: `/login` was the last thing still writing the default. A key is a credential, not a
-        // choice of what a new session starts with, and the model just chosen there is a choice
-        // about this conversation like any other.
         let dir = tempfile::tempdir().unwrap();
         let c = controller(
             dir.path(),
@@ -3182,7 +2748,6 @@ mod tests {
                 base_url: None,
             }),
         );
-        // The session moved, and says how to make that the default.
         assert_eq!(app.header.model, "chosen-at-login");
         assert!(
             app.entries
@@ -3192,7 +2757,6 @@ mod tests {
             "{:?}",
             app.entries
         );
-        // The key was stored, and the file was not touched at all.
         let auth = AuthStore::load(&c.paths.auth_store()).unwrap();
         assert_eq!(auth.key("synthetic"), Some("sk-entered"));
         let written = fs::read_to_string(c.paths.user_config()).unwrap();
@@ -3204,8 +2768,6 @@ mod tests {
 
     #[test]
     fn logging_in_to_a_new_server_still_writes_the_server_itself() {
-        // D91 stops `/login` writing a *default*, not a provider: a server added there has no entry
-        // until its address is in the file, and without one there is nothing to switch to.
         let dir = tempfile::tempdir().unwrap();
         let c = controller(dir.path(), "");
         let mut app = an_app();
@@ -3231,7 +2793,6 @@ mod tests {
 
     #[test]
     fn ctrl_s_writes_the_choice_where_a_new_session_reads_it() {
-        // The other half of D91: the default is not gone, it just cannot be changed by accident.
         let dir = tempfile::tempdir().unwrap();
         let c = controller(
             dir.path(),
@@ -3253,8 +2814,6 @@ mod tests {
 
     #[test]
     fn a_default_changed_elsewhere_does_not_move_a_conversation_that_already_chose() {
-        // D91: the resume is where the two used to meet. A conversation saved on one model comes
-        // back on it, even though the file now names another one.
         let dir = tempfile::tempdir().unwrap();
         let c = controller(
             dir.path(),
@@ -3291,9 +2850,6 @@ mod tests {
             app.key(KeyEvent::new(code, KeyModifiers::NONE))
         }
 
-        // The keyboard path, which is the only one that matters and the one I did not test: typing
-        // the command with the `/` menu open, then enter. Testing `Action::Model(None)` directly
-        // proved the dialog works and nothing about whether `/model` reaches it (D88).
         let dir = tempfile::tempdir().unwrap();
         let c = controller(
             dir.path(),
@@ -3307,7 +2863,6 @@ mod tests {
         for ch in "/model".chars() {
             press(&mut app, KeyCode::Char(ch));
         }
-        // The menu is open over the command being typed, which is where enter used to go instead.
         assert!(app.popup().is_some(), "the / menu is showing");
         let action = press(&mut app, KeyCode::Enter);
         assert_eq!(action, Some(Action::Model(None)), "enter runs /model");
@@ -3320,12 +2875,8 @@ mod tests {
 
     #[test]
     fn slash_model_opens_a_picker_even_when_it_cannot_list_anything() {
-        // D88: whatever is wrong — an unreadable config, a provider not in the catalog — the command
-        // opens the picker and says why. Silence was the reported bug: a note behind a transcript
-        // that a dialog covers reads as nothing happening.
         let dir = tempfile::tempdir().unwrap();
         let c = controller(dir.path(), "provider = \"synthetic\"\n");
-        // A config that cannot be parsed, so preparing the picker fails.
         fs::write(c.paths.user_config(), "provider = ").unwrap();
         let mut app = an_app();
         app.header.provider = "synthetic".into();
@@ -3352,8 +2903,6 @@ mod tests {
 
     #[test]
     fn slash_model_with_a_name_still_switches_straight_to_it() {
-        // The picker is for not knowing the name; someone who knows it should not have to wait for
-        // a listing to come back (D88).
         let dir = tempfile::tempdir().unwrap();
         let c = controller(dir.path(), "provider = \"synthetic\"\n");
         let mut app = an_app();
@@ -3365,7 +2914,6 @@ mod tests {
 
     #[test]
     fn slash_theme_opens_the_list_on_the_theme_in_force() {
-        // `/theme` with no name is the list, not a printed set of names to choose from blind (D74).
         let dir = tempfile::tempdir().unwrap();
         let c = controller(
             dir.path(),
@@ -3388,7 +2936,6 @@ mod tests {
 
     #[test]
     fn a_slash_theme_that_cannot_be_read_says_so_instead_of_opening_message() {
-        // The config is a person's file; a broken one is a note, not a crash and not a silent no-op.
         let dir = tempfile::tempdir().unwrap();
         let c = controller(dir.path(), "this is not toml");
         let mut app = an_app();
@@ -3399,7 +2946,6 @@ mod tests {
         );
     }
 
-    /// A picture announced by the line `line`, and so drawn on the row below it (D59).
     fn placed(line: usize, id: u32) -> Placed {
         Placed {
             line: line + 1,
@@ -3411,7 +2957,6 @@ mod tests {
                 scaled: false,
             },
             pixels: (100, 80),
-            // Not a real picture: these tests are about where it goes, not what it is.
             data: "BwcHBwcHBwc=".to_owned(),
         }
     }
@@ -3422,9 +2967,6 @@ mod tests {
 
     #[test]
     fn a_scroll_moves_the_picture_rather_than_sending_it_again() {
-        // A large picture used to be erased and sent again for every row it scrolled, which
-        // flickered: the whole file went over the wire, and the screen showed nothing until it
-        // arrived. Now it is sent once and the placement is what moves (D59).
         let first = Drawn::default();
         let images = [placed(10, 7)];
         let plan = plan_images(image::Protocol::Kitty, &first, &images, area(), 0, &[]);
@@ -3444,8 +2986,6 @@ mod tests {
             plan.place[0].1
         );
 
-        // Scroll by two lines: the same picture is now at row 9. It is neither sent nor taken off,
-        // only placed again, and the one placement id is what stops it disappearing in between.
         let plan = plan_images(image::Protocol::Kitty, &plan.drawn, &images, area(), 2, &[]);
         assert!(plan.free.is_empty(), "the terminal keeps the data");
         assert!(plan.transmit.is_empty(), "nothing to send a second time");
@@ -3456,7 +2996,6 @@ mod tests {
 
     #[test]
     fn a_frame_where_nothing_moved_sends_nothing() {
-        // Otherwise every keystroke would erase and redraw the picture, which flickers.
         let first = plan_images(
             image::Protocol::Kitty,
             &Drawn::default(),
@@ -3478,9 +3017,6 @@ mod tests {
 
     #[test]
     fn a_picture_below_the_fold_is_drawn_in_part_not_dropped() {
-        // This is what made two images look like one: the second picture sat below the visible
-        // rows, and the old rule skipped it entirely. Now the part that is on screen is drawn, the
-        // way text would be (D59).
         let images = [placed(20, 7)];
         let plan = plan_images(
             image::Protocol::Kitty,
@@ -3491,10 +3027,7 @@ mod tests {
             &[],
         );
         assert_eq!(plan.place.len(), 1, "the visible part is drawn: {plan:?}");
-        // The picture occupies 21..25, and the area is 24 tall, so three of its four rows show.
         assert_eq!(plan.drawn.shown, [(21, 0, 7, 0, 3)]);
-        // Scrolled so the picture starts above the window, the top band comes off and the rest is
-        // drawn from the second row down.
         let plan = plan_images(image::Protocol::Kitty, &plan.drawn, &images, area(), 2, &[]);
         assert_eq!(
             plan.drawn.shown,
@@ -3518,12 +3051,7 @@ mod tests {
 
     #[test]
     fn a_picture_whose_marker_scrolled_off_is_drawn_from_where_it_is_visible() {
-        // The bug: the layout only placed a picture whose *marker line* was on screen, so scrolling
-        // the marker off the top dropped the picture even though most of it was still visible. The
-        // drawing pass was never the problem; it never saw the picture (D59).
         let images = [placed(8, 7)];
-        // The marker is two lines above the top of a 24-row area, so the picture, which occupies
-        // 9..13, has its first row off screen and three on it.
         let plan = plan_images(
             image::Protocol::Kitty,
             &Drawn::default(),
@@ -3543,8 +3071,6 @@ mod tests {
 
     #[test]
     fn a_resize_sends_the_pictures_again_because_the_screen_was_cleared() {
-        // Ratatui clears the screen on every size change, and the protocol says that clear deletes
-        // the images the terminal holds: placing one would name data that no longer exists (D59).
         let images = [placed(10, 7)];
         let first = plan_images(
             image::Protocol::Kitty,
@@ -3565,16 +3091,12 @@ mod tests {
         );
         assert_eq!(plan.transmit.len(), 1, "sent again after the clear");
         assert_eq!(plan.place.len(), 1);
-        // The same size is not a clear, so the next frame only moves what moved.
         let again = plan_images(image::Protocol::Kitty, &plan.drawn, &images, taller, 0, &[]);
         assert!(again.transmit.is_empty() && again.place.is_empty());
     }
 
     #[test]
     fn a_picture_a_menu_covers_is_cut_short_rather_than_drawn_over_it() {
-        // A picture is placed after the frame, so one under the `/` menu would be drawn on top of
-        // it. The rows above the menu are still worth showing, so the band is cut there, and the
-        // terminal keeps the data for the rest (D161).
         let images = [placed(10, 7)];
         let first = plan_images(
             image::Protocol::Kitty,
@@ -3585,7 +3107,6 @@ mod tests {
             &[],
         );
         assert_eq!(first.drawn.shown, [(11, 0, 7, 0, 4)]);
-        // The menu's first row is the picture's second: one row of it is clear.
         let menu = Rect::new(0, 12, 80, 8);
         let cropped = plan_images(
             image::Protocol::Kitty,
@@ -3598,7 +3119,6 @@ mod tests {
         assert_eq!(cropped.drawn.shown, [(11, 0, 7, 0, 1)], "the row above it");
         assert!(cropped.hide.is_empty() && cropped.transmit.is_empty() && cropped.free.is_empty());
         assert_eq!(cropped.place.len(), 1, "cropped, so placed again");
-        // Closing it puts the whole band back, and nothing travels again.
         let back = plan_images(
             image::Protocol::Kitty,
             &cropped.drawn,
@@ -3613,9 +3133,6 @@ mod tests {
 
     #[test]
     fn a_dialog_takes_a_picture_off_the_screen_and_the_terminal_keeps_it() {
-        // A dialog owns the screen, so there is nothing of the picture to show. Its placement is
-        // deleted and its data kept, so closing the dialog is a placement and not a transmission
-        // (D161).
         let images = [placed(10, 7)];
         let first = plan_images(
             image::Protocol::Kitty,
@@ -3643,7 +3160,6 @@ mod tests {
             escapes.contains("a=d,d=i,i=7"),
             "delete the placement, not the data: {escapes:?}"
         );
-        // Closing it puts the picture back, and nothing travels again.
         let back = plan_images(image::Protocol::Kitty, &plan.drawn, &images, area(), 0, &[]);
         assert!(back.transmit.is_empty() && back.hide.is_empty() && back.free.is_empty());
         assert_eq!(back.place.len(), 1, "placed where it was");
@@ -3651,8 +3167,6 @@ mod tests {
 
     #[test]
     fn a_picture_the_menu_does_not_reach_stays_where_it_is() {
-        // Only what is actually covered comes off: a menu at the bottom of the screen must not
-        // disturb a picture higher up, or every keystroke in the `/` menu would flash it (D161).
         let images = [placed(2, 7)];
         let first = plan_images(
             image::Protocol::Kitty,
@@ -3685,13 +3199,10 @@ mod tests {
             0,
             &[],
         );
-        // Scrolled far past it: the picture is not in the list any more, so its placement and the
-        // data the terminal holds are both dropped rather than growing with the transcript.
         let plan = plan_images(image::Protocol::Kitty, &first.drawn, &[], area(), 40, &[]);
         assert_eq!(plan.free, [7]);
         assert!(plan.transmit.is_empty() && plan.place.is_empty());
         assert!(plan.drawn.shown.is_empty());
-        // Coming back is a transmission again, because nothing was kept.
         let plan = plan_images(
             image::Protocol::Kitty,
             &plan.drawn,
@@ -3714,8 +3225,6 @@ mod tests {
             0,
             &[],
         );
-        // Wider only: the terminal cleared its screen with the resize, so the picture is sent again
-        // — placing it would name data the terminal no longer holds (D59).
         let wider = Rect::new(0, 0, 120, 24);
         let plan = plan_images(
             image::Protocol::Kitty,
@@ -3727,8 +3236,6 @@ mod tests {
         );
         assert_eq!(plan.transmit.len(), 1, "the clear took the data with it");
         assert_eq!(plan.place.len(), 1);
-        // A shorter transcript: only the first row of the picture is on screen, so it is placed
-        // again with a smaller band.
         let shorter = Rect::new(0, 0, 80, 12);
         let plan = plan_images(
             image::Protocol::Kitty,
@@ -3741,8 +3248,6 @@ mod tests {
         assert_eq!(plan.transmit.len(), 1, "another clear, another send");
         assert_eq!(plan.place.len(), 1);
         assert_eq!(plan.drawn.shown, [(11, 0, 7, 0, 1)], "one row of four");
-        // Moved down the screen without changing size: the terminal kept its data, and every row
-        // shifts, so it is placed again.
         let moved = Rect::new(0, 2, 80, 12);
         let plan = plan_images(
             image::Protocol::Kitty,
@@ -3776,8 +3281,6 @@ mod tests {
 
     #[test]
     fn a_picture_that_only_moves_is_not_taken_off_first() {
-        // What the flicker was: erase, then transmit, then draw, with the screen empty in between.
-        // Moving is now one placement, which the terminal replaces in place (D59).
         let images = [placed(10, 7), placed(20, 9)];
         let first = plan_images(
             image::Protocol::Kitty,
@@ -3787,7 +3290,6 @@ mod tests {
             0,
             &[],
         );
-        // Scroll by one: both pictures shift, neither is erased or re-sent.
         let plan = plan_images(
             image::Protocol::Kitty,
             &first.drawn,
@@ -3803,9 +3305,6 @@ mod tests {
 
     #[test]
     fn a_replaced_transcript_takes_its_pictures_off_and_sends_the_new_ones() {
-        // The same transcript position has the same id, so a resume or a `/new` can put a different
-        // picture where the last one was drawn. That is the one case where an id on screen cannot
-        // be trusted to be the picture it names (D59).
         let first = plan_images(
             image::Protocol::Kitty,
             &Drawn::default(),
@@ -3832,8 +3331,6 @@ mod tests {
 
     #[test]
     fn the_escapes_forget_a_picture_that_left_and_move_one_that_stayed() {
-        // The two halves of the bug: a picture scrolled off is deleted with its data, and one that
-        // only moved is a cursor move and a placement, with nothing erased first (D59).
         let area = Rect::new(0, 2, 80, 24);
         let first = plan_images(
             image::Protocol::Kitty,
@@ -3859,8 +3356,6 @@ mod tests {
             "the cursor the frame placed is put back after the last placement: {escapes:?}"
         );
 
-        // One picture scrolled off the top: it is deleted and its data freed; the other, whose own
-        // row did not move, is left exactly as it is.
         let second = plan_images(
             image::Protocol::Kitty,
             &first.drawn,
@@ -3884,8 +3379,6 @@ mod tests {
 
     #[test]
     fn a_picture_inside_a_line_is_placed_at_its_column() {
-        // D165: a formula in a sentence is drawn where the words leave it, so moving it across the
-        // row — which is what a re-wrap does — is a new placement, not a frame with nothing in it.
         let mut picture = placed(10, 7);
         picture.column = 4;
         let images = [picture];
@@ -3907,8 +3400,6 @@ mod tests {
         moved[0].column = 5;
         let again = plan_images(image::Protocol::Kitty, &plan.drawn, &moved, area(), 0, &[]);
         assert_eq!(again.place.len(), 1, "the column changed: {again:?}");
-        // And the row it is on is unchanged, so a frame that only re-wraps the words does not send
-        // the picture's data again.
         assert!(again.transmit.is_empty(), "the terminal still holds it");
     }
 
@@ -3939,9 +3430,6 @@ mod tests {
 
     #[test]
     fn placing_a_picture_leaves_the_cursor_where_the_frame_put_it() {
-        // A placement has to move to the picture's row, and the frame had already put the cursor in
-        // the editor. Left there, the terminal drew its block cursor on the formula's first row,
-        // which read as the formula having arrived selected (D165).
         let area = Rect::new(0, 0, 80, 24);
         let images = [placed(10, 7)];
         let plan = plan_images(
@@ -3955,15 +3443,12 @@ mod tests {
         let escapes = image_escapes(&plan, area);
         assert!(escapes.starts_with("\x1b7"), "{escapes:?}");
         assert!(escapes.ends_with("\x1b8"), "{escapes:?}");
-        // A frame with nothing to place is not a save and restore of nothing: it says nothing.
         let quiet = plan_images(image::Protocol::Kitty, &Drawn::default(), &[], area, 0, &[]);
         assert_eq!(image_escapes(&quiet, area), "");
     }
 
     #[test]
     fn an_iterm_picture_is_sent_every_time_because_nothing_is_stored() {
-        // iTerm2 has no image store and no placement id, so its whole file travels with the frame
-        // that moves it. Nothing is transmitted ahead of time and nothing is deleted.
         let images = [placed(10, 7)];
         let first = plan_images(
             image::Protocol::Iterm2,
@@ -3991,9 +3476,6 @@ mod tests {
 
     #[test]
     fn the_image_log_says_what_the_terminal_was_told() {
-        // What `SADDLE_IMAGE_LOG` writes: a terminal that draws a picture the wrong size and an
-        // escape that asked for the wrong size look the same on screen, and this is the difference
-        // in a file (D59). The escapes are written as text, one line a frame.
         let images = [placed(10, 7)];
         let plan = plan_images(
             image::Protocol::Kitty,
@@ -4017,7 +3499,6 @@ mod tests {
             !line.contains('\u{1b}'),
             "no raw control characters: {line}"
         );
-        // Nothing on screen, nothing placed: one line saying so, not an empty file.
         let empty = plan_images(image::Protocol::Kitty, &plan.drawn, &[], area(), 0, &[]);
         let line = trace_line(&empty, area(), 0);
         assert!(line.contains(" free 7"), "{line}");
@@ -4026,12 +3507,9 @@ mod tests {
 
     #[test]
     fn the_clipboard_sequence_is_osc_52_with_base64() {
-        // "hi" is aGk= in base64; BEL ends the sequence.
         assert_eq!(clipboard_sequence("hi", false), "\x1b]52;c;aGk=\x07");
-        // Under tmux the same sequence is wrapped and every ESC inside it doubled.
         let wrapped = clipboard_sequence("hi", true);
         assert_eq!(wrapped, "\x1bPtmux;\x1b\x1b]52;c;aGk=\x07\x1b\\");
-        // Nothing selected is not a copy.
         assert_eq!(clipboard_sequence("", false), "\x1b]52;c;\x07");
     }
 }

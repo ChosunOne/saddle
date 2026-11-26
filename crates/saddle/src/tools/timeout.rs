@@ -1,5 +1,3 @@
-//! host-owned optional wall-clock deadlines across tool transports (D152).
-
 use std::cell::Cell;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -48,8 +46,6 @@ pub fn remaining(ceiling: Duration) -> Result<Duration> {
     Ok(left)
 }
 
-/// The deadline this call asked for, in seconds, for an interface to show (D152). Absent when the
-/// model set none, whatever ceiling the tool or the budgets would otherwise apply.
 pub fn requested(call: &ToolCall) -> Option<u64> {
     call.input
         .as_ref()
@@ -82,7 +78,6 @@ pub fn using<T>(end: Option<Instant>, operation: impl FnOnce() -> T) -> T {
     operation()
 }
 
-/// add a host execution option without making it required or replacing a tool's own field.
 pub fn definition(mut tool: ToolDef) -> ToolDef {
     if let Some(schema) = tool.schema.as_object_mut() {
         let properties = schema.entry("properties").or_insert_with(|| json!({}));
@@ -96,7 +91,6 @@ pub fn definition(mut tool: ToolDef) -> ToolDef {
     tool
 }
 
-/// consume the host option unless the underlying tool already declares it (notably bash).
 pub fn arguments(input: &Value, schema: &Value) -> Value {
     let mut arguments = input.clone();
     if schema
@@ -117,8 +111,6 @@ mod tests {
 
     #[test]
     fn a_call_deadline_is_read_from_its_own_arguments() {
-        // D152: only a deadline the model set is shown; the tool's or the budgets' own ceiling is
-        // not a number the call asked for.
         let call = |input: Value| ToolCall {
             id: "c".into(),
             name: "bash".into(),

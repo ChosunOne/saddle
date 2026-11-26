@@ -1,10 +1,3 @@
-//! Model providers. The conversation is held in one neutral form; each API module renders it into
-//! its own request format and parses its own response stream back into it.
-//!
-//! Two wire formats are supported: the Anthropic Messages API and OpenAI-compatible chat
-//! completions. The second covers OpenAI, DeepSeek, OpenRouter and local servers such as
-//! llama-server, vLLM and Ollama.
-
 use crate::provider::oauth::Flow;
 use base64::engine::general_purpose;
 use saddle_limits as budgets;
@@ -54,17 +47,12 @@ use serde_json::Value;
 pub enum Api {
     Anthropic,
     Openai,
-    /// OpenAI's Responses API: a different conversation shape and a different event stream, reached
-    /// with a ChatGPT subscription token (D85).
     #[serde(rename = "openai-responses")]
     OpenaiResponses,
 }
 
-/// A tool as the model sees it.
 #[derive(Debug, Clone)]
 pub struct ToolDef {
-    /// A `Cow`, because a built-in's name is a literal and an MCP tool's is built when the model
-    /// declares it (D108).
     pub name: Cow<'static, str>,
     pub description: Cow<'static, str>,
     pub schema: Value,
@@ -75,7 +63,6 @@ pub struct ToolDef {
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    /// The parsed input, or the raw text when it was not a JSON object.
     pub input: Result<Value, String>,
 }
 
@@ -84,19 +71,10 @@ pub struct ToolCall {
 pub enum Part {
     Text(String),
     Call(ToolCall),
-    /// An image the user attached, as base64 and its media type (D58). It is a part of a message
-    /// rather than a tool result because that is what the two APIs agree on: Anthropic accepts an
-    /// image block in a tool result, OpenAI does not.
     Image(Image),
-    /// A block only one API understands, such as an Anthropic thinking block. It is sent back
-    /// unchanged to that API and skipped by the other.
-    Native {
-        api: Api,
-        block: Value,
-    },
+    Native { api: Api, block: Value },
 }
 
-/// host-owned origin, persisted with plugin results but never accepted from guest text (D25).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
     pub principal: String,
@@ -114,16 +92,12 @@ pub struct ToolResult {
     pub id: String,
     pub content: String,
     pub is_error: bool,
-    /// Pictures the tool returned, such as a screenshot `read` was asked for (D58). An older saved
-    /// result has none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<Image>,
-    /// For the transcript only; never sent to a provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
 }
 
-/// a structured plugin-supplied location; naming a file does not authorize reading it (D156).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub root: String,
@@ -134,7 +108,6 @@ pub struct Diagnostic {
     pub message: String,
 }
 
-/// a branch-local, append-only plugin fact; its origin is assigned by the host (D156).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Contribution {
     pub id: String,
@@ -150,36 +123,18 @@ pub struct Contribution {
 pub enum Item {
     Contribution(Box<Contribution>),
     User(String),
-    /// A prompt with images attached: the text, then the pictures (D58). Its own variant rather
-    /// than a flag so that every place that matches on an item has to decide what an attachment
-    /// means there.
-    Attached {
-        text: String,
-        images: Vec<Image>,
-    },
+    Attached { text: String, images: Vec<Image> },
     Assistant(Vec<Part>),
     ToolResults(Vec<ToolResult>),
-    /// A compaction summary standing in for the messages before it (D33). Sent as a user message.
     Summary(String),
 }
 
-/// What one request left out of the conversation's pictures (D162).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Omitted {
-    /// How many pictures were replaced by the note that says they were there.
     pub pictures: usize,
-    /// The base64 bytes those pictures come to.
     pub bytes: usize,
 }
 
-/// The conversation as one request may carry it, or `None` when every picture fits (D162).
-///
-/// A conversation keeps every picture it was ever shown, and each request carries all of them: a
-/// long enough conversation asks for more than a provider will accept in one body, and then nothing
-/// can be sent at all — not even the turn that was just typed. Past `budget` bytes of encoded
-/// pictures the older ones are replaced by a line saying they were there, keeping the newest, which
-/// are the ones the turn is about. Nothing stored changes: the transcript and the saved session
-/// keep their pictures, and only the request is thinner.
 pub fn within_image_budget(items: &[Item], budget: usize) -> Option<(Vec<Item>, Omitted)> {
     if image_bytes(items) <= budget {
         return None;
@@ -194,7 +149,6 @@ pub fn within_image_budget(items: &[Item], budget: usize) -> Option<(Vec<Item>, 
     Some((out, omitted))
 }
 
-/// The base64 bytes the pictures in `items` come to.
 fn image_bytes(items: &[Item]) -> usize {
     items.iter().map(item_image_bytes).sum()
 }
@@ -306,7 +260,6 @@ fn omitted_note(image: &Image, budget: usize) -> String {
     )
 }
 
-/// A byte count as a person reads it, for the note about a picture that was not sent (D162).
 pub fn human_size(bytes: usize) -> String {
     if bytes >= 1024 * 1024 {
         return format!("{} MiB", bytes / (1024 * 1024));
@@ -314,9 +267,6 @@ pub fn human_size(bytes: usize) -> String {
     format!("{} KiB", bytes.div_ceil(1024))
 }
 
-/// Whether a request failed because its body was over the provider's limit (D162).
-///
-/// The status is the reliable part; the phrases are what the compatible servers put in the message.
 pub fn is_too_large(message: &str) -> bool {
     let m = message.to_lowercase();
     m.contains("returned 413")
@@ -333,7 +283,6 @@ pub fn is_too_large(message: &str) -> bool {
         .any(|phrase| m.contains(phrase))
 }
 
-/// human-only removal of the authenticated outer plugin frame; stored/model content stays framed.
 pub fn visible_tool_text<'a>(text: &'a str, provenance: Option<&Provenance>) -> &'a str {
     let Some(origin) = provenance else {
         return text;
@@ -358,30 +307,19 @@ pub fn visible_tool_text<'a>(text: &'a str, provenance: Option<&Provenance>) -> 
         .unwrap_or(text)
 }
 
-/// One image, ready for the wire (D58).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Image {
-    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`: what the APIs accept, and what the
-    /// magic bytes said rather than what the extension claimed.
     pub media_type: String,
-    /// The bytes, base64-encoded.
     pub data: String,
-    /// The path it came from, for the line the terminal draws and the transcript keeps.
     pub name: String,
     pub width: u32,
     pub height: u32,
 }
 
-/// The largest image saddle will attach, before base64. Base64 is a third larger again, and both
-/// APIs limit a request.
 #[cfg(test)]
 const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 impl Image {
-    /// Reads an image file, deciding the media type from the bytes themselves (D58).
-    ///
-    /// The extension is not trusted: a `.png` that is really a JPEG is sent as a JPEG, which is what
-    /// makes it render rather than fail at the provider.
     pub fn read(path: &Path, data: Vec<u8>) -> Result<Self, String> {
         if data.len() > budgets::image_bytes() {
             return Err(format!(
@@ -406,10 +344,8 @@ impl Image {
     }
 }
 
-/// What the magic bytes say: the media type and the pixel size (D58).
 fn sniff(d: &[u8]) -> Option<(&'static str, u32, u32)> {
     if d.starts_with(b"\x89PNG\r\n\x1a\n") {
-        // The IHDR chunk holds the size at a fixed offset.
         let w = u32::from_be_bytes(d.get(16..20)?.try_into().ok()?);
         let h = u32::from_be_bytes(d.get(20..24)?.try_into().ok()?);
         return Some(("image/png", w, h));
@@ -420,7 +356,6 @@ fn sniff(d: &[u8]) -> Option<(&'static str, u32, u32)> {
         return Some(("image/gif", w, h));
     }
     if d.starts_with(b"RIFF") && d.get(8..12) == Some(b"WEBP") {
-        // Three WebP variants; the size is in a different place in each.
         let (w, h) = match d.get(12..16)? {
             b"VP8 " => {
                 let w = u16::from_le_bytes(d.get(26..28)?.try_into().ok()?) as u32 & 0x3fff;
@@ -439,7 +374,6 @@ fn sniff(d: &[u8]) -> Option<(&'static str, u32, u32)> {
         return Some(("image/webp", w, h));
     }
     if d.starts_with(&[0xff, 0xd8, 0xff]) {
-        // JPEG has no fixed size field: walk the segments to the frame header.
         let mut i = 2;
         while i + 9 < d.len() {
             if d[i] != 0xff {
@@ -447,7 +381,6 @@ fn sniff(d: &[u8]) -> Option<(&'static str, u32, u32)> {
             }
             let marker = d[i + 1];
             let len = u16::from_be_bytes(d.get(i + 2..i + 4)?.try_into().ok()?) as usize;
-            // SOF0..SOF15, except the three that are not frame headers.
             if (0xc0..=0xcf).contains(&marker) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
                 let h = u16::from_be_bytes(d.get(i + 5..i + 7)?.try_into().ok()?) as u32;
                 let w = u16::from_be_bytes(d.get(i + 7..i + 9)?.try_into().ok()?) as u32;
@@ -460,17 +393,11 @@ fn sniff(d: &[u8]) -> Option<(&'static str, u32, u32)> {
     None
 }
 
-/// Standard base64 with padding, which is what both APIs take.
 pub fn base64_encode(bytes: &[u8]) -> String {
     general_purpose::STANDARD.encode(bytes)
 }
 
 impl Item {
-    /// The prompt the person wrote, with an attachment's own text standing in for it.
-    ///
-    /// A compaction summary is deliberately not one: it stands in for messages rather than being
-    /// something a person typed. This is not a question about which turn is current — D96 removed
-    /// that notion from both renderers, because dropping an earlier turn rewrites the prefix.
     pub fn prompt(&self) -> Option<&str> {
         match self {
             Item::User(text) => Some(text),
@@ -480,35 +407,22 @@ impl Item {
     }
 }
 
-/// The readable text of a reasoning block, for the transcript and for search (D98).
-///
-/// A block is kept whole, because replaying it needs every field (D95); only one of those fields is
-/// prose, and which one it is depends on the surface that produced the block. A block with no prose
-/// in it — an encrypted Responses item, an Anthropic `redacted_thinking` — yields none rather than a
-/// ciphertext, because a value nothing can read is not something a search can find.
 pub fn reasoning_text(part: &Part) -> Option<String> {
     let Part::Native { api, block } = part else {
         return None;
     };
     let text = match api {
-        // Anthropic streams thinking as a block of its own, beside the signature that proves it.
         Api::Anthropic => (block["type"] == "thinking")
             .then(|| block["thinking"].as_str())
             .flatten()?,
-        // Chat completions carry it as one string, under whichever of the two names a server uses.
         Api::Openai => block["reasoning_content"]
             .as_str()
             .or(block["reasoning"].as_str())?,
-        // A Responses item lists summary parts, and its raw content when the server sent that.
         Api::OpenaiResponses => return reasoning_summary(block),
     };
     (!text.is_empty()).then(|| text.to_owned())
 }
 
-/// The prose inside a Responses reasoning item: its summary parts, or its content (D98).
-///
-/// `encrypted_content` is deliberately not read. It is the item's replayable form (D95), not
-/// anything a person or a query can read.
 fn reasoning_summary(block: &Value) -> Option<String> {
     ["summary", "content"].iter().copied().find_map(|key| {
         let text = block[key]
@@ -521,7 +435,6 @@ fn reasoning_summary(block: &Value) -> Option<String> {
     })
 }
 
-/// How a summary item is introduced to the model.
 pub const SUMMARY_INTRO: &str =
     "The conversation so far was compacted. This summary replaces the earlier messages:\n\n";
 
@@ -529,15 +442,11 @@ pub const SUMMARY_INTRO: &str =
 pub enum Stop {
     EndTurn,
     ToolUse,
-    /// The reply hit the output limit; a tool call in it may be incomplete.
     MaxTokens,
-    /// The model or a safety classifier declined; a tool call in it may be incomplete.
     Refusal,
     Other,
 }
 
-/// What one request cost. The transcript keeps it now (D35), so it reads back as well as writes,
-/// and a field added later must not make an older record unreadable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Usage {
@@ -547,28 +456,20 @@ pub struct Usage {
     pub cache_write: u64,
 }
 
-/// What one request cost, in dollars per token, as the provider or the user states it (D36).
-///
-/// Prices are small enough that per-token is the only lossless unit; the config states them per
-/// million, which is how model cards publish them, and they are divided here.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Price {
     pub input: f64,
     pub output: f64,
-    /// Absent where the server states one price for all input; then reads cost the input price.
     pub cache_read: Option<f64>,
     pub cache_write: Option<f64>,
 }
 
 impl Price {
-    /// Nothing priced means nothing to show, rather than a free model.
     pub fn is_known(&self) -> bool {
         self.input > 0.0 || self.output > 0.0
     }
 
-    /// What a reply's usage cost. A cache price the server does not state is charged at the input
-    /// price, so an unpriced cache errs high rather than pretending those tokens were free.
     pub fn cost(&self, u: &Usage) -> f64 {
         let read = self.cache_read.unwrap_or(self.input);
         let write = self.cache_write.unwrap_or(self.input);
@@ -579,12 +480,8 @@ impl Price {
     }
 }
 
-/// The reasoning levels a person can cycle through, in order (D57). "default" sends nothing, so a
-/// provider that has no such setting is not sent one it would reject.
 pub const EFFORTS: &[&str] = &["default", "low", "medium", "high"];
 
-/// The next level after `current`, wrapping. An unrecognised level goes back to the start rather
-/// than to an arbitrary neighbour.
 pub fn next_effort(current: Option<&str>) -> Option<String> {
     let at = current
         .and_then(|c| EFFORTS.iter().position(|e| *e == c))
@@ -593,7 +490,6 @@ pub fn next_effort(current: Option<&str>) -> Option<String> {
     (next != "default").then(|| next.to_owned())
 }
 
-/// A `[providers.<name>.pricing]` table: dollars per million tokens, as model cards publish them.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct PriceEntry {
@@ -601,14 +497,11 @@ pub struct PriceEntry {
     pub output: Option<f64>,
     pub cache_read: Option<f64>,
     pub cache_write: Option<f64>,
-    /// `"million"` (the default here, as model cards publish) or `"token"` for a table copied from
-    /// an API that prices per token (D36).
     pub unit: Option<String>,
 }
 
 impl PriceEntry {
     fn to_price(&self) -> Option<Price> {
-        // A config table is dollars per million unless it says otherwise.
         let per = match self.unit.as_deref().map(str::to_ascii_lowercase) {
             Some(u) if u.contains("token") && !u.contains("million") => 1.0,
             _ => 1_000_000.0,
@@ -623,22 +516,15 @@ impl PriceEntry {
     }
 }
 
-/// What the provider said about the allowance left, from the response headers (D36). Servers state
-/// whichever parts they count, so every field is optional and a session shows only what it was told.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Quota {
-    /// Independent plan windows, each with its own remaining percentage and reset (D93).
     pub windows: Vec<QuotaWindow>,
     pub tokens: Option<u64>,
     pub tokens_limit: Option<u64>,
     pub requests: Option<u64>,
     pub requests_limit: Option<u64>,
-    /// A money or credit balance, in whatever unit the provider sells in (D36).
     pub credits: Option<f64>,
-    /// When the allowance refills, as the provider spelled it ("1s", "6m0s", an RFC 3339 stamp).
     pub reset: Option<String>,
-    /// How much of the period is left, when the provider states a percentage instead of a count —
-    /// which is what a plan that refills in steps reports (D49).
     pub percent: Option<f64>,
 }
 
@@ -659,17 +545,11 @@ impl Quota {
     }
 }
 
-/// How long until the allowance refills, in the fewest characters that stay honest: a status line
-/// has room for `↺1h` and not for a timestamp (D49).
-///
-/// A provider that spells the reset as a duration (`6m0s`) is not second-guessed: that is already
-/// short, and converting it would mean guessing the instant it was measured from.
 pub fn reset_left(spelled: &str, now: SystemTime) -> String {
     let Ok(at) = humantime::parse_rfc3339(spelled) else {
         return spelled.to_owned();
     };
     let left = at.duration_since(now).map(|d| d.as_secs()).unwrap_or(0);
-    // Rounded up, so the last minute reads `1m` rather than `0m` while there is still time.
     let up = |unit: u64| left.div_ceil(unit);
     match left {
         0 => "now".into(),
@@ -684,23 +564,10 @@ pub fn reset_left(spelled: &str, now: SystemTime) -> String {
 pub struct Reply {
     pub parts: Vec<Part>,
     pub stop: Stop,
-    /// The stop reason as the API spelled it.
     pub stop_raw: String,
     pub model: String,
     pub usage: Usage,
-    /// How many of the output tokens were spent thinking (D99).
-    ///
-    /// The API reports this as a number rather than as text saddle gets to keep, so it is the only
-    /// evidence that a model thought when the reasoning itself is hidden. It is a part of
-    /// `usage.output` and not an addition to it, which is why it lives here rather than becoming a
-    /// fifth field of `Usage`: the four in there add up to the bill, and this one would be counted
-    /// twice if it were one of them.
     pub reasoning_tokens: u64,
-    /// How many reasoning items the API said it removed from the input it was sent (D97).
-    ///
-    /// A server drops reasoning when the history before it changed, which is its own anti-distillation
-    /// rule rather than anything saddle asked for. It is counted here so the store can record it and
-    /// the question "is the API eating my reasoning" is a query rather than a guess.
     pub dropped_reasoning: u64,
 }
 
@@ -717,27 +584,19 @@ pub struct Conversation<'a> {
     pub system: &'a str,
     pub tools: &'a [ToolDef],
     pub items: &'a [Item],
-    /// The saved conversation's id, which is also its prompt cache key (D100). Empty when nothing
-    /// has been saved, which is when there is no cache to route to.
     pub session: &'a str,
 }
 
-/// Receives a reply while it streams in.
 pub trait Sink {
     fn text(&mut self, s: &str);
     fn note(&mut self, s: &str);
-    /// Reasoning from a thinking model, as it streams.
     fn reasoning(&mut self, _s: &str) {}
-    /// What the response's headers said about the allowance left (D36). A provider that states
-    /// nothing never calls this.
     fn quota(&mut self, _quota: &Quota) {}
-    /// Checked between stream events; `true` abandons the request with [`Cancelled`].
     fn cancelled(&self) -> bool {
         false
     }
 }
 
-/// The user cancelled the request.
 #[derive(Debug)]
 pub struct Cancelled;
 
@@ -749,55 +608,28 @@ impl Display for Cancelled {
 
 impl Error for Cancelled {}
 
-/// One `[providers.<name>]` table in `config.toml`, or a built-in preset. Fields set in the
-/// config override the preset of the same name.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ProviderEntry {
     pub api: Option<Api>,
     pub base_url: Option<String>,
     pub model: Option<String>,
-    /// Environment variable holding the API key. Empty means the server takes no key.
     pub api_key_env: Option<String>,
     pub max_tokens: Option<u32>,
-    /// The model's context window in tokens, for compaction (D33).
     pub context_window: Option<u64>,
-    /// Anthropic: `output_config.effort`. OpenAI-compatible: `reasoning_effort`.
     pub effort: Option<String>,
-    /// Dollars per million tokens, for a server that states no prices of its own (D36).
     pub pricing: Option<PriceEntry>,
-    /// The provider's own usage or quota endpoint, fetched for the status line (D36). A server
-    /// that states nothing in its response headers can still state a balance here.
     pub usage_url: Option<String>,
-    /// The provider's web search, when it serves one (D82). The `websearch` tool asks here before
-    /// it looks for a key of its own, so a provider's own credential pays for its own search.
     pub search_url: Option<String>,
-    /// Headers sent with every request, for what a compatible server needs beyond the wire format:
-    /// OpenRouter's `HTTP-Referer` and `X-Title`, a gateway's routing header, an account id (D84).
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
-    /// How long to ask OpenAI to keep a cached prefix: `"short"` (the default) sends nothing and
-    /// takes whatever the provider does, `"long"` asks for twenty-four hours (D100).
     pub cache_retention: Option<CacheRetention>,
-    /// Send the cache key and headers to this provider whatever its host is (D100).
     pub cache_affinity: Option<bool>,
-    /// The header the API key goes in, when it is not the one its `api` implies. A JSON body with
-    /// an `Authorization: Bearer` key is the norm; Azure wants `api-key` and no prefix, which is the
-    /// case this exists for (D84).
     pub key_header: Option<String>,
-    /// How the provider authenticates (D85). An OAuth provider has no key: its access token comes
-    /// from the store `/login` writes, and is refreshed when it expires.
     pub auth: Option<Auth>,
-    /// This provider's OAuth endpoints, from a preset or `[providers.<name>.oauth]` (D85).
     pub oauth: Option<Flow>,
 }
 
-/// How a provider authenticates (D85).
-/// How long a provider should keep a cached prefix, where a request may ask (D100).
-///
-/// [`Short`](CacheRetention::Short) sends nothing, which is the provider's own default: for OpenAI
-/// before GPT-5.6 that is already 24 hours unless the organization is under zero data retention, so
-/// asking for the long lifetime is an opt-in rather than something to do to everyone.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CacheRetention {
@@ -809,10 +641,8 @@ pub enum CacheRetention {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Auth {
-    /// A key from the environment or from `/login`.
     #[default]
     ApiKey,
-    /// Tokens from an OAuth login, refreshed when they expire.
     Oauth,
 }
 
@@ -825,35 +655,17 @@ pub struct ProviderConfig {
     pub max_tokens: Option<u32>,
     pub context_window: Option<u64>,
     pub effort: Option<String>,
-    /// Settled from the config or the endpoint's listing, like the window (D36).
     pub price: Option<Price>,
-    /// Where to ask what is left, when the provider has an endpoint for it (D36).
     pub usage_url: Option<String>,
-    /// Where to ask the web a question, when the provider searches on its own (D82).
     pub search_url: Option<String>,
-    /// Headers sent with every request (D84).
     pub headers: BTreeMap<String, String>,
-    /// The header the key goes in, when it is not the default for this `api` (D84).
     pub key_header: Option<String>,
-    /// How long to ask the provider to keep a cached prefix (D100).
     pub cache_retention: CacheRetention,
-    /// Send the cache-affinity key and headers even to a host that is not `api.openai.com` (D100).
-    ///
-    /// For an endpoint that is OpenAI's without being that host — the ChatGPT backend this build
-    /// already talks to — where the fields are probably accepted and cannot be checked from here.
-    /// Off by default, because a server that refuses an unknown field would fail every request.
     pub cache_affinity: bool,
-    /// How the provider authenticates, and where, when it is OAuth (D85).
     pub auth: Auth,
     pub oauth: Option<Flow>,
 }
 
-/// Built-in providers.
-///
-/// Two wire formats and one preset each, because those are the two that every other service is
-/// compatible with: `openai` speaks `/chat/completions` and `anthropic` speaks `/v1/messages`. Any
-/// other server — a gateway, a local model, a proxy — is a `[providers.<name>]` table with `api`
-/// set to whichever of the two it imitates (D84).
 fn presets() -> BTreeMap<&'static str, ProviderEntry> {
     let entry = |base: &str, key: &str| ProviderEntry {
         api: Some(Api::Openai),
@@ -863,13 +675,9 @@ fn presets() -> BTreeMap<&'static str, ProviderEntry> {
     };
     BTreeMap::from([
         (
-            // Synthetic serves its chats under `/openai/v1` and its allowance under `/v2/quotas`,
-            // which is why a provider carries a usage URL of its own rather than a rule for
-            // deriving one (D36).
             "synthetic",
             ProviderEntry {
                 usage_url: Some("https://api.synthetic.new/v2/quotas".into()),
-                // Same host, same version prefix as the quotas endpoint above (D82).
                 search_url: Some("https://api.synthetic.new/v2/search".into()),
                 ..entry("https://api.synthetic.new/openai/v1", "SYNTHETIC_API_KEY")
             },
@@ -879,16 +687,11 @@ fn presets() -> BTreeMap<&'static str, ProviderEntry> {
             entry("https://api.openai.com/v1", "OPENAI_API_KEY"),
         ),
         (
-            // A ChatGPT subscription, which is a different endpoint and a different wire format
-            // from the API-key provider above, not a setting on it (D85).
             "openai-chatgpt",
             ProviderEntry {
                 api: Some(Api::OpenaiResponses),
                 base_url: Some(oauth::OPENAI_API_BASE.into()),
                 usage_url: Some("https://chatgpt.com/backend-api/wham/usage".into()),
-                // D100: Codex sends the cache key and both session headers to this backend, so
-                // saddle does too. `cache-affinity = false` in the table turns it back off, which
-                // is the one-line answer if the endpoint ever refuses them.
                 cache_affinity: Some(true),
                 auth: Some(Auth::Oauth),
                 oauth: Some(oauth::Flow {
@@ -898,8 +701,6 @@ fn presets() -> BTreeMap<&'static str, ProviderEntry> {
                     client_id: Some(oauth::OPENAI_CLIENT_ID.into()),
                     scopes: Some(oauth::OPENAI_SCOPES.into()),
                     redirect_uri: Some(oauth::OPENAI_REDIRECT_URI.into()),
-                    // The code a device login issues belongs to a fixed address of the server's,
-                    // not to the loopback one the browser flow uses (D85).
                     device_redirect_uri: Some(oauth::OPENAI_DEVICE_REDIRECT_URI.into()),
                     redirect_port: Some(oauth::OPENAI_REDIRECT_PORT),
                     device_code_url: Some(oauth::OPENAI_DEVICE_CODE_URL.into()),
@@ -907,7 +708,6 @@ fn presets() -> BTreeMap<&'static str, ProviderEntry> {
                     verification_url: Some(oauth::OPENAI_VERIFICATION_URL.into()),
                     ..oauth::Flow::default()
                 }),
-                // The subscription backend wants both, and states so in its own clients.
                 headers: [(
                     "OpenAI-Beta".to_owned(),
                     "responses=experimental".to_owned(),
@@ -918,8 +718,6 @@ fn presets() -> BTreeMap<&'static str, ProviderEntry> {
             },
         ),
         (
-            // The Anthropic base carries no `/v1`: its client appends `/v1/messages`, which keeps a
-            // gateway's own prefix intact (D84).
             "anthropic",
             ProviderEntry {
                 api: Some(Api::Anthropic),
@@ -929,7 +727,6 @@ fn presets() -> BTreeMap<&'static str, ProviderEntry> {
     ])
 }
 
-/// Merges the preset named `name` with the user's table of the same name.
 pub fn resolve(
     name: &str,
     user: &BTreeMap<String, ProviderEntry>,
@@ -948,7 +745,6 @@ pub fn resolve(
     Ok(ProviderConfig { model, ..config })
 }
 
-/// Like [`resolve`], but the model may be missing (empty), as when `/login` lists the models.
 pub fn endpoint(name: &str, user: &BTreeMap<String, ProviderEntry>) -> Result<ProviderConfig> {
     let presets = presets();
     let preset = presets.get(name);
@@ -1019,8 +815,6 @@ pub fn endpoint(name: &str, user: &BTreeMap<String, ProviderEntry>) -> Result<Pr
     })
 }
 
-/// Every variable that may hold a provider key. These never reach a sandboxed child (D19), even
-/// when an exec grant lists one.
 pub fn secret_env_names(user: &BTreeMap<String, ProviderEntry>) -> Vec<String> {
     let mut names: Vec<String> = presets()
         .values()
@@ -1033,7 +827,6 @@ pub fn secret_env_names(user: &BTreeMap<String, ProviderEntry>) -> Vec<String> {
     names
 }
 
-/// Where to get a key for a built-in provider.
 pub fn key_page(name: &str) -> Option<&'static str> {
     match name {
         "synthetic" => Some("synthetic.new"),
@@ -1046,8 +839,6 @@ pub fn builtin_names() -> Vec<String> {
     presets().keys().map(|k| k.to_string()).collect()
 }
 
-/// Every provider that can be chosen: the presets merged with the user's tables, then the user's
-/// own providers.
 pub fn catalog(user: &BTreeMap<String, ProviderEntry>) -> Vec<(String, ProviderEntry)> {
     let presets = presets();
     let merge = |base: Option<&ProviderEntry>, mine: Option<&ProviderEntry>| {
@@ -1088,14 +879,8 @@ pub fn catalog(user: &BTreeMap<String, ProviderEntry>) -> Vec<(String, ProviderE
     out
 }
 
-/// The context window compaction assumes when neither the config, the provider nor the table
-/// below says otherwise (D34).
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 
-/// Windows published for models served over these APIs, as the longest substring of the
-/// lowercased model id, so `qwen3-coder` beats a broader `qwen3`. They come from the model cards
-/// and exist so that a fresh login is not wrong by default — a window the provider states, or the
-/// user sets, always wins (D34).
 const KNOWN_WINDOWS: &[(&str, u64)] = &[
     ("kimi-k2", 262_144),
     ("qwen3-coder", 262_144),
@@ -1110,14 +895,7 @@ const KNOWN_WINDOWS: &[(&str, u64)] = &[
     ("llama-3.3", 131_072),
 ];
 
-/// The published window for a model, by the most specific family its id names.
-///
-/// Synthetic serves ids like `hf:deepseek-ai/DeepSeek-V4.1-Flash-1017`, so the family table is
-/// matched against the part after `hf:` too, and `deepseek-v4` is in it because that listing states
-/// its own windows anyway; the table is for endpoints that state none.
 pub fn known_window(model: &str) -> Option<u64> {
-    // `hf:vendor/Model-Name` is the same model as `Model-Name`; the prefix and the vendor are not
-    // part of the family name.
     let id = model
         .trim_start_matches("hf:")
         .rsplit('/')
@@ -1131,23 +909,15 @@ pub fn known_window(model: &str) -> Option<u64> {
         .map(|(_, window)| *window)
 }
 
-/// The window to compact against: what the user set, else what this endpoint last reported for
-/// the model, else the published window, else [`DEFAULT_CONTEXT_WINDOW`] (D34).
 pub fn context_window(config: &ProviderConfig, reported: &Reported) -> u64 {
     window_and_source(config, reported).0
 }
 
-/// Where a window came from, so that `saddle check` and `/settings` can say which source answered
-/// rather than only what the number is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowSource {
-    /// `context-window` in config.toml: the user's own answer.
     Config,
-    /// This endpoint's `/models` listing, which is the only place a server states its own limit.
     Endpoint,
-    /// The table of published windows, for a server that states none.
     Published,
-    /// Nothing knew the model.
     Default,
 }
 
@@ -1162,7 +932,6 @@ impl Display for WindowSource {
     }
 }
 
-/// [`context_window`], with the source it came from (D34).
 pub fn window_and_source(config: &ProviderConfig, reported: &Reported) -> (u64, WindowSource) {
     if let Some(window) = config.context_window {
         return (window, WindowSource::Config);
@@ -1176,12 +945,6 @@ pub fn window_and_source(config: &ProviderConfig, reported: &Reported) -> (u64, 
     (DEFAULT_CONTEXT_WINDOW, WindowSource::Default)
 }
 
-/// Asks the endpoint itself what this model takes, caches every window the listing states, and
-/// answers with the one for this model (D34).
-///
-/// The listing is the provider's own word on its limits, so a session asks for it rather than
-/// carrying a guess into its first turn. Failing is silence: a server that is unreachable, has no
-/// models endpoint, or states no window leaves the caller with the best answer it already had.
 pub fn ask_endpoint(p: &Provider, cache: &Path) -> Option<Stated> {
     let config = &p.config;
     let models = list_models(p).ok()?;
@@ -1195,36 +958,16 @@ pub fn ask_endpoint(p: &Provider, cache: &Path) -> Option<Stated> {
     (stated.window.is_some() || stated.price.is_some()).then_some(stated)
 }
 
-/// What a listing said about one model (D34, D36). Either can be absent: a server may state a
-/// window and no price, a price and no window, or neither.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Stated {
     pub window: Option<u64>,
     pub price: Option<Price>,
 }
 
-/// The key a provider would use: its environment variable, else the stored key.
-/// The headers one request carries: the key where this provider says it goes, then the provider's
-/// own (D84).
-///
-/// One function, used by both wire formats, because this is the part that makes a compatible server
-/// usable — a gateway that wants `api-key` rather than a bearer token, an OpenRouter that wants its
-/// own attribution header — and two copies of it would drift the moment one gained a case.
-///
-/// The prefix is decided by the header, not by the wire format: a key in `authorization` is a bearer
-/// token, which is what every OAuth token here is too, and a key in a header the server named is
-/// sent as it is. That is what Azure's `api-key` needs.
-/// Whether a base URL points at OpenAI's own API, which is the only place these fields are
-/// documented (D100).
-///
-/// A compatible server implements the chat-completions format, not OpenAI's cache-routing fields,
-/// and a strict one refuses a body field it does not know. So the fields go where the docs are —
-/// and a proxy in front of `api.openai.com` is, as far as this can tell, a different provider.
 fn openai_api(base_url: &str) -> bool {
     host_of(base_url).eq_ignore_ascii_case("api.openai.com")
 }
 
-/// Whether a base URL is the subscription backend Codex talks to (D101).
 pub fn codex_backend(base_url: &str) -> bool {
     host_of(base_url).eq_ignore_ascii_case("chatgpt.com")
 }
@@ -1241,28 +984,14 @@ fn host_of(base_url: &str) -> &str {
         .unwrap_or_default()
 }
 
-/// Whether this provider should be asked to route a conversation to one cache (D100).
-///
-/// OpenAI's own API is the documented case. Anything else has to say so in its table, because the
-/// fields are not part of the compatible format and a strict server refuses what it does not know.
 pub fn routes_cache(config: &ProviderConfig) -> bool {
     config.cache_affinity || openai_api(&config.base_url)
 }
 
-/// The key that ties one conversation's requests to one cache (D100).
-///
-/// The session id is the key: it is stored with the conversation, so a resumed conversation keeps
-/// the one it had, and it is random, so two sessions in one directory never share a key. OpenAI
-/// routes requests carrying the same key to the machine holding that prefix, which is what makes a
-/// warm cache likely rather than lucky.
 pub fn prompt_cache_key<'a>(config: &ProviderConfig, session: &'a str) -> Option<&'a str> {
     (routes_cache(config) && !session.is_empty()).then_some(session)
 }
 
-/// How long to ask for the prefix to be kept, when the configuration asks for the long lifetime
-/// (D100).
-///
-/// The ChatGPT sign-in endpoint rejects this field, so it is only ever sent with an API key.
 pub fn prompt_cache_retention(config: &ProviderConfig) -> Option<&'static str> {
     (routes_cache(config)
         && config.auth == Auth::ApiKey
@@ -1270,21 +999,11 @@ pub fn prompt_cache_retention(config: &ProviderConfig) -> Option<&'static str> {
         .then_some("24h")
 }
 
-/// The `originator` the subscription backend checks before it answers at all (D100).
-///
-/// That endpoint refuses an originator it does not recognise, and the ones it recognises are the
-/// official clients': `codex_cli_rs`, `codex_vscode`, `codex_sdk_ts`, or anything starting with
-/// `Codex `. Saddle is not on that list, so it names the client it already claims to be when it
-/// asks the backend which models it serves (D85) — the same claim, in the one place where the
-/// alternative is not being served.
 pub fn codex_originator(config: &ProviderConfig) -> Option<&'static str> {
     (config.api == Api::OpenaiResponses && codex_backend(&config.base_url))
         .then_some("codex_cli_rs")
 }
 
-/// The headers Codex sends beside the key, for the same routing purpose (D100).
-///
-/// They are a hint rather than a field of the request, so a server that ignores them loses nothing.
 pub fn affinity_headers(config: &ProviderConfig, session: &str) -> Vec<(String, String)> {
     if !routes_cache(config) || session.is_empty() {
         return Vec::new();
@@ -1315,8 +1034,6 @@ pub fn request_headers(config: &ProviderConfig, key: Option<&str>) -> Vec<(Strin
         headers.push((name.to_owned(), value));
     }
     for (name, value) in &config.headers {
-        // A header the config sets explicitly replaces the one derived above, so a provider can
-        // override even the key's own header without a second mechanism.
         headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
         headers.push((name.clone(), value.clone()));
     }
@@ -1335,8 +1052,6 @@ pub fn available_key(config: &ProviderConfig, stored_key: Option<&str>) -> Optio
         .or_else(|| stored_key.filter(|k| !k.is_empty()).map(str::to_owned))
 }
 
-/// A provider's own web search, as the tool needs it: a URL, and the name of the variable whose key
-/// pays for it (D82). The key value lives in the environment or in the auth store, never here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchTarget {
     pub provider: String,
@@ -1344,12 +1059,6 @@ pub struct SearchTarget {
     pub key_env: Option<String>,
 }
 
-/// A provider's live OAuth state: where its endpoints are, its tokens, and where to write a
-/// refreshed one (D85).
-///
-/// The tokens are shared rather than copied, so a background compaction and the turn it belongs to
-/// see one token: a refresh rotates the refresh token, and two concurrent refreshes would leave one
-/// of them holding a token the server has already retired.
 #[derive(Clone)]
 pub struct OAuthState {
     pub flow: oauth::Flow,
@@ -1372,16 +1081,6 @@ pub struct Provider {
 }
 
 impl Provider {
-    /// The key comes from the provider's environment variable, or else from the key stored by
-    /// `/login`. A provider that names a variable cannot be used without one of the two.
-    ///
-    /// The context window is settled here, from [`context_window`], so that everything downstream
-    /// — compaction, the TUI header, `saddle check` — reads one number rather than each deciding
-    /// for itself what a model takes (D34).
-    /// Where this provider's web search is, when it serves one (D82).
-    ///
-    /// The key is not carried: it is named by `key_env` and looked up at the call, the same way the
-    /// model loop looks it up, so a key put in place mid-session is the key the search uses.
     pub fn search_target(&self) -> Option<SearchTarget> {
         self.config.search_url.as_ref().map(|url| SearchTarget {
             provider: self.name.clone(),
@@ -1416,12 +1115,6 @@ impl Provider {
         }
     }
 
-    /// A second client with the same settings, for a request that runs while the first is busy
-    /// (D78).
-    ///
-    /// A compaction in the background must not share the client the turn is using: `complete` takes
-    /// `&self` and would be fine, but the point is to have an independent request in flight, and a
-    /// clone of the settings is what makes that true without either one borrowing the other.
     pub fn twin(&self) -> Self {
         Self {
             name: self.name.clone(),
@@ -1437,42 +1130,32 @@ impl Provider {
         }
     }
 
-    /// Tokens the model takes, as far as the config, the provider and the table can say.
     pub fn window(&self) -> u64 {
         self.window
     }
 
-    /// Which of those answered [`window`](Self::window).
     pub fn window_source(&self) -> WindowSource {
         self.source
     }
 
-    /// What this model costs per token, when the config or the endpoint says (D36).
     pub fn price(&self) -> Option<Price> {
         self.price
     }
 
-    /// Adopts a price the endpoint stated after the provider was built, unless the config set one.
     pub fn set_price(&mut self, price: Price) {
         if self.config.price.is_none() && price.is_known() {
             self.price = Some(price);
         }
     }
 
-    /// Changes how much the model reasons, for this session (D57). `None` sends nothing, which is
-    /// the provider's own default.
     pub fn set_effort(&mut self, effort: Option<String>) {
         self.config.effort = effort;
     }
 
-    /// The effort in force, if one is set.
     pub fn effort(&self) -> Option<&str> {
         self.config.effort.as_deref()
     }
 
-    /// Adopts a window the endpoint stated after the provider was built. Only a window the config
-    /// does not set is replaced, and the source moves with it, so the header and the loop that
-    /// both read this cannot disagree (D34).
     pub fn set_window(&mut self, window: u64) {
         if self.config.context_window.is_some() {
             return;
@@ -1481,11 +1164,6 @@ impl Provider {
         self.source = WindowSource::Endpoint;
     }
 
-    /// Why requests would fail for want of a key, if they would.
-    /// Attaches whatever `/login` stored for this provider, when it authenticates with OAuth (D85).
-    ///
-    /// A provider built without this says so in `missing_key`, which is the honest answer: the
-    /// tokens exist but this process was not told where to find them.
     pub fn with_stored_oauth(mut self, store: &Path) -> Self {
         let Some(flow) = self.config.oauth.clone() else {
             return self;
@@ -1501,7 +1179,6 @@ impl Provider {
         self
     }
 
-    /// Attaches the OAuth tokens a login stored, so this provider can use and refresh them (D85).
     pub fn with_oauth(&mut self, flow: oauth::Flow, tokens: Tokens, store: PathBuf) {
         self.oauth = Some(OAuthState {
             flow,
@@ -1511,8 +1188,6 @@ impl Provider {
         });
     }
 
-    /// The credential this request is sent with: the access token for an OAuth provider, else the
-    /// API key. A copy, because an OAuth token can be replaced by a refresh.
     pub fn key(&self) -> Option<String> {
         match &self.oauth {
             Some(oauth) => oauth
@@ -1525,8 +1200,6 @@ impl Provider {
         }
     }
 
-    /// The headers this request carries: the credential where the provider wants it, the
-    /// provider's own, and the account an OAuth token belongs to (D84, D85).
     pub fn request_headers(&self) -> Vec<(String, String)> {
         let key = self.key();
         let mut headers = request_headers(&self.config, key.as_deref());
@@ -1538,14 +1211,9 @@ impl Provider {
         headers
     }
 
-    /// [`Provider::request_headers`] plus the cache affinity a session's requests share (D100).
-    ///
-    /// A usage or catalogue request is not part of the conversation and sends neither: they are
-    /// about which machine answers a prompt, and neither of those is a prompt.
     pub fn request_headers_for(&self, session: &str) -> Vec<(String, String)> {
         let mut headers = self.request_headers();
         let add = |headers: &mut Vec<(String, String)>, name: &str, value: &str| {
-            // A header the config sets itself wins, as it does for the key's own header.
             if !headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
                 headers.push((name.to_owned(), value.to_owned()));
             }
@@ -1559,24 +1227,17 @@ impl Provider {
         headers
     }
 
-    /// Usage uses the same refreshed credential and account headers as model requests (D93).
     pub fn usage(&self, url: &str) -> Result<Value, ModelsError> {
         self.refresh_tokens()
             .map_err(|e| ModelsError::Failed(format!("{e:#}")))?;
         http::fetch_usage_headers(url, &self.request_headers())
     }
 
-    /// Refreshes an expired OAuth token before a request, and remembers the new one (D85).
-    ///
-    /// A refresh is a request of its own, so it happens here rather than inside the stream: a 401
-    /// part-way through a reply is not recoverable, and a token that expires mid-turn would
-    /// otherwise fail the turn that was working.
     pub fn refresh_tokens(&self) -> Result<()> {
         let Some(oauth) = &self.oauth else {
             return Ok(());
         };
         let settings = oauth.flow.settings()?;
-        // D156: a plugin deadline also bounds waiting behind another credential refresh.
         let mut tokens = loop {
             timeout::remaining(Duration::from_secs(60))?;
             if cancel::requested() {
@@ -1672,8 +1333,6 @@ mod tests {
 
     #[test]
     fn the_newest_pictures_are_kept_and_the_older_ones_are_replaced_by_a_note() {
-        // Two turns of pictures, and room for the second only: what the person just said is what
-        // the model can see, and the older picture still says that it existed (D162).
         let items = [
             attached("first", &[("old.png", 60)]),
             Item::User("and now".into()),
@@ -1696,7 +1355,6 @@ mod tests {
             Item::Attached { images, .. } => assert_eq!(images.len(), 1, "the newest stays"),
             other => panic!("{other:?}"),
         }
-        // Everything else is untouched, and the items keep their order.
         assert_eq!(trimmed[1], Item::User("and now".into()));
         assert_eq!(trimmed.len(), items.len());
     }
@@ -1726,8 +1384,6 @@ mod tests {
 
     #[test]
     fn a_body_the_provider_called_too_large_is_recognised_but_a_long_prompt_is_not() {
-        // D162: the status is what the retry turns on. A 413 or a phrase about the entity is a
-        // body too big; a context-length message is the other retry's.
         assert!(is_too_large("synthetic returned 413: Payload Too Large"));
         assert!(is_too_large(
             "api returned 400: request body too large for this endpoint"
@@ -1757,8 +1413,6 @@ mod tests {
 
     #[test]
     fn the_prose_in_a_reasoning_block_depends_on_the_surface_that_sent_it() {
-        // D98: three shapes, and two of them are not prose at all. A block that cannot be read
-        // must produce no row rather than a ciphertext in a text column.
         let anthropic = Part::Native {
             api: Api::Anthropic,
             block: json!({"type":"thinking","thinking":"check the offset","signature":"sig"}),
@@ -1829,8 +1483,6 @@ model = "qwen"
 
         let e = resolve("openai", &user, None).unwrap_err().to_string();
         assert!(e.contains("--model"), "{e}");
-        // `anthropic` used to be the example of an unknown provider, because there was no preset
-        // for it; it is a preset now (D84), so the unknown name is one that really is unknown.
         let e = resolve("nonesuch", &user, None).unwrap_err().to_string();
         assert!(e.contains("[providers.nonesuch]"), "{e}");
 
@@ -1879,10 +1531,6 @@ model = "qwen"
 
     #[test]
     fn a_conversation_routes_its_requests_to_one_cache_only_on_openais_own_api() {
-        // D100: the key is the session id, so a resumed conversation keeps its cache and two
-        // sessions in one directory never share one. The fields and headers are OpenAI's own, and
-        // go only where they are documented: a compatible server implements the wire format, not
-        // the routing, and a strict one refuses a body field it does not know.
         let openai = config("gpt", "https://api.openai.com/v1");
         assert_eq!(prompt_cache_key(&openai, "s1"), Some("s1"));
         assert_eq!(
@@ -1898,8 +1546,6 @@ model = "qwen"
             ]
         );
 
-        // The long lifetime is opt-in, and only with an API key: the ChatGPT sign-in endpoint
-        // rejects the field, so a subscription conversation must not carry it.
         let long = ProviderConfig {
             cache_retention: CacheRetention::Long,
             ..config("gpt", "https://api.openai.com/v1")
@@ -1927,13 +1573,9 @@ model = "qwen"
             assert!(affinity_headers(&cfg, "s1").is_empty(), "{other}");
         }
 
-        // Nothing saved means nothing to route.
         assert_eq!(prompt_cache_key(&openai, ""), None);
         assert!(affinity_headers(&openai, "").is_empty());
 
-        // An OpenAI endpoint that is not that host has to ask: the ChatGPT backend Codex sends
-        // these same fields to is the case this exists for, and a refusal there would fail every
-        // request, so it is never assumed.
         let subscription = ProviderConfig {
             cache_affinity: true,
             ..config("m", "https://chatgpt.com/backend-api/codex")
@@ -1944,8 +1586,6 @@ model = "qwen"
 
     #[test]
     fn the_affinity_headers_ride_on_a_model_request_and_nowhere_else() {
-        // D100: the key says which cache; these two say the same thing to the routing layer, which
-        // is what a gateway or a proxy in front of the API would be looking at.
         let p = Provider::new(
             "openai",
             config("gpt", "https://api.openai.com/v1"),
@@ -1959,14 +1599,12 @@ model = "qwen"
             sent.contains(&("authorization".to_owned(), "Bearer sk-1".to_owned())),
             "the credential is still there"
         );
-        // A usage or catalogue request is not part of the conversation, so it carries neither.
         assert!(
             !p.request_headers()
                 .iter()
                 .any(|(n, _)| n.eq_ignore_ascii_case("session-id"))
         );
 
-        // A server that is not OpenAI's is not asked to route anything.
         let other = Provider::new(
             "synthetic",
             config("m", "https://api.synthetic.new/openai/v1"),
@@ -1980,8 +1618,6 @@ model = "qwen"
                 .any(|(n, _)| n.eq_ignore_ascii_case("session-id"))
         );
 
-        // D100: the subscription backend refuses an originator it does not recognise, so it is
-        // told the client saddle already claims to be when it asks what that backend serves.
         let codex = ProviderConfig {
             api: Api::OpenaiResponses,
             cache_affinity: true,
@@ -1998,7 +1634,6 @@ model = "qwen"
             "the API-key endpoint does not check one"
         );
 
-        // A header the configuration sets itself wins, as it does for the key's own header.
         let mut headers = BTreeMap::new();
         headers.insert("session-id".to_owned(), "mine".to_owned());
         let own = Provider::new(
@@ -2022,9 +1657,6 @@ model = "qwen"
 
     #[test]
     fn the_long_cache_lifetime_is_a_configuration_choice() {
-        // D100: it is not on by default, because for OpenAI before GPT-5.6 the provider's own
-        // default is already 24 hours unless the organization is under zero data retention - and
-        // there, asking for it is what gets refused.
         let user: BTreeMap<String, ProviderEntry> = toml::from_str(
             r#"
 [openai]
@@ -2042,14 +1674,11 @@ cache-retention = "long"
                 .cache_retention,
             CacheRetention::Short
         );
-        // The ChatGPT backend is not `api.openai.com`, so it has to ask for the affinity fields:
-        // its preset does, because Codex sends these same fields there (D100).
         assert!(
             endpoint("openai-chatgpt", &BTreeMap::new())
                 .unwrap()
                 .cache_affinity
         );
-        // And a table can take that back, which is the answer if the endpoint ever refuses them.
         let off: BTreeMap<String, ProviderEntry> = toml::from_str(
             r#"
 [openai-chatgpt]
@@ -2062,9 +1691,6 @@ cache-affinity = false
 
     #[test]
     fn a_provider_says_where_its_key_and_its_own_headers_go() {
-        // D84: what makes a third-party compatible server usable. The prefix comes from the header,
-        // not from the wire format, because `api-key: <token>` is Azure and `authorization` is
-        // everyone else.
         let mut headers = BTreeMap::new();
         headers.insert("HTTP-Referer".to_owned(), "https://example.test".to_owned());
         headers.insert("X-Title".to_owned(), "saddle".to_owned());
@@ -2077,7 +1703,6 @@ cache-affinity = false
         assert!(sent.contains(&("HTTP-Referer".to_owned(), "https://example.test".to_owned())));
         assert!(sent.contains(&("X-Title".to_owned(), "saddle".to_owned())));
 
-        // Azure: the key in `api-key`, sent raw, and no bearer prefix anywhere.
         let cfg = ProviderConfig {
             key_header: Some("api-key".to_owned()),
             ..config("m", "https://x.test/v1")
@@ -2085,7 +1710,6 @@ cache-affinity = false
         let sent = request_headers(&cfg, Some("secret"));
         assert_eq!(sent, vec![("api-key".to_owned(), "secret".to_owned())]);
 
-        // An Anthropic-shaped server gets the key where Anthropic wants it unless told otherwise.
         let cfg = ProviderConfig {
             api: Api::Anthropic,
             ..config("m", "https://x.test")
@@ -2095,10 +1719,8 @@ cache-affinity = false
             vec![("x-api-key".to_owned(), "k".to_owned())]
         );
 
-        // A local server that takes no key sends none.
         assert!(request_headers(&config("m", "http://localhost:8080"), None).is_empty());
 
-        // A configured header wins over the derived one rather than being sent twice.
         let mut headers = BTreeMap::new();
         headers.insert("authorization".to_owned(), "Bearer own".to_owned());
         let cfg = ProviderConfig {
@@ -2112,8 +1734,6 @@ cache-affinity = false
 
     #[test]
     fn a_third_party_provider_is_just_a_table() {
-        // The whole of "generic support": `api` picks the wire format, and everything else is a
-        // field. No code, no preset (D84).
         let user: BTreeMap<String, ProviderEntry> = [
             (
                 "gateway".to_owned(),
@@ -2147,7 +1767,6 @@ cache-affinity = false
         assert_eq!(gateway.headers.len(), 1);
         let proxy = resolve("claude-proxy", &user, None).unwrap();
         assert_eq!(proxy.api, Api::Anthropic);
-        // The presets are still there beside them, and `anthropic` is now one of them.
         let names = builtin_names();
         assert!(names.iter().any(|n| n == "anthropic"), "{names:?}");
         let official = endpoint("anthropic", &BTreeMap::new()).unwrap();
@@ -2158,8 +1777,6 @@ cache-affinity = false
 
     #[test]
     fn the_synthetic_preset_names_its_search() {
-        // D82: the search is a provider setting, so it is resolved like any other endpoint field.
-        // The value has to be a sibling of the quotas endpoint, not a guess at a route.
         let user = BTreeMap::new();
         let syn = endpoint("synthetic", &user).unwrap();
         assert_eq!(
@@ -2170,8 +1787,6 @@ cache-affinity = false
             syn.usage_url.as_deref(),
             Some("https://api.synthetic.new/v2/quotas")
         );
-        // A provider that does not search says so by leaving it empty, which is what sends the tool
-        // to the fallback rather than to a route that is not there.
         let config = config("m", "https://example.test/v1");
         assert_eq!(config.search_url, None);
         let user: BTreeMap<String, ProviderEntry> = [(
@@ -2210,7 +1825,6 @@ cache-affinity = false
         );
         assert_eq!(context_window(&c, &reported), 262_144);
 
-        // The same id at an endpoint that stated nothing falls to the published table.
         let elsewhere = config("hf:moonshotai/Kimi-K2.6", "http://127.0.0.1:8080/v1");
         assert_eq!(context_window(&elsewhere, &reported), 262_144);
         assert_eq!(
@@ -2241,7 +1855,6 @@ cache-affinity = false
 
     #[test]
     fn every_answer_says_which_source_gave_it() {
-        // What the endpoint stated beats the published table, and says so.
         let mut reported = Reported::default();
         reported.record(
             "https://api.deepseek.com/v1",
@@ -2257,7 +1870,6 @@ cache-affinity = false
             (500_000, WindowSource::Endpoint)
         );
 
-        // The same model at an endpoint that stated nothing falls to the table, then the default.
         let silent = config("deepseek-v3", "https://elsewhere/v1");
         assert_eq!(
             window_and_source(&silent, &reported),
@@ -2273,7 +1885,6 @@ cache-affinity = false
     #[test]
     fn a_window_the_endpoint_states_later_is_adopted_unless_the_config_says_one() {
         let reported = Reported::default();
-        // A model no table knows, so the default is what it starts on.
         let mut p = Provider::new(
             "unknown",
             config("some-new-model", "https://api.deepseek.com/v1"),
@@ -2287,7 +1898,6 @@ cache-affinity = false
         assert_eq!(p.window(), 500_000);
         assert_eq!(p.window_source(), WindowSource::Endpoint);
 
-        // A window the user set is the last word, so the provider does not unseat it.
         let mut c = config("deepseek-v4.1-flash-1017", "https://api.deepseek.com/v1");
         c.context_window = Some(64_000);
         let mut p = Provider::new("deepseek", c, None, &reported);
@@ -2331,35 +1941,28 @@ output = 0.000015
 "#,
         )
         .unwrap();
-        // Model cards publish per million; that is the default.
         let c = endpoint("per-million", &user).unwrap();
         assert_eq!(c.price.map(|p| p.input), Some(3e-6));
-        // A table copied from a per-token API says so.
         let c = endpoint("per-token", &user).unwrap();
         assert_eq!(c.price.map(|p| p.input), Some(3e-6));
     }
 
     #[test]
     fn an_image_is_recognised_by_its_bytes_not_its_name() {
-        // A 1x1 PNG.
         let png = general_purpose::STANDARD.decode(PNG_1X1).unwrap();
         let image = Image::read(Path::new("shot.txt"), png.clone()).unwrap();
         assert_eq!(image.media_type, "image/png");
         assert_eq!((image.width, image.height), (1, 1));
-        // The name is only for showing; the type came from the bytes.
         assert_eq!(image.name, "shot.txt");
         assert_eq!(general_purpose::STANDARD.decode(&image.data).unwrap(), png);
 
-        // The same bytes behind the wrong extension are still a PNG (D58).
         let gif = general_purpose::STANDARD.decode(GIF_1X1).unwrap();
         let image = Image::read(Path::new("x.png"), gif).unwrap();
         assert_eq!(image.media_type, "image/gif");
         assert_eq!((image.width, image.height), (1, 1));
 
-        // Text is refused with a reason rather than sent and rejected by the provider.
         let e = Image::read(Path::new("a.txt"), b"hello".to_vec()).unwrap_err();
         assert!(e.contains("not a PNG, JPEG, GIF or WebP"), "{e}");
-        // And so is a picture over the limit.
         let mut big = png.clone();
         big.resize(MAX_IMAGE_BYTES as usize + 1, 0);
         let e = Image::read(Path::new("big.png"), big).unwrap_err();
@@ -2371,9 +1974,7 @@ output = 0.000015
 
     #[test]
     fn a_jpeg_size_is_found_by_walking_its_segments() {
-        // SOI, an APP0 segment, then SOF0 with the size at a known offset.
         let mut d = vec![0xff, 0xd8];
-        // The length field counts itself, so 0x10 is the field plus fourteen bytes of payload.
         d.extend_from_slice(&[0xff, 0xe0, 0x00, 0x10]);
         d.extend_from_slice(&[0u8; 14]);
         d.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x64, 0x00, 0xc8]);
@@ -2385,15 +1986,11 @@ output = 0.000015
 
     #[test]
     fn the_reasoning_levels_cycle_and_wrap() {
-        // No level set is the first in the list, so the first cycle picks `low` (D57).
         assert_eq!(next_effort(None), Some("low".to_owned()));
         assert_eq!(next_effort(Some("low")), Some("medium".to_owned()));
         assert_eq!(next_effort(Some("medium")), Some("high".to_owned()));
-        // After the last level comes the default, which is no level at all.
         assert_eq!(next_effort(Some("high")), None);
-        // An unrecognised level restarts rather than guessing a neighbour.
         assert_eq!(next_effort(Some("max")), Some("low".to_owned()));
-        // The list `/thinking` accepts is the one that cycles.
         assert_eq!(EFFORTS, ["default", "low", "medium", "high"]);
     }
 
@@ -2411,13 +2008,11 @@ usage-url = "https://api.openai.com/v1/usage"
             c.usage_url.as_deref(),
             Some("https://api.openai.com/v1/usage")
         );
-        // The preset brings its own, since Synthetic keeps the allowance at a path of its own.
         let c = resolve("synthetic", &user, Some("hf:x")).unwrap();
         assert_eq!(
             c.usage_url.as_deref(),
             Some("https://api.synthetic.new/v2/quotas")
         );
-        // A user's table overrides the preset, and an empty one turns the request off.
         let user: BTreeMap<String, ProviderEntry> =
             toml::from_str("[synthetic]\nusage-url = \"\"\n").unwrap();
         let c = resolve("synthetic", &user, Some("hf:x")).unwrap();
@@ -2426,11 +2021,9 @@ usage-url = "https://api.openai.com/v1/usage"
 
     #[test]
     fn the_most_specific_family_names_the_window() {
-        // `qwen3-coder` is longer than `qwen3`, so it is the one that answers.
         assert_eq!(known_window("hf:Qwen/Qwen3-Coder-30B"), Some(262_144));
         assert_eq!(known_window("Qwen3-32B"), None);
         assert_eq!(known_window("glm-4.6"), Some(200_000));
-        // Synthetic's ids carry a prefix and a vendor, which are not part of the family.
         assert_eq!(
             known_window("hf:zai-org/GLM-5.3"),
             Some(524_288),
@@ -2440,7 +2033,6 @@ usage-url = "https://api.openai.com/v1/usage"
             known_window("hf:deepseek-ai/DeepSeek-V4.1-Flash-1017"),
             Some(524_288)
         );
-        // `gpt-oss` and `deepseek-v3` share a window, so either naming it is the same answer.
         assert_eq!(known_window("gpt-oss-120b"), Some(131_072));
     }
 }

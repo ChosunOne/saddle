@@ -1,5 +1,3 @@
-//! disjoint event channels, narrowing vetoes and bounded host-framed rendering (D155, D156).
-
 use std::collections::VecDeque;
 use std::mem;
 use std::time::{Duration, Instant};
@@ -24,7 +22,6 @@ use super::{HostFailure, Registry};
 use crate::session::Session;
 use crate::tools::timeout;
 
-/// session-owned pending custom events; reload never carries these across authority changes.
 #[derive(Default)]
 pub struct Queue {
     pending: VecDeque<PluginEvent>,
@@ -38,7 +35,6 @@ pub(super) fn valid_name(name: &str, budgets: &Budgets) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
 }
 
-/// publication never accepts a channel or emitter from guest arguments.
 pub(super) fn publish(
     session: &mut Session,
     who: &Principal,
@@ -96,8 +92,6 @@ pub(super) fn publish(
     Ok(Ok(()))
 }
 
-/// emit a host-only lifecycle event, then drain custom events queued by its handlers.
-/// errors from the host/audit remain fatal; a broken observer cannot veto an operation.
 pub fn harness(session: &mut Session, kind: HarnessKind, data: Value) -> Result<()> {
     let mut registry = mem::take(&mut session.plugins);
     let result = registry.dispatch_hooks(session, kind, data.to_string());
@@ -111,7 +105,6 @@ pub fn harness(session: &mut Session, kind: HarnessKind, data: Value) -> Result<
     })
 }
 
-/// a denied callback (including a trap/timeout) can only narrow the proposed operation.
 pub fn veto(session: &mut Session, name: &str, arguments: &Value) -> Result<Option<ToolOutput>> {
     let mut registry = mem::take(&mut session.plugins);
     let result = registry.check_vetoes(session, name, arguments.to_string());

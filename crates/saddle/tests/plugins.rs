@@ -1,5 +1,3 @@
-//! usable plugins through the real binary, with isolated home/config/state and compiled fixtures.
-
 #[path = "support/plugin.rs"]
 mod fixture;
 #[path = "support/http.rs"]
@@ -180,11 +178,9 @@ fn standard_mutation_components_write_edit_and_patch_through_the_production_host
                     fs::read_to_string(env.ws().join("added")).unwrap(),
                     "created\n"
                 );
-                // One target the grant excludes refuses the whole document (D56).
                 let out = env.run(&["plugin", "call", "reader", r#"{"patch":"*** Add File: first\n+ok\n*** Add File: private/blocked\n+blocked\n"}"#]);
                 assert_eq!(out.status.code(), Some(1), "{}", text(&out));
                 assert!(!env.ws().join("first").exists());
-                // Additions are guarded by absence; deletion now requires a readable preimage.
                 env.edit(
                     "[plugin.reader]\ntool={}\nfs-read=[{root='workspace'}]\n",
                     "[plugin.reader]\ntool={}\nfs-read=[]\n",
@@ -241,7 +237,6 @@ fn resource_settings_do_not_let_guests_override_host_batch_bounds() {
     let out = call(&env);
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(fs::read_to_string(env.ws().join("two")).unwrap(), "b");
-    // Higher resource ceilings are not grants: excluded paths stay excluded.
     let excluded = mutation_env(&[("private/file", Some("a"), "any")], WRITE_GRANTS);
     let config = fs::read_to_string(excluded.config()).unwrap();
     fs::write(
@@ -401,8 +396,6 @@ fn mutation_batches_preflight_all_permissions_including_exclusions() {
         assert!(!env.ws().join("newdir").exists(), "{denied}");
         assert!(!env.ws().join(denied).exists(), "{denied}");
     }
-    // D178: the VCS metadata those grants cover is written like anything else in the root, so a
-    // batch that names it is published rather than refused.
     let env = mutation_env(
         &[
             (".git/config", Some("committed"), "any"),
@@ -696,7 +689,6 @@ fn standard_shell_uses_delegated_grants_and_waits_beyond_guest_deadlines() {
         fs::read_to_string(env.ws().join("file")).unwrap(),
         "success"
     );
-    // D178: the plugin's `fs-write` grant covers `.git` like any other path in the root.
     assert_eq!(
         fs::read_to_string(env.ws().join(".git/config")).unwrap(),
         "changed"
@@ -796,8 +788,6 @@ fn managed_mutations_check_both_directories_absolute_paths_and_read_precondition
     managed_manifest(&env, "['tool','tool-write']");
     let settings = fs::read_to_string(env.config()).unwrap();
     fs::write(env.config(), format!("{settings}\n[sandbox]\ntools-defaults=false\nwrite=[{{path={git:?},tools=['write']}}]\n")).unwrap();
-    // D178: a `[sandbox] write` entry that names `tools = ['write']` allows the write; nothing
-    // beneath the declared directory is a second class of path.
     let out = call(&env);
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(fs::read_to_string(git.join("config")).unwrap(), "unsafe");
@@ -996,7 +986,6 @@ fn managed_imports_cannot_borrow_other_roles_roots_or_sibling_grants() {
         let config = fs::read_to_string(env.config()).unwrap();
         fs::write(env.config(), format!("{config}\n[sandbox]\nread=[{{path={:?},tools=['read']}}]\n[plugin.sibling]\ntool-read={{tools=['read']}}\n", shared.to_str().unwrap())).unwrap();
         let listing = env.run(&["plugin", "list"]);
-        // A role absent from the parent's configured reach is refused at load time.
         let ready = expected_ready && !grants.contains("tools=['ls']");
         assert_eq!(
             text(&listing)

@@ -1,8 +1,3 @@
-//! MCP servers: the ones a person declared in `config.toml`, and the transport that reaches one
-//! (D104). The grant in the policy (`mcp`, D103) still decides whether any of them runs and which
-//! tools may be called; this module only reads what was declared and refuses a table that does not
-//! describe exactly one server.
-
 use serde::de::Error;
 pub mod host;
 pub mod http;
@@ -18,67 +13,44 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-/// A per-call deadline when the table does not set one.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The longest description the prompt will show for a server, so one table cannot push the rest
-/// of the prompt out of the way.
 const MAX_DESCRIPTION: usize = 200;
 
-/// The hosts a plain-http server may name. Everything else is https, because a plain-http server
-/// to a remote host sends its traffic, and whatever token it carries, in the clear.
 const LOOPBACK_HTTP: [&str; 3] = ["http://127.0.0.1", "http://localhost", "http://[::1]"];
 
-/// One `[mcp.<name>]` table: what to run, or where to reach it (D104).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct McpEntry {
-    /// The prompt's one line about this server. A person writes it, so unlike a server's own text
-    /// it is not untrusted prose.
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
     pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
-    /// Variables the child gets, on top of the allowlisted environment an `exec` inherits.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// A directory under a root, in the form the file tools take; defaults to the workspace.
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
     pub url: Option<String>,
-    /// Seconds a single call may take.
     #[serde(default)]
     pub timeout: Option<u64>,
-    /// How this server's tools reach the model (D117). Presentation, not authority: the grant still
-    /// decides what may be called.
     #[serde(default, deserialize_with = "exposure")]
     pub exposure: Exposure,
-    /// Per-tool overrides, by exact tool name (D122). A pattern is refused: the grant names tools
-    /// exactly, and a wildcard here would be the one pattern in a file a person writes by hand.
     #[serde(default, rename = "tool-exposure", deserialize_with = "tool_exposures")]
     pub tool_exposure: BTreeMap<String, Exposure>,
 }
 
-/// How a server's tools reach the model, in pi's vocabulary (D117).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Exposure {
-    /// Not declared until `tool_search` matches one. The default, and the cheapest.
     #[default]
     Deferred,
-    /// Declared in the prompt from the first request, like a built-in. The server is started when
-    /// the session opens, because its schemas are needed before the model says anything.
     Direct,
-    /// Registered and never reachable: the table can say "off" without the grant losing the tools
-    /// it names, so turning a server back on cannot be mistaken for granting it (D117).
     Hidden,
 }
 
 impl Exposure {
-    /// The word in the table, refusing pi's `codemode` by name: a person who asked for it asked
-    /// for something saddle does not do, and a silent fall back to deferring would hide that.
     pub fn parse(text: &str) -> Result<Self, String> {
         match text {
             "deferred" => Ok(Self::Deferred),
@@ -96,7 +68,6 @@ impl Exposure {
     }
 }
 
-/// An exposure written as a string, with the refusal above rather than serde's list of variants.
 fn exposure<'de, D>(deserializer: D) -> Result<Exposure, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -105,7 +76,6 @@ where
     Exposure::parse(&text).map_err(Error::custom)
 }
 
-/// The per-tool map (D122): every value is an exposure, and every key is an exact tool name.
 fn tool_exposures<'de, D>(deserializer: D) -> Result<BTreeMap<String, Exposure>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -123,7 +93,6 @@ where
     Ok(out)
 }
 
-/// A description as one line of at most 100 characters, since a server may write a paragraph.
 pub fn first_line(text: &str) -> String {
     let line = text.lines().next().unwrap_or_default().trim();
     if line.chars().count() > 100 {
@@ -134,25 +103,22 @@ pub fn first_line(text: &str) -> String {
     }
 }
 
-/// How a call reaches the server, which the table describes exactly one way (D104).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Transport<'a> {
-    /// A child process spoken to over stdin and stdout.
     Stdio {
         command: &'a str,
         args: &'a [String],
     },
-    /// A streamable-HTTP endpoint, reached by the host as `fetch` is (D39).
-    Http { url: &'a str },
+    Http {
+        url: &'a str,
+    },
 }
 
 impl McpEntry {
-    /// How this server's tools reach the model, which is the table's own choice (D117).
     pub fn exposure(&self) -> Exposure {
         self.exposure
     }
 
-    /// What one tool's exposure is: its own override, or the server's (D122).
     pub fn exposure_of(&self, tool: &str) -> Exposure {
         self.tool_exposure
             .get(tool)
@@ -164,7 +130,6 @@ impl McpEntry {
         self.timeout.map_or(DEFAULT_TIMEOUT, Duration::from_secs)
     }
 
-    /// Which transport the table describes, refusing a table that describes both or neither.
     pub fn transport(&self) -> Result<Transport<'_>> {
         match (&self.command, &self.url) {
             (Some(command), None) => Ok(Transport::Stdio {
@@ -177,8 +142,6 @@ impl McpEntry {
         }
     }
 
-    /// Checks what the table says by itself, so a mistake is reported when the session opens
-    /// rather than when the model first reaches for the server.
     fn validate(&self) -> Result<()> {
         match self.transport()? {
             Transport::Stdio { command, .. } => {
@@ -211,7 +174,6 @@ impl McpEntry {
     }
 }
 
-/// A `url` is https, or plain http to this machine only.
 fn check_url(url: &str) -> Result<()> {
     if let Some(rest) = url.strip_prefix("https://") {
         return check_host(rest);
@@ -234,10 +196,8 @@ fn check_host(rest: &str) -> Result<()> {
     Ok(())
 }
 
-/// The `[mcp]` tables, keyed by the name a grant uses.
 pub type McpTable = BTreeMap<String, McpEntry>;
 
-/// Checks every table, naming the one at fault so a config with ten servers says which is wrong.
 pub fn validate(table: &McpTable) -> Result<()> {
     for (name, entry) in table {
         entry
@@ -322,7 +282,6 @@ timeout = 10
             let text = format!("[s]\n{body}\n");
             assert!(valid_table(&text).is_err(), "{body} was accepted");
         }
-        // Plain http is for this machine, where there is no wire to listen on.
         for url in ["http://127.0.0.1:8080/mcp", "http://localhost/mcp"] {
             let text = format!("[s]\nurl = \"{url}\"\n");
             assert!(valid_table(&text).is_ok(), "{url} was refused");

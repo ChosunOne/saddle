@@ -1,9 +1,3 @@
-//! The status line: a template the user can change, filled from the session (D36, D187).
-//!
-//! A template is text with `{field}` placeholders. A field the session has no answer for renders
-//! as nothing, and takes the separator in front of it along, so leaving out a `[ui] status` field
-//! never leaves a dangling `· ` in the line.
-
 use crate::provider;
 use crate::provider::Quota;
 use std::fmt;
@@ -12,11 +6,9 @@ use std::time::SystemTime;
 
 use crate::provider::Usage;
 
-/// What the line shows when `[ui] status` is not set.
 pub const DEFAULT_STATUS: &str = "↑{input} ↓{output} {cache} {cachehit} · ctx {ctx}/{window} · \
                                   {cost} · {quota} · {tasks} · {workers} · {provider} {model}";
 
-/// The separator an empty field takes with it.
 const SEPARATOR: &str = " · ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,16 +18,13 @@ pub enum Field {
     Input,
     Output,
     Cache,
-    /// How much of the prompt was served from the provider's cache (D50).
     CacheHit,
     Ctx,
     Window,
-    /// The context as a percentage of the window.
     Percent,
     Cost,
     Quota,
     Tasks,
-    /// The live workers of this session, and how many are mid-turn (D195).
     Workers,
     Workspace,
 }
@@ -87,8 +76,6 @@ enum Piece {
     Field(Field),
 }
 
-/// A parsed status line. Parsing is where a typo is caught, so a bad `[ui] status` is reported when
-/// the config is read rather than showing up as a `{costt}` in the corner later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Template {
     pieces: Vec<Piece>,
@@ -120,7 +107,6 @@ impl fmt::Display for Template {
 }
 
 impl Template {
-    /// The placeholders are `{name}`, and `{{` and `}}` are literal braces.
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut pieces = Vec::new();
         let mut run = String::new();
@@ -173,20 +159,10 @@ impl Template {
         Ok(Self { pieces })
     }
 
-    /// Whether the template places the field anywhere, so the layout can leave out the copy it
-    /// would otherwise draw beside the line (the workspace on the left, D36).
     pub fn contains(&self, field: Field) -> bool {
         self.pieces.contains(&Piece::Field(field))
     }
 
-    /// Fills the template in.
-    ///
-    /// A field with no answer renders as nothing, and the separator before it is held rather than
-    /// written: if a later field has a value the separator goes in front of that one, so
-    /// `… {cost}{quota}{model}` reads `… · mock` whether one figure, both or neither are known.
-    /// Literal text between them ends the hold, since it is the separator then. A plain space is
-    /// not held, only dropped, so `{cache} {cachehit}` left without a hit reads `cache 0` rather
-    /// than `cache 0 ` (D50).
     pub fn render(&self, data: &StatusData<'_>) -> String {
         let mut out = String::new();
         let mut held = false;
@@ -219,8 +195,6 @@ impl Template {
     }
 }
 
-/// The live workers of a session. A finished one is kept for inspection but is not an agent at
-/// work any more, so it is not counted (D195).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Workers {
     pub live: usize,
@@ -228,9 +202,6 @@ pub struct Workers {
 }
 
 impl Workers {
-    /// `2 agents: 1 active, 1 idle`, or nothing when the session has no team. Both counts are
-    /// named rather than implied, because "2 agents" alone cannot say whether either is doing
-    /// anything.
     pub fn text(&self) -> String {
         if self.live == 0 {
             return String::new();
@@ -248,14 +219,11 @@ impl Workers {
     }
 }
 
-/// Everything the status line can be filled from.
 pub struct StatusData<'a> {
     pub provider: &'a str,
     pub model: &'a str,
     pub usage: Usage,
     pub cost: f64,
-    /// Whether a price is known at all, so `$0.00` (nothing spent yet) can be told apart from no
-    /// price (D36).
     pub priced: bool,
     pub quota: Option<&'a Quota>,
     pub running_tasks: usize,
@@ -263,8 +231,6 @@ pub struct StatusData<'a> {
     pub context: u64,
     pub window: u64,
     pub workspace: &'a str,
-    /// The clock a refill is counted down against, passed in rather than read, so the line renders
-    /// the same way twice (D49).
     pub now: SystemTime,
 }
 
@@ -284,8 +250,6 @@ impl StatusData<'_> {
                 0 => String::new(),
                 window => format!("{}%", (self.context.saturating_mul(100) / window).min(100)),
             },
-            // No price is not the same as a free session, so neither is shown; but a price with
-            // nothing spent yet is `$0.00`, which is the difference the user needs to see.
             Field::Cost if !self.priced => String::new(),
             Field::Cost if self.cost <= 0.0 => "$0.00".into(),
             Field::Cost => money(self.cost),
@@ -300,7 +264,6 @@ impl StatusData<'_> {
         }
     }
 
-    /// `cache read/write`, with the write only where the provider counts one (D35).
     fn cache(&self) -> String {
         match self.usage.cache_write {
             0 => format!("cache {}", tokens(self.usage.cache_read)),
@@ -308,25 +271,16 @@ impl StatusData<'_> {
         }
     }
 
-    /// The share of the prompt the provider served from its cache: `hit 96%`. Prompt tokens are
-    /// the cached ones plus the ones read fresh, so the ratio is of everything sent, and a session
-    /// that has sent nothing says nothing rather than `0%` (D50).
     fn cache_hit(&self) -> String {
         let fresh = self.usage.input;
         let cached = self.usage.cache_read;
         let prompt = fresh + cached;
-        // A provider that has never written nor read a cache says nothing, rather than claiming
-        // `hit 0%` on every request and looking broken (D50).
         if prompt == 0 || cached == 0 && self.usage.cache_write == 0 {
             return String::new();
         }
-        // Rounded down, so the line never claims a better share than was measured.
         format!("hit {}%", cached * 100 / prompt)
     }
 
-    /// The allowance in the fewest characters that still say something: `94% ↺1h`, `499/500 req`,
-    /// `48.0k/1.0M tok`, `$12.50`. The bar has one row for everything, so a figure that needs a
-    /// sentence belongs in `saddle check` instead (D49).
     fn quota_text(&self) -> String {
         let Some(q) = self.quota.filter(|q| !q.is_empty()) else {
             return String::new();
@@ -344,7 +298,6 @@ impl StatusData<'_> {
                 None => format!("{left} req"),
             });
         }
-        // A balance is the figure a credit-based provider has; it has no limit of its own.
         if let Some(credits) = q.credits {
             parts.push(format!("{credits:.2} cr"));
         }
@@ -359,8 +312,6 @@ impl StatusData<'_> {
             parts.push(text);
         }
         let text = parts.join(", ");
-        // The refill rides on the figure it belongs to, with no separator: `94% ↺1h` reads as one
-        // fact, and `↺` says "until" without a word (D49).
         match (&q.reset, text.is_empty()) {
             (Some(reset), false) => {
                 format!("{text} ↺{}", provider::reset_left(reset, self.now))
@@ -373,7 +324,6 @@ impl StatusData<'_> {
     }
 }
 
-/// A dollar amount: cents matter for one call, fractions of a cent for a session of small ones.
 pub fn money(amount: f64) -> String {
     match amount {
         a if a <= 0.0 => String::new(),
@@ -383,7 +333,6 @@ pub fn money(amount: f64) -> String {
     }
 }
 
-/// 950, 12.0k, 1.2M — the same shape the tokens have always had in the status line.
 pub fn tokens(n: u64) -> String {
     match n {
         0..1_000 => n.to_string(),
@@ -413,7 +362,6 @@ mod tests {
             workers: Workers::default(),
             context: 1_300,
             window: 128_000,
-            // A fixed clock, so the line renders the same way twice (D49).
             now: time::UNIX_EPOCH,
             workspace: "/ws",
         }
@@ -439,8 +387,6 @@ mod tests {
         assert_eq!(with(1, 1), "1 agent: 1 active");
         assert_eq!(with(3, 1), "3 agents: 1 active, 2 idle");
         assert_eq!(with(2, 2), "2 agents: 2 active");
-        // In the default line it sits where `{tasks}` does and disappears with no team, leaving no
-        // dangling separator behind (D187).
         let d = data(Usage::default(), 0.0, None);
         let line = Template::default().render(&d);
         assert!(!line.contains("agent"), "{line}");
@@ -482,7 +428,6 @@ mod tests {
         let line = t.render(&data(Usage::default(), 0.0, None));
         assert_eq!(line, "1% of 128.0k · /ws");
 
-        // Round-trips, so /settings can show what is set.
         assert_eq!(t.to_string(), "{percent} of {window} · {workspace}");
 
         let e = Template::parse("{costt}").unwrap_err();
@@ -490,7 +435,6 @@ mod tests {
         let e = Template::parse("{cost").unwrap_err();
         assert!(e.contains("not closed"), "{e}");
 
-        // A literal brace is written twice and is not a field.
         let t = Template::parse("{{{model}}}").unwrap();
         assert_eq!(t.render(&data(Usage::default(), 0.0, None)), "{mock-model}");
     }
@@ -500,7 +444,6 @@ mod tests {
         let t = Template::parse("{model} · {cost}").unwrap();
         let line = t.render(&data(Usage::default(), 0.0, None));
         assert_eq!(line, "mock-model", "no dangling separator");
-        // With a price it is back.
         let line = t.render(&data(Usage::default(), 0.004, None));
         assert_eq!(line, "mock-model · $0.0040");
     }
@@ -521,7 +464,6 @@ mod tests {
             Template::default().render(&d),
             "↑0 ↓0 cache 0 · ctx 1.3k/128.0k · $0.00 · mock mock-model"
         );
-        // No price at all is still nothing: an unpriced model is not a free one.
         d.priced = false;
         assert_eq!(
             Template::default().render(&d),
@@ -540,7 +482,6 @@ mod tests {
         let line = Template::default().render(&data(Usage::default(), 0.01, Some(&quota)));
         assert!(line.contains("48.0k tok"), "{line}");
         assert!(line.contains("12.50 cr"), "{line}");
-        // A duration is already short, so it rides after the figure as the provider wrote it.
         assert!(line.contains("↺6m0s"), "{line}");
     }
 
@@ -559,23 +500,15 @@ mod tests {
             );
             Template::parse("{cachehit}").unwrap().render(&d)
         };
-        // 9.6k cached against 400 fresh is 96% of the prompt.
         assert_eq!(with(400, 9_600, 0), "hit 96%");
-        // A cache that is written but never read is the shape of a prefix that broke: the rate
-        // falls rather than the line going quiet (D50).
         assert_eq!(with(10_000, 0, 9_000), "hit 0%");
-        // Rounded down, so the line never claims a better share than was measured.
         assert_eq!(with(2, 1, 0), "hit 33%");
-        // A provider that has never cached says nothing rather than `hit 0%` on every reply.
         assert_eq!(with(4_000, 0, 0), "");
-        // And nothing sent yet says nothing.
         assert_eq!(with(0, 0, 0), "");
     }
 
     #[test]
     fn a_plan_percentage_counts_down_to_its_refill() {
-        // What Synthetic's page yields, and the line the bar shows for it: the percentage, then a
-        // countdown marked `↺` — `94% ↺1h`, with no words (D49).
         let quota = Quota {
             percent: Some(94.4),
             reset: Some("2026-11-12T08:26:09.000Z".into()),
@@ -586,12 +519,10 @@ mod tests {
             d.now = now;
             Template::parse("{quota}").unwrap().render(&d)
         };
-        // An hour before the refill.
         assert_eq!(
             render(humantime::parse_rfc3339("2026-11-12T07:26:09.000Z").unwrap()),
             "94% ↺1h"
         );
-        // A few seconds, and a state that has already passed.
         assert_eq!(
             render(humantime::parse_rfc3339("2026-11-12T08:26:04.000Z").unwrap()),
             "94% ↺5s"
@@ -604,8 +535,6 @@ mod tests {
 
     #[test]
     fn a_request_pool_reads_as_a_fraction() {
-        // A provider that states a pool rather than a plan, which is the shape the response
-        // headers carry for Anthropic and OpenAI (D36).
         let pool = Quota {
             requests: Some(499),
             requests_limit: Some(500),
@@ -643,7 +572,6 @@ mod tests {
 
     #[test]
     fn a_price_charges_the_millions_the_config_states() {
-        // $3.00 per million in, $15.00 out, as a model card states them.
         let price = Price {
             input: 3.0 / 1_000_000.0,
             output: 15.0 / 1_000_000.0,
@@ -656,9 +584,7 @@ mod tests {
             cache_read: 1_000_000,
             cache_write: 0,
         };
-        // 3.00 + 1.50 + 0.30
         assert!((price.cost(&usage) - 4.8).abs() < 1e-9);
-        // An unstated cache price is charged at the input price rather than for free.
         let no_cache_price = Price {
             cache_read: None,
             ..price

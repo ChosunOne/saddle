@@ -1,5 +1,3 @@
-//! shell workflow and bounded presentation over the delegated exec SDK (D142).
-
 use saddle_limits as budgets;
 #[cfg(target_arch = "wasm32")]
 use saddle_sdk::configure_limits;
@@ -21,13 +19,9 @@ pub struct Arguments {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub background: bool,
-    /// Whether finishing should resume the session, which is the default (D174). Only meaningful
-    /// with `background`, and a task that declined can be armed later with `tasks` (D182).
     pub wake: Option<bool>,
 }
 
-/// One task as the transcript and a poll show it: how it stands, then what it has said (D179). A
-/// running task has no exit status to report, so `render` is asked for the streams alone.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn format_task(task: &Task) -> String {
     let status = if task.running { "running" } else { "finished" };
@@ -54,8 +48,6 @@ fn invoke_task(args: Arguments) -> Result<(String, bool), String> {
         }
         return execute(&request).map(|reply| format_reply(&reply));
     }
-    // The launch says what its completion should do about the session (D174), rather than leaving
-    // the session to infer it from the call's own association. Reading the task is `tasks` (D182).
     let wake = args.wake.unwrap_or(true);
     let started = start_task(&request)?;
     let task = wake_task(&started.id, wake)?;
@@ -76,8 +68,6 @@ pub fn format_reply(reply: &ExecReply) -> (String, bool) {
     )
 }
 
-/// What `list` says about one task: how it stands, and how it ended (D179). A record outlives its
-/// command, so a poll after the fact still answers what the answer was.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn state(task: &Task) -> String {
     if task.running {
@@ -95,8 +85,6 @@ pub(crate) fn state(task: &Task) -> String {
     }
 }
 
-/// The reply as text: the status line when there is one, then the bounded streams (D179). A task
-/// still running is asked for the streams alone, because "exited" is the one thing it has not done.
 pub fn render(reply: &ExecReply, finished: bool) -> String {
     let mut text = match (reply.code, reply.signal) {
         _ if reply.cancelled => "cancelled by the user\n".into(),
@@ -182,7 +170,6 @@ mod tests {
         };
         let (text, ok) = format_reply(&reply);
         assert!(ok && text.contains("exit code 0") && text.contains("hello"));
-        // A task still running reports its streams and no status line: it has not exited (D179).
         let running = ExecReply {
             code: None,
             signal: None,

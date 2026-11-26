@@ -1,5 +1,3 @@
-//! the initial plugin's operational reach is bounded by the agent (D126, D127, D150).
-
 use crate::component::runtime_supports_scope;
 use crate::narrow::covers;
 use crate::policy::Sessions;
@@ -21,10 +19,6 @@ pub enum DelegationError {
     Reach(String),
 }
 
-/// bounds an explicitly granted tool without inheriting omitted grants.
-///
-/// `tool` registers an export, not operational authority. Additional adapters must extend the interface
-/// catalogue before their scopes can be linked; unsupported grants are never silently ignored.
 pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationError> {
     for scope in plugin.scopes() {
         if !runtime_supports_scope(scope) {
@@ -50,8 +44,6 @@ pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationEr
         tool_write: plugin.tool_write.clone(),
         ..Grants::default()
     };
-    // D163: another conversation of this workspace is the agent's reach to lend, so a plugin reads
-    // beyond its own only when the agent's grant does too.
     if let Some(want) = plugin.plain.get(&Scope::TranscriptRead) {
         let parent = agent
             .plain
@@ -70,9 +62,6 @@ pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationEr
             .as_ref()
             .ok_or(DelegationError::Scope(Scope::ModelInvoke))?;
         let mut grant = want.clone();
-        // A delegated grant is never wider than the one it comes from: no token budget in the
-        // parent leaves the child's own choice, and a child that asks for none still inherits the
-        // parent's cap rather than escaping it.
         grant.tokens_per_session = match (want.tokens_per_session, parent.tokens_per_session) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
@@ -137,8 +126,6 @@ pub fn read_tool(agent: &Grants, plugin: &Grants) -> Result<Grants, DelegationEr
             if held.is_empty() {
                 return Err(DelegationError::Root(want.root.clone()));
             }
-            // Grants are unions. Pairwise intersections preserve an agent's multiple entries for a
-            // root rather than accidentally making one entry's exclusions bind an unrelated entry.
             for grant in held {
                 let mut exclude = want.exclude.clone();
                 for pattern in &grant.exclude {
@@ -334,8 +321,6 @@ mod tests {
 
     #[test]
     fn a_plugin_reads_other_conversations_only_when_the_agent_does() {
-        // D163: the parent's own mode bounds what it can lend, and an omitted mode is the narrow
-        // one for a plugin, so delegation cannot widen the reach by leaving it out.
         let (agent, plugin) = grants(
             "[agent]\ntranscript-read={sessions='workspace'}\n[plugin.reader]\ntool={}\ntranscript-read={sessions='workspace'}\n",
         );

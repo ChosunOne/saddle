@@ -1,5 +1,3 @@
-//! custom-only listener fixture: no tool, harness subscription or publishing authority (D155).
-
 #![cfg(target_arch = "wasm32")]
 
 use saddle_sdk::events::{self as bindings, Event, Handler, Subscription, export_plugin_events};

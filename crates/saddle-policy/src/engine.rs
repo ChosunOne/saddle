@@ -1,8 +1,3 @@
-//! Per-call decisions (D10, D22, D178). Every decision is a lookup over grants: no ordering, no
-//! fallthrough, and a one-sentence explanation either way. A grant is a grant: the workspace's own
-//! `.git` holds no path the policy refuses, because refusing one beneath a granted root would be a
-//! second source of authority (D178).
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -11,10 +6,8 @@ use saddle_cap::policy::{FsGrant, NetGrant, Sessions, net_allows};
 use saddle_cap::{Location, Policy, Principal, RuleId, Scope};
 use serde_json::{Value, json};
 
-/// A request with its arguments already resolved.
 #[derive(Debug, Clone)]
 pub enum Request<'a> {
-    /// the host supplies the current D66 entry's roles, never the guest.
     ToolRead {
         path: &'a str,
         available_tools: &'a [String],
@@ -33,11 +26,9 @@ pub enum Request<'a> {
         argv: &'a [String],
         cwd: &'a Location,
     },
-    /// invoke a protected definition; no executable or path authority comes from this request.
     RunBinary {
         profile: &'a str,
     },
-    /// session-owned process observation/control, still bounded by exec (D153).
     ExecTask {
         operation: &'a str,
         id: Option<&'a str>,
@@ -48,8 +39,6 @@ pub enum Request<'a> {
         host: &'a str,
         port: u16,
         path: &'a str,
-        /// Header *names* only, never values: a value is where a key lives, so it is not part of
-        /// what a decision or an audit record carries (D48).
         headers: &'a [String],
     },
     ModelInvoke {
@@ -60,9 +49,7 @@ pub enum Request<'a> {
         cost: Option<f64>,
     },
     TranscriptQuery {
-        /// The conversation the query is against: this one, or another of this workspace (D163).
         session: &'a str,
-        /// Whether that is a conversation other than the one this session is holding.
         others: bool,
         sql: &'a str,
     },
@@ -71,7 +58,6 @@ pub enum Request<'a> {
         operation: &'a str,
         arguments: &'a Value,
     },
-    /// host-attributed hook delivery or custom-event publication (D155).
     Hook {
         scope: Scope,
         operation: &'a str,
@@ -80,7 +66,6 @@ pub enum Request<'a> {
         name: &'a str,
         data: &'a str,
     },
-    /// Scopes without arguments: transcript-read, context-contribute, tool, veto, ui, persist.
     Plain(Scope),
 }
 
@@ -102,7 +87,6 @@ impl Request<'_> {
         }
     }
 
-    /// Arguments as they go into the audit log. Query values are redacted (D24).
     pub fn args(&self) -> Value {
         match self {
             Request::ToolRead {
@@ -132,7 +116,6 @@ impl Request<'_> {
                     "url": format!("{scheme}://{host}:{port}{}", redact_query(path)),
                 });
                 if !headers.is_empty() {
-                    // The names say what the request carried without saying what was in it.
                     args["headers"] = json!(headers);
                 }
                 args
@@ -194,8 +177,6 @@ impl Decision {
             allow: true,
             scope,
             rule: Some(rule.clone()),
-            // A grant with no `why` (D41) is explained by its rule alone, rather than by a
-            // dangling colon.
             explanation: match why.is_empty() {
                 true => rule.to_string(),
                 false => format!("{rule}: {why}"),
@@ -220,10 +201,6 @@ pub struct Engine {
     money: Arc<Mutex<BTreeMap<Principal, f64>>>,
 }
 
-/// One narrowed list of net grants against one request (D110). A component or a server has a list
-/// of its own rather than a principal the policy resolves, so the question is asked here — with the
-/// same constructors and the same explanation an ordinary decision gets — and the caller names what
-/// it was answering for.
 pub fn net_decision(reach: &[NetGrant], req: &Request<'_>, who: &str) -> Decision {
     match req {
         Request::Net {
@@ -314,7 +291,6 @@ impl Engine {
             None => Decision::deny(Scope::ModelInvoke, "model-invoke is not granted".into()),
         }
     }
-    /// reconcile reported usage; unknown/failed usage retains its reservation (D156).
     pub fn settle_model(
         &self,
         who: &Principal,
@@ -338,14 +314,10 @@ impl Engine {
         &self.policy
     }
 
-    /// replaces effective grants without refunding any principal's session spending (D129).
     pub fn replace_policy(&mut self, policy: Policy) {
         self.policy = policy;
     }
 
-    /// Which conversations the principal's transcript grant covers (D163). `None` when it holds
-    /// none, which is what the host uses to decide whether another session may even be resolved;
-    /// the decision itself is still [`Engine::decide`].
     pub fn transcript_sessions(&self, who: &Principal) -> Option<Sessions> {
         self.policy
             .grants(who)
@@ -353,9 +325,6 @@ impl Engine {
             .map(|g| g.sessions)
     }
 
-    /// Whether a net grant names this host exactly (D28). The fetch tool asks before dialling a
-    /// literal address: a wildcard grant allows public addresses but does not open loopback, which
-    /// only a grant that spells the address out may do (D40).
     pub fn net_names_host(&self, who: &Principal, host: &str) -> bool {
         self.policy.grants(who).is_some_and(|g| g.names_host(host))
     }
@@ -431,8 +400,6 @@ impl Engine {
                 *used += tokens;
                 Decision::allow(scope, &g.rule, &g.why)
             }
-            // D163: the grant names which conversations it covers. A query against this one needs
-            // no more than the grant itself; one against another needs the workspace's.
             Request::TranscriptQuery { others, .. } => {
                 let Some(grant) = grants.plain.get(&Scope::TranscriptRead) else {
                     return Decision::deny(scope, format!("{who} has no {scope} grant"));
@@ -561,7 +528,6 @@ mod tests {
                 )
                 .allow
         );
-        // Rejected admissions did not charge either owner.
         assert!(
             engine
                 .decide(
@@ -660,8 +626,6 @@ model-invoke = { tokens-per-session = 100, why = "summaries" }
 
     #[test]
     fn a_transcript_query_against_another_conversation_needs_a_workspace_grant() {
-        // D163: `transcript-read` names the conversations it covers. Reading the one in hand is
-        // what it always meant; reading another is the workspace's, and a bare grant is that.
         let (dir, _) = engine();
         let roots = Roots::resolve([(RootName::workspace(), dir.path().into())], &[]).unwrap();
         let case = |text: &str, others: bool| {
@@ -695,7 +659,6 @@ model-invoke = { tokens-per-session = 100, why = "summaries" }
 
     #[test]
     fn a_net_request_records_its_header_names_and_no_values() {
-        // D48: the record says what the request carried, not what was in it.
         let headers = vec!["authorization".to_owned(), "x-api-key".to_owned()];
         let req = Request::Net {
             method: "GET",
@@ -709,7 +672,6 @@ model-invoke = { tokens-per-session = 100, why = "summaries" }
         assert_eq!(args["headers"], serde_json::json!(headers));
         assert_eq!(args["url"], "https://api.example.com:443/v2/quotas?token=…");
         assert!(!args.to_string().contains("secret"), "{args}");
-        // With no headers the field is left out entirely.
         let req = Request::Net {
             method: "GET",
             scheme: "https",
@@ -745,7 +707,6 @@ model-invoke = { tokens-per-session = 100, why = "summaries" }
 
     #[test]
     fn an_allow_without_a_why_is_explained_by_its_rule() {
-        // D41: a grant may omit its reason, and an allow then names the rule without a colon.
         let dir = tempfile::tempdir().unwrap();
         let roots = Roots::resolve([(RootName::workspace(), dir.path().into())], &[]).unwrap();
         let policy = Policy::parse("version = 1\n[agent]\nexec = {}\n", &roots).unwrap();
@@ -790,9 +751,6 @@ model-invoke = { tokens-per-session = 100, why = "summaries" }
             "workspace:conf/.env.local is excluded by agent.fs-write[0]"
         );
 
-        // A grant is a grant (D178): the workspace's own VCS metadata is inside the grant, and
-        // `git` and `jj` write it as ordinary work — `git remote add` writes `.git/config`, an
-        // installer writes `.git/hooks`, `jj` adopts the config it finds in the tree.
         for path in [
             ".git/config",
             ".git/hooks/pre-commit",
@@ -809,7 +767,6 @@ model-invoke = { tokens-per-session = 100, why = "summaries" }
             let d = e.decide(&a, &Request::FsWrite { loc: &ws(path) });
             assert!(d.allow, "{path}: {}", d.explanation);
         }
-        // It is the ordinary grant that allows it, not a special case in the engine.
         let d = e.decide(
             &a,
             &Request::FsWrite {
@@ -834,8 +791,6 @@ model-invoke = { tokens-per-session = 100, why = "summaries" }
 
     #[test]
     fn a_grant_without_a_token_budget_does_not_cap_spending() {
-        // A grant written as the capability alone: the model-invoke table may carry no budgets, so
-        // nothing here turns the absence of one into a ceiling of zero (D37, D156).
         let ws = tempfile::tempdir().unwrap();
         let roots = Roots::resolve([(RootName::workspace(), ws.path().into())], &[]).unwrap();
         let policy = Policy::parse(

@@ -1,13 +1,9 @@
-//! Server-sent events, as both APIs stream them.
-
 use std::io::{self, BufRead};
 
 use anyhow::Result;
 
 use super::Sink;
 
-/// A source of events that a reply parser reads from. The sink lets a source report retries and
-/// notice a cancel while it waits.
 pub trait Events {
     fn next(&mut self, sink: &mut dyn Sink) -> Result<Option<Event>>;
 }
@@ -37,7 +33,6 @@ impl<R: BufRead> Reader<R> {
         }
     }
 
-    /// The next event with data, or `None` at the end of the stream.
     pub fn next_event(&mut self) -> io::Result<Option<Event>> {
         let mut event = String::new();
         let mut data: Option<String> = None;

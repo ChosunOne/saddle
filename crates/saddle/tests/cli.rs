@@ -1,6 +1,3 @@
-//! End to end through the binary: the policy in force, decisions, the exec sandbox, network
-//! grants and the audit log, in a throwaway workspace with its own XDG directories.
-
 #[path = "support/launch_profiles.rs"]
 mod launch_profile_tests;
 #[path = "support/sandbox_overrides.rs"]
@@ -44,8 +41,6 @@ struct Env {
     ws: tempfile::TempDir,
     xdg: tempfile::TempDir,
     outside: tempfile::TempDir,
-    /// A throwaway home for every call, so the suite never reads the developer's own `~/.agents`,
-    /// `~/.cargo` or config. A test that needs a home of its own passes one to `saddle_in`.
     home: tempfile::TempDir,
 }
 
@@ -67,12 +62,10 @@ impl Env {
         env
     }
 
-    /// The one config file, holding both the base grants and each workspace's own (D63).
     fn policy_path(&self) -> PathBuf {
         self.xdg.path().join("config/saddle/config.toml")
     }
 
-    /// This workspace's own grant file, one per workspace (D63).
     fn override_path(&self) -> PathBuf {
         self.xdg
             .path()
@@ -80,8 +73,6 @@ impl Env {
             .join(format!("{}.toml", self.workspace_key()))
     }
 
-    /// Writes this workspace's own grants, as a policy-shaped document. The `workspace` line is
-    /// what the file is checked against, so it is written here (D63).
     fn write_override(&self, text: &str) {
         let path = self.override_path();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -93,8 +84,6 @@ impl Env {
         .unwrap();
     }
 
-    /// The provider line at the top of the same file, for a test that needs the session to know
-    /// which provider it is talking to (D82).
     fn write_config(&self, text: &str) {
         let path = self.policy_path();
         let base = fs::read_to_string(&path).unwrap_or_default();
@@ -102,7 +91,6 @@ impl Env {
         fs::write(&path, format!("{text}{base}")).unwrap();
     }
 
-    /// The base grants: `[agent]` in `config.toml` (D63).
     fn write_policy(&self, text: impl AsRef<str>) {
         let agent = agent_of(text.as_ref());
         let path = self.policy_path();
@@ -116,7 +104,6 @@ impl Env {
         fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
     }
 
-    /// Changes the base grants in place, so a test does not have to spell the serialised TOML.
     fn edit_agent(&self, change: impl FnOnce(&mut toml::Table)) {
         let path = self.policy_path();
         let text = fs::read_to_string(&path).unwrap_or_default();
@@ -130,7 +117,6 @@ impl Env {
     }
 
     fn workspace_key(&self) -> String {
-        // pi's scheme, as `paths::workspace_key` (D63).
         let ws = self.ws.path().canonicalize().unwrap();
         let inner = ws
             .to_string_lossy()
@@ -171,8 +157,6 @@ impl Env {
         self.ws.path().join(rel)
     }
 
-    /// The skills a run advertised: discovery writes one `skill` record, which is what the prompt
-    /// listing is built from, so this is the observable form of "the model was told about it".
     fn advertised(&self, home: &Path) -> Vec<String> {
         let out = saddle_in(self, home, &["tool", "ls", r#"{"path":"."}"#]);
         assert!(out.status.success(), "{}", stderr(&out));
@@ -199,8 +183,6 @@ impl Env {
             .collect()
     }
 
-    /// Everything the runs so far recorded, as text. Every run opens its own log, so a test that
-    /// makes two runs has to read both.
     fn audit(&self) -> String {
         self.audit_logs()
             .iter()
@@ -211,7 +193,6 @@ impl Env {
 
     fn audit_logs(&self) -> Vec<PathBuf> {
         let dir = self.xdg.path().join("state/saddle/audit");
-        // No run yet means no audit directory, which is not a failure.
         let Ok(entries) = fs::read_dir(dir) else {
             return Vec::new();
         };
@@ -221,7 +202,6 @@ impl Env {
     }
 }
 
-/// The `[agent]` table of a policy-shaped document, which is what the merged file stores.
 fn agent_of(text: &str) -> toml::Value {
     let doc: toml::Table = text.parse().unwrap_or_default();
     doc.get("agent")
@@ -280,8 +260,6 @@ fn every_shipped_tool_accepts_the_optional_host_timeout_without_guest_schema_cha
         ),
         ("tool_search", serde_json::json!({"query":""}), true),
         ("config_help", serde_json::json!({}), true),
-        // A standalone run has nobody to ask: the call is shaped, answered and failed, and it is
-        // the shipped component that did it (D197).
         (
             "ask",
             serde_json::json!({"question":"which one?", "options":[{"label":"this"}]}),
@@ -296,7 +274,6 @@ fn every_shipped_tool_accepts_the_optional_host_timeout_without_guest_schema_cha
             "{name}: {text}"
         );
     }
-    // Invalid deadlines are rejected before any effects, and omitted timeout remains compatible.
     let (ok, text) = env.tool(
         "write",
         serde_json::json!({"path":"never-created", "content":"x", "timeout_secs":0}),
@@ -306,8 +283,6 @@ fn every_shipped_tool_accepts_the_optional_host_timeout_without_guest_schema_cha
     assert!(env.tool("read", serde_json::json!({"path":"README"})).0);
 }
 
-/// D171: the configuration reference is a shipped component with no reach at all, so it answers in a
-/// workspace whose grants allow nothing — which is also the evidence that it is not a host tool.
 #[test]
 fn config_help_answers_from_a_component_that_holds_no_authority() {
     let env = ready();
@@ -320,8 +295,6 @@ fn config_help_answers_from_a_component_that_holds_no_authority() {
     let (ok, text) = env.tool("config_help", serde_json::json!({"section": "nonsense"}));
     assert!(!ok && text.contains("the sections are:"), "{text}");
 
-    // Nothing granted, and it still answers: the guest imports the budgets snapshot and nothing
-    // that reaches a file, a host or another conversation.
     env.edit_agent(toml::Table::clear);
     let (ok, text) = env.tool("config_help", serde_json::json!({}));
     assert!(ok, "{text}");
@@ -351,7 +324,7 @@ fn fetch_total_timeout_cuts_off_host_io_and_keeps_the_audit_chain_valid() {
         let mut streams = Vec::new();
         while !done.load(Ordering::Relaxed) {
             if let Ok((stream, _)) = listener.accept() {
-                streams.push(stream); // Accept, but deliberately send no response.
+                streams.push(stream);
                 accepted.store(true, Ordering::Relaxed);
             }
             thread::sleep(Duration::from_millis(5));
@@ -400,7 +373,6 @@ fn existing_configs_need_explicit_standard_profiles_and_omitted_scopes_never_inh
     fs::write(env.policy_path(), toml::to_string(&doc).unwrap()).unwrap();
     let (ok, text) = env.tool("read", serde_json::json!({"path":"README"}));
     assert!(!ok && text.contains("no native fallback"), "{text}");
-    // the refusal names the row to add, not only the mechanism that refused (D182)
     assert!(
         text.contains(r#"read = ["fs-read", "tool-read"]"#),
         "{text}"
@@ -437,8 +409,6 @@ fn existing_configs_need_explicit_standard_profiles_and_omitted_scopes_never_inh
     assert!(env.tool("read", serde_json::json!({"path":"README"})).0);
 }
 
-/// D197: a question reaches a person rather than a file or a socket, and the shipped component owns
-/// the schema and the answer's shape. A standalone `saddle tool ask` has nobody to ask, and says so.
 #[test]
 fn ask_reaches_a_person_and_says_when_there_is_none() {
     let env = ready();
@@ -455,7 +425,6 @@ fn ask_reaches_a_person_and_says_when_there_is_none() {
     assert!(!ok, "{text}");
     assert!(text.contains("No person could be asked"), "{text}");
 
-    // Nothing granted, and the question still reaches the same answer: it asks for no resource.
     env.edit_agent(toml::Table::clear);
     let (ok, text) = env.tool(
         "ask",
@@ -464,14 +433,12 @@ fn ask_reaches_a_person_and_says_when_there_is_none() {
     assert!(text.contains("No person could be asked"), "{text}");
     assert!(!ok);
 
-    // A question the interface could not draw is refused before any person sees it.
     let (ok, text) = env.tool(
         "ask",
         serde_json::json!({"question": "which one?", "options": []}),
     );
     assert!(!ok && text.contains("between 1"), "{text}");
 
-    // The record keeps the question's size and hash, never its words (D24, D197).
     let audit = env.audit();
     assert!(audit.contains("question_sha256"), "{audit}");
     assert!(!audit.contains("which approach?"), "{audit}");
@@ -480,7 +447,6 @@ fn ask_reaches_a_person_and_says_when_there_is_none() {
 #[test]
 fn first_run_includes_and_enables_shipped_tools_without_manual_configuration() {
     let env = Env::new();
-    // Remove the helper's explicit configuration so the real first-run path supplies everything.
     fs::remove_file(env.policy_path()).unwrap();
     let (ok, text) = env.tool("read", serde_json::json!({"path":"README"}));
     assert!(ok && text.trim_end() == "hello", "{text}");
@@ -500,7 +466,6 @@ fn first_run_includes_and_enables_shipped_tools_without_manual_configuration() {
     for artifact in saddle_standard::ARTIFACTS {
         assert!(config["standard-tools"].get(artifact.name).is_some());
         let status = if matches!(artifact.name, "fetch" | "websearch" | "run_binary") {
-            // Enabled tools never invent network or named launch grants missing from defaults.
             "standard tool unavailable:"
         } else {
             "ready: shipped standard tool"
@@ -534,8 +499,6 @@ fn shipped_tool_inventory_and_delegation_template_do_not_modify_existing_config(
 
 #[test]
 fn a_profile_is_layered_between_the_base_grants_and_the_project() {
-    // D176: the order is `[agent]`, then the profile, then this workspace's own file. A profile
-    // names what it changes and inherits the rest, so switching sets do not mean copying the base.
     let env = Env::new();
     env.write_policy(POLICY);
     env.edit_agent(|agent| {
@@ -566,7 +529,6 @@ fn a_profile_is_layered_between_the_base_grants_and_the_project() {
     let write = |doc: &toml::Table| fs::write(&path, toml::to_string(doc).unwrap()).unwrap();
     write(&doc);
 
-    // `[agent]` as written, with the alternatives named.
     let out = env.saddle(&["check"]);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
@@ -579,7 +541,6 @@ fn a_profile_is_layered_between_the_base_grants_and_the_project() {
     );
     assert!(text.contains("agent.exec = timeout 20s"), "{text}");
 
-    // The profile's own scope replaces the base's, and everything else is inherited.
     let out = env.saddle(&["--profile", "build", "check"]);
     assert!(out.status.success(), "{}", stderr(&out));
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -594,7 +555,6 @@ fn a_profile_is_layered_between_the_base_grants_and_the_project() {
         "inherited from the base too: {text}"
     );
 
-    // A list scope can be emptied by the profile, which is how one narrows; a table scope cannot.
     let out = env.saddle(&["--profile", "offline", "check"]);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
@@ -603,8 +563,6 @@ fn a_profile_is_layered_between_the_base_grants_and_the_project() {
     );
     assert!(text.contains("agent.exec = timeout 20s"), "{text}");
 
-    // A `-name` entry takes one grant away without restating the ones it keeps (D177), and what
-    // the base gave is still there.
     let out = env.saddle(&["--profile", "narrow", "check"]);
     assert!(out.status.success(), "{}", stderr(&out));
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -617,7 +575,6 @@ fn a_profile_is_layered_between_the_base_grants_and_the_project() {
         "and the scopes it does not name are inherited: {text}"
     );
 
-    // A name that nothing inherits is a mistake in that profile, not a no-op, and it says so.
     let out = env.saddle(&["--profile", "typo", "check"]);
     assert!(!out.status.success());
     let e = stderr(&out);
@@ -625,7 +582,6 @@ fn a_profile_is_layered_between_the_base_grants_and_the_project() {
     assert!(e.contains("nothing inherited matches -nope.example"), "{e}");
     assert!(e.contains("api.example.com"), "it names what is there: {e}");
 
-    // This workspace's own file is layered on top of both (D63).
     env.write_override("version = 1\n[agent]\nexec = { timeout-secs = 7 }\n");
     let out = env.saddle(&["--profile", "build", "check"]);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -638,7 +594,6 @@ fn a_profile_is_layered_between_the_base_grants_and_the_project() {
         "and it leaves what it does not name alone: {text}"
     );
 
-    // A name that is not defined is refused, never quietly replaced by `[agent]`.
     let out = env.saddle(&["--profile", "nope", "check"]);
     assert!(!out.status.success());
     assert!(
@@ -647,7 +602,6 @@ fn a_profile_is_layered_between_the_base_grants_and_the_project() {
         stderr(&out)
     );
 
-    // The file's own default is what a session starts on, and `none` goes back to `[agent]`.
     doc.insert("profile".into(), toml::Value::String("build".into()));
     write(&doc);
     let out = env.saddle(&["check"]);
@@ -663,7 +617,6 @@ fn a_profile_is_layered_between_the_base_grants_and_the_project() {
         String::from_utf8_lossy(&out.stdout)
     );
 
-    // The project's file subtracts in the same form, from what the profile left (D177).
     env.write_override("version = 1\n[agent]\nfs-read = [\"-workspace\"]\n");
     let out = env.saddle(&["--profile", "build", "check"]);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -679,9 +632,6 @@ fn a_profile_is_layered_between_the_base_grants_and_the_project() {
 
 #[test]
 fn a_workspace_layers_its_own_file_on_the_base() {
-    // D63: one `config.toml`. `[agent]` is the base every workspace inherits, and
-    // `[workspaces."<key>"]` is this workspace's own, replacing a key it lists and inheriting the
-    // rest.
     let env = Env::new();
     let out = env.saddle(&["check"]);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -692,7 +642,6 @@ fn a_workspace_layers_its_own_file_on_the_base() {
     );
     assert!(text.contains("agent.exec = timeout 20s"), "{text}");
 
-    // Editing the base changes the effective grants here.
     env.write_policy(POLICY.replace("timeout-secs = 20", "timeout-secs = 45"));
     let out = env.saddle(&["check"]);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -701,7 +650,6 @@ fn a_workspace_layers_its_own_file_on_the_base() {
         "the base change reached this workspace: {text}"
     );
 
-    // An entry that narrows one scope leaves the others inherited.
     env.write_override(
         "version = 1\n[agent]\nfs-write = [{ root = \"workspace\", exclude = [\".env*\", \"/secrets\"] }]\n",
     );
@@ -713,8 +661,6 @@ fn a_workspace_layers_its_own_file_on_the_base() {
         "still inherited: {text}"
     );
 
-    // It may widen too: it is the authority for this directory, and it lives where nothing the
-    // agent runs can write it (D42, D43).
     env.write_override(
         "version = 1\n[agent]\nnet = [{ host = \"api.example.com\" }]\nexec = { timeout-secs = 5 }\n",
     );
@@ -727,7 +673,6 @@ fn a_workspace_layers_its_own_file_on_the_base() {
     );
     assert!(text.contains("agent.exec = timeout 5s"), "{text}");
 
-    // A tree-level file is reported and not read.
     env.write_override("version = 1\n");
     fs::write(
         env.path("saddle.toml"),
@@ -745,8 +690,6 @@ fn a_workspace_layers_its_own_file_on_the_base() {
 
 #[test]
 fn a_command_cannot_write_the_policy_that_governs_it() {
-    // The whole point of D42: the file is outside every root, so the kernel refuses the write and
-    // no snapshot has to put anything back.
     let env = ready();
     let before = env.policy();
     let path = env.policy_path();
@@ -761,7 +704,6 @@ fn a_command_cannot_write_the_policy_that_governs_it() {
     );
     assert_eq!(env.policy(), before, "the policy is untouched");
 
-    // And through the tools it is not even reachable, since no root contains it.
     let (ok, text) = env.tool(
         "write",
         serde_json::json!({"path": path.to_string_lossy(), "content": "version = 1\n"}),
@@ -807,8 +749,6 @@ fn file_tools_follow_the_policy() {
         serde_json::json!({"path": ".env", "content": "x"}),
         "excluded by agent.fs-write[0]",
     );
-    // D178: nothing inside the workspace is reserved, `.git` and `saddle.toml` included; the grant
-    // on the root decides, as it does for every other path.
     for path in [".git/hooks/pre-commit", "saddle.toml"] {
         let (ok, text) = env.tool("write", serde_json::json!({"path": path, "content": "x"}));
         assert!(ok, "{path}: {text}");
@@ -826,8 +766,6 @@ fn file_tools_follow_the_policy() {
         "outside every root",
     );
 
-    // A grant is a grant (D178): a link into `.git` is decided on its target, and the target is
-    // inside the workspace write grant, so it is written.
     unix_fs::symlink(".git/hooks/pre-commit", env.path("innocent")).unwrap();
     let (ok, text) = env.tool(
         "write",
@@ -862,8 +800,6 @@ fn bash_runs_sandboxed_and_vcs_metadata_is_the_workspace_s_own() {
     );
     assert!(!ok && text.contains("Permission denied"), "{text}");
 
-    // D178: `.git` is inside the workspace grant, so what a command writes there is its own —
-    // `git remote add` and an installer write exactly these paths as ordinary work.
     let (ok, text) = env.tool(
         "bash",
         serde_json::json!({"command": "echo hook > .git/hooks/pre-commit && echo 'fsmonitor = cargo-watch' >> .git/config"}),
@@ -899,8 +835,6 @@ fn a_provider_key_never_reaches_a_command_even_when_the_exec_grant_names_it() {
             toml::Value::Array(vec!["ANTHROPIC_API_KEY".into(), "SADDLE_VISIBLE".into()]),
         );
     });
-    // `saddle tool` opens its session without the interactive start-up, which is where the strip
-    // used to be, so it is the path that would show the key (D19).
     let input = serde_json::json!({
         "command": "printf '%s|%s' \"${ANTHROPIC_API_KEY-unset}\" \"${SADDLE_VISIBLE-unset}\""
     });
@@ -957,7 +891,6 @@ fn every_decision_is_logged_and_the_chain_verifies() {
         stderr(&out)
     );
 
-    // Dropping the last line is caught by the index even though the remaining chain is intact.
     let text = fs::read_to_string(&logs[1]).unwrap();
     let kept: Vec<&str> = text.lines().take(2).collect();
     fs::write(&logs[1], kept.join("\n") + "\n").unwrap();
@@ -967,7 +900,6 @@ fn every_decision_is_logged_and_the_chain_verifies() {
 
 #[test]
 fn fetch_needs_a_net_grant_and_says_which_one() {
-    // No net grant at all: the call is denied as an ordinary tool result, and audited.
     let env = Env::new();
     let (ok, text) = env.tool(
         "fetch",
@@ -976,11 +908,9 @@ fn fetch_needs_a_net_grant_and_says_which_one() {
     assert!(!ok, "a workspace with no net grant must refuse: {text}");
     assert!(text.contains("denied:"), "{text}");
     assert!(text.contains("needs scope `net`"), "{text}");
-    // No adapter is initialized without net; the attempted tool call is audited, not a fictitious GET.
     let logs = env.audit_logs();
     let record = fs::read_to_string(logs.last().unwrap()).unwrap();
     assert!(record.contains("\"allow\":false"));
-    // A grant for one host does not cover another.
     env.edit_agent(|agent| {
         agent.insert(
             "net".into(),
@@ -992,7 +922,6 @@ fn fetch_needs_a_net_grant_and_says_which_one() {
         text.contains("no net grant covering https://evil.test:443"),
         "{text}"
     );
-    // http is not covered by an https grant either (D28).
     let (_, text) = env.tool(
         "fetch",
         serde_json::json!({"url": "http://api.example.com/x"}),
@@ -1061,7 +990,6 @@ fn a_private_fetch_refusal_is_audited_without_header_values_or_query_secrets() {
 
 #[test]
 fn a_wildcard_net_grant_allows_any_host_but_not_the_local_machine() {
-    // `*` covers every public host without naming one, which is the point of it (D40).
     let env = Env::new();
     env.edit_agent(|agent| {
         agent.insert(
@@ -1076,8 +1004,6 @@ fn a_wildcard_net_grant_allows_any_host_but_not_the_local_machine() {
         );
     });
 
-    // A public host passes the gate. It cannot be reached here (this sandbox has no sockets), so
-    // the failure is the lookup, not a denial: that is what proves the grant allowed it.
     let (ok, text) = env.tool(
         "fetch",
         serde_json::json!({"url": "https://example.test/x"}),
@@ -1088,7 +1014,6 @@ fn a_wildcard_net_grant_allows_any_host_but_not_the_local_machine() {
         "the wildcard grant allowed it: {text}"
     );
 
-    // Loopback is not opened by a wildcard: only a grant that spells the address out may (D28).
     env.edit_agent(|agent| {
         agent.insert(
             "net".into(),
@@ -1106,17 +1031,12 @@ fn a_wildcard_net_grant_allows_any_host_but_not_the_local_machine() {
         serde_json::json!({"url": "http://127.0.0.1:80/v1/models"}),
     );
     assert!(!ok, "{text}");
-    // The refusal names the grant to write, so a local server is not a mystery (D40).
     assert!(
         text.contains(r#"net = [{ host = "127.0.0.1", scheme = "http""#),
         "it should say which grant: {text}"
     );
     assert!(text.contains("policy file"), "{text}");
 
-    // Naming the address does open it, which is the escape hatch the rule is built around. The
-    // port is one nothing listens on, on purpose: a test that used 80 would be asking whether
-    // something happens to be bound there, and inside a command's network namespace something is
-    // (D79).
     env.edit_agent(|agent| {
         agent.insert(
             "net".into(),
@@ -1144,13 +1064,10 @@ fn a_wildcard_net_grant_allows_any_host_but_not_the_local_machine() {
 
 #[test]
 fn websearch_is_a_tool_and_the_gate_decides_it() {
-    // D82: the search host is decided like any other request. With no provider configured, the tool
-    // falls back to Exa — and that path needs Exa's host, not a vendor's name.
     let env = Env::new();
     let (ok, text) = env.tool("websearch", serde_json::json!({ "query": "anything" }));
     assert!(!ok, "{text}");
     assert!(text.contains("needs scope `net`"), "{text}");
-    // A grant for a different Exa host is not a grant for this one.
     env.write_policy(POLICY.replace(
         "[agent]",
         "[agent]\nnet = [{ host = \"api.exa.ai\", why = \"the keyed search\" }]",
@@ -1160,16 +1077,12 @@ fn websearch_is_a_tool_and_the_gate_decides_it() {
     assert!(text.contains("mcp.exa.ai"), "{text}");
     assert!(!text.contains("api.exa.ai"), "{text}");
 
-    // The second step of a search needs a search to expand (D82). No network is involved in the
-    // refusal, which is what makes it testable here.
     let (ok, text) = env.tool("websearch", serde_json::json!({ "result": 1 }));
     assert!(!ok, "{text}");
     assert!(text.contains("no search to expand"), "{text}");
-    // Neither field is a refusal that says what to pass.
     let (ok, text) = env.tool("websearch", serde_json::json!({}));
     assert!(!ok, "{text}");
     assert!(text.contains("`query` is empty"), "{text}");
-    // A result number is a number, and 1-based.
     let (ok, text) = env.tool(
         "websearch",
         serde_json::json!({ "query": "x", "result": 0 }),
@@ -1177,7 +1090,6 @@ fn websearch_is_a_tool_and_the_gate_decides_it() {
     assert!(!ok, "{text}");
     assert!(text.contains("positive whole number"), "{text}");
 
-    // An unknown tool names the ones that exist, so the catalogue is readable from the binary.
     let refused = env.saddle(&["tool", "nonesuch", "{}"]);
     let listed = String::from_utf8_lossy(&refused.stderr);
     assert!(listed.contains("websearch"), "{listed}");
@@ -1185,12 +1097,8 @@ fn websearch_is_a_tool_and_the_gate_decides_it() {
 
 #[test]
 fn a_provider_that_searches_is_asked_before_exa() {
-    // D82: Synthetic serves `/v2/search` beside `/v2/quotas`, so a session whose provider is
-    // Synthetic searches there, with the provider's own key, and never reaches Exa.
     let env = Env::new();
     env.write_config("provider = \"synthetic\"\n");
-    // A grant for Exa's hosts alone must not let the provider's search through, which is what shows
-    // the request goes to the provider and is decided on the host it actually names.
     env.write_policy(POLICY.replace(
         "[agent]",
         "[agent]\nnet = [{ host = \"mcp.exa.ai\" }, { host = \"api.exa.ai\" }]",
@@ -1200,14 +1108,11 @@ fn a_provider_that_searches_is_asked_before_exa() {
     assert!(text.contains("api.synthetic.new"), "{text}");
     assert!(!text.contains("exa.ai"), "{text}");
 
-    // The grant the search actually needs is the one its refusal named.
     env.write_policy(POLICY.replace(
         "[agent]",
         "[agent]\nnet = [{ host = \"api.synthetic.new\", why = \"the provider's search\" }]",
     ));
     let (ok, text) = env.tool("websearch", serde_json::json!({ "query": "anything" }));
-    // No key is stored in a throwaway state directory, so the request is refused before it is made
-    // — and the refusal says which variable to set.
     assert!(!ok, "{text}");
     assert!(text.contains("SYNTHETIC_API_KEY"), "{text}");
     assert!(text.contains("saddle login synthetic"), "{text}");
@@ -1215,9 +1120,6 @@ fn a_provider_that_searches_is_asked_before_exa() {
 
 #[test]
 fn check_says_what_network_a_command_will_get() {
-    // D79: a command runs in its own namespace with one door to the proxy, or with no network at
-    // all when a namespace cannot be made. Which one it will be is not something a person should
-    // have to run a command to find out.
     let env = Env::new();
     let out = env.saddle(&["check"]);
     let text = String::from_utf8_lossy(&out.stdout);
@@ -1226,8 +1128,6 @@ fn check_says_what_network_a_command_will_get() {
 
 #[test]
 fn check_says_which_mcp_servers_are_declared_and_granted() {
-    // D104: a server that is declared and not granted, or granted and not declared, would
-    // otherwise show up as a server that silently never starts.
     let env = Env::new();
     env.write_config(
         r#"
@@ -1265,9 +1165,6 @@ mcp     = [{ server = "scout", tools = ["search"] }, { server = "ghost", tools =
     );
 }
 
-/// A loopback streamable-HTTP MCP server: JSON for `initialize`, an event stream for `tools/list`,
-/// so both framings a server may answer with are exercised (D110). It stops when the test says so,
-/// because a refused request never reaches it and would otherwise leave a thread waiting forever.
 fn mock_http_mcp() -> (String, Arc<AtomicUsize>, Arc<AtomicBool>, JoinHandle<()>) {
     mock_http_mcp_with_slow_call(false)
 }
@@ -1297,7 +1194,6 @@ fn mock_http_mcp_with_slow_call(
             let mut stream = stream;
             let mut raw = Vec::new();
             let mut buf = [0u8; 4096];
-            // Headers first, then exactly as many bytes of body as they announced.
             loop {
                 match Read::read(&mut stream, &mut buf) {
                     Ok(0) | Err(_) => break,
@@ -1337,7 +1233,6 @@ fn mock_http_mcp_with_slow_call(
                 break;
             }
             let answer = if body.contains("tools/list") {
-                // An event stream, which is what a server may answer any request with.
                 let event = r#"data: {"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"says it back","inputSchema":{}}]}}
 
 "#;
@@ -1396,9 +1291,6 @@ mcp=[{{server='remote',tools=['echo'],net=[{{host='127.0.0.1',scheme='http',port
 
 #[test]
 fn a_request_from_the_server_is_answered_so_the_listing_can_finish() {
-    // D114: a server may ask the client something of its own. This one asks for the roots before
-    // it will hand over its catalogue, so a listing that completes at all proves the answer went
-    // back down the pipe — and that it carried the workspace root rather than an empty list.
     let env = Env::new();
     let script = env.ws.path().join("asking-mcp.sh");
     fs::write(
@@ -1451,8 +1343,6 @@ mcp     = [{ server = "fake", tools = ["search"] }]
 
 #[test]
 fn a_server_that_never_answers_is_cut_off_at_the_deadline_its_table_names() {
-    // D113: `[mcp.<name>] timeout` is a promise the config makes, so it is the deadline actually
-    // enforced rather than a constant. Two seconds, and the message says which deadline it was.
     let env = Env::new();
     let script = env.ws.path().join("mute-mcp.sh");
     fs::write(
@@ -1507,8 +1397,6 @@ mcp     = [{ server = "fake", tools = ["search"] }]
     assert!(began.elapsed() < Duration::from_secs(5));
 }
 
-/// A loopback authorization server: metadata, registration and a token endpoint, each echoing the
-/// `client_id` it was given so the exchange can be checked end to end.
 fn mock_auth_server() -> (String, Arc<AtomicBool>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let port = listener.local_addr().expect("the bound address").port();
@@ -1568,8 +1456,6 @@ fn mock_auth_server() -> (String, Arc<AtomicBool>, JoinHandle<()>) {
             } else if request_line.contains("/register") {
                 r#"{"client_id":"saddle-test-client"}"#.to_owned()
             } else if request_line.contains("/token") {
-                // The code the test sends back is echoed in the access token, so the assertion can
-                // see the whole round trip and not just that something was stored.
                 let code = body
                     .split('&')
                     .find_map(|pair| pair.strip_prefix("code="))
@@ -1592,11 +1478,8 @@ fn mock_auth_server() -> (String, Arc<AtomicBool>, JoinHandle<()>) {
     (format!("http://127.0.0.1:{port}/mcp"), stop, handle)
 }
 
-/// The headers a mock server was sent, kept for the assertion.
 type SeenHeaders = Arc<Mutex<Vec<String>>>;
 
-/// An MCP server that wants a bearer token: 401 without one, and the value it saw kept for the
-/// assertion (D116).
 fn mock_token_mcp() -> (String, SeenHeaders, Arc<AtomicBool>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let port = listener.local_addr().expect("the bound address").port();
@@ -1687,8 +1570,6 @@ fn mock_token_mcp() -> (String, SeenHeaders, Arc<AtomicBool>, JoinHandle<()>) {
 
 #[test]
 fn mcp_logout_forgets_the_token_so_the_next_call_says_how_to_sign_in() {
-    // D121: signing out is removing the one entry a token lives in. Afterwards the call is refused
-    // with the command that fixes it, rather than retried without a token.
     let env = Env::new();
     let auth_path = env.xdg.path().join("state/saddle/auth.json");
     fs::create_dir_all(auth_path.parent().expect("the state directory")).unwrap();
@@ -1710,7 +1591,6 @@ fn mcp_logout_forgets_the_token_so_the_next_call_says_how_to_sign_in() {
         "another provider's credential was removed too: {stored}"
     );
 
-    // Nothing to forget the second time, and that is not a failure.
     let out = env.saddle(&["mcp", "logout", "remote"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{text}");
@@ -1719,8 +1599,6 @@ fn mcp_logout_forgets_the_token_so_the_next_call_says_how_to_sign_in() {
 
 #[test]
 fn the_transport_sends_the_stored_token_and_says_how_to_get_one() {
-    // D116: a token the person obtained is sent as a bearer, and a server that refuses without one
-    // is told nothing by a retry — the error has to name the command that fixes it.
     let env = Env::new();
     let (url, seen, stop, handle) = mock_token_mcp();
     env.write_config(&format!("\n[mcp.remote]\nurl = {url:?}\n"));
@@ -1741,7 +1619,6 @@ mcp     = [{{ server = "remote", tools = ["echo"], net = [{{ host = "127.0.0.1",
 "#
     ));
 
-    // No token yet: the failure has to say which command obtains one.
     let out = env.saddle(&["mcp", "call", "remote", "echo", "{}"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(!out.status.success(), "{text}");
@@ -1750,12 +1627,10 @@ mcp     = [{{ server = "remote", tools = ["echo"], net = [{{ host = "127.0.0.1",
         "the refusal does not say how to sign in: {text}"
     );
 
-    // The token the person stored is sent, and the call completes.
     let auth_path = env.xdg.path().join("state/saddle/auth.json");
     fs::create_dir_all(auth_path.parent().expect("the state directory")).unwrap();
     fs::write(
         &auth_path,
-        // `AuthStore` is transparent over its map, so the key is the top level.
         r#"{"mcp:remote":{"oauth":{"access":"planted-token","refresh":"","expires-at":0}}}"#,
     )
     .unwrap();
@@ -1774,9 +1649,6 @@ mcp     = [{{ server = "remote", tools = ["echo"], net = [{{ host = "127.0.0.1",
 
 #[test]
 fn mcp_auth_signs_in_and_stores_the_token_outside_every_root() {
-    // D115: the whole flow, driven by the test pretending to be the browser. The URL is taken from
-    // what saddle printed, the callback is sent back with the state it carried, and what is stored
-    // is the token from the round trip — in `auth.json`, which no command can read.
     let env = Env::new();
     let (url, stop, handle) = mock_auth_server();
     env.write_config(&format!("\n[mcp.remote]\nurl = {url:?}\n"));
@@ -1808,7 +1680,6 @@ mcp     = [{{ server = "remote", tools = ["echo"], net = [{{ host = "127.0.0.1",
         .spawn()
         .expect("spawning saddle mcp auth");
 
-    // Read until the URL, then behave like the browser: a GET on the redirect the URL names.
     let stdout = child.stdout.take().expect("piped stdout");
     let mut lines = BufReader::new(stdout).lines();
     let mut printed = String::new();
@@ -1870,10 +1741,6 @@ mcp     = [{{ server = "remote", tools = ["echo"], net = [{{ host = "127.0.0.1",
 
 #[test]
 fn a_table_says_how_its_tools_reach_the_model_and_codemode_is_refused() {
-    // D117: exposure is the table's own word for what reaches the prompt. `direct` is the one a
-    // small frequent set wants, and `codemode` — pi's default — is a load error here rather than a
-    // silent fall back to deferring, because a person who asked for it asked for something saddle
-    // does not do.
     let env = Env::new();
     let script = env.ws.path().join("fake-mcp.sh");
     fs::write(
@@ -1919,8 +1786,6 @@ mcp     = [{ server = "fake", tools = ["search"] }]
         "the listing hides the exposure: {text}"
     );
 
-    // `write_config` prepends, so the codemode case gets its own workspace rather than a second
-    // `[mcp.fake]` table in the same file.
     let env = Env::new();
     let script = env.ws.path().join("fake-mcp.sh");
     fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
@@ -1944,9 +1809,6 @@ mcp     = [{ server = "fake", tools = ["search"] }]
 
 #[test]
 fn mcp_call_runs_one_tool_as_the_model_would_and_refuses_an_ungranted_one() {
-    // D111: one call without a conversation around it, decided by the same grant the model's call
-    // is decided by. It is what a person checks a server with, and the only way to reach a remote
-    // one before a search has declared anything.
     let env = Env::new();
     let script = env.ws.path().join("fake-mcp.sh");
     fs::write(
@@ -1985,7 +1847,6 @@ mcp     = [{ server = "fake", tools = ["search"] }]
     assert!(out.status.success(), "{text}");
     assert!(text.contains("found two postings"), "{text}");
 
-    // A tool the grant does not name is refused before the server is even started.
     let out = env.saddle(&["mcp", "call", "fake", "rm_rf"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(!out.status.success(), "{text}");
@@ -1994,8 +1855,6 @@ mcp     = [{ server = "fake", tools = ["search"] }]
         "the refusal did not name the tool: {text}"
     );
 
-    // D112: both calls are in the record — the allow and the deny — with the server, the tool and
-    // a hash of the arguments rather than the arguments themselves.
     let log = env.audit();
     assert!(
         log.contains(r#""server":"fake","tool":"search""#),
@@ -2025,9 +1884,6 @@ mcp     = [{ server = "fake", tools = ["search"] }]
 
 #[test]
 fn an_http_server_is_reached_only_through_its_own_narrowed_reach() {
-    // D110: an HTTP server has no child to confine, so its authority is asked at every request —
-    // against its own reach, narrowed from the agent's. The same server with the same grant but no
-    // net reach is refused before anything is sent, and the record says which server it was for.
     let env = Env::new();
     let (url, seen, stop, handle) = mock_http_mcp();
     env.write_config(&format!("\n[mcp.remote]\nurl = {url:?}\n"));
@@ -2053,9 +1909,6 @@ mcp     = [{{ server = "remote", tools = ["echo"], net = [{{ host = "127.0.0.1",
     assert!(text.contains("granted"), "{text}");
     let asked = seen.load(Ordering::SeqCst);
 
-    // The same server, granted the tool and a reach that is *narrower* than the agent's: it names
-    // another port, so the agent's own grant for this one does not answer for it. Refused before
-    // anything is sent, and the mock hears nothing more.
     env.write_policy(format!(
         r#"
 version = 1
@@ -2092,8 +1945,6 @@ mcp     = [{{ server = "remote", tools = ["echo"], net = [{{ host = "127.0.0.1",
 
 #[test]
 fn mcp_list_starts_a_server_and_says_what_the_grant_allows() {
-    // D107: proven from outside, through the real binary. A declared server is started under the
-    // sandbox, spoken to over its own stdin and stdout, and its tools compared with the grant.
     let env = Env::new();
     let script = env.ws.path().join("fake-mcp.sh");
     fs::write(
@@ -2143,8 +1994,6 @@ mcp     = [{ server = "fake", tools = ["search"] }]
 
 #[test]
 fn tool_search_declares_what_the_grant_allows_and_nothing_else() {
-    // D108: a server's tools are not in the prompt until the model searches for them, and a search
-    // can only ever declare what the grant names.
     let env = Env::new();
     let script = env.ws.path().join("fake-mcp.sh");
     fs::write(
@@ -2221,8 +2070,6 @@ fn workspace_containing_the_state_dir_is_refused() {
 
 #[test]
 fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() {
-    // D60. Nothing is refused from the warning itself: the refusal names the session id and a
-    // command a person runs in their own terminal, and the allowance is written outside every root.
     let home = tempfile::tempdir().unwrap();
     let xdg = tempfile::tempdir().unwrap();
     fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
@@ -2241,7 +2088,6 @@ fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() 
             .unwrap()
     };
 
-    // A project inside home exposes nothing, so it needs no allowance at all.
     let project = saddle(&sub, &["check"]);
     assert!(project.status.success(), "{}", stderr(&project));
     assert!(
@@ -2250,7 +2096,6 @@ fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() 
         String::from_utf8_lossy(&project.stdout)
     );
 
-    // `check` reports and succeeds: it is the review tool, not the gate.
     let checked = saddle(home.path(), &["check"]);
     assert!(checked.status.success(), "{}", stderr(&checked));
     let text = String::from_utf8_lossy(&checked.stdout).into_owned();
@@ -2259,7 +2104,6 @@ fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() 
         "{text}"
     );
 
-    // A session there is refused, and says which session id to allow.
     let refused = saddle(home.path(), &["tool", "read", r#"{"path":"README"}"#]);
     assert_eq!(refused.status.code(), Some(2), "{}", stderr(&refused));
     let text = stderr(&refused);
@@ -2273,7 +2117,6 @@ fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() 
         .to_owned();
     assert!(!id.is_empty(), "{text}");
 
-    // The id is findable afterwards, which is the whole reason the request is recorded.
     let pending = saddle(home.path(), &["session", "pending"]);
     assert!(pending.status.success(), "{}", stderr(&pending));
     let listed = String::from_utf8_lossy(&pending.stdout).into_owned();
@@ -2283,7 +2126,6 @@ fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() 
         "the age tells a person which message it was: {listed}"
     );
 
-    // Allowing another workspace does not allow this one.
     let elsewhere = tempfile::tempdir().unwrap();
     let wrong = saddle(
         home.path(),
@@ -2306,7 +2148,6 @@ fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() 
         "the allowance names another workspace"
     );
 
-    // Allowing this workspace for this id lets that session, and only that session, in.
     let allow = saddle(home.path(), &["session", "allow", &id]);
     assert!(allow.status.success(), "{}", stderr(&allow));
     fs::write(home.path().join("README"), "hello\n").unwrap();
@@ -2337,8 +2178,6 @@ fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() 
         String::from_utf8_lossy(&allowed.stdout)
     );
 
-    // The allowance outlives the session so it can be picked again without copying the id (D61),
-    // which makes it something to revoke rather than something that expires by itself.
     let listed = saddle(home.path(), &["session", "list"]);
     assert!(listed.status.success(), "{}", stderr(&listed));
     let text = String::from_utf8_lossy(&listed.stdout).into_owned();
@@ -2348,7 +2187,6 @@ fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() 
         "{text}"
     );
 
-    // A prefix is enough, and a later session reuses the allowance instead of being refused.
     let prefix = &id[..8];
     let reused = saddle(
         home.path(),
@@ -2356,8 +2194,6 @@ fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() 
     );
     assert!(reused.status.success(), "{}", stderr(&reused));
 
-    // Revoking is how an allowance goes away for a capability that was only needed briefly, and it
-    // takes the same short forms as `--session` (D61).
     let revoked = saddle(home.path(), &["session", "revoke", prefix]);
     assert!(revoked.status.success(), "{}", stderr(&revoked));
     let after = saddle(
@@ -2369,8 +2205,6 @@ fn a_session_in_a_workspace_holding_credentials_needs_an_allowance_for_its_id() 
 
 #[test]
 fn allow_sensitive_in_the_users_config_skips_the_question() {
-    // The escape hatch for a machine where home holds no secrets. It is the user's file, outside
-    // every root, so nothing the agent runs can set it (D42, D60).
     let home = tempfile::tempdir().unwrap();
     let xdg = tempfile::tempdir().unwrap();
     fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
@@ -2406,8 +2240,6 @@ fn allow_sensitive_in_the_users_config_skips_the_question() {
 
 #[test]
 fn the_directory_above_home_is_reported_too() {
-    // A root above home contains home, and therefore every credential under it, even though the
-    // path looks different (D60).
     let above = tempfile::tempdir().unwrap();
     let home = above.path().join("me");
     fs::create_dir_all(&home).unwrap();
@@ -2432,7 +2264,6 @@ fn the_directory_above_home_is_reported_too() {
 
 #[test]
 fn default_includes_limit_children_to_toolchains_and_config_and_withhold_credentials() {
-    // D160: default command reads have explicit narrow bases, not an implicit home walk.
     let home = tempfile::tempdir().unwrap();
     let xdg = tempfile::tempdir().unwrap();
     fs::create_dir_all(xdg.path().join("config/saddle")).unwrap();
@@ -2445,7 +2276,6 @@ fn default_includes_limit_children_to_toolchains_and_config_and_withhold_credent
     fs::write(h.join(".ssh/id_rsa"), "sk-live-private\n").unwrap();
     let auth = xdg.path().join("state/saddle/auth.json");
     fs::create_dir_all(auth.parent().unwrap()).unwrap();
-    // The shape `AuthStore` reads, so the file is a real store rather than a parse error.
     fs::write(&auth, r#"{"synthetic":{"api-key":"sk-live-api"}}"#).unwrap();
     let saddle = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_saddle"))
@@ -2458,7 +2288,6 @@ fn default_includes_limit_children_to_toolchains_and_config_and_withhold_credent
             .output()
             .unwrap()
     };
-    // `check` names the directories a command may read, because the list is the authority.
     let checked = saddle(&["check"]);
     assert!(checked.status.success(), "{}", stderr(&checked));
     let text = String::from_utf8_lossy(&checked.stdout).into_owned();
@@ -2490,8 +2319,6 @@ fn default_includes_limit_children_to_toolchains_and_config_and_withhold_credent
 
 #[test]
 fn an_extra_except_line_takes_one_more_directory_out_of_reach() {
-    // The point of the shape: a person adds one pattern and the exclusion is real for children,
-    // because the directory never reaches the kernel in the first place (D62).
     let home = tempfile::tempdir().unwrap();
     let xdg = tempfile::tempdir().unwrap();
     let h = home.path();
@@ -2555,12 +2382,9 @@ except = ["^notes/private$", "^\\.cargo/registry$"]
 
 #[test]
 fn a_session_override_changes_the_grants_for_one_run_and_writes_nothing() {
-    // D63: `--grant` and `--revoke` are the per-session half of one config file. They are folded
-    // into the merged grants before parsing, so they are validated and audited like any other.
     let env = Env::new();
     let before = env.policy();
 
-    // A write is allowed normally, and refused when the scope is revoked for the run.
     let (ok, _) = env.tool(
         "write",
         serde_json::json!({"path": "a.txt", "content": "x"}),
@@ -2577,7 +2401,6 @@ fn a_session_override_changes_the_grants_for_one_run_and_writes_nothing() {
     assert!(!out.status.success(), "{text}");
     assert!(text.contains("no fs-write grant"), "{text}");
 
-    // The listing shows the grants of the run, not the file's.
     let out = env.saddle(&["--revoke", "fs-write", "check"]);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
@@ -2589,10 +2412,8 @@ fn a_session_override_changes_the_grants_for_one_run_and_writes_nothing() {
         "the note says what changed: {text}"
     );
 
-    // Nothing was written: the file is byte for byte what it was.
     assert_eq!(env.policy(), before, "an override is not stored");
 
-    // A scope the file does not have is still revoked cleanly, and an unknown form is refused.
     let out = env.saddle(&["--grant", "nonsense:thing", "check"]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     assert!(
@@ -2604,11 +2425,8 @@ fn a_session_override_changes_the_grants_for_one_run_and_writes_nothing() {
 
 #[test]
 fn the_old_policy_file_is_migrated_once() {
-    // D63, temporary: `policy.toml` held the base grants and is no longer read. They are moved
-    // into `config.toml` and the original renamed, so a second run does nothing.
     let env = Env::new();
     let config = env.policy_path();
-    // The old layout: a config with machine settings only, and a `policy.toml` beside it.
     fs::write(&config, "provider = \"synthetic\"\n").unwrap();
     let dir = config.parent().unwrap();
     fs::write(
@@ -2619,7 +2437,6 @@ fn the_old_policy_file_is_migrated_once() {
 
     let out = env.saddle(&["check"]);
     assert!(out.status.success(), "{}", stderr(&out));
-    // The "moved" line is a first-run notice, so it goes to stderr like the others.
     let notice = stderr(&out);
     assert!(notice.contains("moved 1 grants file"), "{notice}");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -2628,7 +2445,6 @@ fn the_old_policy_file_is_migrated_once() {
         "the old base was taken: {text}"
     );
 
-    // The original is kept under a name nothing reads, and a second run is a no-op.
     assert!(dir.join("policy.toml.imported").exists());
     let out = env.saddle(&["check"]);
     assert!(
@@ -2642,9 +2458,6 @@ fn the_old_policy_file_is_migrated_once() {
 
 #[test]
 fn a_grants_file_that_names_another_directory_is_refused() {
-    // D63: the file says which directory it governs. The name is a readable encoding and is lossy,
-    // so `~/a-b` and `~/a/b` collide — and applying one directory's grants to another is how a
-    // `net *` written for one project would silently cover a second.
     let env = Env::new();
     let key = env.workspace_key();
     let dir = env.policy_path().parent().unwrap().join("policies");
@@ -2661,7 +2474,6 @@ fn a_grants_file_that_names_another_directory_is_refused() {
     assert!(text.contains("is for /somewhere/else"), "{text}");
     assert!(text.contains("two directories cannot share"), "{text}");
 
-    // The same file naming this directory is used, which is the ordinary case.
     let ws = env.ws.path().canonicalize().unwrap();
     fs::write(
         &file,
@@ -2679,8 +2491,6 @@ fn a_grants_file_that_names_another_directory_is_refused() {
 
 #[test]
 fn a_skill_is_loaded_with_the_read_tool() {
-    // D67: a skill is a file, and `read` is how a file is loaded. Discovery advertises the name,
-    // the description and the file to read; there is no tool of its own.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let dir = env.path(".agents/skills/house");
@@ -2708,10 +2518,8 @@ fn a_skill_is_loaded_with_the_read_tool() {
         "the body is the file"
     );
 
-    // Advertised, so the model knows it exists and which file to read.
     assert_eq!(env.advertised(home.path()), ["house"]);
 
-    // There is no `skill` tool: it was removed rather than kept beside `read`.
     let out = saddle_in(&env, home.path(), &["tool", "skill", r#"{"name":"house"}"#]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     assert!(
@@ -2723,9 +2531,6 @@ fn a_skill_is_loaded_with_the_read_tool() {
 
 #[test]
 fn a_skill_the_policy_refuses_is_not_advertised() {
-    // D67: discovery reads through the same gate as `read`, so a skill the grants refuse is never
-    // pointed at by the prompt. The listing and the tool agree by construction, not by a second
-    // reachability check that could drift.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let dir = env.path(".agents/skills/house");
@@ -2764,8 +2569,6 @@ fn a_skill_the_policy_refuses_is_not_advertised() {
 
 #[test]
 fn a_skill_under_the_config_directory_is_not_advertised() {
-    // D67 removed the one reason the config-directory tier existed: a dedicated tool that could
-    // read what no root reaches. Now nothing can read it, so advertising it would point at a denial.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let dir = env.xdg.path().join("config/saddle/skills/pdf-tools");
@@ -2800,18 +2603,12 @@ fn a_skill_under_the_config_directory_is_not_advertised() {
 
 #[test]
 fn a_sandbox_path_reaches_commands_and_not_the_file_tools() {
-    // D65: the two sets are different on purpose. `[sandbox] read` is one allow-list per child
-    // process, with no per-call decision and no record per access; wiring it into the file tools
-    // would let a directory be read with no grant, no exclusion and no audit record. So a path
-    // there makes `bash` succeed and leaves `read` refusing, and this test exists to keep it that
-    // way if someone later finds the asymmetry surprising.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let notes = home.path().join("notes");
     fs::create_dir_all(&notes).unwrap();
     fs::write(notes.join("a.md"), "hi\n").unwrap();
 
-    // A path in [sandbox] read, not a root and not a grant.
     let config = env.policy_path();
     let mut doc: toml::Table = fs::read_to_string(&config).unwrap().parse().unwrap();
     let sandbox = doc
@@ -2850,7 +2647,6 @@ fn a_sandbox_path_reaches_commands_and_not_the_file_tools() {
     assert!(out.status.success(), "{text}");
     assert!(text.contains("hi"), "{text}");
 
-    // And `check` names it under exec reads, never under roots.
     let out = run(&["check"]);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let notes = notes.display().to_string();
@@ -2867,8 +2663,6 @@ fn a_sandbox_path_reaches_commands_and_not_the_file_tools() {
     assert!(text.contains(&notes), "it is listed as exec reach: {text}");
 }
 
-/// Runs the binary with `HOME` pointed at a throwaway directory, so a `[sandbox]` entry can name
-/// something under it.
 fn saddle_in(env: &Env, home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_saddle"))
         .arg("-C")
@@ -2881,7 +2675,6 @@ fn saddle_in(env: &Env, home: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
-/// Writes `[sandbox] read` as the given TOML value, keeping the rest of the config.
 fn set_sandbox_read(env: &Env, value: toml::Value) {
     let path = env.policy_path();
     let mut doc: toml::Table = fs::read_to_string(&path)
@@ -2897,8 +2690,6 @@ fn set_sandbox_read(env: &Env, value: toml::Value) {
 
 #[test]
 fn a_sandbox_entry_naming_tools_lets_those_tools_reach_it() {
-    // D66: a directory outside the workspace, reachable by the tools named on its `[sandbox]`
-    // entry. It is not a root, so no policy can name it, and it is not part of the session.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let agents = home.path().join(".agents");
@@ -2922,7 +2713,6 @@ fn a_sandbox_entry_naming_tools_lets_those_tools_reach_it() {
         toml::Value::Array(vec!["~/notes".into(), entry("~/.agents", &["read", "ls"])]),
     );
 
-    // A named tool reaches it.
     let out = saddle_in(
         &env,
         home.path(),
@@ -2939,7 +2729,6 @@ fn a_sandbox_entry_naming_tools_lets_those_tools_reach_it() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(text.contains("name: a"), "{text}");
 
-    // A tool the entry does not name is refused, and says which are allowed.
     let out = saddle_in(
         &env,
         home.path(),
@@ -2955,7 +2744,6 @@ fn a_sandbox_entry_naming_tools_lets_those_tools_reach_it() {
     let text = stderr(&out);
     assert!(text.contains("no tool-write role"), "{text}");
 
-    // A bare path is indirect reach only: the entry above keeps ~/notes out of the tools' way.
     let out = saddle_in(
         &env,
         home.path(),
@@ -2971,7 +2759,6 @@ fn a_sandbox_entry_naming_tools_lets_those_tools_reach_it() {
         stderr(&out)
     );
 
-    // `check` shows it under its own heading, never under roots.
     let out = saddle_in(&env, home.path(), &["check"]);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let roots = text.split("grants").next().unwrap_or_default();
@@ -2982,9 +2769,6 @@ fn a_sandbox_entry_naming_tools_lets_those_tools_reach_it() {
 
 #[test]
 fn a_sandbox_entry_naming_tools_allows_a_write_and_nothing_inside_it_is_reserved() {
-    // The tools run in saddle, so the list is what allows a write there; the kernel is not
-    // involved. D178: what the entry allows is the whole of it — a `.git/hooks` path under a
-    // tool-visible directory is the person's own directory like any other.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let scratch = home.path().join("scratch");
@@ -3029,7 +2813,6 @@ fn a_sandbox_entry_naming_tools_allows_a_write_and_nothing_inside_it_is_reserved
         "#!/bin/sh"
     );
 
-    // What the entry does not name is still refused: the list is the authority, not the skeleton.
     let out = saddle_in(
         &env,
         home.path(),
@@ -3047,8 +2830,6 @@ fn a_sandbox_entry_naming_tools_allows_a_write_and_nothing_inside_it_is_reserved
 
 #[test]
 fn a_sandbox_entry_may_not_reach_the_policy_or_the_audit_log() {
-    // D16: no sandbox entry may reach the state or config directory. It used to be unchecked, so
-    // `read = ["~/.config/saddle"]` handed a command the policy file.
     let env = Env::new();
     let config = env.policy_path();
     let dir = config.parent().unwrap().to_path_buf();
@@ -3061,7 +2842,6 @@ fn a_sandbox_entry_may_not_reach_the_policy_or_the_audit_log() {
     let text = stderr(&out);
     assert!(text.contains("no sandbox entry may reach it"), "{text}");
 
-    // Naming something above it is refused too, since a rule covers everything beneath it.
     let parent = dir.parent().unwrap().display().to_string();
     set_sandbox_read(&env, toml::Value::Array(vec![toml::Value::from(parent)]));
     let out = env.saddle(&["check"]);
@@ -3070,8 +2850,6 @@ fn a_sandbox_entry_may_not_reach_the_policy_or_the_audit_log() {
 
 #[test]
 fn a_misspelt_tool_name_in_a_sandbox_entry_is_an_error() {
-    // The list is the authority for that directory, and there is no kernel check behind a
-    // host-side tool, so a typo must not read as a permission that silently does nothing.
     let env = Env::new();
     let mut table = toml::Table::new();
     table.insert("path".into(), "/tmp".into());
@@ -3088,8 +2866,6 @@ fn a_misspelt_tool_name_in_a_sandbox_entry_is_an_error() {
 
 #[test]
 fn sdk_resolution_ranges_and_mutation_preconditions_have_separate_access_records() {
-    // Each SDK metadata/range/precondition access is decided; registration/emission are not file reads.
-    // Resolution plus one range are two records. Edits also guard their preimage twice before publishing.
     let env = ready();
     let decisions = |name: &str, input: &str| -> usize {
         let before = env.audit_logs().len();
@@ -3112,7 +2888,6 @@ fn sdk_resolution_ranges_and_mutation_preconditions_have_separate_access_records
         "a refusal"
     );
     assert_eq!(decisions("ls", r#"{"path":"."}"#), 2);
-    // edit legitimately makes two: it reads the old text and writes the new one.
     assert_eq!(
         decisions("edit", r#"{"path":"README","old":"hello","new":"bye"}"#),
         5
@@ -3121,8 +2896,6 @@ fn sdk_resolution_ranges_and_mutation_preconditions_have_separate_access_records
 
 #[test]
 fn the_shared_skills_directory_is_readable_by_default() {
-    // D66: ~/.agents is built in and read-only, because that is where skills are installed and a
-    // skill's own references have to be readable. Nothing is written in the config for this.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let skill = home.path().join(".agents/skills/s");
@@ -3146,7 +2919,6 @@ fn the_shared_skills_directory_is_readable_by_default() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(String::from_utf8_lossy(&out.stdout).contains("name: s"));
 
-    // The bundled file too: that is the point of the directory being tool-readable.
     let out = saddle_in(
         &env,
         home.path(),
@@ -3161,7 +2933,6 @@ fn the_shared_skills_directory_is_readable_by_default() {
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("the reference"));
 
-    // Read-only: the default names no tool that writes.
     let out = saddle_in(
         &env,
         home.path(),
@@ -3180,13 +2951,11 @@ fn the_shared_skills_directory_is_readable_by_default() {
         stderr(&out)
     );
 
-    // Shown under tool paths, and named as the built-in it is.
     let out = saddle_in(&env, home.path(), &["check"]);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(text.contains("tool paths"), "{text}");
     assert!(text.contains("~/.agents"), "{text}");
 
-    // `tools-defaults = false` turns it off.
     let path = env.policy_path();
     let mut doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
     doc.entry("sandbox")
@@ -3213,8 +2982,6 @@ fn the_shared_skills_directory_is_readable_by_default() {
 
 #[test]
 fn an_entry_for_a_default_path_adds_to_it_rather_than_replacing_it() {
-    // Two entries over one directory are one claim, so writing an entry for ~/.agents widens it
-    // instead of silently dropping the default tools.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let agents = home.path().join(".agents");
@@ -3238,7 +3005,6 @@ fn an_entry_for_a_default_path_adds_to_it_rather_than_replacing_it() {
             "{tool} missing from the merged entry: {text}"
         );
     }
-    // One line, not two: the union is a single claim.
     assert_eq!(text.matches("~/.agents").count(), 1, "{text}");
 
     let out = saddle_in(
@@ -3258,10 +3024,6 @@ fn an_entry_for_a_default_path_adds_to_it_rather_than_replacing_it() {
 
 #[test]
 fn a_config_with_no_sandbox_table_keeps_the_built_in_defaults() {
-    // `UserConfig.sandbox` is `#[serde(default)]`, so a config with no `[sandbox]` table got
-    // `SandboxConfig`'s *derived* Default — where both flags were false. A hand-written config then
-    // silently lost the built-in include rule (D62) and, later, the built-in tool path (D66), and
-    // "absent" has to mean "on" for both.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let skill = home.path().join(".agents/skills/s");
@@ -3272,7 +3034,6 @@ fn a_config_with_no_sandbox_table_keeps_the_built_in_defaults() {
     )
     .unwrap();
 
-    // Env::new wrote a config with `[agent]` and nothing else; make sure there is no [sandbox].
     let path = env.policy_path();
     let mut doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
     doc.remove("sandbox");
@@ -3295,9 +3056,6 @@ fn a_config_with_no_sandbox_table_keeps_the_built_in_defaults() {
 
 #[test]
 fn a_tool_path_may_follow_a_link_to_another_declared_path() {
-    // D66: skills are installed by linking them in, so a link out of the directory is normal. The
-    // target must be another directory the user declared: that is what stops a link pointing at the
-    // policy, and it means the fix for a linked skill is one more entry, not a looser rule.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let real = home.path().join("elsewhere/skills/prose-lint");
@@ -3308,7 +3066,6 @@ fn a_tool_path_may_follow_a_link_to_another_declared_path() {
     fs::create_dir_all(&agents).unwrap();
     unix_fs::symlink(&real, agents.join("prose-lint")).unwrap();
 
-    // Undeclared: refused, and the message says what to do about it.
     let out = saddle_in(
         &env,
         home.path(),
@@ -3327,7 +3084,6 @@ fn a_tool_path_may_follow_a_link_to_another_declared_path() {
         "{text}"
     );
 
-    // Declared: the link resolves, and so does a file beneath it.
     set_sandbox_read(
         &env,
         toml::Value::Array(vec![toml::Value::Table({
@@ -3373,7 +3129,6 @@ fn a_tool_path_may_follow_a_link_to_another_declared_path() {
         stderr(&out)
     );
 
-    // A link may not reach the policy: the config directory is protected for every entry (D16).
     let policy = env.policy_path();
     let escape = agents.join("escape.md");
     unix_fs::symlink(&policy, &escape).unwrap();
@@ -3391,8 +3146,6 @@ fn a_tool_path_may_follow_a_link_to_another_declared_path() {
 
 #[test]
 fn the_projects_skills_are_in_one_directory_at_the_root() {
-    // D68: one place, as pi has one. A skills directory in a subdirectory is not the project's, and
-    // the scan does not go looking for it.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     for rel in [".agents/skills/at-root", "crates/sub/.agents/skills/nested"] {
@@ -3410,8 +3163,6 @@ fn the_projects_skills_are_in_one_directory_at_the_root() {
 
 #[test]
 fn skill_discovery_honours_ignore_files_and_skips_node_modules() {
-    // The rules apply inside the one skills directory: a dependency's skills are not the project's,
-    // and a project that ignores a path in its skills directory means it.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     for dir in ["keep", "ignored", "node_modules/pkg", ".hidden"] {
@@ -3429,9 +3180,6 @@ fn skill_discovery_honours_ignore_files_and_skips_node_modules() {
 
 #[test]
 fn a_directory_holding_a_skill_yields_one_skill_and_a_bare_markdown_file_is_one() {
-    // pi's rule: a directory with SKILL.md is a skill and is not searched further, so a skill's own
-    // `references/` never becomes more skills. At the top level a bare `.md` is a skill too; deeper
-    // down only SKILL.md counts.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let dir = env.path(".agents/skills/a");
@@ -3464,8 +3212,6 @@ fn a_directory_holding_a_skill_yields_one_skill_and_a_bare_markdown_file_is_one(
 
 #[test]
 fn a_refusal_is_said_out_loud_and_the_first_skill_of_a_name_wins() {
-    // pi's rule: the first discovered keeps the name and the collision is reported. The note reaches
-    // stderr, which is where a silent skip used to be invisible.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     for (dir, declared) in [
@@ -3511,8 +3257,6 @@ fn a_refusal_is_said_out_loud_and_the_first_skill_of_a_name_wins() {
 
 #[test]
 fn the_session_offers_its_skills_and_records_a_load() {
-    // D69: `/skill:name` is served from what discovery read, so the session must expose those
-    // skills to the interface, and a load is recorded as the other half of discovery's record.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     let dir = env.path(".agents/skills/manim");
@@ -3523,8 +3267,6 @@ fn the_session_offers_its_skills_and_records_a_load() {
     )
     .unwrap();
 
-    // A hidden skill is not in the prompt but is still offered as a command, and the audit says
-    // both things.
     let out = saddle_in(&env, home.path(), &["tool", "ls", r#"{"path":"."}"#]);
     assert!(out.status.success(), "{}", stderr(&out));
     let log = env.audit_logs().last().cloned().unwrap();
@@ -3542,10 +3284,6 @@ fn the_session_offers_its_skills_and_records_a_load() {
 
 #[test]
 fn reload_reads_instruction_files_and_skills_again() {
-    // D70: everything the prompt is built from, read again on request — files that appear after the
-    // session opened. Driven through line mode, which is where a reload can be run without a
-    // terminal; the session opens before it reads stdin, so writing the files first and reloading
-    // second is a real mid-session change.
     let env = Env::new();
     let home = tempfile::tempdir().unwrap();
     fs::create_dir_all(env.path(".agents/skills/first")).unwrap();
@@ -3571,7 +3309,6 @@ fn reload_reads_instruction_files_and_skills_again() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // Read as it is written, so a full pipe cannot stop the child before its session opens.
     let stdout = Arc::new(Mutex::new(Vec::new()));
     let (ready, opened) = mpsc::channel();
     let out = stdout.clone();
@@ -3586,17 +3323,12 @@ fn reload_reads_instruction_files_and_skills_again() {
         }
     });
 
-    // The session is open and waiting on stdin; now the workspace gains a rule and a skill. A
-    // fixed sleep would be a race on a loaded machine, so the banner line mode prints once its
-    // session is up is waited for instead.
     let stderr = child.stderr.take().unwrap();
     let errors = Arc::new(Mutex::new(String::new()));
     let seen = errors.clone();
     let reader = thread::spawn(move || {
         let mut told = false;
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            // The first line names the provider, the model and the audit log, and it is written
-            // once the session is open and about to read stdin.
             if !told && line.contains(" \u{b7} audit ") {
                 told = true;
                 let _ = ready.send(());
@@ -3621,8 +3353,6 @@ fn reload_reads_instruction_files_and_skills_again() {
     }
     let status = child.wait().unwrap();
     assert!(status.success(), "{status:?}");
-    // A pipe still being drained is closed once the child is gone, and joining it is what makes
-    // the output complete before it is read.
     drain.join().unwrap();
     reader.join().unwrap();
     let mut text = String::from_utf8_lossy(&stdout.lock().unwrap()).into_owned();
@@ -3637,9 +3367,6 @@ fn reload_reads_instruction_files_and_skills_again() {
 
 #[test]
 fn a_custom_theme_is_read_from_the_users_config() {
-    // D71: a theme is a table of roles in config.toml, selected by `[ui] theme`. The CLI has no
-    // screen to paint, so what is checked here is that the file is read and that a theme which
-    // cannot build is reported rather than silently replaced by the default.
     let env = Env::new();
     let path = env.policy_path();
     fs::write(
@@ -3656,11 +3383,9 @@ fs-read = [{ root = "workspace" }]
 "##,
     )
     .unwrap();
-    // `check` reads the same config the TUI would; the theme must not make it fail.
     let out = env.saddle(&["check"]);
     assert!(out.status.success(), "{}", stderr(&out));
 
-    // A theme naming an unknown base is an error the person sees, not a fallback.
     fs::write(
         &path,
         "[ui]\ntheme = \"nope\"\n\n[agent]\nfs-read = [{ root = \"workspace\" }]\n",
@@ -3671,7 +3396,6 @@ fs-read = [{ root = "workspace" }]
         out.status.success(),
         "check does not paint, so it does not care"
     );
-    // The message itself comes from theme::build, which the unit tests cover.
 }
 
 #[test]

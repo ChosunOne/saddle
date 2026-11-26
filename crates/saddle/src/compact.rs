@@ -1,6 +1,3 @@
-//! Compaction (D33): when the conversation nears the model's context window, the older part is
-//! replaced by a summary the model writes, and the recent part is kept word for word.
-
 use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
@@ -12,17 +9,10 @@ pub use crate::provider::DEFAULT_CONTEXT_WINDOW;
 
 pub const DEFAULT_RESERVE: u64 = 16_384;
 pub const DEFAULT_KEEP_RECENT: u64 = 20_000;
-/// Half the window: the point where a session left alone is worth summarizing (D77).
 pub const DEFAULT_IDLE_FRACTION: f64 = 0.5;
-/// Two minutes: long enough not to be a pause between typing, short enough to have happened before
-/// a person comes back to the terminal.
 pub const DEFAULT_IDLE_SECONDS: u64 = 120;
-/// Three quarters: near enough to the hard threshold to be worth summarizing, far enough that there
-/// is room to finish the summary while the turn uses what is left (D78).
 pub const DEFAULT_BACKGROUND_FRACTION: f64 = 0.75;
-/// Tool output is cut to this many characters in the text the summary is written from.
 const TOOL_RESULT_CHARS: usize = 2000;
-/// Tool input is cut to this many characters there too.
 const TOOL_INPUT_CHARS: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -37,10 +27,6 @@ pub struct Settings {
     pub background_fraction: f64,
 }
 
-/// A share of the window, clamped to something a person meant.
-///
-/// `0` would compact a session the moment it had one message and `1` would never fire before the
-/// hard threshold, so both are read as unset rather than obeyed.
 fn fraction(value: Option<f64>, default: f64) -> f64 {
     match value {
         Some(f) if f > 0.0 && f < 1.0 => f,
@@ -72,13 +58,9 @@ impl Default for Settings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     Manual,
-    /// The context neared the window.
     Threshold,
-    /// The provider refused a request as too long.
     Overflow,
-    /// The session was left alone and the context was half full (D77).
     Idle,
-    /// The context reached the background threshold and the turn carried on (D78).
     Background,
 }
 
@@ -93,17 +75,11 @@ impl Reason {
         }
     }
 
-    /// Whether this compaction stops the turn, which is what the interface shows as an activity.
-    ///
-    /// A background one does not: the turn is still answering, and saying "compacting" while it
-    /// writes would be a lie about what the terminal is waiting for (D78).
     pub fn blocks(self) -> bool {
         !matches!(self, Reason::Background)
     }
 }
 
-/// What the UI is told while a compaction runs. Reasoning and summary text stream in as the model
-/// writes them.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     Started {
@@ -123,7 +99,6 @@ pub enum Event {
     Failed(String),
 }
 
-/// Characters an item adds to a request, for estimating tokens.
 pub fn chars(item: &Item) -> usize {
     match item {
         Item::Contribution(value) => value.content.len(),
@@ -131,8 +106,6 @@ pub fn chars(item: &Item) -> usize {
         Item::Attached { text, images } => text.len() + images.len() * 64,
         Item::Assistant(parts) => parts
             .iter()
-            // Images are described rather than sent: the summary is about the work, and a
-            // picture would cost more than it explains (D58).
             .map(|p| match p {
                 Part::Text(t) => t.len(),
                 Part::Call(c) => {
@@ -141,7 +114,6 @@ pub fn chars(item: &Item) -> usize {
                             .as_ref()
                             .map_or_else(String::len, |v| v.to_string().len())
                 }
-                // An attachment is worth a line in the summary, not its bytes.
                 Part::Image(_) => 64,
                 Part::Native { block, .. } => block.to_string().len(),
             })
@@ -150,14 +122,10 @@ pub fn chars(item: &Item) -> usize {
     }
 }
 
-/// A rough token count: four characters a token.
 pub fn tokens(chars: usize) -> u64 {
     (chars / 4) as u64
 }
 
-/// Where to cut: items before the index are summarized, the rest kept. The kept part holds at most
-/// about `keep` tokens and starts at a prompt where possible, else at a reply, and never at tool
-/// results, which must stay with their call. Returns 0 when there is nothing to summarize.
 pub fn cut_point(items: &[Item], keep: u64) -> usize {
     let mut used = 0;
     let mut at_prompt = None;
@@ -176,11 +144,9 @@ pub fn cut_point(items: &[Item], keep: u64) -> usize {
     let last = |want: fn(&Item) -> bool| items.iter().rposition(want);
     let cut = at_prompt
         .or(at_reply)
-        // Even the last exchange is over the budget: keep it anyway.
         .or_else(|| last(|i| matches!(i, Item::User(_) | Item::Attached { .. })))
         .or_else(|| last(|i| matches!(i, Item::Assistant(_))))
         .unwrap_or(0);
-    // Cutting at the start, or keeping nothing but a summary, would change nothing.
     if cut == 0 || (cut == 1 && matches!(items[0], Item::Summary(_))) {
         0
     } else {
@@ -199,8 +165,6 @@ fn clip(s: &str, max: usize) -> String {
     format!("{}[… {} more characters]", &s[..cut], s.len() - cut)
 }
 
-/// The conversation as text, so the model summarizes it rather than continuing it. Reasoning is
-/// left out and tool output is cut. Past `max_chars`, the oldest part is dropped.
 pub fn serialize(items: &[Item], max_chars: usize) -> String {
     let mut parts = Vec::new();
     for item in items {
@@ -278,7 +242,6 @@ pub const SYSTEM: &str = "You write handover summaries of coding sessions. Anoth
 continue the work from your summary alone, without the earlier messages. Reply with the summary \
 only.";
 
-/// The request for a summary of `transcript`, with the user's focus if they gave one.
 pub fn request(transcript: &str, workspace: &Path, focus: Option<&str>) -> String {
     let focus = match focus {
         Some(f) => format!("\nThe user asked the summary to focus on: {f}\n"),
@@ -309,8 +272,6 @@ Be specific and complete; this replaces the conversation.{focus}
     )
 }
 
-/// The request for a summary of the branch being left, so what it found is not lost (D54). It is
-/// sent only when the person said to summarize, because it is a model request (D167).
 pub fn branch_request(transcript: &str, workspace: &Path) -> String {
     format!(
         "Below is a coding session between a user and an assistant working in {}. The user is \
@@ -327,10 +288,8 @@ word NONE and nothing else.
     )
 }
 
-/// What the model says when an abandoned branch held nothing worth a note.
 pub const BRANCH_NOTHING: &str = "NONE";
 
-/// Whether a provider error means the request was too long for the context window.
 pub fn is_overflow(message: &str) -> bool {
     let m = message.to_lowercase();
     [
@@ -349,16 +308,10 @@ pub fn is_overflow(message: &str) -> bool {
     .any(|p| m.contains(p))
 }
 
-/// Builds a conversation of about `tokens` tokens, for the tests that need a full window (D77).
-///
-/// Not compiled into the binary: it exists so a test can say "a session at 60% of a 100k window"
-/// without writing out a transcript.
 #[cfg(test)]
 pub mod tests_support {
     use super::{Item, Part};
 
-    /// Items of a thousand tokens each, alternating a prompt and a reply, so a cut point has
-    /// boundaries to fall on and the kept part can fit under `keep_recent`.
     pub fn conversation(tokens: usize) -> Vec<Item> {
         let mut items = Vec::new();
         let mut left = tokens * 4;
@@ -413,7 +366,6 @@ mod tests {
 
     #[test]
     fn the_cut_keeps_recent_turns_and_never_splits_a_call() {
-        // Each item is about 100 tokens; keep 250 tokens.
         let items = vec![
             user(400),
             reply(400),
@@ -433,10 +385,8 @@ mod tests {
             0,
             "everything fits: nothing to do"
         );
-        // One huge last turn: keep it anyway.
         let big = vec![user(400), reply(400), user(400), reply(100_000)];
         assert_eq!(cut_point(&big, 250), 2);
-        // A summary followed by one turn has nothing more to give.
         let done = vec![Item::Summary("s".into()), user(400), reply(100_000)];
         assert_eq!(cut_point(&done, 10), 0);
     }

@@ -1,5 +1,3 @@
-//! The /resume dialog: this workspace's saved sessions, newest first, filtered as you type.
-
 use std::time::{Duration, SystemTime};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -12,8 +10,6 @@ pub struct SessionPicker {
     pub sessions: Vec<Summary>,
     pub selected: usize,
     pub filter: String,
-    /// The selected conversation waiting for a second ctrl+d, since deleting is not undoable
-    /// (D55).
     pub confirming: Option<String>,
 }
 
@@ -22,9 +18,7 @@ pub enum PickOutcome {
     Stay,
     Close,
     Resume(String),
-    /// Rename the selected conversation to this (D55).
     Rename(String, String),
-    /// Delete the selected conversation, after a second press of the same key (D55).
     Delete(String),
 }
 
@@ -38,7 +32,6 @@ impl SessionPicker {
         }
     }
 
-    /// Sessions whose first prompt contains the filter, ignoring case.
     pub fn visible(&self) -> Vec<&Summary> {
         let needle = self.filter.trim().to_lowercase();
         self.sessions
@@ -70,7 +63,6 @@ impl SessionPicker {
                     return PickOutcome::Resume(s.id.clone());
                 }
             }
-            // Anything other than a second ctrl+d means the delete was not meant.
             KeyCode::Char('d') if ctrl => {
                 if let Some(s) = self.visible().get(self.selected) {
                     let id = s.id.clone();
@@ -110,7 +102,6 @@ impl SessionPicker {
     }
 }
 
-/// "just now", "5m ago", "3h ago", "2d ago", or a date for anything older than a month.
 pub fn age(when: SystemTime, now: SystemTime) -> String {
     let secs = now.duration_since(when).unwrap_or(Duration::ZERO).as_secs();
     match secs {

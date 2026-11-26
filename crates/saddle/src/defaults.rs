@@ -1,6 +1,3 @@
-//! Files saddle writes on first run so it works without setup (D30): a user config with the
-//! toolchains it finds (D30). The grants live in the same file, under `[agent]` (D63).
-
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -11,8 +8,6 @@ use anyhow::{Context, Result};
 use crate::paths::Paths;
 use crate::standard::DEFAULT_PROFILES;
 
-/// The grants applied when a config has no `[agent]` table at all. A present table, even an empty
-/// one, is taken as written: that is how a person says "no grants" rather than "not yet" (D63).
 pub const DEFAULT_AGENT: &str = r#"
 fs-read  = [{ root = "workspace", exclude = [".env*"], why = "reads the project" }]
 fs-write = [{ root = "workspace", exclude = [".env*"], why = "edits the project" }]
@@ -20,18 +15,9 @@ exec     = { why = "runs builds, tests and git" }
 transcript-read = { why = "reads this workspace's conversations" }
 "#;
 
-/// A directory under `$HOME` that confined commands need: its root name, and whether they may
-/// write it.
-/// Cache directories a command may write, as paths. Not roots: a root is nameable by every policy
-/// in the tree, so `fs-write` on a `cargo` root would let a workspace policy plant a program in
-/// `~/.cargo/bin` — which runs outside the sandbox the next time it is called. These are caches
-/// only, and `~/.cargo/bin` is deliberately absent (D62).
 const WRITABLE_CACHES: &[&str] = &[".cargo/registry", ".cargo/git"];
 
-/// The default config.toml for a home directory.
 pub fn config_text(home: Option<&Path>) -> String {
-    // Only the caches that exist, and only those, are writable. Nothing is a root: what a command
-    // may read is the include rule below, and what it may write is these two caches (D62).
     let write = WRITABLE_CACHES
         .iter()
         .copied()
@@ -219,10 +205,6 @@ write = [{write}]
     )
 }
 
-/// Creates whichever default files are missing and returns the ones it wrote. Existing files are
-/// never touched.
-/// The policy text a workspace's file is seeded with when it has none: the global policy, or this
-/// built-in one when the global file is missing or unreadable (D42).
 pub fn ensure(paths: &Paths) -> Result<Vec<PathBuf>> {
     let home = env::var_os("HOME")
         .filter(|h| !h.is_empty())
@@ -272,8 +254,6 @@ mod tests {
         let text = config_text(Some(home.path()));
         let cfg: UserConfig = toml::from_str(&text).unwrap();
         assert_eq!(cfg.provider, None, "first run asks instead of assuming");
-        // D62: no toolchain directory is a root. A root is nameable by every policy, so `cargo`
-        // as a root let a workspace policy grant write to it and plant a program in ~/.cargo/bin.
         assert!(cfg.roots.is_empty(), "{:?}", cfg.roots);
         assert!(cfg.sandbox.read.is_empty());
         assert_eq!(
@@ -284,7 +264,6 @@ mod tests {
             ],
             "caches by path, not by name"
         );
-        // The built-in rule rather than one written into the file (D62).
         assert!(cfg.sandbox.include_defaults);
         assert!(
             cfg.sandbox.include.is_empty(),
@@ -301,10 +280,7 @@ mod tests {
 
     #[test]
     fn default_toolchain_includes_do_not_grant_personal_files_in_a_real_tree() {
-        // Enumerate the actual default bases: personal siblings must not be considered or
-        // granted, while known stores within the selected bases remain withheld (D160).
         let home = tempfile::tempdir().unwrap();
-        // Everything the default list names, created so the walk has to find it.
         let withheld = [
             ".ssh/id_rsa",
             ".gnupg/private-keys-v1.d",
@@ -409,7 +385,6 @@ mod tests {
         let got: Vec<&Path> = out.iter().map(|p| p.as_path()).collect();
         for rel in withheld {
             let path = home.path().join(rel);
-            // A rule on the file, or on a directory above it, would both reach it.
             let reachable = got.iter().any(|g| path == *g || path.starts_with(g));
             assert!(!reachable, "{rel} is reachable through {:?}", got);
         }
@@ -424,8 +399,6 @@ mod tests {
 
     #[test]
     fn explicit_home_compatibility_exclusions_match_the_stores_they_name() {
-        // A pattern that never matches is silent: the directory is simply granted. So each one is
-        // pinned to the path it is meant to withhold (D62).
         let rule = config::explicit_home_defaults();
         let patterns: Vec<regex::Regex> = rule
             .except
@@ -458,8 +431,6 @@ mod tests {
             ".gem/credentials",
             ".m2/settings.xml",
             ".gradle/gradle.properties",
-            // The one this list nearly missed: a crates.io token, in a directory granted for the
-            // toolchain itself.
             ".cargo/credentials.toml",
             ".cargo/credentials",
         ] {
@@ -468,7 +439,6 @@ mod tests {
                 "{rel} is not withheld by any default pattern"
             );
         }
-        // And the things that have to keep working are not withheld.
         for rel in [
             ".cargo",
             ".cargo/registry",
@@ -507,7 +477,6 @@ mod tests {
 
     #[test]
     fn the_generated_config_is_valid_and_never_overwritten() {
-        // One file now (D63), so the check is that its [agent] table parses as a policy.
         let ws = tempfile::tempdir().unwrap();
         let roots = Roots::resolve([(RootName::workspace(), ws.path().into())], &[]).unwrap();
         let cfg: UserConfig = toml::from_str(&config_text(None)).unwrap();

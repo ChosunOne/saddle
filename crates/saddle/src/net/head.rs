@@ -1,42 +1,18 @@
-//! What a plaintext request says about the host it is for (D79).
-//!
-//! Three shapes arrive at the relay, and each names its host somewhere different: a `CONNECT` line
-//! (`host:port`), an absolute request line (`GET http://host/path`), or an origin-form request line
-//! whose host is in the `Host` header. Parsing them here rather than in the socket loop is what
-//! makes the security-relevant decision testable without a network.
-//!
-//! A request that names no host is [`Route::Unknown`], which the proxy refuses: the guest is
-//! supposed to be reaching the relay under a name, and an unnamed request is one whose host cannot
-//! be checked against a grant.
-
 use crate::net::client::Target;
 use std::str;
 
-/// A request head this large is refused rather than buffered without bound.
 pub const MAX_HEAD: usize = 16 * 1024;
 
-/// Where the bytes of a plaintext connection should go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
-    /// Nothing decidable has arrived yet.
     Incomplete,
-    /// Not a request this proxy understands.
     Unknown,
-    /// The head never ended within the size a head may be.
     TooLong,
-    /// `CONNECT host:port`: the rest of the connection is carried through unchanged.
     Tunnel(Target),
-    /// A request whose line carried the whole URL: forwarded in origin form to this target.
     Absolute { target: Target, head: Vec<u8> },
-    /// An origin-form request naming its host in a header: forwarded to this target unchanged.
     Origin { target: Target, head: Vec<u8> },
 }
 
-/// Reads the first request of a plaintext connection.
-///
-/// The returned head is the part up to and including the blank line; the caller forwards it and
-/// then carries whatever follows, so a later request on the same connection is read as a new head
-/// rather than being spliced blindly.
 pub fn route(buf: &[u8]) -> Route {
     let Some(end) = head_end(buf) else {
         return if buf.len() > MAX_HEAD {
@@ -59,8 +35,6 @@ pub fn route(buf: &[u8]) -> Route {
             None => Route::Unknown,
         };
     }
-    // An absolute request line carries the scheme, so it is the only form whose scheme is not a
-    // guess.
     if rest.contains("://") {
         let Ok(target) = Target::parse(rest) else {
             return Route::Unknown;
@@ -83,20 +57,15 @@ pub fn route(buf: &[u8]) -> Route {
     }
 }
 
-/// The scheme a `CONNECT` to `port` is for. A tunnel to 80 is plaintext HTTP and anything else is
-/// TLS, which is what a grant's scheme has to match.
 pub fn connect_scheme(port: u16) -> &'static str {
     if port == 80 { "http" } else { "https" }
 }
 
-/// [`Target`] for `CONNECT`, whose authority is `host:port` with no scheme of its own.
 fn connect_target(authority: &str) -> Option<Target> {
     let authority = authority.trim();
     if authority.is_empty() {
         return None;
     }
-    // A CONNECT without a port would leave the scheme undecidable, and the scheme is half of what
-    // a grant matches on.
     let bracketed = authority.starts_with('[');
     let has_port = match authority.rfind(']') {
         Some(i) => authority[i..].starts_with("]:"),
@@ -109,8 +78,6 @@ fn connect_target(authority: &str) -> Option<Target> {
     Target::parse(&format!("{}://{authority}", connect_scheme(port))).ok()
 }
 
-/// Rewrites `GET http://host/p HTTP/1.1` as `GET /p HTTP/1.1`, which is what the origin expects,
-/// and makes sure the head names its host.
 fn origin_form(method: &str, target: &Target, head: &[u8]) -> Vec<u8> {
     let mut out = format!("{method} {} HTTP/1.1\r\n", target.path).into_bytes();
     let rest = match head.iter().position(|b| *b == b'\n') {
@@ -126,7 +93,6 @@ fn origin_form(method: &str, target: &Target, head: &[u8]) -> Vec<u8> {
         } else {
             format!("{}:{}", target.host, target.port)
         };
-        // After the request line, before the blank line that ends the head.
         let at = out
             .windows(1)
             .position(|w| w[0] == b'\n')
@@ -142,7 +108,6 @@ fn default_port(scheme: &str) -> u16 {
     if scheme == "https" { 443 } else { 80 }
 }
 
-/// The byte after the blank line that ends the head.
 fn head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
 }
@@ -152,7 +117,6 @@ fn first_line(head: &[u8]) -> Option<&str> {
     str::from_utf8(&head[..end]).ok()
 }
 
-/// One header value by lowercase name. The first occurrence wins, as HTTP requires for `Host`.
 fn header(head: &[u8], name: &str) -> Option<String> {
     let mut lines = head.split(|b| *b == b'\n').skip(1);
     lines.find_map(|line| {
@@ -165,8 +129,6 @@ fn header(head: &[u8], name: &str) -> Option<String> {
     })
 }
 
-/// Every header name in a head, lowercased, for the audit record: a value is where a key lives,
-/// so it is never part of what a decision or a record carries (D48).
 pub fn header_names(head: &[u8]) -> Vec<String> {
     head.split(|b| *b == b'\n')
         .skip(1)
@@ -197,7 +159,6 @@ mod tests {
         assert_eq!(target.scheme, "https");
         assert_eq!(target.host, "crates.io");
         assert_eq!(target.port, 443);
-        // A tunnel to 80 is plaintext, so a grant has to have been written for http.
         let Route::Tunnel(plain) = r("CONNECT example.com:80 HTTP/1.1\r\n\r\n") else {
             panic!("not a tunnel");
         };
@@ -220,7 +181,6 @@ mod tests {
         };
         assert_eq!(target.host, "crates.io");
         assert_eq!(target.path, "/api?q=1");
-        // The origin is told the path, never the whole URL.
         assert_eq!(
             String::from_utf8(head).unwrap(),
             "GET /api?q=1 HTTP/1.1\r\nHost: crates.io\r\n\r\n"
@@ -239,7 +199,6 @@ mod tests {
             head,
             "GET /x HTTP/1.1\r\nHost: crates.io\r\nAccept: */*\r\n\r\n"
         );
-        // A non-default port is carried in the header, or the origin would look on 443.
         let Route::Absolute { head, .. } = r("GET https://127.0.0.1:8443/x HTTP/1.1\r\n\r\n")
         else {
             panic!("not absolute");
@@ -261,7 +220,6 @@ mod tests {
         assert_eq!(target.scheme, "http");
         assert_eq!(target.host, "example.com");
         assert_eq!(target.port, 80);
-        // The header may carry the port, and an IPv6 literal is bracketed.
         let Route::Origin { target, .. } = r("GET / HTTP/1.1\r\nHost: [::1]:3000\r\n\r\n") else {
             panic!("not origin form");
         };
@@ -275,7 +233,6 @@ mod tests {
             r("GET /index.html HTTP/1.1\r\nAccept: */*\r\n\r\n"),
             Route::Unknown
         );
-        // HTTP/2's connection preface is not something this proxy parses.
         assert_eq!(r("PRI * HTTP/2.0\r\n\r\n"), Route::Unknown);
         assert_eq!(r("\r\n\r\n"), Route::Unknown);
     }

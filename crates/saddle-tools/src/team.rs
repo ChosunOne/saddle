@@ -1,6 +1,3 @@
-//! branch-local peer outboxes and named team discovery through the gated transcript service (D194),
-//! and the live team's message bus and serial command queue through the workers service (D195, D196).
-
 use saddle_sdk::workers::{Brief, Done, Job, Message, Operation, manage};
 use saddle_sdk::{Definition, Output, Tool, query_transcript};
 use serde::Deserialize;

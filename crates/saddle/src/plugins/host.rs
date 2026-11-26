@@ -1,5 +1,3 @@
-//! component host calls use the session's one engine and audit log (D129, D131).
-
 use saddle_limits as budgets;
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -73,7 +71,6 @@ pub enum Reply {
     },
 }
 
-/// audit and host failures stop the session; they are never downgraded to a broken extension.
 #[derive(Debug)]
 pub struct Fatal(pub anyhow::Error);
 impl Display for Fatal {
@@ -166,7 +163,6 @@ enum Event {
         who: Principal,
         deadline: Instant,
         sql: String,
-        /// The conversation the guest asked for: empty for the one in hand (D163).
         session: String,
         answer: SyncSender<HostReply<String, String>>,
     },
@@ -441,10 +437,6 @@ impl HostServices for Host {
                 answer,
             })
             .map_err(|_| anyhow!("plugin session ended"))?;
-        // A person answers in their own time: with no allowance this waits for the answer itself,
-        // which the session sends when the question is answered, dismissed or the turn is cancelled
-        // (D197). An allowance is only outlived by a poll, so an answer is never dropped on a
-        // rounding edge.
         let received = match allowance {
             Some(allowance) => result.recv_timeout(allowance + Duration::from_millis(500)),
             None => result.recv().map_err(|_| RecvTimeoutError::Disconnected),
@@ -663,10 +655,6 @@ pub fn execute(
     budgets::using(&limits, || execute_inner(prepared, session, job, call))
 }
 
-/// Whether a job is part of a turn the person can cancel, and so should stop when they do: a tool
-/// call, a hook, a veto or a panel drawn while the turn runs. Registration — `describe` and the two
-/// subscription reads — happens between turns, at load or reload, and is bounded by the plugin
-/// deadline instead (D183).
 fn turn_scoped(job: &Job) -> bool {
     matches!(
         job,
@@ -701,16 +689,12 @@ fn execute_inner(
             .map(|byte| format!("{byte:02x}"))
             .collect(),
     };
-    // D183: only a job that belongs to a turn is cancelled with one. Loading a component answers
-    // `describe` and reads its subscriptions with no turn in flight, so a flag left set by an Esc
-    // must not decide whether the session can register its tools.
     let turn_scoped = turn_scoped(&job);
     let cancelled = Arc::new(AtomicBool::new(
         turn_scoped && cancel::FLAG.load(Ordering::Relaxed),
     ));
     let flag = cancelled.clone();
     let deadline = timeout::deadline();
-    // Reserve host frames beyond Wasmtime's configured guest stack; never silently exceed the thread.
     let stack_bytes = prepared
         .stack_bytes()
         .checked_add(2 * 1024 * 1024)

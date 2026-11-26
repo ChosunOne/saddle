@@ -1,13 +1,3 @@
-//! D115: OAuth for a remote MCP server, discovered rather than configured. A server that answers
-//! 401 says where its authorization server is (RFC 9728), that server says where to authorize, to
-//! exchange and to register, and saddle does the rest: register itself, generate a PKCE verifier,
-//! print a URL, catch the loopback redirect and store the tokens beside the provider credentials —
-//! outside every root, in `auth.json`, where no command can read them (D16, D42).
-//!
-//! Every request here is decided like any other egress. The hosts are named by a document the
-//! server supplied, so they are exactly the kind of address a grant has to allow rather than a
-//! harness constant; the label in the record says it was authorization and for which server.
-
 use crate::provider::oauth;
 use saddle_cap::policy::NetGrant;
 use std::io::{BufRead, BufReader, Write};
@@ -26,11 +16,8 @@ use crate::provider::oauth::Tokens;
 use crate::provider::oauth::pkce;
 use crate::session::Session;
 
-/// How long the person has to finish in the browser. Long, because a sign-in is a person's time,
-/// but finite, because a terminal waiting forever is worse than one that says it gave up.
 const WAIT: Duration = Duration::from_secs(300);
 
-/// The authorization server one MCP server points at.
 pub struct AuthServer {
     pub issuer: String,
     pub authorize: String,
@@ -38,10 +25,8 @@ pub struct AuthServer {
     pub register: Option<String>,
 }
 
-/// What `saddle mcp auth` needs from the session: a way to make decided requests.
 pub struct Flow<'a> {
     pub session: &'a mut Session,
-    /// The net grants these requests are decided against, and the label they are recorded under.
     pub reach: Vec<NetGrant>,
     pub label: String,
     pub timeout: Duration,
@@ -100,9 +85,6 @@ impl Flow<'_> {
     }
 }
 
-/// The authorization server a server's URL points at, by the two metadata documents the spec
-/// defines. A server that publishes nothing but is itself the issuer is the common case, so the
-/// origin is tried as the issuer when the resource metadata is absent.
 pub fn discover(flow: &mut Flow<'_>, url: &str) -> Result<AuthServer> {
     let target = Target::parse(url).map_err(|why| anyhow!("{url}: {why}"))?;
     let origin = format!("{}://{}", target.scheme, authority(&target));
@@ -121,7 +103,6 @@ pub fn discover(flow: &mut Flow<'_>, url: &str) -> Result<AuthServer> {
                 issuer = first.trim_end_matches('/').to_owned();
             }
         }
-        // No protected-resource document: the server is its own issuer.
         Ok(_) => {}
         Err(e) => return Err(e),
     }
@@ -153,8 +134,6 @@ pub fn discover(flow: &mut Flow<'_>, url: &str) -> Result<AuthServer> {
     })
 }
 
-/// Registers saddle as a client of the server's authorization server, which is what lets there be
-/// no client id in the config for a server the person has never set up before.
 pub fn register(flow: &mut Flow<'_>, auth: &AuthServer, redirect: &str) -> Result<String> {
     let endpoint = auth.register.as_deref().with_context(|| {
         format!(
@@ -188,12 +167,8 @@ pub fn register(flow: &mut Flow<'_>, auth: &AuthServer, redirect: &str) -> Resul
         .with_context(|| format!("{endpoint} registered a client with no client_id"))
 }
 
-/// The whole sign-in: discover, register, send the person to the browser, catch the callback, and
-/// store what comes back.
 pub fn sign_in(flow: &mut Flow<'_>, server: &str, url: &str, store_path: &Path) -> Result<String> {
     let auth = discover(flow, url)?;
-    // A loopback listener on any port: the registration names the redirect, so it need not be
-    // fixed, and a fixed port is the one thing most likely to be taken.
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("reserving a loopback port")?;
     let port = listener.local_addr()?.port();
     let redirect = format!("http://127.0.0.1:{port}/callback");
@@ -229,7 +204,6 @@ pub fn sign_in(flow: &mut Flow<'_>, server: &str, url: &str, store_path: &Path) 
     Ok(format!("{server}: signed in via {}", auth.issuer))
 }
 
-/// A refresh, for the transport to call when a request comes back 401 (D116).
 pub fn refresh(
     flow: &mut Flow<'_>,
     server: &str,
@@ -255,7 +229,6 @@ pub fn refresh(
     Ok(fresh)
 }
 
-/// The token answer, as the store keeps it.
 fn tokens_from(answer: &Answer, endpoint: &str) -> Result<Tokens> {
     let value: Value = serde_json::from_str(&answer.body)
         .with_context(|| format!("{endpoint} did not answer with JSON"))?;
@@ -290,8 +263,6 @@ fn tokens_from(answer: &Answer, endpoint: &str) -> Result<Tokens> {
     })
 }
 
-/// One request on the loopback listener, answered with a page the person can read, and read for
-/// the code the browser carried back.
 fn wait_for_callback(listener: TcpListener, state: &str) -> Result<String> {
     listener.set_nonblocking(false)?;
     let (mut stream, _) = listener.accept().context("waiting for the browser")?;
@@ -319,8 +290,6 @@ fn wait_for_callback(listener: TcpListener, state: &str) -> Result<String> {
     parsed
 }
 
-/// The `code` out of a callback path, refusing one whose `state` is not the one we sent: a code
-/// that arrives without it is a code someone else put in the person's browser.
 fn callback(target: &str, state: &str) -> Result<String> {
     let query = target.split_once('?').map(|(_, q)| q).unwrap_or_default();
     let mut code = None;
@@ -354,8 +323,6 @@ fn authority(target: &Target) -> String {
     }
 }
 
-/// Percent-encoding, for the query and the form body. Everything but the unreserved characters,
-/// which is the conservative reading and what every authorization server expects.
 fn encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
@@ -401,7 +368,6 @@ fn decode(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// A bounded excerpt of what a server said, for an error the person has to act on.
 fn detail(body: &str) -> String {
     let text = body.trim();
     if text.len() > 300 {

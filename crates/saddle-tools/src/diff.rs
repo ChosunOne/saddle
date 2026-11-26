@@ -1,11 +1,7 @@
-//! native-style minimal line hunks in the guest, before filesystem effects (D146).
-
 use saddle_limits as budgets;
 use similar::{ChangeTag, TextDiff};
 use std::fmt::Write as _;
 
-/// format Myers line hunks with native line numbers, three context lines and gap markers.
-/// guest fuel/memory bound computation; no unsupported native clock is used in Wasm.
 pub fn lines(path: &str, old: &str, new: &str) -> String {
     let diff = TextDiff::from_lines(old, new);
     let groups = diff.grouped_ops(3);

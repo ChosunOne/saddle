@@ -1,5 +1,3 @@
-//! named launch confinement and pinned executables (D184, D186, D188, D189, D191, D193).
-
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::env::{self, consts};
@@ -33,7 +31,6 @@ use sha2::{Digest, Sha256};
 use crate::linux::start_network;
 use crate::{SandboxError, SandboxSpec, launch_availability};
 
-/// system runtime paths; no ordinary command includes, checkout or general home access.
 const LIB_DIRS: &[&str] = &[
     "/lib",
     "/lib32",
@@ -63,9 +60,6 @@ pub(crate) fn enter(spec: &SandboxSpec, guard: &NamedLaunch) -> Result<Infallibl
     let argv = pointers(&argv);
     let envp = pointers(&envp);
 
-    // The fresh helper has consumed its spec and replaced stdin. Do not pass any other inherited
-    // handle to the relay or executable. Do this before making sockets or starting threads.
-    // SAFETY: close_range takes descriptor numbers and flags; preserve the pinned executable.
     let fd = executable.as_raw_fd();
     for (first, last) in [(3, fd as u32 - 1), (fd as u32 + 1, u32::MAX)] {
         if first <= last && unsafe { libc::syscall(libc::SYS_close_range, first, last, 0u32) } < 0 {
@@ -86,10 +80,6 @@ pub(crate) fn enter(spec: &SandboxSpec, guard: &NamedLaunch) -> Result<Infallibl
         return exec(path, &executable, &argv, &envp);
     }
     let (send, receive) = mpsc::sync_channel::<File>(0);
-    // Only trusted helper code is running. The monitor is started after Landlock, before the
-    // exec-notification filter. It authorizes one syscall and drops the CLOEXEC listener. The
-    // successful exec destroys this thread; all later exec attempts inherit the filter but have
-    // no listener, and the kernel denies them. There is no monitor serving untrusted requests.
     let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
     thread::Builder::new()
         .name("launch-once".into())
@@ -101,8 +91,6 @@ pub(crate) fn enter(spec: &SandboxSpec, guard: &NamedLaunch) -> Result<Infallibl
             }
         })?;
     let listener = exec_listener()?;
-    // A later filter with its own listener could supersede USER_NOTIF. Seal both Linux filter
-    // installation paths before any untrusted code runs.
     seal_filters()?;
     send.send(listener)
         .map_err(|_| SandboxError::Spec("launch monitor stopped".into()))?;
@@ -115,8 +103,6 @@ fn exec(
     argv: &[*const libc::c_char],
     envp: &[*const libc::c_char],
 ) -> Result<Infallible, SandboxError> {
-    // SAFETY: the pinned ELF fd stays owned and argv/envp consist of live NUL-terminated strings
-    // and a terminating null pointer. AT_EMPTY_PATH executes the opened inode, not a reopened path.
     unsafe {
         libc::syscall(
             libc::SYS_execveat,
@@ -208,8 +194,6 @@ fn hash_elf(path: &Path, executable: &mut File) -> Result<[u8; 32], SandboxError
     Ok(digest.finalize().into())
 }
 
-/// Open an absolute path without following any links, using pinned parents. An explicit
-/// executable must be a regular file; its trust comes from the protected launch profile.
 fn open_pinned(path: &Path, executable: bool) -> Result<File, SandboxError> {
     let mut parts = path.components().peekable();
     if parts.next() != Some(Component::RootDir) || parts.peek().is_none() {
@@ -248,7 +232,6 @@ fn open_pinned(path: &Path, executable: bool) -> Result<File, SandboxError> {
 }
 
 fn open_at(dir: libc::c_int, name: &CStr, flags: libc::c_int) -> io::Result<File> {
-    // SAFETY: name is live and NUL-terminated, no creation mode is needed, and the fd is owned.
     let fd = unsafe {
         libc::openat(
             dir,
@@ -333,8 +316,6 @@ fn confine_files(
             access & !AccessFs::ReadDir
         };
         if *written == "/dev/null" {
-            // Git opens this sink O_RDWR to fill any missing standard descriptors (D191).
-            // Check the pinned device identity before granting write, not just the pathname.
             if metadata.rdev() != libc::makedev(1, 3) {
                 return Err(SandboxError::Spec("unexpected /dev/null device".into()));
             }
@@ -377,8 +358,6 @@ fn confine_files(
                 path.display()
             )));
         }
-        // Everything but Execute: a writable tree must never become a place to run a new
-        // program, which is why approved executables are checked against this reach (D188).
         let write = AccessFs::from_all(abi) & !AccessFs::Execute;
         rules = rules.add_rule(PathBeneath::new(dir, write)).map_err(ll)?;
     }
@@ -474,8 +453,6 @@ fn confine_syscalls(networked: bool) -> Result<(), SandboxError> {
     .map_err(sc)?
     .try_into()
     .map_err(sc)?;
-    // The x32 ABI uses the same audit architecture but aliases native syscall numbers. Reject it
-    // in both launch modes so it cannot evade restrictions such as socket and process-group rules.
     #[cfg(target_arch = "x86_64")]
     let program = {
         let mut program = program;
@@ -487,13 +464,13 @@ fn confine_syscalls(networked: bool) -> Result<(), SandboxError> {
                     jt: 0,
                     jf: 0,
                     k: 0,
-                }, // load seccomp_data.nr
+                },
                 SockFilter {
                     code: 0x35,
                     jt: 0,
                     jf: 1,
                     k: 0x4000_0000,
-                }, // nr >= x32 bit
+                },
                 SockFilter {
                     code: 0x06,
                     jt: 0,
@@ -548,8 +525,6 @@ fn exec_listener() -> Result<File, SandboxError> {
             .map_err(sc)?
             .try_into()
             .map_err(sc)?;
-    // seccompiler does not yet expose USER_NOTIF. Rewrite only the constant TRACE return it
-    // emitted above; reject a compiler change that does not produce that return instruction.
     let mut rewritten = false;
     for op in &mut program {
         if op.code == 0x06 && op.k == libc::SECCOMP_RET_TRACE {
@@ -566,8 +541,6 @@ fn exec_listener() -> Result<File, SandboxError> {
         len: program.len() as u16,
         filter: program.as_mut_ptr().cast(),
     };
-    // SAFETY: the kernel copies this live BPF program. This attaches to the calling thread only;
-    // its future executable and descendants inherit it. The returned descriptor is CLOEXEC.
     let fd = unsafe {
         libc::syscall(
             libc::SYS_seccomp,
@@ -585,7 +558,6 @@ fn exec_listener() -> Result<File, SandboxError> {
 }
 
 fn allow_initial_exec(listener: &File, tid: u32) -> io::Result<()> {
-    // SAFETY: ioctl writes into a zero-initialized kernel ABI record owned by this thread.
     let mut request: libc::seccomp_notif = unsafe { mem::zeroed() };
     loop {
         if unsafe {
@@ -612,7 +584,6 @@ fn allow_initial_exec(listener: &File, tid: u32) -> io::Result<()> {
         error: 0,
         flags: libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32,
     };
-    // SAFETY: the kernel reads the live response for the single trusted helper syscall.
     if unsafe {
         libc::ioctl(
             listener.as_raw_fd(),
@@ -644,7 +615,6 @@ mod tests {
             helpers: vec![],
         };
         verified_executable(&path, Some(&expected), &guard).unwrap();
-        // Same inode and length: a pathname or file size check alone would miss this.
         fs::write(&path, b"\x7fELF-modified").unwrap();
         let err = verified_executable(&path, Some(&expected), &guard).unwrap_err();
         assert!(

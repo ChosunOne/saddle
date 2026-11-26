@@ -1,8 +1,3 @@
-//! The Anthropic Messages API, streamed.
-//!
-//! Blocks the loop does not interpret (thinking, fallback markers, anything newer) are kept as
-//! `Part::Native` and sent back unchanged, in their original position, on the next request.
-
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
@@ -17,8 +12,6 @@ pub(super) const VERSION: &str = "2026-10-21";
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const DEFAULT_MAX_TOKENS: u32 = 64_000;
 
-/// Server-side refusal fallbacks and eager tool-input streaming go only to the official endpoint;
-/// a proxy or gateway may reject either field.
 fn official(cfg: &ProviderConfig) -> bool {
     cfg.base_url == OFFICIAL_BASE_URL
 }
@@ -46,8 +39,6 @@ pub fn body(cfg: &ProviderConfig, conv: &Conversation<'_>) -> Value {
                 "input_schema": t.schema,
             });
             if official {
-                // Large inputs (file contents) stream as they are generated. The input is then
-                // unvalidated, so the loop checks it before running the tool.
                 tool["eager_input_streaming"] = true.into();
             }
             tool
@@ -59,7 +50,6 @@ pub fn body(cfg: &ProviderConfig, conv: &Conversation<'_>) -> Value {
         "stream": true,
         "system": conv.system,
         "messages": messages(conv.items),
-        // Automatic prompt caching: the breakpoint follows the end of the conversation.
         "cache_control": { "type": "ephemeral" },
     });
     if !tools.is_empty() {
@@ -74,8 +64,6 @@ pub fn body(cfg: &ProviderConfig, conv: &Conversation<'_>) -> Value {
     body
 }
 
-/// Renders the conversation. Consecutive items with the same role are merged into one message, so
-/// a user message after a turn's tool results lands in the same message as the results.
 pub fn messages(items: &[Item]) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for item in items {
@@ -84,7 +72,6 @@ pub fn messages(items: &[Item]) -> Vec<Value> {
                 ("user", vec![json!({"type":"text","text":value.content})])
             }
             Item::User(text) => ("user", vec![json!({ "type": "text", "text": text })]),
-            // The pictures come after the text, in the same message (D58).
             Item::Attached { text, images } => {
                 let mut blocks = vec![json!({ "type": "text", "text": text })];
                 blocks.extend(
@@ -98,9 +85,6 @@ pub fn messages(items: &[Item]) -> Vec<Value> {
                 "user",
                 vec![json!({ "type": "text", "text": format!("{SUMMARY_INTRO}{text}") })],
             ),
-            // Anthropic takes images inside the tool result itself, except on an error result: it
-            // rejects one whose content is not text, so those images follow the results in the
-            // same user message instead (D58).
             Item::ToolResults(results) => {
                 let mut blocks: Vec<Value> = Vec::new();
                 let mut moved: Vec<Value> = Vec::new();
@@ -148,7 +132,6 @@ fn render(part: &Part) -> Option<Value> {
             api: Api::Anthropic,
             block,
         } => Some(block.clone()),
-        // Anthropic takes the bytes inline, as base64 with the media type beside them (D58).
         Part::Image(image) => Some(json!({
             "type": "image",
             "source": {
@@ -161,7 +144,6 @@ fn render(part: &Part) -> Option<Value> {
     }
 }
 
-/// What one tool result carries, and any images that have to travel beside it (D58).
 fn tool_result_content(r: &ToolResult) -> (Value, Vec<Value>) {
     if r.images.is_empty() {
         return (json!(r.content), Vec::new());
@@ -172,8 +154,6 @@ fn tool_result_content(r: &ToolResult) -> (Value, Vec<Value>) {
         .filter_map(|i| render(&Part::Image(i.clone())))
         .collect();
     if r.is_error {
-        // The result keeps its text; the pictures go after every result, with a line saying where
-        // they came from, because Anthropic rejects a non-text error result.
         let caption = format!(
             "image{} from the failed call {}:",
             if images.len() == 1 { "" } else { "s" },
@@ -183,8 +163,6 @@ fn tool_result_content(r: &ToolResult) -> (Value, Vec<Value>) {
         carry.extend(images);
         return (json!(r.content), carry);
     }
-    // Otherwise the pictures are part of the result, and the text is kept even when empty so the
-    // model sees that the call said nothing.
     let mut blocks = vec![json!({ "type": "text", "text": r.content })];
     blocks.extend(images);
     (json!(blocks), Vec::new())
@@ -264,7 +242,6 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
                 data["error"]["type"].as_str().unwrap_or("error"),
                 data["error"]["message"].as_str().unwrap_or("no message")
             ),
-            // content_block_stop, ping, and event types added later.
             _ => {}
         }
     }
@@ -284,10 +261,7 @@ pub fn read_stream(mut events: impl sse::Events, sink: &mut dyn Sink) -> Result<
     Ok(Reply {
         parts,
         stop,
-        // Anthropic reports no such thing; a thinking block it did not accept is an error instead.
         dropped_reasoning: 0,
-        // D99: and no split either — `output_tokens` already counts the thinking, with nothing
-        // saying how much of it there was.
         reasoning_tokens: 0,
         stop_raw,
         model,
@@ -342,7 +316,6 @@ fn apply_delta(open: &mut Open, delta: &Value, sink: &mut dyn Sink) {
                 list.push(delta["citation"].clone());
             }
         }
-        // thinking_delta, signature_delta and later string deltas append to the field they name.
         _ => {
             if let Some(fields) = delta.as_object() {
                 for (k, v) in fields.iter().filter(|(k, _)| *k != "type") {
@@ -397,9 +370,6 @@ fn is_fallback(part: &Part) -> bool {
     matches!(part, Part::Native { block, .. } if block["type"] == "fallback")
 }
 
-/// After a mid-reply fallback, the declined model's thinking and tool calls before the last
-/// `fallback` block are omitted from the history; its text and the `fallback` blocks stay where
-/// they were. The omitted calls are never run.
 fn drop_before_fallback(parts: &mut Vec<Part>) {
     let Some(boundary) = parts.iter().rposition(is_fallback) else {
         return;
@@ -432,7 +402,6 @@ mod tests {
 
     #[test]
     fn a_tool_result_carries_its_image_inside_itself() {
-        // Anthropic accepts an image block in a tool result, so it rides with the text (D58).
         let items = [Item::ToolResults(vec![ToolResult {
             provenance: None,
             id: "c1".into(),
@@ -455,8 +424,6 @@ mod tests {
 
     #[test]
     fn an_error_result_keeps_its_text_and_its_images_follow_it() {
-        // Anthropic rejects an error tool result whose content is not text, so the picture is
-        // moved after the result, with a line saying where it came from (D58).
         let items = [Item::ToolResults(vec![ToolResult {
             provenance: None,
             id: "c9".into(),
@@ -466,10 +433,8 @@ mod tests {
             images: vec![image("shot.png")],
         }])];
         let blocks = messages(&items)[0]["content"].as_array().unwrap().clone();
-        // The result itself is text only.
         assert_eq!(blocks[0]["type"], "tool_result");
         assert_eq!(blocks[0]["content"], "denied: no exec grant");
-        // And the picture follows in the same user message, captioned with the call it came from.
         assert_eq!(blocks[1]["type"], "text");
         assert!(
             blocks[1]["text"].as_str().unwrap().contains("c9"),
@@ -512,7 +477,6 @@ mod tests {
         let content = msgs[0]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "what is wrong here?");
-        // Anthropic takes the bytes inline with the media type beside them (D58).
         assert_eq!(content[1]["type"], "image");
         assert_eq!(content[1]["source"]["type"], "base64");
         assert_eq!(content[1]["source"]["media_type"], "image/png");
@@ -665,9 +629,6 @@ mod tests {
 
     #[test]
     fn a_formula_is_sent_as_the_tex_and_never_as_a_picture() {
-        // D165: setting a formula is something the person's terminal does. The conversation — and
-        // so the request — carries the source in the words it was written in, so a model reads an
-        // earlier formula back as TeX rather than as a picture it cannot see.
         let formula = "$$\\int_0^1 x^2 \\, dx = \\frac{1}{3}$$";
         let items = vec![
             Item::User(format!("check {formula} please")),
@@ -679,7 +640,6 @@ mod tests {
             format!("check {formula} please")
         );
         assert_eq!(m[1]["content"][0]["text"], format!("it follows: {formula}"));
-        // The only image blocks a request carries are the ones a person attached (D58, D162).
         assert!(!json!(m).to_string().contains("\"image\""));
     }
 

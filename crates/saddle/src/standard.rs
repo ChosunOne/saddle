@@ -1,5 +1,3 @@
-//! explicit protected delegation profiles for shipped standard components (D147).
-
 use anyhow::{Result, bail};
 use saddle_cap::manifest::Manifest;
 use saddle_cap::policy::PlainGrant;
@@ -7,7 +5,6 @@ use saddle_cap::{Grants, Scope};
 use saddle_standard::artifact;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// presence registers a shipped tool; listed scopes select only the parent's current reach.
 pub type Profiles = BTreeMap<String, BTreeSet<Scope>>;
 
 pub use saddle_standard::DEFAULT_PROFILES;
@@ -27,7 +24,6 @@ pub fn validate(profiles: &Profiles) -> Result<()> {
     Ok(())
 }
 
-/// a profile is an explicit scope selector, never an independent resource list or authority.
 pub fn delegate(parent: &Grants, name: &str, scopes: &BTreeSet<Scope>) -> Grants {
     let mut child = Grants::default();
     child.plain.insert(
@@ -86,9 +82,6 @@ pub fn delegate(parent: &Grants, name: &str, scopes: &BTreeSet<Scope>) -> Grants
     child
 }
 
-/// the `[standard-tools]` line the shipped defaults carry for one tool (D182), read out of the
-/// defaults' own text so it matches what `saddle tools --config` prints. A refusal uses it to show
-/// what to add rather than only which mechanism refused.
 pub fn default_entry(name: &str) -> Option<&'static str> {
     DEFAULT_PROFILES.lines().find_map(|line| {
         let (key, _) = line.split_once('=')?;

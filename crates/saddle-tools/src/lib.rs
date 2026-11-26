@@ -1,5 +1,3 @@
-//! standard tool implementations; the core owns effects, guests own presentation (D131).
-
 pub mod ask;
 pub mod bash;
 pub mod config_help;
@@ -32,7 +30,6 @@ use serde_json::{Value, json};
 
 const CHUNK_BYTES: u32 = 8192;
 
-/// a model-facing reader; importing it does not grant any filesystem access.
 pub struct Read;
 
 #[derive(Deserialize)]
@@ -149,7 +146,6 @@ fn normalize_path(arguments: &str, default: Option<&str>) -> Result<String, Stri
     Ok(arguments.to_string())
 }
 
-/// reads the requested format without detection or fallback between text and images (D136).
 pub fn read_with_media(
     arguments: &str,
     mut read: impl FnMut(&str, &str, u64, u32) -> Result<(Vec<u8>, bool), String>,

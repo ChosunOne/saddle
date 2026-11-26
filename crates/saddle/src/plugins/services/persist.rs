@@ -1,5 +1,3 @@
-//! transactional private KV rows, never guest-chosen filesystem paths (D156).
-
 use std::collections::BTreeSet;
 use std::os::unix::ffi::OsStrExt;
 use std::time::Instant;

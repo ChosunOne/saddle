@@ -1,5 +1,3 @@
-//! The policy file (D22): grants only, every grant explained, everything resolved at load.
-
 use serde::de::Error;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -46,7 +44,6 @@ impl<'de> Deserialize<'de> for PluginId {
     }
 }
 
-/// Who is asking. The agent is a principal like any plugin (D17).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Principal {
     Agent,
@@ -62,7 +59,6 @@ impl fmt::Display for Principal {
     }
 }
 
-/// The TOML path of a grant, such as `agent.fs-read[0]`. This is the rule recorded under D10.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RuleId(String);
 
@@ -79,8 +75,6 @@ impl RuleId {
     }
 }
 
-/// A rule inside another, such as `agent.mcp[0].fs-read[1]`: an audit record names the exact line
-/// a person wrote, not just the grant it sits in.
 impl RuleId {
     fn under(&self, part: &str, index: usize) -> Self {
         Self(format!("{}.{part}[{index}]", self.0))
@@ -103,7 +97,6 @@ pub struct FsGrant {
 }
 
 impl FsGrant {
-    /// keeps the compiled matcher in step with the written exclusions when delegating a grant.
     pub(crate) fn with_exclusions(&self, exclude: Vec<String>) -> Result<Self, String> {
         Ok(Self {
             exclude_set: exclude_set(&exclude)?,
@@ -112,8 +105,6 @@ impl FsGrant {
         })
     }
 
-    /// Whether this grant's exclusions cover `rel`. Patterns without a `/` match at any depth, as
-    /// in `.gitignore`, and a pattern that names a directory also covers everything beneath it.
     pub fn excludes(&self, rel: &RelPath) -> bool {
         !rel.is_root() && self.exclude_set.is_match(rel.as_slash())
     }
@@ -123,12 +114,10 @@ impl FsGrant {
 pub struct ExecGrant {
     pub rule: RuleId,
     pub why: String,
-    /// Environment variable names passed to the child on top of the base allowlist (D19).
     pub env: Vec<String>,
     pub timeout: Duration,
 }
 
-/// permission to invoke one protected launch profile, not reach to its files (D184).
 #[derive(Debug, Clone)]
 pub struct LaunchGrant {
     pub rule: RuleId,
@@ -136,7 +125,6 @@ pub struct LaunchGrant {
     pub profile: String,
 }
 
-/// syntax shared between the protected definition and the grant that names it (D184).
 pub fn valid_launch_profile_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -147,11 +135,8 @@ pub fn valid_launch_profile_name(name: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostPattern {
-    /// A hostname or an IP literal.
     Exact(String),
-    /// `*.example.com`: any strict subdomain of `example.com`.
     Suffix(String),
-    /// `*`: any host at all, which is the one grant whose `why` carries all the weight (D40).
     Any,
 }
 
@@ -241,12 +226,9 @@ pub struct NetGrant {
     pub why: String,
     pub host: HostPattern,
     pub scheme: UrlScheme,
-    /// `None` allows only the scheme's default port.
     pub port: Option<u16>,
 }
 
-/// One list of net grants against one request. A server's reach is a narrowed list rather than a
-/// principal the engine resolves, so the question is asked here and answered the same way (D110).
 pub fn net_allows<'a>(
     grants: &'a [NetGrant],
     scheme: &str,
@@ -256,9 +238,6 @@ pub fn net_allows<'a>(
     grants.iter().find(|g| g.allows(scheme, host, port))
 }
 
-/// Whether a list of grants spells the host out rather than covering it with a pattern. Only a
-/// grant that names an address can reach loopback or private space (D40), and a server's narrowed
-/// reach has to be asked the same question the agent's grants are (D110).
 pub fn names_host(grants: &[NetGrant], host: &str) -> bool {
     grants
         .iter()
@@ -277,29 +256,19 @@ impl NetGrant {
 pub struct BudgetGrant {
     pub rule: RuleId,
     pub why: String,
-    /// `None` is no token budget: a grant written without `tokens-per-session` leaves spending
-    /// uncapped by tokens, as it is by cost when `cost-per-session` is absent.
     pub tokens_per_session: Option<u64>,
     pub cost_per_session: Option<f64>,
 }
 
-/// One MCP server, and the tools of it the model may reach (D103). The server's own tool list is
-/// never authority: it can only contain names written here.
 #[derive(Debug, Clone)]
 pub struct McpGrant {
     pub rule: RuleId,
     pub why: String,
     pub server: String,
-    /// Every tool named, never a pattern: a server that grows a tool overnight does not grow it
-    /// into the callable set.
     pub tools: Vec<String>,
-    /// What the server asks to reach. Empty means it inherits the agent's own reach; anything
-    /// here must be inside it, or the policy does not load (D105).
     pub reach: McpReach,
 }
 
-/// The files and hosts one MCP server asks for, before it is narrowed to what the agent holds
-/// (D105).
 #[derive(Debug, Clone, Default)]
 pub struct McpReach {
     pub fs_read: Vec<FsGrant>,
@@ -313,15 +282,11 @@ impl McpGrant {
     }
 }
 
-/// which conversations a `transcript-read` grant covers (D163).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 pub enum Sessions {
-    /// this conversation only: what the grant meant before a session could read another's (D92).
     #[serde(rename = "self")]
     #[default]
     SelfOnly,
-    /// every saved conversation of this workspace. The default when the field is not written,
-    /// because reading the rest of the workspace is what the grant is for (D163).
     #[serde(rename = "workspace")]
     Workspace,
 }
@@ -339,13 +304,10 @@ impl fmt::Display for Sessions {
 pub struct PlainGrant {
     pub rule: RuleId,
     pub why: String,
-    /// Meaningful only for `transcript-read`, and only ever set from that grant: the other plain
-    /// scopes carry the narrowest value so a grant copied by delegation cannot widen by omission.
     pub sessions: Sessions,
 }
 
 impl PlainGrant {
-    /// registration metadata compiled from an explicit protected host-tool selection (D147).
     pub fn registration(source: String, why: String) -> Self {
         Self {
             rule: RuleId(source),
@@ -355,11 +317,9 @@ impl PlainGrant {
     }
 }
 
-/// read-only roles D66 can delegate through its SDK service (D138).
 pub const TOOL_READ_ROLES: &[&str] = &["read", "ls", "find", "grep"];
 pub const TOOL_WRITE_ROLES: &[&str] = &["write", "edit", "patch"];
 
-/// delegates existing D66 tool-path reach, not new directories or policy roots (D138).
 #[derive(Debug, Clone)]
 pub struct ToolReadGrant {
     pub rule: RuleId,
@@ -368,7 +328,6 @@ pub struct ToolReadGrant {
 }
 
 impl ToolReadGrant {
-    /// constructs the write ceiling from the same protected D66 declarations (D141).
     pub fn for_agent_write(tools: Vec<String>) -> Self {
         Self {
             rule: RuleId::new(&Principal::Agent, Scope::ToolWrite, None),
@@ -376,7 +335,6 @@ impl ToolReadGrant {
             tools,
         }
     }
-    /// constructs the parent's ceiling from host-validated D66 configuration (D138).
     pub fn for_agent(tools: Vec<String>) -> Self {
         Self {
             rule: RuleId::new(&Principal::Agent, Scope::ToolRead, None),
@@ -386,7 +344,6 @@ impl ToolReadGrant {
     }
 }
 
-/// everything one principal holds.
 #[derive(Debug, Clone, Default)]
 pub struct Grants {
     pub tool_read: Option<ToolReadGrant>,
@@ -398,14 +355,10 @@ pub struct Grants {
     pub net: Vec<NetGrant>,
     pub mcp: Vec<McpGrant>,
     pub model_invoke: Option<BudgetGrant>,
-    /// Scopes whose grant carries no parameters: transcript-read, context-contribute, tool, veto,
-    /// ui, persist.
     pub plain: BTreeMap<Scope, PlainGrant>,
 }
 
 impl Grants {
-    /// Whether a grant names `host` exactly, which is what lets a private address be reached
-    /// (D28): a wildcard grant is not a name, so it does not open loopback (D40).
     pub fn names_host(&self, host: &str) -> bool {
         names_host(&self.net, host)
     }
@@ -446,14 +399,12 @@ impl Grants {
         out
     }
 
-    /// the grant for this exact profile name (D184).
     pub fn launch_profile(&self, profile: &str) -> Option<&LaunchGrant> {
         self.run_binary
             .iter()
             .find(|grant| grant.profile == profile)
     }
 
-    /// The grant for one server, which is what decides every call to it (D103).
     pub fn mcp_server(&self, server: &str) -> Option<&McpGrant> {
         self.mcp.iter().find(|g| g.server == server)
     }
@@ -476,8 +427,6 @@ pub enum PolicyError {
     Invalid { at: String, msg: String },
 }
 
-/// A TOML value as a document, which is what `Policy::parse` reads. `toml::to_string` on a `Value`
-/// writes an inline `{...}`, which is not a document.
 pub fn document(value: &toml::Value) -> Result<String, PolicyError> {
     let table = match value {
         toml::Value::Table(t) => t.clone(),
@@ -490,20 +439,11 @@ pub fn document(value: &toml::Value) -> Result<String, PolicyError> {
     Ok(toml::to_string(&toml::Value::Table(table))?)
 }
 
-/// `project` on top of `global`, as one TOML document (D43).
-///
-/// Tables merge, so a grant the project leaves alone keeps the global value. Grants are lists, and
-/// a project's list replaces the global one for that scope — the whole point of overriding. A list
-/// written as `-name` entries is the exception (D177): it means the inherited list without those
-/// entries, so a layer can take one grant away without restating the rest.
 pub fn merge(global: toml::Value, project: toml::Value) -> Result<toml::Value, PolicyError> {
-    // Subtraction is a layer's form, so it means nothing in what everything else inherits.
     reject_subtractions(&global, "")?;
     merge_at("", Some(global), project)
 }
 
-/// The field that names one entry of a list scope, which is what a `-name` entry subtracts (D177).
-/// The identity is per scope because the entries are not strings: a host, a root, a server.
 fn entry_name(scope: &str) -> Option<&'static str> {
     match scope {
         "fs-read" | "fs-write" => Some("root"),
@@ -514,8 +454,6 @@ fn entry_name(scope: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether one inherited entry is the one `-name` removes. A host is a name like a DNS name is,
-/// so it compares the way `HostPattern` matches; a root and a server are spelled as they are.
 fn names_entry(entry: &toml::Value, field: &str, name: &str) -> bool {
     match entry.get(field).and_then(toml::Value::as_str) {
         Some(written) if field == "host" => written.eq_ignore_ascii_case(name),
@@ -550,8 +488,6 @@ fn merge_at(
             Ok(toml::Value::Table(out))
         }
         toml::Value::Array(entries) => {
-            // A list of names subtracts, a list of entries (or an empty one) replaces; only the
-            // scopes whose entries carry a name can do the first.
             let scope = at.rsplit('.').next().unwrap_or(at);
             let subtracts = entries.iter().any(|e| e.is_str());
             match entry_name(scope).filter(|_| subtracts && !entries.is_empty()) {
@@ -629,15 +565,10 @@ fn subtract(
     Ok(toml::Value::Array(kept))
 }
 
-/// The base grants are what every layer inherits, so a `-name` entry there has nothing to
-/// subtract from and is refused where the base is built, before a profile or a project is layered
-/// on it (D177).
 pub fn check_base(value: &toml::Value) -> Result<(), PolicyError> {
     reject_subtractions(value, "")
 }
 
-/// A `-name` entry subtracts from a list a layer below granted, so it is refused where there is
-/// nothing below: the base grants, and a server's own reach, which is written out in full (D177).
 fn reject_subtractions(value: &toml::Value, at: &str) -> Result<(), PolicyError> {
     let path = |key: &str| {
         if at.is_empty() {
@@ -685,8 +616,6 @@ fn invalid(at: impl fmt::Display, msg: impl Into<String>) -> PolicyError {
         msg: msg.into(),
     }
 }
-
-// Wire format. Unknown keys are errors everywhere.
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -795,8 +724,6 @@ struct RawPlain {
     why: Option<String>,
 }
 
-/// `transcript-read` names the conversations it covers; every other plain scope carries nothing
-/// but its `why` (D163).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTranscriptRead {
@@ -814,19 +741,9 @@ struct RawToolRead {
 }
 
 impl Policy {
-    /// Parses and validates a policy against the session's roots. Every root a grant names must
-    /// exist in `roots`.
-    /// The global policy with a workspace's own on top (D43). A grant the workspace file does not
-    /// mention keeps the global value; one it does mention replaces it for that scope, whether that
-    /// makes it narrower or wider. The workspace file is the authority for that directory: it lives
-    /// in the config directory (D42), which nothing the agent can run is able to write, so it is a
-    /// person's declaration and not something a project can smuggle in.
     pub fn layer(global: &str, project: &str, roots: &Roots) -> Result<Policy, PolicyError> {
         let global: toml::Value = toml::from_str(global)?;
         let project: toml::Value = toml::from_str(project)?;
-        // Both sides must parse first, so a project cannot slip past the check by being invalid.
-        // `toml::to_string` on a `Value` writes an inline `{...}`, which is not a document, so the
-        // merged table is rendered as one first.
         let merged = merge(global, project)?;
         Policy::parse(&document(&merged)?, roots)
     }
@@ -852,7 +769,6 @@ impl Policy {
         self.principals.get(who)
     }
 
-    /// One line per grant, stable across runs. `saddle check` prints them.
     pub fn describe(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for g in self.principals.values() {
@@ -932,8 +848,6 @@ impl Policy {
             }
             for (scope, p) in &g.plain {
                 let mut line = p.rule.to_string();
-                // Which conversations a transcript grant covers is worth saying out loud, since a
-                // bare grant means the whole workspace (D163).
                 if *scope == Scope::TranscriptRead {
                     line.push_str(&format!(" ({})", p.sessions));
                 }
@@ -944,15 +858,10 @@ impl Policy {
     }
 }
 
-/// A grant's `why`, which a person reads in `saddle check` and in the audit log (D22). It is
-/// optional (D41): an absent or blank one is an empty string, and everything that prints a grant
-/// then prints no reason rather than an empty one.
 fn why(why: Option<String>) -> String {
     why.unwrap_or_default().trim().to_owned()
 }
 
-/// A grant's line, with its reason only when there is one, so a grant without a `why` leaves no
-/// dangling `# ` for a reviewer to wonder about (D41).
 fn with_why(line: String, why: &str) -> String {
     if why.is_empty() {
         line
@@ -961,7 +870,6 @@ fn with_why(line: String, why: &str) -> String {
     }
 }
 
-/// One filesystem entry of an MCP grant, checked against the roots exactly as an agent's is.
 fn lower_fs(rule: RuleId, f: RawFs, roots: &Roots) -> Result<FsGrant, PolicyError> {
     let root = RootName::new(&f.root).map_err(|e| invalid(&rule, e.to_string()))?;
     if !roots.contains(&root) {
@@ -1195,7 +1103,6 @@ fn lower(who: &Principal, raw: RawGrants, roots: &Roots) -> Result<Grants, Polic
             PlainGrant {
                 why: why(p.why),
                 rule,
-                // Bare `transcript-read` is every conversation of the workspace (D163).
                 sessions: p.sessions.unwrap_or(Sessions::Workspace),
             },
         );
@@ -1209,8 +1116,6 @@ fn valid_env_name(s: &str) -> bool {
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-/// Compiles exclusion patterns with `.gitignore`-like anchoring: a pattern without `/` matches at
-/// any depth, a leading `/` anchors to the root, and every pattern also covers what lies beneath.
 pub fn exclude_set(patterns: &[String]) -> Result<GlobSet, String> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
@@ -1264,7 +1169,6 @@ model-invoke = { tokens-per-session = 200000, why = "summarises results" }
         }
         assert_eq!(any.to_string(), "*");
 
-        // A suffix is still a suffix, and a wildcard is not a name.
         let policy = Policy::parse(
             &format!("{EXAMPLE}\n[plugin.wild]\nnet = [{{ host = \"*\", why = \"anywhere\" }}]\n"),
             &roots().1,
@@ -1288,8 +1192,6 @@ model-invoke = { tokens-per-session = 200000, why = "summarises results" }
 
     #[test]
     fn transcript_read_names_the_conversations_it_covers() {
-        // D163: a bare grant is every conversation of the workspace; `self` is what the grant
-        // meant before that, and anything else is a typo rather than a silent fallback.
         let bare = Policy::parse(
             "version = 1\n[agent]\ntranscript-read = { why = \"x\" }\n",
             &roots().1,
@@ -1322,7 +1224,6 @@ model-invoke = { tokens-per-session = 200000, why = "summarises results" }
         );
         assert!(bad.is_err(), "a word that is not a scope is refused");
 
-        // The other plain scopes take no such field: they name a permission, not a place.
         let wrong = Policy::parse(
             "version = 1\n[agent]\npersist = { sessions = \"workspace\" }\n",
             &roots().1,
@@ -1384,12 +1285,10 @@ fs-read  = [{ root = "workspace", why = "reads the project" }]
 fs-write = [{ root = "workspace", exclude = [".env*"], why = "edits the project" }]
 exec     = { why = "runs tests" }
 "#;
-        // The project says nothing: it inherits everything.
         let same = Policy::layer(global, "version = 1\n", &roots).unwrap();
         let base = Policy::parse(global, &roots).unwrap();
         assert_eq!(same.describe(), base.describe());
 
-        // The project narrows one scope and leaves the rest alone.
         let narrower = "version = 1\n[agent]\nfs-write = [{ root = \"workspace\", exclude = [\".env*\", \"/secrets\"] }]\n";
         let layered = Policy::layer(global, narrower, &roots).unwrap();
         let agent = layered.grants(&Principal::Agent).unwrap();
@@ -1404,8 +1303,6 @@ exec     = { why = "runs tests" }
 
     #[test]
     fn a_layer_subtracts_one_entry_from_an_inherited_list() {
-        // D177: `-name` takes one grant away instead of the layer restating the whole list, so a
-        // profile can give up a host without copying the ones it keeps.
         let (_d, roots) = roots();
         let global = r#"
 version = 1
@@ -1431,8 +1328,6 @@ mcp     = [{ server = "exa", tools = ["search"] }]
         );
         assert_eq!(agent.mcp[0].server, "exa");
 
-        // A root names every entry for it, whether or not they narrow it differently, and a
-        // subtraction can empty a scope altogether.
         let empties = r#"
 version = 1
 [agent]
@@ -1445,7 +1340,6 @@ mcp = ["-exa"]
         assert!(agent.mcp.is_empty());
         assert_eq!(agent.net.len(), 2, "still inherited");
 
-        // Layers stack, so each one subtracts from what the layer below it left (D176, D177).
         let base: toml::Value = toml::from_str(global).unwrap();
         let one: toml::Value =
             toml::from_str("version = 1\n[agent]\nnet = [\"-api.example.com\"]\n").unwrap();
@@ -1461,8 +1355,6 @@ mcp = ["-exa"]
 
     #[test]
     fn a_subtraction_that_could_not_have_meant_anything_is_refused() {
-        // D177: a name nothing inherits, a list that mixes names with entries, a `+` entry and a
-        // name written without its `-` are all mistakes, and each says which.
         let (_d, roots) = roots();
         let global = "version = 1\n[agent]\nnet = [{ host = \"api.example.com\" }]\n";
         let refused = |layer: &str| {
@@ -1486,8 +1378,6 @@ mcp = ["-exa"]
         let e = refused("version = 1\n[agent]\nnet = [\"-\"]\n");
         assert!(e.contains("needs a name to subtract"), "{e}");
 
-        // There is nothing below the base grants, so a `-` there is not a narrowing but a typo:
-        // it is refused where the base is built, and by the merge as well (D177).
         let base = "version = 1\n[agent]\nnet = [\"-api.example.com\"]\n";
         let value: toml::Value = toml::from_str(base).unwrap();
         let e = super::check_base(&value).unwrap_err().to_string();
@@ -1495,7 +1385,6 @@ mcp = ["-exa"]
         assert!(e.contains("agent.net"), "it names where: {e}");
         let e = Policy::layer(base, "", &roots).unwrap_err().to_string();
         assert!(e.contains("there is no inherited list here"), "{e}");
-        // A server's own reach is written in full, not layered, so the same form is refused there.
         let base = "version = 1\n[agent]\nmcp = [{ server = \"exa\", net = [\"-a.test\"] }]\n";
         let e = Policy::layer(base, "", &roots).unwrap_err().to_string();
         assert!(e.contains("there is no inherited list here"), "{e}");
@@ -1504,8 +1393,6 @@ mcp = ["-exa"]
 
     #[test]
     fn a_workspace_policy_may_widen_because_it_is_the_authority_for_its_directory() {
-        // D43: the workspace file is written by a person in the config directory, which nothing
-        // the agent runs can write, so it may grant more as well as less.
         let (_d, roots) = roots();
         let global = "version = 1\n\n[agent]\nfs-read = [{ root = \"workspace\" }]\n";
         let wider = r#"
@@ -1525,7 +1412,6 @@ exec = { timeout-secs = 60 }
         assert_eq!(agent.net[0].host.to_string(), "api.example.com");
         assert_eq!(agent.fs_write[0].root.as_str(), "workspace");
 
-        // A budget above the global ceiling is just a budget the person chose.
         let with_budget = "version = 1\n\n[agent]\nmodel-invoke = { tokens-per-session = 100 }\n";
         let raised = "version = 1\n\n[agent]\nmodel-invoke = { tokens-per-session = 500 }\n";
         let layered = Policy::layer(with_budget, raised, &roots).unwrap();
@@ -1540,8 +1426,6 @@ exec = { timeout-secs = 60 }
             Some(500)
         );
 
-        // What is still refused is a grant that makes no sense for the session: an unknown root,
-        // exactly as in a single-file policy.
         let e = Policy::layer(
             global,
             "version = 1\n[agent]\nfs-read = [{ root = \"nope\" }]\n",
@@ -1554,8 +1438,6 @@ exec = { timeout-secs = 60 }
 
     #[test]
     fn a_grant_without_a_why_is_accepted_and_prints_without_one() {
-        // D41: the reason is optional, so a policy can be written without one; nothing prints a
-        // dangling `#` for a grant that has none.
         let (_d, roots) = roots();
         let text = "version = 1\n\n[agent]\nnet = [{ host = \"*\" }]\nexec = { why = \"  \" }\n";
         let policy = Policy::parse(text, &roots).unwrap();
@@ -1569,8 +1451,6 @@ exec = { timeout-secs = 60 }
         );
         assert!(lines.iter().all(|l| !l.contains('#')), "{lines:?}");
 
-        // One that does say why still shows it, and an allow is explained by the rule alone when
-        // there is nothing to quote.
         let text = "version = 1\n\n[agent]\nnet = [{ host = \"a.test\", why = \"a reason\" }]\n";
         let policy = Policy::parse(text, &roots).unwrap();
         assert_eq!(
@@ -1611,8 +1491,6 @@ exec = { timeout-secs = 60 }
 
     #[test]
     fn an_mcp_grant_names_a_server_and_each_of_its_tools() {
-        // D103: the grant is what makes a server and its tools reachable, and both the prompt and
-        // `saddle check` print it because both read these lines.
         let (_d, roots) = roots();
         let policy = Policy::parse(
             r#"
@@ -1644,7 +1522,6 @@ mcp = [{ server = "job-scout", tools = ["search", "fetch-posting", "search"], wh
 
     #[test]
     fn an_mcp_grant_must_name_its_tools_rather_than_a_pattern() {
-        // D103: no wildcard, so a tool the server grows overnight is not callable on its own.
         let (_d, roots) = roots();
         for body in [
             r#"mcp = [{ server = "x" }]"#,

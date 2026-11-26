@@ -1,5 +1,3 @@
-//! The closed scope enumeration (plan §4).
-
 use std::fmt;
 use std::str::FromStr;
 

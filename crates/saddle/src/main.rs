@@ -69,29 +69,18 @@ use crate::tools::{ToolOutput, timeout};
     about = "Coding-agent harness whose plugins run under declared scopes"
 )]
 struct Cli {
-    /// Directory to start from; the workspace is the git toplevel above it.
     #[arg(long, short = 'C', global = true, default_value = ".")]
     dir: PathBuf,
-    /// Add a grant for this run only, as `scope` or `scope:what`: `--grant fs-read:scratch`,
-    /// `--grant exec`. Nothing is written, so it is gone when the session ends (D63).
     #[arg(long, global = true)]
     grant: Vec<String>,
-    /// Drop a scope's grants for this run only, as in `--revoke net` (D63).
     #[arg(long, global = true)]
     revoke: Vec<String>,
-    /// Use one of config.toml's `[profiles.<name>]` sets of grants for this run, instead of
-    /// `[agent]`; `none` is `[agent]` as written (D175). Nothing is written, so a new session starts
-    /// on the file's own default again.
     #[arg(long, global = true, value_name = "NAME")]
     profile: Option<String>,
-    /// Use this theme for one run without changing what is saved, as pi's `--use-theme` (D72).
     #[arg(long, global = true, value_name = "NAME")]
     use_theme: Option<String>,
-    /// Name the session, so an allowance made with `saddle session allow` can be used by it. One is
-    /// generated and printed when the workspace needs approving (D60).
     #[arg(long, global = true)]
     session: Option<String>,
-    /// With no command, saddle opens the terminal UI.
     #[command(flatten)]
     agent: AgentArgs,
     #[command(subcommand)]
@@ -100,77 +89,54 @@ struct Cli {
 
 #[derive(Args)]
 struct AgentArgs {
-    /// Give the new conversation a label at its first prompt (e.g. review/tests for a swarm).
     #[arg(long, conflicts_with = "resume_latest")]
     name: Option<String>,
-    /// A built-in provider (synthetic, openai) or a [providers.*] table from config.toml.
     #[arg(long, short)]
     provider: Option<String>,
-    /// Overrides the provider's model.
     #[arg(long, short)]
     model: Option<String>,
-    /// Model requests per prompt before the loop stops and waits for the user (default: no
-    /// limit; `max-steps` in config.toml sets one).
     #[arg(long)]
     max_steps: Option<usize>,
-    /// Continue the most recent session in this workspace.
     #[arg(long = "continue", short = 'c')]
     resume_latest: bool,
-    /// Write one JSON object per line on stdout instead of text (D52). Implies line mode, even on
-    /// a terminal, and leaves stderr for host errors.
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Inspect shipped standard components, or print explicit delegation defaults without editing config.
     Tools {
         #[arg(long)]
         config: bool,
     },
-    /// Explicit local WASI plugins: installing is separate from enablement and grants (D128).
     Plugin {
         #[command(subcommand)]
         cmd: PluginCmd,
     },
-    /// Run the agent. With a prompt, answer it and exit. Without one, open the terminal UI, or
-    /// read one prompt per line when stdin is not a terminal.
     Run {
         prompt: Option<String>,
         #[command(flatten)]
         agent: AgentArgs,
     },
-    /// Print the policies in force, the roots and the effective grants.
     Check,
-    /// Run one built-in tool as the agent, through the policy gate.
     Tool {
-        /// read, write, edit or bash.
         name: String,
-        /// The tool input as JSON, e.g. '{"path": "src/main.rs"}'.
         input: String,
     },
-    /// MCP servers: what each declared and granted one actually offers (D107).
     Mcp {
         #[command(subcommand)]
         cmd: McpCmd,
     },
-    /// Log in to a provider: an OAuth provider's browser code, or an API key typed in (D85).
     Login {
-        /// The provider's name, as `saddle check` and `/login` list it.
         provider: String,
     },
-    /// Forget a provider's stored credential (D85).
     Logout {
-        /// The provider's name.
         provider: String,
     },
-    /// Session allowances: letting one session id use a workspace that holds credentials (D60).
     Session {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
-    /// Audit log commands.
     Audit {
         #[command(subcommand)]
         cmd: AuditCmd,
@@ -179,36 +145,23 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum PluginCmd {
-    /// Copy a local manifest and component to protected storage; do not enable or grant it.
     Install { manifest: PathBuf },
-    /// Inspect enabled/granted plugins and show any load failure.
     List,
-    /// Call one enabled and granted plugin through the same path as the model.
     Call { id: String, input: String },
 }
 
 #[derive(Subcommand)]
 enum McpCmd {
-    /// Start each declared and granted server, and say what it offers against what is granted.
     List,
-    /// Sign in to a remote server's authorization server, storing the token where no command can
-    /// read it.
     Auth {
-        /// The server's name, as `[mcp.<name>]` spells it.
         server: String,
     },
-    /// Forget the token a server's sign-in stored.
     Logout {
-        /// The server's name, as `[mcp.<name>]` spells it.
         server: String,
     },
-    /// Call one tool of a declared server, the way the model would, with no conversation around it.
     Call {
-        /// The server's name, as `[mcp.<name>]` and the grant spell it.
         server: String,
-        /// The tool's own name, without the `mcp__…` prefix.
         tool: String,
-        /// The arguments, as one JSON object.
         #[arg(default_value = "{}")]
         input: String,
     },
@@ -216,39 +169,27 @@ enum McpCmd {
 
 #[derive(Subcommand)]
 enum SessionCmd {
-    /// Allow one session id to use a workspace. Run this as yourself, in a terminal: the file it
-    /// writes is outside every root, so nothing the agent runs can write it (D60).
     Allow {
-        /// The session id, as printed by the session that was refused.
         id: String,
-        /// The workspace to allow. Taken from the waiting request when not given.
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
-    /// List the session ids waiting for an allowance, with their workspaces.
     Pending,
-    /// List the workspaces a session id is already allowed to use, so one can be picked instead of
-    /// remembered (D61). `filter` matches the id or the workspace path, ignoring case.
     List {
         #[arg(default_value = "")]
         filter: String,
     },
-    /// Withdraw an allowance, so that session id can no longer run in the workspace (D61). Takes
-    /// what the list shows: a number, or an id or unique prefix.
     Revoke {
-        /// A number from `session list`, or an id or unique prefix.
         id: String,
     },
 }
 
 #[derive(Subcommand)]
 enum AuditCmd {
-    /// Walk a session log's hash chain and compare its head with sessions.jsonl.
     Verify { log: PathBuf },
 }
 
 fn main() -> ExitCode {
-    // The sandbox helper (D18) runs before anything else touches the environment or arguments.
     if env::args_os().nth(1).is_some_and(|a| a == "__sandbox") {
         saddle_sandbox::helper_main();
     }
@@ -269,10 +210,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     {
         return verify(log);
     }
-    // First run: write the default config (D30).
     let paths = paths::Paths::from_env()?;
-    // Before the defaults are written, so a config created here does not shadow the grants an
-    // older install still keeps in `policy.toml` (D63).
     let migrated: Vec<PathBuf> =
         config::migrate(&paths.user_config(), &paths.policies_dir()).unwrap_or_default();
     let mut created: Vec<String> = defaults::ensure(&paths)?
@@ -286,7 +224,6 @@ fn run(cli: Cli) -> Result<ExitCode> {
             paths.user_config().display()
         ));
     }
-    // The agent shows these itself (the TUI's intro, or line mode's header).
     if !matches!(cli.cmd, None | Some(Cmd::Run { .. })) {
         for line in &created {
             eprintln!("saddle: {line}");
@@ -297,14 +234,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         revoke: cli.revoke,
         profile: cli.profile,
     };
-    // One id for the whole invocation: it names the session in the audit log, and it is what an
-    // allowance is written against (D60).
     let session = match cli.session {
         Some(id) => {
             allow::check_id(&id)?;
-            // A prefix is enough when it names exactly one allowance, so an id does not have to be
-            // copied in full (D61). Without a match the id is used as given, which is what an
-            // allowance is then made for.
             let allowance = allow::Allowance::new(&paths.state);
             match allow::Allowance::resolve(&id, &allowance.allowed())? {
                 Some(full) => full,
@@ -364,7 +296,6 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
-/// What this invocation chose that is not written to any file (D63, D72).
 struct OneRun<'a> {
     session: &'a str,
     overrides: &'a config::Overrides,
@@ -380,8 +311,6 @@ fn run_agent(
     one: OneRun<'_>,
 ) -> Result<ExitCode> {
     let user = UserConfig::load(&paths.user_config())?;
-    // Before a provider is chosen and before anything is opened, so a refusal costs nothing: no
-    // session, no audit log, no network call (D60).
     let picked = {
         let workspace = dir
             .canonicalize()
@@ -396,8 +325,6 @@ fn run_agent(
     let interactive =
         prompt.is_none() && !args.json && io::stdin().is_terminal() && io::stdout().is_terminal();
     let mut notes = created;
-    // In the TUI, anything missing (a provider, its model, its key) opens the login dialog.
-    // Without it there is nowhere to fix that, so it stops here.
     let (provider, start) = match args.provider.or_else(|| user.provider.clone()) {
         None if interactive => (None, tui::Start::ChooseProvider),
         None => bail!(
@@ -408,8 +335,6 @@ fn run_agent(
             Ok(config) => {
                 let mut p = Provider::new(&name, config, auth.key(&name), &reported)
                     .with_stored_oauth(&paths.auth_store());
-                // Headless there is no session to update later, so the endpoint is asked now
-                // rather than a guess carried into the first turn (D34).
                 if !interactive {
                     p.refresh_tokens()?;
                     provider::ask_endpoint(&p, &paths.reported_windows());
@@ -432,8 +357,6 @@ fn run_agent(
     };
 
     let mut session = Session::open_with(dir, Some(session), one.overrides)?;
-    // The provider resolved above is the one in use, which `-p` can make differ from the config's
-    // default; the web search follows it (D82).
     session.search = provider
         .as_ref()
         .and_then(provider::Provider::search_target);
@@ -450,7 +373,6 @@ fn run_agent(
     notes.extend(session.skill_notes.clone());
     notes.extend(session.plugins.report());
 
-    // A bad `[ui] status` is reported where it can be seen, and the session keeps the default.
     let status = match user.ui.status.as_deref() {
         None => tui::status::Template::default(),
         Some(text) => match tui::status::Template::parse(text) {
@@ -461,8 +383,6 @@ fn run_agent(
             }
         },
     };
-    // A theme that does not build is reported here rather than only in the TUI, so a mistake in
-    // config.toml is visible wherever saddle runs. The default is drawn meanwhile (D71).
     if let Err(e) = tui::theme_selected(&user) {
         notes.push(format!("{e:#}"));
     }
@@ -486,12 +406,10 @@ fn run_agent(
         status,
         show_reasoning: user.ui.show_reasoning.unwrap_or(true),
         expand_tools: user.ui.expand_tools.unwrap_or(false),
-        // Unlimited unless the flag or the config sets a limit (D37).
         max_steps: args.max_steps.or(user.max_steps),
         images: user.ui.images.clone(),
         notify: user.ui.notify.unwrap_or_default(),
         math_scale: user.ui.math_scale.unwrap_or(1.0),
-        // One run's choice wins over the saved setting, and is not written anywhere.
         theme: one.theme.clone().or_else(|| user.ui.theme.clone()),
         keys: user.keys.clone(),
     };
@@ -506,12 +424,7 @@ fn run_agent(
         None
     };
     let max_steps = header.max_steps;
-    // A `direct` server is started now rather than at the first search, because its schemas are
-    // part of the first request (D117). A failure here is not fatal: the model gets the rest of
-    // the tools, and `/mcp` says which server did not start.
     let mcp_notes = {
-        // The registry is a field of the session it has to ask, so it is taken out for the start
-        // and put back, the way a tool call does it (D108).
         let mut registry = mem::take(&mut session.mcp);
         let notes = registry.start_direct(&mut session);
         session.mcp = registry;
@@ -532,21 +445,16 @@ fn run_agent(
         Some(store),
         compact::Settings::from_config(&user.compaction),
     );
-    // Kept so the prompt can be rebuilt when discovery runs again (D70).
     agent.set_context(context.clone());
     agent.set_initial_name(args.name);
 
     if interactive {
-        // `/mcp` is where a failure shows in the interface; a line is the whole screen here.
         tui::run(agent, session, header, paths, start, latest)?;
         return Ok(ExitCode::SUCCESS);
     }
     for note in &mcp_notes {
         eprintln!("saddle: an mcp server did not start — {note}");
     }
-    // A question is asked on the terminal only where one is sitting at it: a piped run has no one to
-    // ask, and a JSON stream has a program at the other end, so both leave the tool unanswered
-    // rather than eating a line that was a prompt (D197).
     if !args.json && io::stdin().is_terminal() {
         session.questions = Some(Box::new(output::LineQuestions));
     }
@@ -588,7 +496,6 @@ fn run_agent(
     Ok(code)
 }
 
-/// Line mode: one prompt from the command line, or one per line of stdin.
 fn converse(
     agent: &mut Agent,
     session: &mut Session,
@@ -598,8 +505,6 @@ fn converse(
 ) -> Result<ExitCode> {
     if let Some(prompt) = prompt {
         let mut end = line_turn(agent, session, out, &prompt, theme)?;
-        // D174: work the agent asked to be woken by keeps a one-shot run going, so a background
-        // task it started is not killed by the process leaving. Each completion is one more turn.
         if let Some(last) = wake_turns(agent, session, out)? {
             end = last;
         }
@@ -661,12 +566,6 @@ fn converse(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Waits for the background work the agent asked to be woken by, and runs the follow-up turns that
-/// show it the completions (D174).
-///
-/// A one-shot run has no idle tick to do this, so a task the agent is waiting on would otherwise be
-/// killed when the process leaves. Answers with the last turn's end when a turn ran, and with none
-/// when there was nothing left to wait for.
 fn wake_turns(
     agent: &mut Agent,
     session: &mut Session,
@@ -675,15 +574,10 @@ fn wake_turns(
     let mut last = None;
     let _sigint = cancel::SigintGuard::install();
     loop {
-        // A run the person interrupted stays interrupted: the wait ends, and no follow-up turn is
-        // started on their behalf.
         if cancel::requested() {
             return Ok(last);
         }
         while tasks::waiting(session)? || session.team.working() {
-            // The monitors, the proxy and the audit are serviced from here, as they are on an idle
-            // tick (D153, D159). Ctrl+C ends the wait, not the process: the session still closes
-            // through its own cleanup.
             if cancel::requested() {
                 return Ok(last);
             }
@@ -692,8 +586,6 @@ fn wake_turns(
         if !(tasks::pending(session)? || session.team.pending()) {
             return Ok(last);
         }
-        // The turn consumes the completion itself: it notes it to the person and puts the
-        // host-owned notification in front of the model (D159).
         cancel::reset();
         let Some(end) = agent.background_turn(session, out)? else {
             return Ok(last);
@@ -704,8 +596,6 @@ fn wake_turns(
     }
 }
 
-/// One line-mode prompt: `!cmd` and `!!cmd` run a command, `/compact` compacts, anything else is
-/// a turn. Ctrl+C cancels it (D19).
 fn line_turn(
     agent: &mut Agent,
     session: &mut Session,
@@ -742,8 +632,6 @@ fn line_turn(
                 out.info(&session::profile_report(&session.setup));
                 End::Answered
             } else {
-                // A switch is a policy change, so it is applied the way `/reload` applies one (D47):
-                // the session reloads, the model's next request carries the new grants (D175).
                 let chosen = (arg != config::NONE_PROFILE).then_some(arg);
                 match session.switch_profile(chosen) {
                     Ok(()) => {
@@ -775,9 +663,6 @@ fn line_turn(
                 result => result?,
             }
             agent.refresh_extensions(session, out);
-            // Everything the prompt and the interface were built from, read again (D70). Skills and
-            // instruction files reach the model on its next request; a newly added instruction file
-            // is also handed to the conversation, so the transcript shows it arriving.
             let cfg = session.setup.context.clone();
             let paths = session.setup.paths.clone();
             let (files, refused) = context::load(session, &cfg, &paths)?;
@@ -802,9 +687,6 @@ fn line_turn(
             );
             End::Answered
         } else if text == "/theme" || text.starts_with("/theme ") {
-            // A screen has the list to choose from (D74); a piped session has the names, and the
-            // same switch, so a command meant for the interface is not sent to the model as a
-            // prompt and charged for.
             theme_command(
                 session,
                 out,
@@ -813,9 +695,6 @@ fn line_turn(
             )?;
             End::Answered
         } else if let Some(rest) = text.strip_prefix("/skill:") {
-            // The same expansion as the TUI's, from the skills the session discovered (D69). A
-            // prompt written as a skill command works the same way in line mode, so a piped prompt
-            // does not need a different spelling.
             let name = rest.split_whitespace().next().unwrap_or_default();
             let args = rest[name.len()..].trim();
             match session.skills.iter().find(|s| s.name == name) {
@@ -845,8 +724,6 @@ fn line_turn(
     Ok(end)
 }
 
-/// `/theme` without a screen: report the names, or switch to one and save it, as the interface does
-/// (D71, D74).
 fn theme_command(
     session: &Session,
     out: &mut output::Output,
@@ -873,8 +750,6 @@ fn theme_command(
         );
         return Ok(());
     }
-    // Built before it is written, for the reason the interface gives: a name that does not build
-    // must not be saved, or the next session opens on an error whose cause is not on screen.
     match tui::theme::build(asked, &user.themes) {
         Ok(theme) => {
             config::edit(&config, |doc| {
@@ -891,15 +766,6 @@ fn theme_command(
     Ok(())
 }
 
-/// Refuses to open a session in a workspace that puts credentials in reach, unless a person has
-/// allowed this session id to use it (D60).
-///
-/// The warning cannot be answered where it is printed: there is no keypress and no `--force`. It
-/// names the session id and the command that allows it, and the allowance is written by a separate
-/// invocation, from a person's terminal, into the state directory — outside every root, so the agent
-/// cannot grant itself anything (D16). The allowance covers this id and that workspace and is
-/// removed when the session ends. `allow-sensitive` in the user's config skips the check entirely
-/// for machines where the home directory holds nothing secret.
 fn gate_workspace(paths: &paths::Paths, workspace: &Path, id: &str) -> Result<Option<String>> {
     let user = UserConfig::load(&paths.user_config())?;
     if user.allow_sensitive {
@@ -913,10 +779,7 @@ fn gate_workspace(paths: &paths::Paths, workspace: &Path, id: &str) -> Result<Op
     if allowance.allows(id, workspace) {
         return Ok(None);
     }
-    // Sessions already allowed for this workspace. Picking one is how a person avoids remembering
-    // an id (D61); it does not approve anything new, because a person made those allowances.
     let reusable = allowance.for_workspace(workspace);
-    // Record the request, so the id stays findable after this message has scrolled away.
     allowance.request(id, workspace)?;
     let chosen = env::current_exe()
         .ok()
@@ -965,18 +828,12 @@ fn gate_workspace(paths: &paths::Paths, workspace: &Path, id: &str) -> Result<Op
     message.push_str(
         "  or set `allow-sensitive = true` in config.toml if this machine's home holds no secrets",
     );
-    // Only where a person is sitting: a picker that read from a pipe would eat a prompt.
     if !reusable.is_empty() && io::stdin().is_terminal() {
         return pick_allowed(&reusable, workspace);
     }
     bail!("{message}")
 }
 
-/// Asks which already-allowed session id to use, and returns it (D61).
-///
-/// This is not approving anything: the allowances listed were made by a person with
-/// `saddle session allow`. Picking one just saves copying an id, and an empty answer stops as the
-/// refusal would have.
 fn pick_allowed(candidates: &[(String, allow::Entry)], workspace: &Path) -> Result<Option<String>> {
     eprintln!("saddle: pick one of these, or press enter to stop:");
     for (n, (id, entry)) in candidates.iter().enumerate() {
@@ -1004,9 +861,6 @@ fn pick_allowed(candidates: &[(String, allow::Entry)], workspace: &Path) -> Resu
     }
 }
 
-/// `saddle session`: the allowance commands, which are a person's tool and never a tool the agent
-/// can call (D45, D46). The files are in the state directory, so a sandboxed child cannot write
-/// them either.
 fn session_cmd(cmd: SessionCmd, paths: &paths::Paths) -> Result<ExitCode> {
     let allowance = allow::Allowance::new(&paths.state);
     match cmd {
@@ -1066,7 +920,6 @@ fn session_cmd(cmd: SessionCmd, paths: &paths::Paths) -> Result<ExitCode> {
                     entry.workspace.display()
                 );
             }
-            // The command that undoes each line, named where the lines are (D61).
             println!(
                 "  withdraw one with: saddle session revoke <number>   (or a prefix of the id)"
             );
@@ -1077,9 +930,6 @@ fn session_cmd(cmd: SessionCmd, paths: &paths::Paths) -> Result<ExitCode> {
                 println!("no session is waiting for an allowance");
             }
             for (id, entry) in waiting {
-                // A refused session exits, so its request is a record of what was asked for
-                // rather than a live process. The age is what tells a person whether it is the
-                // message still on their screen.
                 let allowed = if allowance.allows(&id, &entry.workspace) {
                     "  (allowed)"
                 } else {
@@ -1093,8 +943,6 @@ fn session_cmd(cmd: SessionCmd, paths: &paths::Paths) -> Result<ExitCode> {
             }
         }
         SessionCmd::Revoke { id } => {
-            // The same short forms as `--session`, because a revocation should not be harder to
-            // type than the permission it removes (D61).
             let allowed = allowance.allowed();
             let id = match allow::Allowance::resolve(&id, &allowed)? {
                 Some(id) => id,
@@ -1123,15 +971,10 @@ fn session_cmd(cmd: SessionCmd, paths: &paths::Paths) -> Result<ExitCode> {
 fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
     let tmp = PrivateTmp::create(&session_id())?;
     let setup = Setup::load(dir, tmp.path(), overrides)?;
-    // The layering happens in `Setup::load`, so an invalid project file is reported here rather
-    // than on the first tool call.
     println!("workspace  {}", setup.workspace.display());
     for what in &setup.exposed {
-        // `check` is the review tool, so it reports what a session here would put in reach and
-        // still succeeds: no directory is invalid, the person decides (D60).
         println!("           in reach: {what}");
     }
-    // D65: the file tools' namespace, which is not the same set as what a child may reach below.
     println!("roots      what read, ls, find, grep, write and edit decide over");
     for (name, path) in setup.roots.iter() {
         let note = if name.as_str() == "tmp" {
@@ -1141,16 +984,11 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
         };
         println!("  {:<12} {}{note}", name.as_str(), path.display());
     }
-    // Both files, in the order they apply, since a grant can come from either (D43).
-    // One file now (D63): the base grants and this workspace's own, with the hash of each so a
-    // change is visible.
     println!(
         "grants     {} (sha256 {})",
         setup.policy_path.display(),
         &setup.global_sha256[..16]
     );
-    // Which base those grants are layered on (D175), with the alternatives, so a profile that is in
-    // force is visible and one that could be is discoverable.
     println!(
         "profile    {}{}",
         setup
@@ -1184,8 +1022,6 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ");
-        // A tool that delegates nothing — the configuration reference — is present without a line
-        // of nothing after its colon.
         println!(
             "  {name}: {}",
             if said.is_empty() { "no scopes" } else { &said }
@@ -1215,13 +1051,9 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
             println!("  {name} = {value}");
         }
     }
-    // D104: the servers a person declared, and which of them a grant enables. A server that is
-    // declared and not granted, or granted and not declared, is the mistake worth seeing here.
     for line in &setup.mcp {
         println!("mcp        {line}");
     }
-    // D66: directories the file tools reach outside every root, and the tools on each. Not roots:
-    // no policy can name one, and they are not part of the session.
     if !setup.tool_paths.is_empty() {
         println!(
             "tool paths  reachable by these tools, outside every root, not part of the session"
@@ -1230,7 +1062,6 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
             println!("  {:<28} {}", path.written, path.tools.join(", "));
         }
     }
-    // A pattern is an input; this list is the authority a command actually runs under (D62).
     if !setup.extras.include.is_empty() || !setup.extras.read.is_empty() {
         println!("exec reads");
         for path in setup.extras.include.iter().chain(&setup.extras.read) {
@@ -1289,13 +1120,10 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
         Ok(abi) => println!("exec       available (landlock ABI {abi})"),
         Err(reason) => println!("exec       unavailable: {reason}"),
     }
-    // A command used to have no network at all; now it has its own, with one door (D79).
     match saddle_sandbox::network_availability() {
         Ok(what) => println!("net        a command gets {what}"),
         Err(reason) => println!("net        a command has no network: {reason}"),
     }
-    // What an attached picture will do, and what decided it, since a terminal that draws nothing
-    // looks the same as one that was never asked (D59).
     {
         let get = |k: &str| env::var(k).ok();
         let setting = UserConfig::load(&setup.paths.user_config())?.ui.images;
@@ -1306,8 +1134,6 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
         };
         println!("images     {protocol:?}, {why}");
     }
-    // What a formula is sized against (D165): the cell, and whether the terminal is the one that
-    // said so, because a guess and an answer look the same on screen.
     {
         let (cell, answered) = tui::terminal::cell_report();
         let source = if answered {
@@ -1318,14 +1144,10 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
         println!("cell       {}x{} px, {source}", cell.0, cell.1);
     }
     let user = UserConfig::load(&setup.paths.user_config())?;
-    // D165: how large a formula is drawn, and what decided it, because a formula that is the wrong
-    // size is a setting to check rather than something to rebuild the binary for.
     println!(
         "math       {}x the size its fonts and the terminal's cell give",
         user.ui.math_scale.unwrap_or(1.0)
     );
-    // D169: the moves that have a key only because `[keys]` gave them one, since a key that never
-    // fires is a line to look at rather than a bug to report.
     println!(
         "keys       {}",
         user.keys
@@ -1355,15 +1177,9 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
                     p.window(),
                     p.window_source()
                 );
-                // D36: what a reply costs, and where that came from, since nothing shows it until
-                // a session has spent something.
                 println!("price      {}", price_line(p.price()));
-                // D100, D101: every one of these is conditional and silent, so the review tool is
-                // where a person sees which of them this provider will actually be given.
                 println!("cache      {}", cache_line(&p));
                 if let Some(url) = &p.config.usage_url {
-                    // D36: the same figures the status line shows, so a shape that does not parse
-                    // can be seen without opening a session.
                     match p.usage(url) {
                         Ok(page) => {
                             let (quota, spent) = provider::quota_from_page(&page);
@@ -1371,8 +1187,6 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
                                 "usage      {}",
                                 usage_line(&quota, spent, SystemTime::now())
                             );
-                            // When nothing was recognised, the field names are what is needed to
-                            // teach the parser the shape; the figures are not printed (D36).
                             if quota.is_empty() && spent.is_none() {
                                 let paths = provider::page_paths(&page);
                                 if !paths.is_empty() {
@@ -1390,8 +1204,6 @@ fn check(dir: &Path, overrides: &config::Overrides) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The price as `check` prints it: dollars per million, and nothing when nobody priced the model.
-/// What this provider will be told about caching, and how its requests travel (D100, D101).
 fn cache_line(p: &Provider) -> String {
     let config = &p.config;
     let responses = format!("{}/responses", config.base_url.trim_end_matches('/'));
@@ -1430,7 +1242,6 @@ fn price_line(price: Option<provider::Price>) -> String {
     format!("{} per million tokens", parts.join(", "))
 }
 
-/// The two ways a model list or usage page can fail, as one sentence.
 fn models_error(e: &provider::ModelsError) -> String {
     match e {
         provider::ModelsError::Rejected(why) => format!("the key was refused: {why}"),
@@ -1438,8 +1249,6 @@ fn models_error(e: &provider::ModelsError) -> String {
     }
 }
 
-/// The usage page as `check` prints it, including "nothing found" rather than an empty line, since
-/// a shape the parser does not know is the likeliest reason a figure does not appear (D36).
 fn usage_line(quota: &provider::Quota, spent: Option<f64>, now: SystemTime) -> String {
     let mut parts = Vec::new();
     for window in &quota.windows {
@@ -1489,10 +1298,6 @@ fn usage_line(quota: &provider::Quota, spent: Option<f64>, now: SystemTime) -> S
     }
 }
 
-/// Logs in to a provider: the device code for an OAuth provider, a typed key otherwise (D85).
-///
-/// This runs in the terminal rather than behind the TUI dialog on purpose: the flow needs a prompt
-/// the person answers while a poll runs, and the terminal is where a code is read and typed.
 fn login(provider_name: &str, paths: &paths::Paths) -> Result<ExitCode> {
     let user = config::UserConfig::load(&paths.user_config())?;
     let config = provider::endpoint(provider_name, &user.providers)?;
@@ -1541,7 +1346,6 @@ fn login(provider_name: &str, paths: &paths::Paths) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Forgets a provider's stored credential.
 fn logout(provider_name: &str, paths: &paths::Paths) -> Result<ExitCode> {
     let store_path = paths.auth_store();
     let mut store = auth::AuthStore::load(&store_path)?;
@@ -1553,9 +1357,6 @@ fn logout(provider_name: &str, paths: &paths::Paths) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `saddle mcp list`: starts each server the policy grants and prints what it offers against what
-/// the grant allows (D107). This is the by-hand check `saddle tool` plays for the built-ins: a
-/// server that is declared, granted and broken says so here rather than at the first tool call.
 fn mcp_cmd(
     cmd: McpCmd,
     dir: &Path,
@@ -1575,9 +1376,6 @@ fn mcp_cmd(
     }
 }
 
-/// `saddle mcp logout <server>`: forget the token a sign-in stored (D121). The entry is the whole of
-/// it — there is nowhere else a token lives — so removing it is a complete sign-out, and a call
-/// afterwards says how to sign in again rather than silently retrying without one.
 fn mcp_logout(paths: &paths::Paths, server: &str) -> Result<ExitCode> {
     let store_path = paths.auth_store();
     let mut store = auth::AuthStore::load(&store_path)?;
@@ -1591,9 +1389,6 @@ fn mcp_logout(paths: &paths::Paths, server: &str) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `saddle mcp auth <server>`: the OAuth sign-in a remote server needs, discovered from the server
-/// itself (D115). Every request it makes is decided against the person's own net grants, because a
-/// host named by a document the server supplied is exactly what a grant is for.
 fn mcp_auth(
     dir: &Path,
     session: &str,
@@ -1652,9 +1447,6 @@ fn mcp_auth(
     Ok(code)
 }
 
-/// `saddle mcp call <server> <tool> '<json>'`: one call, decided and audited exactly as the model's
-/// would be (D111). It is what a person checks a server with before letting a model near it, and it
-/// is the only way to reach a remote server without a conversation to search from first.
 fn mcp_call(
     dir: &Path,
     session: &str,
@@ -1694,8 +1486,6 @@ fn mcp_call(
         bail!("`{server}` has no [mcp.{server}] table in config.toml");
     }
     let tmp = session.roots().get(&RootName::tmp()).map(Path::to_path_buf);
-    // The model's own path, not a second one beside it: the registry starts the server, declares
-    // what the grant allows, and decides the call exactly as it does for a model (D108, D112).
     let mut registry = mcp::registry::Registry::new(
         agent.mcp.clone(),
         user.mcp.clone(),
@@ -1776,8 +1566,6 @@ fn mcp_list(
             failed = true;
             continue;
         };
-        // A stdio server needs its command and arguments before it can be lowered; an HTTP one is
-        // reached by the URL its table already holds.
         let stdio = match entry.transport() {
             Ok(Transport::Stdio { command, args }) => Some((command.to_owned(), args.to_vec())),
             Ok(Transport::Http { .. }) => None,
@@ -1812,15 +1600,12 @@ fn mcp_list(
     })
 }
 
-/// What one listing needs that outlives the loop: where the sandbox helper is, and the little the
-/// spec needs that does not come from the grant.
 struct OneServer<'a> {
     helper: &'a Path,
     tmp: Option<&'a Path>,
     host_env: &'a [(String, String)],
 }
 
-/// One server, opened: whichever transport its table names (D107, D110).
 enum Opened {
     Stdio(Box<Client>, Option<Bridge>),
     Http(Box<mcp::http::Client>),
@@ -1836,10 +1621,8 @@ impl OneServer<'_> {
     ) -> Result<Opened> {
         match (entry.transport()?, stdio) {
             (Transport::Stdio { command, args }, Some(_)) => {
-                // One lowering, shared with the session's registry (D105, D107).
                 let mut spec =
                     mcp::lower::spec(session, grant, entry, command, args, self.host_env)?;
-                // A server gets the same network a command gets (D79): the relay here, one way out.
                 let bridge = self.tmp.and_then(|dir| Bridge::start(dir).ok());
                 if let Some(bridge) = &bridge {
                     spec.net = Some(bridge.spec());
@@ -1856,8 +1639,6 @@ impl OneServer<'_> {
                 ))
             }
             (Transport::Http { url }, _) => {
-                // No child to start, so the host makes the requests itself, decided against the
-                // server's own reach like every other one (D110).
                 let reach = mcp::lower::net_reach(session, grant)?;
                 Ok(Opened::Http(Box::new(mcp::http::Client::start(
                     &grant.server,
@@ -1889,8 +1670,6 @@ impl OneServer<'_> {
                 };
                 client.initialize(&mut service)?;
                 let tools = client.tools(&mut service)?;
-                // Dropped here, which kills the process group: a listing has no reason to leave a
-                // server running once it has answered.
                 drop(client);
                 tools
             }
@@ -1924,7 +1703,6 @@ impl OneServer<'_> {
     }
 }
 
-/// How a server's tools reach the model, in one word (D117).
 fn exposure(entry: &McpEntry) -> &'static str {
     match entry.exposure() {
         Exposure::Deferred => "deferred",
@@ -1997,7 +1775,6 @@ fn tool(
         bail!("unknown tool `{name}` (known: {})", tools::NAMES.join(", "));
     }
     let input: serde_json::Value = serde_json::from_str(input).context("tool input is not JSON")?;
-    // The same gate as the model loop: `saddle tool` runs as the agent (D17, D60).
     let workspace = dir
         .canonicalize()
         .map(|abs| paths::find_workspace(&abs))
@@ -2005,9 +1782,6 @@ fn tool(
     let picked = gate_workspace(paths, &workspace, session)?;
     let session = picked.as_deref().unwrap_or(session);
     let mut session = Session::open_with(dir, Some(session), overrides)?;
-    // Discovery's notes say why a skill was not advertised. Line mode shows them in its header and
-    // the TUI in its intro; without this a refused or malformed skill is silent here, which is the
-    // shape a silent skip takes (D68).
     for note in &session.skill_notes {
         eprintln!("saddle: {note}");
     }
@@ -2068,8 +1842,6 @@ fn verify(log: &Path) -> Result<ExitCode> {
             );
             return Ok(ExitCode::from(1));
         }
-        // Intact but unvouched: the chain holds, yet no index entry names this log, so it cannot
-        // be checked against the close record. Said plainly rather than passed over (D10).
         None => println!("chain intact, but no entry in sessions.jsonl names this log"),
     }
     Ok(ExitCode::SUCCESS)
@@ -2082,8 +1854,6 @@ mod tests {
 
     #[test]
     fn the_usage_line_says_what_is_left_and_when_it_refills() {
-        // The real page, through the parser, so the line is checked against what `saddle check`
-        // will actually print for this provider rather than against a hand-built figure (D49).
         let page: serde_json::Value = serde_json::from_str(
             r#"{"subscription":{"limit":500,"requests":0,
                     "renewsAt":"2026-11-12T13:18:26.671Z"},
@@ -2093,15 +1863,12 @@ mod tests {
         )
         .unwrap();
         let (quota, spent) = provider::quota_from_page(&page);
-        // An hour before the stamp in the page, so the line says how long is left rather than
-        // repeating the date the provider already sent (D49).
         let regen = humantime::parse_rfc3339("2026-11-12T08:26:09.000Z").unwrap();
         let now = regen - Duration::from_secs(3600);
         assert_eq!(
             usage_line(&quota, spent, now),
             "94% of the plan left, resets in 1h"
         );
-        // Nothing recognised is said plainly, so the diagnostic reads as a finding.
         assert_eq!(
             usage_line(&provider::Quota::default(), None, now),
             "the response states no figure saddle recognises"

@@ -1,5 +1,3 @@
-//! bounded loopback HTTP fixtures, stopped even when a refused request never arrives.
-
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};

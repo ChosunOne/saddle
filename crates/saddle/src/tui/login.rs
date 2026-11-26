@@ -1,11 +1,3 @@
-//! The /login dialog: pick a provider, enter its key or sign in through the browser, let the host
-//! check the credential by listing the provider's models, then pick a model.
-//!
-//! A provider that authenticates with OAuth has no key to type, so picking it starts a device
-//! sign-in instead: the code and the address go on screen, the host polls in the background, and the
-//! model list follows the approval (D85). The dialog never does the network itself, so the
-//! interface stays live while a poll is in flight.
-
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::provider::ModelsError;
@@ -13,27 +5,18 @@ use crate::provider::ModelsError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Choice {
     pub name: String,
-    /// The model, or the server address, shown beside the name.
     pub detail: String,
-    /// "logged in", "key from $VAR", "no key needed", or empty.
     pub status: String,
-    /// The provider names a key variable, so it cannot run without a key.
     pub needs_key: bool,
-    /// A key is already available, from the environment or the key store.
     pub has_key: bool,
-    /// The configured model, selected first in the model list.
     pub model: Option<String>,
-    /// The entry that adds a new OpenAI-compatible server.
     pub custom: bool,
-    /// This provider signs in with OAuth, so it has no key to type (D85).
     pub oauth: bool,
 }
 
-/// A device sign-in as the dialog shows it: where to go, the code to type, and what went wrong.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Device {
     pub url: String,
-    /// `None` until the host has asked the server for one.
     pub code: Option<String>,
     pub error: Option<String>,
 }
@@ -68,13 +51,10 @@ impl Field {
     }
 }
 
-/// What the host needs to list models: the provider, and a key or address entered here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Draft {
     pub provider: String,
-    /// `None` keeps the key the provider already has, or uses none.
     pub key: Option<String>,
-    /// Set for a new OpenAI-compatible server.
     pub base_url: Option<String>,
 }
 
@@ -86,25 +66,18 @@ pub struct LoginRequest {
     pub base_url: Option<String>,
 }
 
-/// One model of one provider, as the picker lists them (D89).
-///
-/// The id alone is not enough once the list spans providers: two of them may serve a model with the
-/// same name, and choosing an entry has to say which provider it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pick {
     pub provider: String,
     pub model: String,
 }
 
-/// What a listing answered, and which providers it could not ask (D89).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Listed {
     pub picks: Vec<Pick>,
-    /// One line per provider that failed, so a partial list says what is missing from it.
     pub failed: Vec<String>,
 }
 
-/// Why the dialog is open: to sign in, or to choose the model of a provider already set up (D88).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
     Login,
@@ -115,11 +88,9 @@ pub enum Purpose {
 pub enum Stage {
     Pick,
     Fill,
-    /// Waiting for the model list; `id` matches the answer to this request.
     Checking {
         id: u64,
     },
-    /// Waiting for a device sign-in to be approved; `id` matches this attempt (D85).
     SigningIn {
         id: u64,
     },
@@ -135,23 +106,14 @@ pub enum Stage {
 pub enum Outcome {
     Stay,
     Close,
-    /// List the models for this draft and answer with [`Login::models`].
     Check(u64, Draft),
-    /// List what every provider serves and answer with [`Login::models`] (D89).
     ListAll(u64),
-    /// Use this provider and model in this conversation only (D91).
     Use(Pick),
-    /// Use it, and make it what a new session starts with: both the provider and the model (D91).
     Default(Pick),
-    /// The login flow, where the credential and the model entered are the new default (D85).
     Submit(LoginRequest),
-    /// Start a device sign-in for this provider (D85).
     SignIn(u64, String),
-    /// That sign-in was abandoned, so the host should stop polling for it (D85).
     CancelSignIn(u64),
-    /// Open this link in the person's browser (D86).
     OpenLink(String),
-    /// Put this link on the clipboard (D86).
     CopyLink(String),
 }
 
@@ -162,21 +124,12 @@ pub struct Login {
     pub fields: Vec<Field>,
     pub at: usize,
     pub error: Option<String>,
-    /// The sign-in on screen while `Stage::SigningIn` waits.
     pub device: Device,
-    /// What the host owes this dialog, when it was opened straight at a provider: a sign-in to
-    /// start, or the model list to ask for (D85).
     pending: Option<Outcome>,
-    /// Signing in, or only picking a model (D88).
     purpose: Purpose,
-    /// The provider in force when the picker opened, so a model typed rather than chosen goes to
-    /// the provider the session is already using (D89).
     current: Option<String>,
-    /// That provider's model, which the title names and the highlight starts on (D89).
     current_model: Option<String>,
-    /// Where keys are stored, shown under the key field.
     pub auth_path: String,
-    /// Opened at a provider's fields directly; esc there closes instead of going back.
     direct: bool,
     builtin: Vec<String>,
     draft: Option<Draft>,
@@ -184,11 +137,9 @@ pub struct Login {
 }
 
 pub const CUSTOM_LABEL: &str = "other OpenAI-compatible server";
-/// Rows of the model list shown at once.
 pub const MODEL_ROWS: usize = 12;
 
 impl Login {
-    /// `preselect` picks a provider; with `direct`, the dialog opens at its fields.
     pub fn new(
         choices: Vec<Choice>,
         builtin: Vec<String>,
@@ -217,8 +168,6 @@ impl Login {
         };
         if direct && found.is_some() {
             login.direct = true;
-            // A constructor cannot start anything, so what the choice asks for is left for the
-            // host, which takes it straight after opening the dialog.
             let outcome = login.choose();
             if outcome != Outcome::Stay {
                 login.pending = Some(outcome);
@@ -227,13 +176,6 @@ impl Login {
         login
     }
 
-    /// The picker over every provider at once (D89).
-    ///
-    /// `/model` has to answer "what can I switch to", and on a machine with more than one provider
-    /// that is not one list: the subscription serves models the API key does not, and each names
-    /// them differently. So the list is the union, every entry carrying its provider, and choosing
-    /// one switches both. `current` is the provider in force, which is what a typed name means and
-    /// whose model is preselected.
     pub fn for_all_models(
         choices: Vec<Choice>,
         current: &str,
@@ -259,8 +201,6 @@ impl Login {
         &self.choices[self.selected]
     }
 
-    /// The provider and model in force, which a typed name is relative to and the title names
-    /// (D89).
     pub fn in_force(&self) -> Option<(&str, &str)> {
         Some((
             self.current.as_deref()?,
@@ -272,7 +212,6 @@ impl Login {
         matches!(self.stage, Stage::Checking { .. })
     }
 
-    /// Esc closes the dialog rather than stepping back.
     pub fn esc_closes(&self) -> bool {
         self.purpose == Purpose::Model
             || self.stage == Stage::Pick
@@ -280,8 +219,6 @@ impl Login {
     }
 
     fn choose(&mut self) -> Outcome {
-        // Picking a model for a provider that is already set up: there is nothing to type, so the
-        // listing is the only question (D88).
         if self.purpose == Purpose::Model {
             self.next_id += 1;
             let id = self.next_id;
@@ -290,8 +227,6 @@ impl Login {
             return Outcome::ListAll(id);
         }
         if self.choices[self.selected].oauth {
-            // Already signed in: there is nothing to type and nothing to wait for, so the model
-            // list is the only question left (D85).
             if self.choices[self.selected].has_key {
                 return self.ask_models();
             }
@@ -335,10 +270,6 @@ impl Login {
         Outcome::Stay
     }
 
-    /// Where esc goes from a stage the credential was needed for: the fields, or the list.
-    ///
-    /// An OAuth provider has no fields, so going back to them would leave the next keystroke
-    /// indexing an empty list.
     fn back(&mut self) {
         if self.fields.is_empty() {
             self.stage = Stage::Pick;
@@ -349,22 +280,15 @@ impl Login {
         self.error = None;
     }
 
-    /// The address to type the code at, once the server has named one.
     pub fn link(&self) -> Option<String> {
         let url = self.device.url.trim();
         (!url.is_empty()).then(|| url.to_owned())
     }
 
-    /// Whether this attempt is the one on screen, so a stale answer is not acted on (D85).
     pub fn is_signing_in(&self, id: u64) -> bool {
         self.stage == (Stage::SigningIn { id })
     }
 
-    /// Moves to the sign-in stage and answers with what the host must start (D85).
-    ///
-    /// Marking it asked is what keeps a second call from polling a second time: the host asks once
-    /// when the dialog opens at a provider directly, and the key handler answers once when a person
-    /// picks one from the list.
     fn begin_sign_in(&mut self) -> Option<(u64, String)> {
         let c = self.choices.get(self.selected)?;
         if !c.oauth {
@@ -379,7 +303,6 @@ impl Login {
         Some((id, provider))
     }
 
-    /// Moves to the model list for this provider's already-stored credential.
     fn ask_models(&mut self) -> Outcome {
         let draft = Draft {
             provider: self.choice().name.clone(),
@@ -394,8 +317,6 @@ impl Login {
         Outcome::Check(id, draft)
     }
 
-    /// What the host owes the dialog, when it was opened straight at a provider: taken once, so a
-    /// sign-in is not started twice and a listing is not asked for twice.
     pub fn take_pending(&mut self) -> Option<Outcome> {
         self.pending.take()
     }
@@ -411,9 +332,6 @@ impl Login {
         if key.code == KeyCode::Esc && self.esc_closes() {
             return Outcome::Close;
         }
-        // Read before the stage is borrowed mutably. A typed name belongs to the provider in force
-        // in the picker, or — in the login flow, where the list is one provider's — to the provider
-        // the draft is for (D89).
         let current = self.current.clone().or_else(|| {
             self.draft
                 .as_ref()
@@ -451,7 +369,6 @@ impl Login {
             },
             Stage::Checking { .. } => {
                 if key.code == KeyCode::Esc {
-                    // A picker has nothing behind it to step back to (D88).
                     if self.purpose == Purpose::Model {
                         return Outcome::Close;
                     }
@@ -459,10 +376,6 @@ impl Login {
                 }
             }
             Stage::SigningIn { id } => {
-                // The two things a person needs from this screen: the link opened, and the link
-                // copied. The code is already on the clipboard by now (D86).
-                // Read from `device` rather than through `link()`, because `stage` is borrowed
-                // mutably by the match this arm is in.
                 let url = self.device.url.trim().to_owned();
                 if !url.is_empty() {
                     match key.code {
@@ -475,7 +388,6 @@ impl Login {
                         _ => {}
                     }
                 }
-                // Back to the list, which is where a failed or abandoned sign-in is retried from.
                 if key.code == KeyCode::Esc {
                     let id = *id;
                     self.stage = Stage::Pick;
@@ -491,8 +403,6 @@ impl Login {
                 ..
             } => {
                 let shown = matching(models, filter).len();
-                // Worked out before the match, so both keys agree on what is chosen: ctrl+s is
-                // enter plus "and remember it", never a different entry (D91).
                 let chosen = matches!(key.code, KeyCode::Enter | KeyCode::Char('s'))
                     .then(|| pick_of(models, filter, *selected, current.as_deref()))
                     .flatten();
@@ -513,10 +423,6 @@ impl Login {
                         filter.clear();
                         *selected = 0;
                     }
-                    // The one key that changes what a later session starts with: everything else
-                    // here is a choice about this conversation (D91). Only in the picker: the
-                    // login flow's list carries the credential that was just entered, and
-                    // submitting it is the whole reason it opened.
                     KeyCode::Char('s') if ctrl && self.purpose == Purpose::Model => {
                         if let Some(pick) = chosen {
                             return Outcome::Default(pick);
@@ -530,15 +436,9 @@ impl Login {
                         let Some(pick) = chosen else {
                             return Outcome::Stay;
                         };
-                        // `/model` chooses for the conversation. It used to write the choice into
-                        // config.toml, which silently moved every later session too (D91).
                         if self.purpose == Purpose::Model {
                             return Outcome::Use(pick);
                         }
-                        // The key and address entered for a login belong to the provider they were
-                        // entered for, and only to that one: the picker's own list has neither, and
-                        // taking one from a draft for another provider would save a credential to
-                        // the wrong place (D89).
                         let draft = self
                             .draft
                             .clone()
@@ -624,7 +524,6 @@ impl Login {
         Outcome::Check(self.next_id, draft)
     }
 
-    /// The host's answer for a started sign-in: where to go, and the code to type there (D85).
     pub fn device_code(&mut self, id: u64, result: Result<(String, String), String>) {
         if self.stage != (Stage::SigningIn { id }) {
             return;
@@ -639,17 +538,11 @@ impl Login {
         }
     }
 
-    /// The host's answer when the sign-in ended: an approved one goes on to the model list.
-    ///
-    /// There is no key to check afterwards, so the only question left is which model to use, and the
-    /// listing is asked for with the token that was just stored.
     pub fn signed_in(&mut self, id: u64, result: Result<(), String>) -> Option<(u64, Draft)> {
         if self.stage != (Stage::SigningIn { id }) {
             return None;
         }
         if let Err(why) = result {
-            // The failure is shown where the code was, so what failed and what to do about it are
-            // on one screen; esc goes back to the list to try again (D85).
             self.device.code = None;
             self.device.error = Some(why);
             return None;
@@ -667,10 +560,6 @@ impl Login {
         Some((check, draft))
     }
 
-    /// The same screen, opened without a listing, saying why it could not be asked (D88).
-    ///
-    /// A picker must always appear: the alternative is a note in the transcript, which a dialog
-    /// covers, so the command looks like it did nothing at all.
     pub fn for_model_unavailable(provider: &str, why: String, auth_path: String) -> Self {
         let mut login = Self::unavailable(provider, why, auth_path);
         login.purpose = Purpose::Model;
@@ -693,7 +582,6 @@ impl Login {
         login
     }
 
-    /// Say on the list that it could not be fetched, keeping the screen a picker (D88).
     pub fn note_listing_failed(&mut self, why: String) {
         self.stage = Stage::Models {
             models: Vec::new(),
@@ -704,7 +592,6 @@ impl Login {
         self.error = None;
     }
 
-    /// The host's answer to [`Outcome::Check`]. Answers to an abandoned check are ignored.
     pub fn models(&mut self, id: u64, result: Result<Listed, ModelsError>) {
         if self.stage != (Stage::Checking { id }) {
             return;
@@ -714,8 +601,6 @@ impl Login {
                 picks: models,
                 failed,
             }) => {
-                // The model in force is where the highlight starts, matched on the provider too: the
-                // same id can be served by two of them (D89).
                 let selected = self
                     .current
                     .as_deref()
@@ -733,8 +618,6 @@ impl Login {
                         format!("{}; type a model name instead", failed.join("; "))
                     })
                 } else if !failed.is_empty() {
-                    // A partial list says what is missing from it, or a provider that is down looks
-                    // like one that serves nothing (D89).
                     Some(failed.join("; "))
                 } else {
                     None
@@ -748,8 +631,6 @@ impl Login {
             }
             Err(ModelsError::Rejected(why)) => {
                 let why = format!("the key was rejected: {why}");
-                // A picker has no key field to send anyone back to, so the reason goes on the list
-                // and a name can still be typed (D88).
                 if self.fields.is_empty() {
                     self.note_listing_failed(format!("{why}; type a model name"));
                     return;
@@ -774,11 +655,6 @@ impl Login {
     }
 }
 
-/// What a fan-out answered, as the dialog takes it (D89).
-///
-/// Nothing at all, with failures to explain it, is a failure: a picker that says "no models" without
-/// saying that three providers are unreachable is a picker that looks broken. Some models with some
-/// failures is a list with a note, because the ones that answered are usable.
 pub fn answer(picks: Vec<Pick>, failed: Vec<String>) -> Result<Listed, ModelsError> {
     if picks.is_empty() && !failed.is_empty() {
         return Err(ModelsError::Failed(failed.join("; ")));
@@ -786,11 +662,6 @@ pub fn answer(picks: Vec<Pick>, failed: Vec<String>) -> Result<Listed, ModelsErr
     Ok(Listed { picks, failed })
 }
 
-/// The entries the filter keeps, ignoring case (D89).
-///
-/// A model is matched on its own id and on its provider's name, so typing `openai` narrows the union
-/// to one provider — which is how a list that spans providers is read. `provider/model` matches the
-/// pair, for the case where a name alone is ambiguous between two of them.
 pub fn matching<'a>(models: &'a [Pick], filter: &str) -> Vec<&'a Pick> {
     let needle = filter.trim().to_lowercase();
     if needle.is_empty() {
@@ -813,11 +684,6 @@ pub fn matching<'a>(models: &'a [Pick], filter: &str) -> Vec<&'a Pick> {
         .collect()
 }
 
-/// What enter would choose in the model list: the highlighted entry, or the name typed when
-/// nothing lists it (D89).
-///
-/// A name nothing serves goes to the provider in force, which is the one a person is switching when
-/// they type a name at all; with no provider in force there is nothing to send it to.
 fn pick_of(models: &[Pick], filter: &str, selected: usize, current: Option<&str>) -> Option<Pick> {
     if let Some(pick) = matching(models, filter).get(selected) {
         return Some((**pick).clone());
@@ -871,7 +737,6 @@ mod tests {
         )
     }
 
-    /// The same list with an OAuth provider in it, which is the one that has no key (D85).
     fn with_sign_in() -> Login {
         let mut list = choices();
         list.insert(
@@ -890,7 +755,6 @@ mod tests {
         Login::new(list, vec![], None, false, "auth.json".into())
     }
 
-    /// A listing answer for one provider, which is what the login flow gets.
     fn listed(provider: &str, models: &[&str]) -> Listed {
         Listed {
             picks: models
@@ -931,7 +795,6 @@ mod tests {
         assert_eq!(draft.key.as_deref(), Some("sk-abc"));
         assert!(l.checking());
 
-        // A rejected key goes back to the key field with the reason.
         l.models(id, Err(ModelsError::Rejected("invalid api key".into())));
         assert_eq!(l.stage, Stage::Fill);
         assert!(l.error.as_deref().unwrap().contains("invalid api key"));
@@ -1027,8 +890,6 @@ mod tests {
     }
     #[test]
     fn an_oauth_provider_signs_in_instead_of_asking_for_a_key() {
-        // D85: there is no key to type, so picking it must start the sign-in rather than show a
-        // field that expects one.
         let mut l = with_sign_in();
         press(&mut l, KeyCode::Down);
         assert_eq!(l.choice().name, "chatgpt");
@@ -1040,10 +901,8 @@ mod tests {
         assert_eq!(provider, "chatgpt");
         assert_eq!(l.stage, Stage::SigningIn { id });
         assert!(l.fields.is_empty(), "an OAuth provider has no key field");
-        // Picking it from the list answers the host directly: the constructor has nothing pending.
         assert_eq!(l.take_pending(), None);
 
-        // The code arriving is what the screen shows, and esc is the way out of it.
         l.device_code(
             id,
             Ok(("https://auth.test/device".into(), "AB12-CD34".into())),
@@ -1053,7 +912,6 @@ mod tests {
         assert_eq!(press(&mut l, KeyCode::Esc), Outcome::CancelSignIn(id));
         assert_eq!(l.stage, Stage::Pick);
         assert_eq!(l.device, Device::default());
-        // Back on the list it can be picked again, which is a new attempt.
         let Outcome::SignIn(again, _) = press(&mut l, KeyCode::Enter) else {
             panic!("expected a second sign-in");
         };
@@ -1062,8 +920,6 @@ mod tests {
 
     #[test]
     fn a_fan_out_that_answered_something_lists_it_and_says_what_is_missing() {
-        // D89: the picker spans providers, so one of them being down must not look like one that
-        // serves nothing, and a total failure must not look like an empty list.
         let pick = |provider: &str, model: &str| Pick {
             provider: provider.to_owned(),
             model: model.to_owned(),
@@ -1076,7 +932,6 @@ mod tests {
         assert_eq!(some.picks.len(), 2);
         assert_eq!(some.failed, ["anthropic: no route to host"]);
 
-        // Nothing at all, and a reason, is a failure that names the reasons.
         let ModelsError::Failed(why) = answer(
             Vec::new(),
             vec!["openai: 401".to_owned(), "synthetic: timeout".to_owned()],
@@ -1087,15 +942,12 @@ mod tests {
         assert!(why.contains("openai: 401"), "{why}");
         assert!(why.contains("synthetic: timeout"), "{why}");
 
-        // Nothing to list and nothing wrong is an empty list, which the dialog words itself.
         let empty = answer(Vec::new(), Vec::new()).expect("not an error");
         assert!(empty.picks.is_empty() && empty.failed.is_empty());
     }
 
     #[test]
     fn the_filter_matches_a_provider_name_and_a_paired_name() {
-        // D89: a union list is narrowed by provider as often as by model, and `provider/model` is
-        // how an id two providers share is disambiguated.
         let picks = vec![
             Pick {
                 provider: "openai".into(),
@@ -1130,8 +982,6 @@ mod tests {
 
     #[test]
     fn the_model_picker_goes_straight_to_the_list_and_filters_as_you_type() {
-        // D88: `/model` with no name must not need the name. The list is the dialog, typing is the
-        // filter, and choosing submits without a key.
         let mut list = choices();
         list[0].model = Some("synthetic-model".into());
         let mut l = Login::for_all_models(list, "openai", "synthetic-model", "auth.json".into());
@@ -1144,8 +994,6 @@ mod tests {
         assert!(l.fields.is_empty(), "nothing to type but the filter");
 
         l.models(id, Ok(listed("openai", &["gpt-5.4", "gpt-5.5", "o4-mini"])));
-        // Typing narrows the list; enter takes what is highlighted, for this conversation only
-        // (D91).
         type_text(&mut l, "5.5");
         assert_eq!(
             press(&mut l, KeyCode::Enter),
@@ -1158,8 +1006,6 @@ mod tests {
 
     #[test]
     fn ctrl_s_chooses_the_same_entry_as_enter_and_says_it_is_the_default() {
-        // D91: `/model` used to write the choice into config.toml, so changing the model here moved
-        // every later session too. Both keys are now the same entry, and only ctrl+s is a default.
         let mut l = Login::for_all_models(choices(), "openai", "m", "auth.json".into());
         let Some(Outcome::ListAll(id)) = l.take_pending() else {
             panic!("a listing to ask for");
@@ -1173,7 +1019,6 @@ mod tests {
         assert_eq!(press(&mut l, KeyCode::Enter), Outcome::Use(chosen.clone()));
         let save = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert_eq!(l.key(save), Outcome::Default(chosen));
-        // A plain `s` is still a letter in the filter, not a key.
         let typed = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
         assert_eq!(l.key(typed), Outcome::Stay);
         let Stage::Models { filter, .. } = &l.stage else {
@@ -1184,9 +1029,6 @@ mod tests {
 
     #[test]
     fn a_rejected_listing_leaves_the_picker_a_picker() {
-        // D88: a rejected listing sent a picker into the field stage, which it has no fields for —
-        // an empty box with nothing to type in. The reason belongs on the list, where a name can
-        // still be typed instead.
         let mut l = Login::for_all_models(choices(), "openai", "m", "auth.json".into());
         let Some(Outcome::ListAll(id)) = l.take_pending() else {
             panic!("a listing to ask for");
@@ -1199,7 +1041,6 @@ mod tests {
         let note = note.as_deref().unwrap_or_default();
         assert!(note.contains("rejected"), "{note}");
         assert!(note.contains("type a model name"), "{note}");
-        // And a name typed there still works, which is the way out.
         type_text(&mut l, "a-typed-model");
         assert_eq!(
             press(&mut l, KeyCode::Enter),
@@ -1212,8 +1053,6 @@ mod tests {
 
     #[test]
     fn a_picker_that_could_not_ask_what_is_served_says_so_on_the_list() {
-        // D88: the command must always open something. A note in the transcript is invisible while
-        // a dialog is what the person is waiting for, which reads as the command doing nothing.
         let mut l = Login::for_model_unavailable(
             "openai",
             "config.toml: expected an equals".into(),
@@ -1234,8 +1073,6 @@ mod tests {
 
     #[test]
     fn the_model_picker_closes_rather_than_backing_into_a_key_field() {
-        // It was opened for a model, so there is nothing behind it: esc closes from the wait and
-        // from the list, and never lands on a field asking for a key that already exists (D88).
         let mut l = Login::for_all_models(choices(), "openai", "m", "auth.json".into());
         let Some(Outcome::ListAll(id)) = l.take_pending() else {
             panic!("a listing to ask for");
@@ -1244,8 +1081,6 @@ mod tests {
         l.models(id, Ok(listed("openai", &["m"])));
         assert!(matches!(l.stage, Stage::Models { .. }));
         assert_eq!(press(&mut l, KeyCode::Esc), Outcome::Close);
-        // A name typed that the server does not list is still usable, which is the way out when a
-        // listing is empty.
         let mut l = Login::for_all_models(choices(), "openai", "m", "auth.json".into());
         let Some(Outcome::ListAll(id)) = l.take_pending() else {
             panic!("a listing to ask for");
@@ -1263,14 +1098,11 @@ mod tests {
 
     #[test]
     fn o_opens_the_link_and_c_copies_it() {
-        // D86: the address is what the person needs, and a dialog's text is not selectable, so both
-        // ways of getting it out are keys rather than a mouse drag.
         let mut l = with_sign_in();
         press(&mut l, KeyCode::Down);
         let Outcome::SignIn(id, _) = press(&mut l, KeyCode::Enter) else {
             panic!("expected a sign-in");
         };
-        // Before there is an address there is nothing to open or copy, and esc still cancels.
         assert_eq!(press(&mut l, KeyCode::Char('o')), Outcome::Stay);
         assert_eq!(press(&mut l, KeyCode::Char('c')), Outcome::Stay);
         l.device_code(id, Ok(("https://auth.test/device".into(), "AB12".into())));
@@ -1282,7 +1114,6 @@ mod tests {
             press(&mut l, KeyCode::Char('c')),
             Outcome::CopyLink("https://auth.test/device".into())
         );
-        // The address pasted in with a trailing space is still the address.
         l.device_code(id, Ok((" https://auth.test/device ".into(), "AB12".into())));
         assert_eq!(
             l.link().as_deref(),
@@ -1301,10 +1132,8 @@ mod tests {
         };
         let (check, draft) = l.signed_in(id, Ok(())).expect("the model list follows");
         assert_eq!(draft.provider, "chatgpt");
-        // No key: the token the sign-in stored is what the listing is sent with.
         assert_eq!(draft.key, None);
         assert_eq!(l.stage, Stage::Checking { id: check });
-        // The answer is matched by id, so a stale one does nothing.
         assert_eq!(l.signed_in(id, Ok(())), None);
         l.models(check, Ok(listed("chatgpt", &["gpt-5-codex", "gpt-5"])));
         assert!(matches!(l.stage, Stage::Models { selected: 0, .. }));
@@ -1325,7 +1154,6 @@ mod tests {
         };
         l.device_code(id, Ok(("https://auth.test/device".into(), "AB12".into())));
         assert_eq!(l.signed_in(id, Err("the code expired".into())), None);
-        // Still signing in, with the reason where the code was, so esc is one key away.
         assert_eq!(l.stage, Stage::SigningIn { id });
         assert_eq!(l.device.code, None);
         assert_eq!(l.device.error.as_deref(), Some("the code expired"));
@@ -1335,8 +1163,6 @@ mod tests {
 
     #[test]
     fn a_dialog_opened_at_an_oauth_provider_owes_the_host_a_sign_in() {
-        // The host asks after opening, because a constructor has nothing to answer to. It must be
-        // told exactly once, or a provider chosen from a menu would poll twice.
         let mut list = choices();
         list.push(Choice {
             name: "chatgpt".into(),
@@ -1358,13 +1184,10 @@ mod tests {
         assert_eq!(l.stage, Stage::SigningIn { id });
         assert_eq!(l.take_pending(), None, "started twice");
 
-        // A provider with a key is still a key field, and asks for nothing.
         let mut l = login(Some("openai"), true);
         assert_eq!(l.take_pending(), None);
         assert_eq!(l.stage, Stage::Fill);
 
-        // One already signed in has no key to type and nothing to wait for, so the model list is
-        // the only question left and that is what the host is asked for (D85).
         let mut list = choices();
         list.push(Choice {
             name: "chatgpt".into(),

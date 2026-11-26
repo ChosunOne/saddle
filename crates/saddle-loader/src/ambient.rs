@@ -1,5 +1,3 @@
-//! only authority-free WASI adapters are linked (D11, D12, D127, D150).
-
 use anyhow::{Result, bail};
 use saddle_cap::component::WasiInterface;
 use wasmtime::component::{HasData, HasSelf, Linker, ResourceTable};
@@ -22,7 +20,6 @@ impl HasData for Context {
     type Data<'a> = WasiCtxView<'a>;
 }
 
-/// bind only a classified import; the cap catalogue owns eligibility and availability (D150).
 pub(super) fn bind<H: HostServices>(
     linker: &mut Linker<State<H>>,
     interface: WasiInterface,
@@ -76,8 +73,6 @@ pub(super) fn bind<H: HostServices>(
         WasiInterface::Streams => {
             streams::add_to_linker::<_, HasSelf<ResourceTable>>(linker, |s| &mut s.resources)
         }
-        // No synchronous poll, raw HTTP or broad WASI linker helper: fuel cannot interrupt
-        // guest-chosen blocking native I/O. Catalogue checks refuse even unused imports first.
         WasiInterface::Poll | WasiInterface::HttpOutgoingHandler | WasiInterface::HttpTypes => {
             bail!("wasi adapter is not implemented: {}", interface.name())
         }

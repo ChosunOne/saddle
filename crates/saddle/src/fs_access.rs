@@ -1,5 +1,3 @@
-//! pinned, no-follow descriptors for plugin artifacts and authorized file reads (D129).
-
 use std::fs::{File, OpenOptions as StdOpenOptions};
 use std::io::{self, ErrorKind};
 use std::os::unix::fs::OpenOptionsExt as StdOpenOptionsExt;
@@ -30,7 +28,6 @@ fn options(directory: bool) -> OpenOptions {
     options
 }
 
-/// pins a canonical absolute root without allowing a replaced ancestor to steer the open.
 pub fn root(path: &Path) -> io::Result<Dir> {
     if !path.is_absolute() {
         return Err(io::Error::new(
@@ -38,9 +35,6 @@ pub fn root(path: &Path) -> io::Result<Dir> {
             "root is not absolute",
         ));
     }
-    // Ancestors are locations, not readable grants. O_PATH pins them without requiring read-dir
-    // on `/` or widening landlock. Directory enumeration and final file opens still need their
-    // normal permissions, exactly as with cap-std's O_PATH directory handles.
     let anchor = StdOpenOptions::new()
         .read(true)
         .custom_flags(PATH_HANDLE | O_DIRECTORY | O_NOFOLLOW)
@@ -63,7 +57,6 @@ pub fn root(path: &Path) -> io::Result<Dir> {
     Ok(dir)
 }
 
-/// opens a previously resolved relative path; any subsequent symlink substitution fails closed.
 pub fn file(root: &Dir, rel: &RelPath) -> io::Result<File> {
     let path = rel.to_path();
     let mut parts = path.components().peekable();
@@ -88,7 +81,6 @@ pub fn file(root: &Dir, rel: &RelPath) -> io::Result<File> {
     ))
 }
 
-/// pins a previously resolved directory without following any replaced path component (D132).
 pub fn directory(root: &Dir, rel: &RelPath) -> io::Result<Dir> {
     let mut dir = root.try_clone()?;
     for part in rel.to_path().components() {

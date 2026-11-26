@@ -1,22 +1,17 @@
-//! runtime resource budgets, never capability grants (D145).
-
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 
 macro_rules! budgets {
     ($($name:ident : $ty:ty = $default:expr),* $(,)?) => {
-        /// host-owned resource settings; no field grants an operation.
         #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
         #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
-        pub struct Budgets { $(/// a configurable resource/presentation budget.
+        pub struct Budgets { $(
             pub $name: $ty,)* }
-        /// one source of defaults for the host, loader and standard guests.
         pub const DEFAULTS: Budgets = Budgets { $($name: $default,)* };
         impl Default for Budgets {
             fn default() -> Self { DEFAULTS.clone() }
         }
         impl Budgets {
-            /// reject zero/unrepresentable budgets instead of wrapping at the guest ABI.
             pub fn validate(&self) -> Result<(), String> {
                 $(if (self.$name == 0 && !matches!(stringify!($name), "http_redirects" | "exec_report_paths" | "exec_report_denials" | "web_quotes" | "image_count" | "team_steps" | "ask_wait_seconds")) || (stringify!($ty) == "usize" && self.$name as u64 > u64::from(u32::MAX)) {
                     return Err(format!("tool-limits.{} must be positive (except disabled report/redirect/image counts) and fit its ABI representation", stringify!($name).replace('_', "-")));
@@ -24,7 +19,7 @@ macro_rules! budgets {
                 Ok(())
             }
         }
-        $(/// read a budget in the current synchronous operation.
+        $(
         pub fn $name() -> $ty { CURRENT.with(|value| value.borrow().$name) })*
     }
 }
@@ -41,8 +36,6 @@ budgets! {
     persist_total_bytes: usize = 4 * 1024 * 1024,
     persist_changes: usize = 32,
     team_workers: usize = 8,
-    // no default request limit, as a conversation has none (D37): 0 means a worker turn runs
-    // until it answers.
     team_steps: usize = 0,
     model_input_bytes: usize = 64 * 1024,
     model_output_tokens: usize = 4096,
@@ -73,14 +66,11 @@ budgets! {
     plugin_output_bytes: usize = 64 * 1024,
     host_wait_seconds: usize = 300,
     host_calls: usize = 16,
-    // D197: one question, its choices and the answer a person types.
     ask_bytes: usize = 4096,
     ask_options: usize = 8,
     ask_option_bytes: usize = 512,
     ask_preview_bytes: usize = 8 * 1024,
     ask_reply_bytes: usize = 4 * 1024,
-    // D197: how long a question waits, 0 meaning it waits for the person and nothing else. A turn
-    // the person cancels still ends it, and a model's own `timeout_secs` still bounds the call.
     ask_wait_seconds: usize = 0,
     metadata_bytes: usize = 64 * 1024,
     path_bytes: usize = 4096,
@@ -147,19 +137,16 @@ budgets! {
 
 thread_local! { static CURRENT: RefCell<Budgets> = RefCell::new(Budgets::default()); }
 
-/// snapshot the current resource context; it carries no authority or credentials.
 pub fn current() -> Budgets {
     CURRENT.with(|value| value.borrow().clone())
 }
 
-/// install a context for one synchronous operation and restore it, including on unwind.
 pub fn using<T>(budgets: &Budgets, operation: impl FnOnce() -> T) -> T {
     let previous = CURRENT.with(|value| value.replace(budgets.clone()));
     let _restore = Restore(previous);
     operation()
 }
 
-/// initialize a fresh guest instance from its host's immutable invocation snapshot.
 pub fn initialize(budgets: Budgets) {
     CURRENT.with(|value| {
         value.replace(budgets);
@@ -201,8 +188,6 @@ mod tests {
             .validate()
             .is_err()
         );
-        // A worker turn has no request limit by default, so zero is a meaning here rather than a
-        // missing budget (D37, D195).
         assert_eq!(DEFAULTS.team_steps, 0);
         assert!(
             Budgets {
