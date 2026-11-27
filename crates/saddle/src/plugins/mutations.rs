@@ -157,7 +157,11 @@ fn expected(plan: &Planned, deadline: Instant) -> Result<()> {
                 }
                 hash.update(&bytes[..n]);
             }
-            let actual = format!("{:x}", hash.finalize());
+            let actual = hash
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
             if !actual.eq_ignore_ascii_case(want) {
                 return Err(anyhow!(
                     "mutation precondition failed: file changed; read it again"

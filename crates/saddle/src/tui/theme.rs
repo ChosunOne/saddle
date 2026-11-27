@@ -273,16 +273,15 @@ pub fn terminal_appearance() -> Appearance {
             Appearance::Dark
         };
     }
-    if let Ok(value) = env::var("COLORFGBG") {
-        if let Some(bg) = value.rsplit(';').next()
-            && let Ok(index) = bg.trim().parse::<u8>()
-        {
-            return match index {
-                7 => Appearance::Light,
-                9..=15 => Appearance::Light,
-                _ => Appearance::Dark,
-            };
-        }
+    if let Ok(value) = env::var("COLORFGBG")
+        && let Some(bg) = value.rsplit(';').next()
+        && let Ok(index) = bg.trim().parse::<u8>()
+    {
+        return match index {
+            7 => Appearance::Light,
+            9..=15 => Appearance::Light,
+            _ => Appearance::Dark,
+        };
     }
     Appearance::Dark
 }

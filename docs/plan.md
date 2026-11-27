@@ -122,10 +122,11 @@ deadline live in the store and are dropped with it. State a plugin keeps between
 `persist`. A `lifetime = "session"` manifest field is the planned addition if a parity feature, such
 as an LSP client, needs a long-lived instance.
 
-**D14.** The host pins `wasmtime`, `wasmtime-wasi` and `wasmtime-wasi-http` to one exact version
-(`=X.Y.Z`) and upgrades on purpose. Rust plugins build for the `wasm32-wasip2` target with the
-`wit-bindgen` macro; any toolchain that emits a component works, because the host reads only the
-component's type. WASI 0.2 is the target unless 0.3 is final in the pinned wasmtime. Every import name
+**D14.** The host takes `wasmtime`, `wasmtime-wasi` and `wasmtime-wasi-http` from one runtime line —
+one minor version, every WASI crate from it — and upgrades on purpose. Rust plugins build for the
+`wasm32-wasip2` target with the `wit-bindgen` macro; any toolchain that emits a component works,
+because the host reads only the component's type. WASI 0.2 is the target unless 0.3 is final in the
+runtime line in force. (D201 supersedes the `=X.Y.Z` pin this decision first asked for.) Every import name
 contains its package version, so the D11 check also checks the ABI version, and an unsupported version
 is refused with a message naming the supported one. Before 1.0 the host supports one minor line at a
 time.
@@ -2991,9 +2992,10 @@ and model arguments. The loader does not depend on the binary's session: a narro
 trait receives the host-assigned plugin and invocation identity. Implementations must decide and
 audit each operation against that identity; neither guest arguments nor tool names select it.
 
-Wasmtime and WASI are pinned to `36.0.23` (Rust 1.86 minimum, within our 1.88 MSRV); the future
-WASI-HTTP adapter must use that same exact version. WASI remains 0.2, and guest bindings use
-`wit-bindgen` 0.45.0. Each invocation has a fresh store and
+Wasmtime and WASI come from one runtime line, `51` today, stated as a semver requirement rather than
+an exact pin (D201), so a patch release inside the line arrives without a manifest change; the future
+WASI-HTTP adapter must come from that same line. WASI remains 0.2, and guest bindings use
+`wit-bindgen` 0.63. Each invocation has a fresh store and
 instance, bounded linear memories, tables, fuel and argument/result sizes, plus an epoch wall-clock
 deadline and cancellation. These bounds also cover initialization and `describe`. Ambient WASI has
 empty args/environment, no inherited streams or preopens, a 128-entry host resource table and
@@ -4893,12 +4895,25 @@ is read against RustSec's database by two tools that agree on the exceptions; an
 one and not the other fails the run they disagree in. The workspace crates are `publish = false`,
 which is what makes a wildcard requirement an error: their own path dependencies are exempt from
 what crates.io requires of a published crate, and a registry wildcard is still refused. Duplicate
-versions are reported and not forbidden, because the pinned wasmtime line (D14) and the pinned typst
-line (D165) carry their own; a duplicate outside them is a signal to read rather than a gate. An
-advisory no version requirement here can move is ignored by name with a reason that says which
-pinned line holds it and why it is not reachable, and the rest is fixed: setting the gate up found
-four wasmtime advisories and one in `url`, and the pinned line moved to `36.0.23` and `2.5.9` rather
-than being ignored.
+versions are reported and not forbidden, because the wasmtime line (D14) and the typst line (D165)
+each carry their own; a duplicate outside them is a signal to read rather than a gate. An advisory
+no version requirement here can move is ignored by name with a reason that says which line holds it
+and why it is not reachable, and the rest is fixed: setting the gate up found four wasmtime
+advisories and one in `url`, and moving the runtime line and `url` fixed them rather than a new
+ignore.
+
+**D201.** A version requirement here is a semver requirement, never an exact pin. `=X.Y.Z` in a
+manifest is the shape D14 first asked for and it is gone: a manifest names the line the code is built
+against and a `cargo update` may move anywhere inside it, so a patch or minor release is an upgrade
+nobody had to schedule. That is what makes the gate of D200 worth having — the tree moves, and the
+gate says whether the new bytes are acceptable, where a pin decided that no new bytes would arrive
+until a person moved it. What D14 settles is unchanged: the wasmtime crates are one line and move
+together, the component-model ABI they speak is checked by name, and the `wasm32-wasip2` target and
+`wit-bindgen` generate the guest side. The workspace MSRV follows the graph rather than leading it —
+`rust-version = "1.100"` is what the upgraded lines require — and no requirement may be written in a
+form crates.io would read as a wildcard, which D200 refuses. Two lines of one crate name existing at
+once (`wasmtime`'s own sub-crates, `typst`'s) is a fact about those lines, reported as a duplicate and
+not unified with a pin.
 
 ## 4. Scope enumeration
 
@@ -5029,9 +5044,10 @@ read bindings under a write capability must never let that principal read a file
   `deny.toml` under D200). It formats and parses RFC3339 in the audit log, the session store and the
   status line, so the swap is a source change with tests of its own, not a dependency bump.
 - Moving the typst line (D165) to a hayagriva and citationberg that accept `quick-xml >= 0.41`, which
-  is the fix for RUSTSEC-2026-0194 and RUSTSEC-2026-0195. The two advisories are about parsing
+  is the fix for RUSTSEC-2026-0194 and RUSTSEC-2026-0195. typst 0.15 still takes citationberg 0.7,
+  which requires `^0.38.1`, so the line has not moved yet. The two advisories are about parsing
   untrusted XML, which nothing here does — the harness compiles math markup, never a bibliography —
-  so they are ignored by name until that line moves.
+  so they are ignored by name until it does.
 
 ## 9. Known risks
 
@@ -5045,7 +5061,9 @@ read bindings under a write capability must never let that principal read a file
   Makefile.
 - Parity pressure will pull toward extension points that have no scope yet, and the easy answer will be
   a generic escape hatch.
-- The component model toolchain moves. A pinned version is a schedule dependency, not a detail.
+- The component model toolchain moves, and a line moves under this workspace on its own (D201). A
+  breaking release inside the line reaches the build as a compile error rather than as a pin that
+  silently holds it back, which is the trade D201 makes.
 - The sandbox depends on a list of system paths (D19). A tool that needs a path outside the list fails
   with a permission error that looks like a bug in the tool.
 - **Landlock does not decide metadata, so a command can look at paths no grant names.** Its

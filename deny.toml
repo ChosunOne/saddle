@@ -23,27 +23,27 @@ yanked = "deny"
 # answer is a reason rather than a version requirement this repository cannot move. A warning that
 # an entry is unused says the risk is gone, and the entry goes with it.
 ignore = [
-    # typst 0.14 typesets every formula and pins its citation line at citationberg 0.6.1, which
+    # typst 0.15 typesets every formula and takes its citation line from citationberg 0.7, which
     # requires quick-xml ^0.38.1; the fixed 0.41 cannot be selected until that does. Neither
     # advisory is reachable from here: the harness compiles math markup, never a bibliography, and
     # the parsing while it does is bounded by the formula it was given rather than by a document
     # from the network.
-    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.38 is pinned by typst's citationberg; no untrusted XML is parsed" },
-    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.38 is pinned by typst's citationberg; no untrusted XML is parsed" },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.38 comes from typst's citationberg; no untrusted XML is parsed" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.38 comes from typst's citationberg; no untrusted XML is parsed" },
     # No patched version exists, and it is unmaintained rather than vulnerable: humantime formats
     # and parses RFC3339 timestamps in the audit log, the session store and the status line.
     # Replacing it is a source change of its own (docs/plan.md §8).
     { id = "RUSTSEC-2026-0542", reason = "unmaintained, not vulnerable; replacing it is tracked in docs/plan.md §8" },
-    # The rest are unmaintained crates inside the two pinned presentation lines. Nothing selects
-    # them out of a workspace manifest, so no version requirement here could move them: syntect
-    # 5.3 (D80) loads its grammars through yaml-rust and bincode 1, and typst 0.14 (D165) lays text
-    # out with ttf-parser and rustybuzz and cites with hayagriva's serde_yaml and paste.
+    # The rest are unmaintained crates inside the two presentation lines. Nothing selects them out
+    # of a workspace manifest, so no version requirement here could move them: syntect 5.3 (D80)
+    # loads its grammars through yaml-rust and bincode 1, and typst 0.15 (D165) lays text out with
+    # ttf-parser and rustybuzz and cites with hayagriva's serde_yaml and paste.
     { id = "RUSTSEC-2024-0320", reason = "yaml-rust, required by syntect 5.3 (D80)" },
-    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml, required by typst 0.14's serde_yaml (D165)" },
-    { id = "RUSTSEC-2024-0436", reason = "paste, required by typst 0.14's hayagriva (D165)" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml, required by typst 0.15's serde_yaml (D165)" },
+    { id = "RUSTSEC-2024-0436", reason = "paste, required by typst 0.15's hayagriva (D165)" },
     { id = "RUSTSEC-2025-0141", reason = "bincode 1, required by syntect 5.3 (D80)" },
-    { id = "RUSTSEC-2026-0192", reason = "ttf-parser, required by typst 0.14 (D165)" },
-    { id = "RUSTSEC-2026-0206", reason = "rustybuzz, required by typst 0.14 (D165)" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser, required by typst 0.15 (D165)" },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz, required by typst 0.15 (D165)" },
 ]
 
 [licenses]
@@ -71,8 +71,8 @@ allow = [
 ]
 
 [bans]
-# Duplicates are reported, not forbidden: the pinned wasmtime line and the pinned typst line each
-# carry their own crates, and a duplicate outside them is a signal to read rather than a gate. A
+# Duplicates are reported, not forbidden: the wasmtime line and the typst line each carry their own
+# crates, and a duplicate outside them is a signal to read rather than a gate. A
 # wildcard version requirement from a registry is an error, while the workspace's own path
 # dependencies — unpublished, so exempt from what crates.io requires — are not.
 multiple-versions = "warn"
@@ -88,9 +88,9 @@ deny = [
     { crate = "openssl-sys", use-instead = "rustls" },
 ]
 skip-tree = [
-    { crate = "wasmtime", reason = "the runtime line is pinned by D14; its internal duplicates are not ours to remove" },
-    { crate = "wasmtime-wasi", reason = "the same pinned runtime line" },
-    { crate = "typst", reason = "the typesetting line is pinned by D165" },
+    { crate = "wasmtime", reason = "the runtime line of D14, D201; its internal duplicates are not ours to remove" },
+    { crate = "wasmtime-wasi", reason = "the same runtime line" },
+    { crate = "typst", reason = "the typesetting line of D165" },
 ]
 
 [sources]

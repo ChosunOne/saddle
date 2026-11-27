@@ -13,13 +13,18 @@ use typst::diag::FileError;
 use typst::diag::FileResult;
 use typst::foundations::Bytes;
 use typst::foundations::Datetime;
-use typst::layout::PagedDocument;
+use typst::foundations::Duration;
 use typst::syntax::FileId;
+use typst::syntax::RootedPath;
 use typst::syntax::Source;
 use typst::syntax::VirtualPath;
+use typst::syntax::VirtualRoot;
 use typst::text::Font;
 use typst::text::FontBook;
 use typst::utils::LazyHash;
+use typst::utils::Scalar;
+use typst_layout::PagedDocument;
+use typst_render::RenderOptions;
 use typst_render::render as rasterise;
 
 use crate::provider::Image;
@@ -143,7 +148,7 @@ const MAIN: &str = "/equation.typ";
 
 fn typeset(body: &str, room: &Room) -> Option<Formula> {
     let document = compile(body, room, false)?;
-    let page = document.pages.first()?;
+    let page = document.pages().first()?;
     let size = page.frame.size();
     let (width_pt, height_pt) = (size.x.to_pt(), size.y.to_pt());
     if width_pt <= 0.0 || height_pt <= 0.0 {
@@ -163,7 +168,13 @@ fn typeset(body: &str, room: &Room) -> Option<Formula> {
         ((height_pt * scale / cell_h).round() as u16).max(1),
     );
     let refine = (scale * RESOLUTION as f64).min((MAX_PIXELS / (width_pt * height_pt)).sqrt());
-    let pixmap = rasterise(page, refine as f32);
+    let pixmap = rasterise(
+        page,
+        &RenderOptions {
+            pixel_per_pt: Scalar::new(refine),
+            render_bleed: false,
+        },
+    );
     let (width, height) = (pixmap.width(), pixmap.height());
     if width == 0 || height == 0 {
         return None;
@@ -191,7 +202,7 @@ pub fn render_inline(source: &str, room: &Room) -> Option<Formula> {
 
 fn typeset_inline(body: &str, room: &Room) -> Option<Formula> {
     let document = compile(body, room, true)?;
-    let page = document.pages.first()?;
+    let page = document.pages().first()?;
     let size = page.frame.size();
     let (width_pt, height_pt) = (size.x.to_pt() as f32, size.y.to_pt() as f32);
     if width_pt <= 0.0 {
@@ -203,7 +214,13 @@ fn typeset_inline(body: &str, room: &Room) -> Option<Formula> {
     let (cell_w, cell_h) = (room.cell.0.max(1) as f32, room.cell.1.max(1) as f32);
     let natural = LINE_PT / X_HEIGHT;
     let probe = cell_h / natural * RESOLUTION as f32;
-    let pixmap = rasterise(page, probe);
+    let pixmap = rasterise(
+        page,
+        &RenderOptions {
+            pixel_per_pt: Scalar::new(probe as f64),
+            render_bleed: false,
+        },
+    );
     let (page_px, page_rows) = (pixmap.width(), pixmap.height());
     if page_px == 0 || page_rows == 0 {
         return None;
@@ -296,8 +313,8 @@ fn layout(body: &str, room: &Room, inline: bool) -> Option<PagedDocument> {
              $ {body} $\n"
         )
     };
-    let world = Snippet::new(&text);
-    typst::compile(&world).output.ok()
+    let world = Snippet::new(&text)?;
+    typst::compile::<PagedDocument>(&world).output.ok()
 }
 
 fn encode_png(width: u32, height: u32, data: &[u8]) -> Option<Vec<u8>> {
@@ -332,16 +349,19 @@ struct Snippet {
 }
 
 impl Snippet {
-    fn new(text: &str) -> Self {
+    fn new(text: &str) -> Option<Self> {
         let (book, fonts) = fonts();
-        let main = FileId::new(None, VirtualPath::new(MAIN));
-        Self {
+        let main = FileId::new(RootedPath::new(
+            VirtualRoot::Project,
+            VirtualPath::new(MAIN).ok()?,
+        ));
+        Some(Self {
             main,
             source: Source::new(main, text.to_owned()),
             library: LazyHash::new(Library::default()),
             book,
             fonts,
-        }
+        })
     }
 }
 
@@ -390,7 +410,7 @@ impl World for Snippet {
         self.fonts.get(index).cloned()
     }
 
-    fn today(&self, _offset: Option<i64>) -> Option<Datetime> {
+    fn today(&self, _offset: Option<Duration>) -> Option<Datetime> {
         None
     }
 }
@@ -972,7 +992,7 @@ fn symbol(name: &str) -> Option<&'static str> {
         "mod" => "mod",
         "bmod" => "mod",
         "infty" => "infinity",
-        "partial" => "diff",
+        "partial" => "partial",
         "nabla" => "nabla",
         "forall" => "forall",
         "exists" => "exists",
@@ -1013,6 +1033,8 @@ fn symbol(name: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
 
     fn room() -> Room {
@@ -1201,8 +1223,8 @@ mod tests {
 
     fn ink_rows_of(png: &str) -> Option<(u32, u32)> {
         let bytes = general_purpose::STANDARD.decode(png).ok()?;
-        let mut reader = png::Decoder::new(bytes.as_slice()).read_info().ok()?;
-        let mut buffer = vec![0; reader.output_buffer_size()];
+        let mut reader = png::Decoder::new(Cursor::new(bytes)).read_info().ok()?;
+        let mut buffer = vec![0; reader.output_buffer_size()?];
         let info = reader.next_frame(&mut buffer).ok()?;
         let row_bytes = info.width as usize * 4;
         let mut first = None;

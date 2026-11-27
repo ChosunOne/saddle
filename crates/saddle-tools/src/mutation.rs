@@ -76,7 +76,10 @@ struct PatchArguments {
 }
 
 fn hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn submit(fs: &mut impl Filesystem, changes: &[Change]) -> Result<(), String> {

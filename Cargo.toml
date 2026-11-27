@@ -6,7 +6,7 @@ members = ["crates/*"]
 version = "0.0.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.88"
+rust-version = "1.100"
 publish = false
 
 [workspace.lints.rust]
@@ -37,29 +37,30 @@ saddle-loader = { path = "crates/saddle-loader" }
 saddle-sdk = { path = "crates/saddle-sdk" }
 saddle-ignore = { path = "crates/saddle-ignore" }
 
-# D14, D127: one deliberately pinned runtime line; 36 supports the workspace's Rust 1.88 MSRV.
-# The future wasmtime-wasi-http adapter must use the same exact version.
-wasmtime = { version = "=36.0.23", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
-wasmtime-wasi = { version = "=36.0.23", default-features = false }
-wit-bindgen = { version = "=0.45.0", default-features = false, features = ["macros", "realloc", "std"] }
-wat = "=1.236.1"
-wit-component = "=0.238.1"
-wit-parser = "=0.238.1"
+# D14, D127, D201: one runtime line, every WASI crate from it, taken as a semver requirement rather
+# than an exact pin. The future wasmtime-wasi-http adapter must come from the same line.
+wasmtime = { version = "51", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime-wasi = { version = "51", default-features = false, features = ["p2"] }
+wasmtime-wasi-io = { version = "51", default-features = false }
+wit-bindgen = { version = "0.63", default-features = false, features = ["macros", "realloc", "std"] }
+wat = "1.263"
+wit-component = "0.263"
+wit-parser = "0.263"
 
 anyhow = "1"
 cap-std = "4"
 cap-fs-ext = "4"
 clap = { version = "4", features = ["derive"] }
 globset = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 humantime = "2"
-landlock = "0.4.7"
+landlock = "0.4.8"
 libc = "0.2"
 seccompiler = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-getrandom = "0.3"
+sha2 = "0.11"
+getrandom = "0.4"
 tempfile = "3"
 thiserror = "2"
 toml = "1"
@@ -77,20 +78,21 @@ tungstenite = { version = "0.30", features = ["url", "rustls-tls-webpki-roots"] 
 ratatui = "0.30"
 pulldown-cmark = { version = "0.13", default-features = false }
 # Mathematics in the transcript (D165): Typst typesets the formula, and the picture goes to the
-# terminal's graphics protocol at one image pixel per screen pixel. 0.14 is the line whose MSRV is
-# this workspace's, and `typst-assets` is the bundled New Computer Modern family, so no system font
-# is needed and the same formula looks the same everywhere.
-typst = "0.14"
-typst-render = "0.14"
-typst-assets = { version = "0.14", features = ["fonts"] }
-png = "0.17"
+# terminal's graphics protocol at one image pixel per screen pixel. `typst-assets` is the bundled
+# New Computer Modern family, so no system font is needed and the same formula looks the same
+# everywhere.
+typst = "0.15"
+typst-layout = "0.15"
+typst-render = "0.15"
+typst-assets = { version = "0.15", features = ["fonts"] }
+png = "0.18"
 unicode-width = "0.2"
 toml_edit = "0.25"
 similar = "3"
 regex = "1"
 memchr = "2"
 # The session store (D53). Bundled, so no system SQLite is required to build or run.
-rusqlite = { version = "0.41", features = ["bundled", "hooks", "limits"] }
+rusqlite = { version = "0.43", features = ["bundled", "hooks", "limits"] }
 
 [workspace.metadata.dylint]
 libraries = [{ path = "lints/qualified-paths" }]

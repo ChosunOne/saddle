@@ -119,7 +119,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             .validate(true)
             .encode()?;
         let native = Loader::precompile_for_target(&wasm, &target)?;
-        let hash = format!("{:x}", Sha256::digest(&wasm));
+        let hash = Sha256::digest(&wasm)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         let manifest = Manifest::parse(&fs::read_to_string(
             workspace.join(format!("crates/saddle-tools/plugins/{name}/plugin.toml")),
         )?)?;

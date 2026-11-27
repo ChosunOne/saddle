@@ -179,7 +179,17 @@ fn hash_elf(path: &Path, executable: &mut File) -> Result<[u8; 32], SandboxError
     let mut digest = Sha256::new();
     digest.update(magic);
     let remaining = before.len().saturating_sub(magic.len() as u64);
-    let copied = io::copy(&mut executable.take(remaining), &mut digest)?;
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut copied = 0u64;
+    while copied < remaining {
+        let want = (remaining - copied).min(buffer.len() as u64) as usize;
+        let read = executable.read(&mut buffer[..want])?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        copied += read as u64;
+    }
     let after = executable.metadata()?;
     if before.len() < magic.len() as u64
         || copied != remaining

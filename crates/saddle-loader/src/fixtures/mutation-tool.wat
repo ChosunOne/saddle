@@ -20,7 +20,7 @@
   )
   (core instance $memory (instantiate $memory))
   (core func $apply-lowered (canon lower (func $apply)
-    (memory $memory "memory") (realloc (func $memory "realloc"))))
+    (memory (core memory $memory "memory")) (realloc (core func $memory "realloc"))))
   (core module $guest
     (import "memory" "memory" (memory 32))
     (import "host" "apply" (func $apply (param i32 i32 i32)))
@@ -62,9 +62,9 @@
   (type $definition (record (field "name" string) (field "description" string) (field "input-schema" string)))
   (type $output (record (field "text" string) (field "is-error" bool)))
   (func $describe (result $definition) (canon lift (core func $guest "describe")
-    (memory $memory "memory") (realloc (func $memory "realloc"))))
+    (memory (core memory $memory "memory")) (realloc (core func $memory "realloc"))))
   (func $invoke (param "arguments" string) (result $output) (canon lift (core func $guest "invoke")
-    (memory $memory "memory") (realloc (func $memory "realloc"))))
+    (memory (core memory $memory "memory")) (realloc (core func $memory "realloc"))))
   (instance $tool
     (export "definition" (type $definition)) (export "output" (type $output))
     (export "describe" (func $describe)) (export "invoke" (func $invoke)))

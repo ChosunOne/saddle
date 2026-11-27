@@ -22,7 +22,7 @@
   )
   (core instance $memory (instantiate $memory))
   (core func $read-lowered (canon lower (func $read)
-    (memory $memory "memory") (realloc (func $memory "realloc"))))
+    (memory (core memory $memory "memory")) (realloc (core func $memory "realloc"))))
 
   (core module $guest
     (import "memory" "memory" (memory 1))
@@ -68,10 +68,10 @@
     (field "input-schema" string)))
   (type $output (record (field "text" string) (field "is-error" bool)))
   (func $describe (result $definition) (canon lift (core func $guest "describe")
-    (memory $memory "memory") (realloc (func $memory "realloc"))))
+    (memory (core memory $memory "memory")) (realloc (core func $memory "realloc"))))
   (func $invoke (param "arguments" string) (result $output)
     (canon lift (core func $guest "invoke")
-      (memory $memory "memory") (realloc (func $memory "realloc"))))
+      (memory (core memory $memory "memory")) (realloc (core func $memory "realloc"))))
   (instance $tool
     (export "definition" (type $definition))
     (export "output" (type $output))

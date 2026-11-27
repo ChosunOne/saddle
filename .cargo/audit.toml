@@ -13,7 +13,7 @@ ignore = [
     "RUSTSEC-2026-0195",
     # humantime: unmaintained, not vulnerable, and replaced by a source change of its own
     "RUSTSEC-2026-0542",
-    # unmaintained crates inside the pinned syntect (D80) and typst (D165) lines
+    # unmaintained crates inside the syntect (D80) and typst (D165) lines
     "RUSTSEC-2024-0320",
     "RUSTSEC-2024-0449",
     "RUSTSEC-2024-0436",

@@ -15,7 +15,7 @@ its boundaries are. `docs/settings.md` is the key-by-key reference (also returne
 Requirements:
 
 - Linux for the command sandbox (landlock ABI 3+; named launch profiles need ABI 6).
-- Rust 1.88 or newer with the `wasm32-unknown-unknown` target, which builds the shipped WASI tools.
+- Rust 1.100 or newer with the `wasm32-unknown-unknown` target, which builds the shipped WASI tools.
 
 ```sh
 rustup target add wasm32-unknown-unknown

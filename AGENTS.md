@@ -313,7 +313,7 @@ One binary at a time is `--lib` or `--test <name>`, as in
 `cargo nextest run --test cli`; the binary's own unit tests are `--bin saddle`.
 
 There is no CI config in the tree, no `rust-toolchain` pin and no `rustfmt.toml`. Edition 2024,
-`rust-version = 1.88`. All dependencies are declared in the root `Cargo.toml` under
+`rust-version = "1.100"`. All dependencies are declared in the root `Cargo.toml` under
 `[workspace.dependencies]` and referenced per crate as `dep.workspace = true`; add new dependencies
 in the root, not in a crate manifest.
 

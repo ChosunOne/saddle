@@ -1436,10 +1436,10 @@ impl Controller {
         let store = self.paths.auth_store();
         let provider = provider.to_owned();
         let stop = Arc::new(AtomicBool::new(false));
-        if let Ok(mut current) = self.signing.lock() {
-            if let Some(previous) = current.replace(stop.clone()) {
-                previous.store(true, Ordering::Relaxed);
-            }
+        if let Ok(mut current) = self.signing.lock()
+            && let Some(previous) = current.replace(stop.clone())
+        {
+            previous.store(true, Ordering::Relaxed);
         }
         thread::Builder::new()
             .name("saddle-sign-in".into())

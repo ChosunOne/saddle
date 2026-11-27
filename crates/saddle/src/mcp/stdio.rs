@@ -40,6 +40,7 @@ pub struct Client {
     stdin: ChildStdin,
     messages: Receiver<Message>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    tail_done: Receiver<()>,
     next: u64,
     timeout: Duration,
     roots: Vec<Value>,
@@ -90,6 +91,7 @@ impl Client {
         });
         let tail = Arc::new(Mutex::new(Vec::new()));
         let sink = tail.clone();
+        let (tail_tx, tail_done) = channel();
         thread::spawn(move || {
             let mut reader = BufReader::new(stderr);
             loop {
@@ -107,6 +109,7 @@ impl Client {
                     }
                 }
             }
+            let _ = tail_tx.send(());
         });
         Ok(Self {
             name: name.to_owned(),
@@ -115,6 +118,7 @@ impl Client {
             stdin,
             messages,
             stderr: tail,
+            tail_done,
             next: 0,
             timeout: REPLY_TIMEOUT,
             roots: Vec::new(),
@@ -202,12 +206,19 @@ impl Client {
                 return Err(timeout::TimedOut.into());
             }
             match self.stdin.write(bytes) {
-                Ok(0) => bail!("`{}` closed its input", self.name),
+                Ok(0) => {
+                    let name = self.name.clone();
+                    bail!("`{name}` closed its input{}", self.why());
+                }
                 Ok(n) => bytes = &bytes[n..],
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
                     thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
                 }
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == ErrorKind::BrokenPipe => {
+                    let name = self.name.clone();
+                    bail!("`{name}` closed its input{}", self.why());
+                }
                 Err(error) => {
                     return Err(error)
                         .with_context(|| format!("writing to the `{}` server", self.name));
@@ -269,15 +280,18 @@ impl Client {
     }
 
     fn why(&mut self) -> String {
+        let status = match self.child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = self.tail_done.recv_timeout(POLL * 5);
+                format!(", exited {status}")
+            }
+            _ => String::new(),
+        };
         let tail = self
             .stderr
             .lock()
             .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
             .unwrap_or_default();
-        let status = match self.child.try_wait() {
-            Ok(Some(status)) => format!(", exited {status}"),
-            _ => String::new(),
-        };
         if tail.is_empty() {
             status
         } else {

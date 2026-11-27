@@ -55,7 +55,7 @@ use saddle_wit::saddle::host::workers::{self, Host as WorkerHost, Operation as W
 use saddle_wit::saddle::widgets::types::{self as widget_types, Panel};
 use saddle_wit::veto::exports::saddle::plugin::veto::{Decision as VetoDecision, PendingToolCall};
 use sha2::{Digest, Sha256};
-use wasmtime::component::types::{Component as ComponentType, ComponentItem};
+use wasmtime::component::types::{Component as ComponentType, ComponentExtern, ComponentItem};
 use wasmtime::component::{
     Component, ComponentNamedList, HasSelf, InstancePre, Lift, Linker, Lower, ResourceTable,
 };
@@ -70,6 +70,14 @@ pub const MAX_IMAGE_BYTES: usize = budgets::DEFAULTS.image_bytes;
 pub const MAX_QUERY_BYTES: usize = budgets::DEFAULTS.query_bytes;
 pub const MAX_QUERY_RESULT_BYTES: usize = budgets::DEFAULTS.query_result_bytes;
 const TICK: Duration = Duration::from_millis(10);
+
+fn trap(error: anyhow::Error) -> wasmtime::Error {
+    wasmtime::Error::msg(format!("{error:#}"))
+}
+
+fn trap_body<T>(body: impl FnOnce() -> anyhow::Result<T>) -> Result<T, wasmtime::Error> {
+    body().map_err(trap)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -87,7 +95,7 @@ pub enum Error {
     Cancelled,
 }
 
-fn runtime(stage: &'static str) -> impl FnOnce(anyhow::Error) -> Error {
+fn runtime(stage: &'static str) -> impl FnOnce(wasmtime::Error) -> Error {
     move |err| Error::Runtime {
         stage,
         detail: format!("{err:#}"),
@@ -472,132 +480,145 @@ impl<H: HostServices> State<H> {
     }
 }
 impl<H: HostServices> ContextHost for State<H> {
-    fn append(&mut self, value: Contribution) -> anyhow::Result<Result<String, String>> {
-        match self.service(Service::Contribute(value))? {
+    fn append(&mut self, value: Contribution) -> Result<Result<String, String>, wasmtime::Error> {
+        trap_body(|| match self.service(Service::Contribute(value))? {
             Ok(ServiceReply::Contribution(id)) => Ok(Ok(id)),
             Err(why) => Ok(Err(why)),
             _ => Err(anyhow!("wrong typed extension reply")),
-        }
+        })
     }
 }
 impl<H: HostServices> PersistHost for State<H> {
-    fn get(&mut self, key: String) -> anyhow::Result<Result<Option<Vec<u8>>, String>> {
-        match self.service(Service::PersistGet(key))? {
+    fn get(&mut self, key: String) -> Result<Result<Option<Vec<u8>>, String>, wasmtime::Error> {
+        trap_body(|| match self.service(Service::PersistGet(key))? {
             Ok(ServiceReply::Value(value)) => Ok(Ok(value)),
             Err(why) => Ok(Err(why)),
             _ => Err(anyhow!("wrong typed extension reply")),
-        }
+        })
     }
-    fn apply(&mut self, changes: Vec<PersistChange>) -> anyhow::Result<Result<bool, String>> {
-        match self.service(Service::PersistApply(changes))? {
+    fn apply(
+        &mut self,
+        changes: Vec<PersistChange>,
+    ) -> Result<Result<bool, String>, wasmtime::Error> {
+        trap_body(|| match self.service(Service::PersistApply(changes))? {
             Ok(ServiceReply::Applied(value)) => Ok(Ok(value)),
             Err(why) => Ok(Err(why)),
             _ => Err(anyhow!("wrong typed extension reply")),
-        }
+        })
     }
 }
 impl<H: HostServices> WorkerHost for State<H> {
-    fn manage(&mut self, op: WorkerOperation) -> anyhow::Result<Result<String, String>> {
-        match self.service(Service::Worker(op))? {
+    fn manage(&mut self, op: WorkerOperation) -> Result<Result<String, String>, wasmtime::Error> {
+        trap_body(|| match self.service(Service::Worker(op))? {
             Ok(ServiceReply::Worker(value)) => Ok(Ok(value)),
             Err(why) => Ok(Err(why)),
             _ => Err(anyhow!("wrong worker service reply")),
-        }
+        })
     }
 }
 impl<H: HostServices> ModelHost for State<H> {
-    fn invoke(&mut self, request: ModelRequest) -> anyhow::Result<Result<ModelReply, String>> {
-        match self.service(Service::Model(request))? {
+    fn invoke(
+        &mut self,
+        request: ModelRequest,
+    ) -> Result<Result<ModelReply, String>, wasmtime::Error> {
+        trap_body(|| match self.service(Service::Model(request))? {
             Ok(ServiceReply::Model(value)) => Ok(Ok(value)),
             Err(why) => Ok(Err(why)),
             _ => Err(anyhow!("wrong typed extension reply")),
-        }
+        })
     }
 }
 impl<H: HostServices> UiHost for State<H> {
-    fn publish(&mut self, panel: Panel) -> anyhow::Result<Result<(), String>> {
-        match self.service(Service::PublishPanel(panel))? {
+    fn publish(&mut self, panel: Panel) -> Result<Result<(), String>, wasmtime::Error> {
+        trap_body(|| match self.service(Service::PublishPanel(panel))? {
             Ok(ServiceReply::Unit) => Ok(Ok(())),
             Err(why) => Ok(Err(why)),
             _ => Err(anyhow!("wrong typed extension reply")),
-        }
+        })
     }
-    fn clear(&mut self) -> anyhow::Result<Result<(), String>> {
-        match self.service(Service::ClearPanel)? {
+    fn clear(&mut self) -> Result<Result<(), String>, wasmtime::Error> {
+        trap_body(|| match self.service(Service::ClearPanel)? {
             Ok(ServiceReply::Unit) => Ok(Ok(())),
             Err(why) => Ok(Err(why)),
             _ => Err(anyhow!("wrong typed extension reply")),
-        }
+        })
     }
 }
 impl<H: HostServices> widget_types::Host for State<H> {}
 
 impl<H: HostServices> AskHost for State<H> {
-    fn ask(&mut self, question: Question) -> anyhow::Result<Result<AskOutcome, String>> {
-        if question.question.len() > budgets::ask_bytes()
-            || question.choices.is_empty()
-            || question.choices.len() > budgets::ask_options()
-            || question.choices.iter().any(|choice| {
-                choice.label.trim().is_empty()
-                    || choice.label.len().saturating_add(choice.description.len())
-                        > budgets::ask_option_bytes()
-                    || choice.preview.len() > budgets::ask_preview_bytes()
-            })
-        {
-            return Ok(Err(
-                "question or its choices exceed the configured limits".into()
-            ));
-        }
-        self.host_question(|host, call, allowance| host.ask(call, question, allowance))
+    fn ask(&mut self, question: Question) -> Result<Result<AskOutcome, String>, wasmtime::Error> {
+        trap_body(|| {
+            if question.question.len() > budgets::ask_bytes()
+                || question.choices.is_empty()
+                || question.choices.len() > budgets::ask_options()
+                || question.choices.iter().any(|choice| {
+                    choice.label.trim().is_empty()
+                        || choice.label.len().saturating_add(choice.description.len())
+                            > budgets::ask_option_bytes()
+                        || choice.preview.len() > budgets::ask_preview_bytes()
+                })
+            {
+                return Ok(Err(
+                    "question or its choices exceed the configured limits".into()
+                ));
+            }
+            self.host_question(|host, call, allowance| host.ask(call, question, allowance))
+        })
     }
 }
 
 impl<H: HostServices> EventsHost for State<H> {
-    fn emit(&mut self, name: String, data: String) -> anyhow::Result<Result<(), String>> {
-        self.host_wait(
-            Duration::from_secs(budgets::host_wait_seconds() as u64),
-            |host, call, _| host.emit_event(call, name, data),
-        )
+    fn emit(&mut self, name: String, data: String) -> Result<Result<(), String>, wasmtime::Error> {
+        trap_body(|| {
+            self.host_wait(
+                Duration::from_secs(budgets::host_wait_seconds() as u64),
+                |host, call, _| host.emit_event(call, name, data),
+            )
+        })
     }
 }
 
 impl<H: HostServices> BudgetsHost for State<H> {
-    fn read(&mut self) -> anyhow::Result<String> {
-        Ok(serde_json::to_string(&self.call.budgets)?)
+    fn read(&mut self) -> Result<String, wasmtime::Error> {
+        trap_body(|| Ok(serde_json::to_string(&self.call.budgets)?))
     }
 }
 
 impl<H: HostServices> ExecHost for State<H> {
-    fn run(&mut self, mut request: Command) -> anyhow::Result<Result<ExecReply, String>> {
-        if request.argv.is_empty()
-            || request.argv.len() > budgets::exec_arguments()
-            || request.argv.iter().map(String::len).sum::<usize>() > budgets::exec_argument_bytes()
-            || request.argv.iter().any(|s| s.contains('\0'))
-        {
-            return Ok(Err("invalid command or exceeds argument bounds".into()));
-        }
-        let granted = self
-            .call
-            .grants
-            .exec
-            .as_ref()
-            .map_or(Duration::ZERO, |grant| grant.timeout);
-        let timeout = Duration::from_secs(
-            request
-                .timeout_secs
-                .clamp(1, budgets::exec_seconds() as u64),
-        )
-        .min(granted);
-        let result = self.host_wait(timeout, |host, call, allowance| {
-            request.timeout_secs = allowance.as_secs().max(1);
-            host.execute(call, request)
-        })?;
-        Ok(bounded_exec_reply(result))
+    fn run(&mut self, mut request: Command) -> Result<Result<ExecReply, String>, wasmtime::Error> {
+        trap_body(|| {
+            if request.argv.is_empty()
+                || request.argv.len() > budgets::exec_arguments()
+                || request.argv.iter().map(String::len).sum::<usize>()
+                    > budgets::exec_argument_bytes()
+                || request.argv.iter().any(|s| s.contains('\0'))
+            {
+                return Ok(Err("invalid command or exceeds argument bounds".into()));
+            }
+            let granted = self
+                .call
+                .grants
+                .exec
+                .as_ref()
+                .map_or(Duration::ZERO, |grant| grant.timeout);
+            let timeout = Duration::from_secs(
+                request
+                    .timeout_secs
+                    .clamp(1, budgets::exec_seconds() as u64),
+            )
+            .min(granted);
+            let result = self.host_wait(timeout, |host, call, allowance| {
+                request.timeout_secs = allowance.as_secs().max(1);
+                host.execute(call, request)
+            })?;
+            Ok(bounded_exec_reply(result))
+        })
     }
 }
 
 impl<H: HostServices> LaunchHost for State<H> {
-    fn run(&mut self, request: Launch) -> anyhow::Result<Result<LaunchReply, String>> {
+    fn run(&mut self, request: Launch) -> Result<Result<LaunchReply, String>, wasmtime::Error> {
         self.run_with_options(request, true)
     }
 
@@ -605,28 +626,31 @@ impl<H: HostServices> LaunchHost for State<H> {
         &mut self,
         request: Launch,
         allow_children: bool,
-    ) -> anyhow::Result<Result<LaunchReply, String>> {
-        if !valid_launch_profile_name(&request.profile)
-            || request.timeout_secs == 0
-            || request.argv.len() >= budgets::exec_arguments()
-            || request.argv.iter().map(String::len).sum::<usize>() > budgets::exec_argument_bytes()
-            || request.argv.iter().any(|s| s.contains('\0'))
-        {
-            return Ok(Err("invalid named launch or exceeds argument bounds".into()));
-        }
-        let allowance =
-            Duration::from_secs(request.timeout_secs.min(budgets::exec_seconds() as u64));
-        let result = self.host_wait(allowance, |host, call, left| {
-            host.run_binary(call, request, left, allow_children)
-        })?;
-        if matches!(&result, Ok(reply) if !valid_exec_output(&reply.stdout, &reply.stderr, &reply.denials))
-        {
-            return Ok(Err("execution reply exceeds bounds".into()));
-        }
-        if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
-            return Ok(Err("host error exceeds configured byte limit".into()));
-        }
-        Ok(result)
+    ) -> Result<Result<LaunchReply, String>, wasmtime::Error> {
+        trap_body(|| {
+            if !valid_launch_profile_name(&request.profile)
+                || request.timeout_secs == 0
+                || request.argv.len() >= budgets::exec_arguments()
+                || request.argv.iter().map(String::len).sum::<usize>()
+                    > budgets::exec_argument_bytes()
+                || request.argv.iter().any(|s| s.contains('\0'))
+            {
+                return Ok(Err("invalid named launch or exceeds argument bounds".into()));
+            }
+            let allowance =
+                Duration::from_secs(request.timeout_secs.min(budgets::exec_seconds() as u64));
+            let result = self.host_wait(allowance, |host, call, left| {
+                host.run_binary(call, request, left, allow_children)
+            })?;
+            if matches!(&result, Ok(reply) if !valid_exec_output(&reply.stdout, &reply.stderr, &reply.denials))
+            {
+                return Ok(Err("execution reply exceeds bounds".into()));
+            }
+            if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
+                return Ok(Err("host error exceeds configured byte limit".into()));
+            }
+            Ok(result)
+        })
     }
 }
 
@@ -702,48 +726,57 @@ impl<H: HostServices> State<H> {
 }
 
 impl<H: HostServices> TasksHost for State<H> {
-    fn start(&mut self, request: Command) -> anyhow::Result<Result<Task, String>> {
-        self.one_task(TaskOperation::Start(request))
+    fn start(&mut self, request: Command) -> Result<Result<Task, String>, wasmtime::Error> {
+        self.one_task(TaskOperation::Start(request)).map_err(trap)
     }
-    fn inspect(&mut self, id: String) -> anyhow::Result<Result<Task, String>> {
-        self.one_task(TaskOperation::Inspect(id))
+    fn inspect(&mut self, id: String) -> Result<Result<Task, String>, wasmtime::Error> {
+        self.one_task(TaskOperation::Inspect(id)).map_err(trap)
     }
-    fn list(&mut self) -> anyhow::Result<Result<Vec<Task>, String>> {
-        self.task_operation(TaskOperation::List)
+    fn list(&mut self) -> Result<Result<Vec<Task>, String>, wasmtime::Error> {
+        self.task_operation(TaskOperation::List).map_err(trap)
     }
-    fn cancel(&mut self, id: String) -> anyhow::Result<Result<Task, String>> {
-        self.one_task(TaskOperation::Cancel(id))
+    fn cancel(&mut self, id: String) -> Result<Result<Task, String>, wasmtime::Error> {
+        self.one_task(TaskOperation::Cancel(id)).map_err(trap)
     }
-    fn set_wake(&mut self, id: String, wake: bool) -> anyhow::Result<Result<Task, String>> {
-        self.one_task(TaskOperation::Wake(id, wake))
+    fn set_wake(
+        &mut self,
+        id: String,
+        wake: bool,
+    ) -> Result<Result<Task, String>, wasmtime::Error> {
+        self.one_task(TaskOperation::Wake(id, wake)).map_err(trap)
     }
 }
 
 impl<H: HostServices> HttpHost for State<H> {
-    fn get(&mut self, request: HttpRequest) -> anyhow::Result<Result<HttpResponse, String>> {
-        if request.url.len() > budgets::url_bytes()
-            || request.headers.len() > budgets::http_headers()
-            || request
-                .headers
-                .iter()
-                .map(|h| h.name.len() + h.value.len())
-                .sum::<usize>()
-                > budgets::http_header_bytes()
-        {
-            return Ok(Err("HTTP request exceeds bounds".into()));
-        }
-        let result = self.host_wait(
-            Duration::from_secs(budgets::network_seconds() as u64),
-            |host, call, _| host.http_get(call, request),
-        )?;
-        if matches!(&result, Ok(reply) if reply.body.len() > budgets::http_capture_bytes() || reply.headers.len() > budgets::http_headers() || reply.headers.iter().map(|h|h.name.len()+h.value.len()).sum::<usize>() > budgets::http_header_bytes())
-        {
-            return Ok(Err("HTTP response exceeds bounds".into()));
-        }
-        if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
-            return Ok(Err("host error exceeds configured byte limit".into()));
-        }
-        Ok(result)
+    fn get(
+        &mut self,
+        request: HttpRequest,
+    ) -> Result<Result<HttpResponse, String>, wasmtime::Error> {
+        trap_body(|| {
+            if request.url.len() > budgets::url_bytes()
+                || request.headers.len() > budgets::http_headers()
+                || request
+                    .headers
+                    .iter()
+                    .map(|h| h.name.len() + h.value.len())
+                    .sum::<usize>()
+                    > budgets::http_header_bytes()
+            {
+                return Ok(Err("HTTP request exceeds bounds".into()));
+            }
+            let result = self.host_wait(
+                Duration::from_secs(budgets::network_seconds() as u64),
+                |host, call, _| host.http_get(call, request),
+            )?;
+            if matches!(&result, Ok(reply) if reply.body.len() > budgets::http_capture_bytes() || reply.headers.len() > budgets::http_headers() || reply.headers.iter().map(|h|h.name.len()+h.value.len()).sum::<usize>() > budgets::http_header_bytes())
+            {
+                return Ok(Err("HTTP response exceeds bounds".into()));
+            }
+            if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
+                return Ok(Err("host error exceeds configured byte limit".into()));
+            }
+            Ok(result)
+        })
     }
 }
 
@@ -752,37 +785,41 @@ impl<H: HostServices> SearchHost for State<H> {
         &mut self,
         query: String,
         count: u32,
-    ) -> anyhow::Result<Result<SearchSnapshot, String>> {
-        if query.len() > budgets::web_query_bytes()
-            || !(1..=budgets::web_results() as u32).contains(&count)
-        {
-            return Ok(Err("invalid search query/count or exceeds 16 KiB".into()));
-        }
-        let result = self.host_wait(
-            Duration::from_secs(budgets::network_seconds() as u64),
-            |host, call, _| host.search_web(call, query, count),
-        )?;
-        if matches!(&result, Ok(snapshot) if snapshot.body.len() > budgets::search_response_bytes() || snapshot.query.len() > budgets::web_query_bytes() || snapshot.provider.len() > budgets::metadata_bytes() || snapshot.via.len() > budgets::metadata_bytes())
-        {
-            return Ok(Err("search response exceeds bounds".into()));
-        }
-        if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
-            return Ok(Err("host error exceeds configured byte limit".into()));
-        }
-        Ok(result)
+    ) -> Result<Result<SearchSnapshot, String>, wasmtime::Error> {
+        trap_body(|| {
+            if query.len() > budgets::web_query_bytes()
+                || !(1..=budgets::web_results() as u32).contains(&count)
+            {
+                return Ok(Err("invalid search query/count or exceeds 16 KiB".into()));
+            }
+            let result = self.host_wait(
+                Duration::from_secs(budgets::network_seconds() as u64),
+                |host, call, _| host.search_web(call, query, count),
+            )?;
+            if matches!(&result, Ok(snapshot) if snapshot.body.len() > budgets::search_response_bytes() || snapshot.query.len() > budgets::web_query_bytes() || snapshot.provider.len() > budgets::metadata_bytes() || snapshot.via.len() > budgets::metadata_bytes())
+            {
+                return Ok(Err("search response exceeds bounds".into()));
+            }
+            if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
+                return Ok(Err("host error exceeds configured byte limit".into()));
+            }
+            Ok(result)
+        })
     }
-    fn last(&mut self) -> anyhow::Result<Result<Option<SearchSnapshot>, String>> {
-        let result = self.host_wait(Duration::from_secs(1), |host, call, _| {
-            host.last_search(call)
-        })?;
-        if matches!(&result, Ok(Some(snapshot)) if snapshot.body.len() > budgets::search_response_bytes() || snapshot.query.len() > budgets::web_query_bytes() || snapshot.provider.len() > budgets::metadata_bytes() || snapshot.via.len() > budgets::metadata_bytes())
-        {
-            return Ok(Err("search snapshot exceeds bounds".into()));
-        }
-        if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
-            return Ok(Err("host error exceeds configured byte limit".into()));
-        }
-        Ok(result)
+    fn last(&mut self) -> Result<Result<Option<SearchSnapshot>, String>, wasmtime::Error> {
+        trap_body(|| {
+            let result = self.host_wait(Duration::from_secs(1), |host, call, _| {
+                host.last_search(call)
+            })?;
+            if matches!(&result, Ok(Some(snapshot)) if snapshot.body.len() > budgets::search_response_bytes() || snapshot.query.len() > budgets::web_query_bytes() || snapshot.provider.len() > budgets::metadata_bytes() || snapshot.via.len() > budgets::metadata_bytes())
+            {
+                return Ok(Err("search snapshot exceeds bounds".into()));
+            }
+            if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
+                return Ok(Err("host error exceeds configured byte limit".into()));
+            }
+            Ok(result)
+        })
     }
 }
 
@@ -796,53 +833,63 @@ impl<H: HostServices> WasiView for State<H> {
 }
 
 impl<H: HostServices> Host for State<H> {
-    fn read_file(&mut self, path: Path) -> anyhow::Result<Result<Vec<u8>, Failure>> {
-        if self.call.cancelled() || Instant::now() >= self.call.deadline {
-            return Err(anyhow!("plugin call cancelled or timed out"));
-        }
-        let result = self.host.read_file(&self.call, path)?;
-        if matches!(&result, Ok(bytes) if bytes.len() > budgets::range_bytes()) {
-            return Ok(Err(Failure::TooLarge));
-        }
-        Ok(result)
+    fn read_file(&mut self, path: Path) -> Result<Result<Vec<u8>, Failure>, wasmtime::Error> {
+        trap_body(|| {
+            if self.call.cancelled() || Instant::now() >= self.call.deadline {
+                return Err(anyhow!("plugin call cancelled or timed out"));
+            }
+            let result = self.host.read_file(&self.call, path)?;
+            if matches!(&result, Ok(bytes) if bytes.len() > budgets::range_bytes()) {
+                return Ok(Err(Failure::TooLarge));
+            }
+            Ok(result)
+        })
     }
 }
 
 impl<H: HostServices> TranscriptHost for State<H> {
-    fn query(&mut self, sql: String, session: String) -> anyhow::Result<Result<String, String>> {
-        if self.call.cancelled() || Instant::now() >= self.call.deadline {
-            return Err(anyhow!("plugin call cancelled or timed out"));
-        }
-        if sql.len() > budgets::query_bytes() {
-            return Ok(Err("transcript SQL exceeds 16 KiB".into()));
-        }
-        if session.len() > budgets::directory_name_bytes() {
-            return Ok(Err("transcript session selector is too long".into()));
-        }
-        let result = self.host.query_transcript(&self.call, sql, session)?;
-        if matches!(&result, Ok(value) | Err(value) if value.len() > budgets::query_result_bytes())
-        {
-            return Ok(Err("transcript result exceeds 50 KiB".into()));
-        }
-        Ok(result)
+    fn query(
+        &mut self,
+        sql: String,
+        session: String,
+    ) -> Result<Result<String, String>, wasmtime::Error> {
+        trap_body(|| {
+            if self.call.cancelled() || Instant::now() >= self.call.deadline {
+                return Err(anyhow!("plugin call cancelled or timed out"));
+            }
+            if sql.len() > budgets::query_bytes() {
+                return Ok(Err("transcript SQL exceeds 16 KiB".into()));
+            }
+            if session.len() > budgets::directory_name_bytes() {
+                return Ok(Err("transcript session selector is too long".into()));
+            }
+            let result = self.host.query_transcript(&self.call, sql, session)?;
+            if matches!(&result, Ok(value) | Err(value) if value.len() > budgets::query_result_bytes())
+            {
+                return Ok(Err("transcript result exceeds 50 KiB".into()));
+            }
+            Ok(result)
+        })
     }
 }
 
 impl<H: HostServices> WriteHost for State<H> {
-    fn apply(&mut self, changes: Vec<Change>) -> anyhow::Result<Result<(), String>> {
-        if self.call.cancelled() || Instant::now() >= self.call.deadline {
-            return Err(anyhow!("plugin call cancelled or timed out"));
-        }
-        if changes.is_empty() || changes.len() > budgets::mutation_changes()
+    fn apply(&mut self, changes: Vec<Change>) -> Result<Result<(), String>, wasmtime::Error> {
+        trap_body(|| {
+            if self.call.cancelled() || Instant::now() >= self.call.deadline {
+                return Err(anyhow!("plugin call cancelled or timed out"));
+            }
+            if changes.is_empty() || changes.len() > budgets::mutation_changes()
             || changes.iter().any(|change| change.path.len() > budgets::path_bytes() || matches!(&change.expected, Expectation::Sha256(hash) if hash.len() != 64 || !hash.bytes().all(|c| c.is_ascii_hexdigit())))
             || changes.iter().map(|change| change.content.as_ref().map_or(0, Vec::len)).sum::<usize>() > budgets::mutation_bytes() {
             return Ok(Err("invalid mutation batch or exceeds configured path/byte limit".into()));
         }
-        let result = self.host.apply_changes(&self.call, changes)?;
-        if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
-            return Ok(Err("mutation error exceeds host result limit".into()));
-        }
-        Ok(result)
+            let result = self.host.apply_changes(&self.call, changes)?;
+            if matches!(&result, Err(why) if why.len() > budgets::metadata_bytes()) {
+                return Ok(Err("mutation error exceeds host result limit".into()));
+            }
+            Ok(result)
+        })
     }
 }
 
@@ -852,60 +899,68 @@ impl<H: HostServices> RangeHost for State<H> {
         path: Path,
         offset: u64,
         limit: u32,
-    ) -> anyhow::Result<Result<Chunk, Failure>> {
-        if self.call.cancelled() || Instant::now() >= self.call.deadline {
-            return Err(anyhow!("plugin call cancelled or timed out"));
-        }
-        let result = self.host.read_range(&self.call, path, offset, limit)?;
-        if matches!(&result, Ok(chunk) if chunk.bytes.len() > budgets::range_bytes() || chunk.bytes.len() as u64 > u64::from(limit))
-        {
-            return Ok(Err(Failure::TooLarge));
-        }
-        Ok(result)
+    ) -> Result<Result<Chunk, Failure>, wasmtime::Error> {
+        trap_body(|| {
+            if self.call.cancelled() || Instant::now() >= self.call.deadline {
+                return Err(anyhow!("plugin call cancelled or timed out"));
+            }
+            let result = self.host.read_range(&self.call, path, offset, limit)?;
+            if matches!(&result, Ok(chunk) if chunk.bytes.len() > budgets::range_bytes() || chunk.bytes.len() as u64 > u64::from(limit))
+            {
+                return Ok(Err(Failure::TooLarge));
+            }
+            Ok(result)
+        })
     }
 }
 
 impl<H: HostServices> PreimageHost for State<H> {
-    fn read(&mut self, path: Path) -> anyhow::Result<Result<Option<Vec<u8>>, Failure>> {
-        if self.call.cancelled() || Instant::now() >= self.call.deadline {
-            return Err(anyhow!("preimage read cancelled or timed out"));
-        }
-        if path.root.len() > 64 || path.relative.len() > budgets::path_bytes() {
-            return Ok(Err(Failure::InvalidPath(
-                "preimage path exceeds limits".into(),
-            )));
-        }
-        let result = self.host.read_preimage(&self.call, path)?;
-        if matches!(&result, Ok(Some(bytes)) if bytes.len() > budgets::mutation_bytes()) {
-            return Ok(Err(Failure::TooLarge));
-        }
-        Ok(result)
+    fn read(&mut self, path: Path) -> Result<Result<Option<Vec<u8>>, Failure>, wasmtime::Error> {
+        trap_body(|| {
+            if self.call.cancelled() || Instant::now() >= self.call.deadline {
+                return Err(anyhow!("preimage read cancelled or timed out"));
+            }
+            if path.root.len() > 64 || path.relative.len() > budgets::path_bytes() {
+                return Ok(Err(Failure::InvalidPath(
+                    "preimage path exceeds limits".into(),
+                )));
+            }
+            let result = self.host.read_preimage(&self.call, path)?;
+            if matches!(&result, Ok(Some(bytes)) if bytes.len() > budgets::mutation_bytes()) {
+                return Ok(Err(Failure::TooLarge));
+            }
+            Ok(result)
+        })
     }
 }
 
 impl<H: HostServices> PathsHost for State<H> {
-    fn label_root(&mut self, root: String) -> anyhow::Result<Result<String, Failure>> {
-        if root.len() > 128 || self.call.cancelled() || Instant::now() >= self.call.deadline {
-            return Ok(Err(Failure::Denied(
-                "invalid root label request or timed out".into(),
-            )));
-        }
-        let result = self.host.label_root(&self.call, root)?;
-        if matches!(&result,Ok(label) if label.len() > budgets::metadata_bytes()) {
-            return Ok(Err(Failure::TooLarge));
-        }
-        Ok(result)
+    fn label_root(&mut self, root: String) -> Result<Result<String, Failure>, wasmtime::Error> {
+        trap_body(|| {
+            if root.len() > 128 || self.call.cancelled() || Instant::now() >= self.call.deadline {
+                return Ok(Err(Failure::Denied(
+                    "invalid root label request or timed out".into(),
+                )));
+            }
+            let result = self.host.label_root(&self.call, root)?;
+            if matches!(&result,Ok(label) if label.len() > budgets::metadata_bytes()) {
+                return Ok(Err(Failure::TooLarge));
+            }
+            Ok(result)
+        })
     }
-    fn resolve_path(&mut self, value: String) -> anyhow::Result<Result<Path, Failure>> {
-        if self.call.cancelled() || Instant::now() >= self.call.deadline {
-            return Err(anyhow!("plugin call cancelled or timed out"));
-        }
-        let result = self.host.resolve_path(&self.call, value)?;
-        if matches!(&result, Ok(path) if path.root.len() > 64 || path.relative.len() > budgets::path_bytes())
-        {
-            return Ok(Err(Failure::TooLarge));
-        }
-        Ok(result)
+    fn resolve_path(&mut self, value: String) -> Result<Result<Path, Failure>, wasmtime::Error> {
+        trap_body(|| {
+            if self.call.cancelled() || Instant::now() >= self.call.deadline {
+                return Err(anyhow!("plugin call cancelled or timed out"));
+            }
+            let result = self.host.resolve_path(&self.call, value)?;
+            if matches!(&result, Ok(path) if path.root.len() > 64 || path.relative.len() > budgets::path_bytes())
+            {
+                return Ok(Err(Failure::TooLarge));
+            }
+            Ok(result)
+        })
     }
 }
 
@@ -915,16 +970,18 @@ impl<H: HostServices> ListHost for State<H> {
         path: Path,
         after: String,
         limit: u32,
-    ) -> anyhow::Result<Result<DirectoryPage, Failure>> {
-        if self.call.cancelled() || Instant::now() >= self.call.deadline {
-            return Err(anyhow!("plugin call cancelled or timed out"));
-        }
-        let result = self.host.read_directory(&self.call, path, after, limit)?;
-        if matches!(&result, Ok(page) if page.entries.len() > budgets::directory_page_entries() || page.entries.len() as u64 > u64::from(limit) || page.entries.iter().map(|entry| entry.name.len()).sum::<usize>() > budgets::metadata_bytes())
-        {
-            return Ok(Err(Failure::TooLarge));
-        }
-        Ok(result)
+    ) -> Result<Result<DirectoryPage, Failure>, wasmtime::Error> {
+        trap_body(|| {
+            if self.call.cancelled() || Instant::now() >= self.call.deadline {
+                return Err(anyhow!("plugin call cancelled or timed out"));
+            }
+            let result = self.host.read_directory(&self.call, path, after, limit)?;
+            if matches!(&result, Ok(page) if page.entries.len() > budgets::directory_page_entries() || page.entries.len() as u64 > u64::from(limit) || page.entries.iter().map(|entry| entry.name.len()).sum::<usize>() > budgets::metadata_bytes())
+            {
+                return Ok(Err(Failure::TooLarge));
+            }
+            Ok(result)
+        })
     }
 }
 
@@ -938,158 +995,171 @@ fn tool_failure(failure: Failure) -> ToolFailure {
 }
 
 impl<H: HostServices> ToolPathsHost for State<H> {
-    fn resolve_path(&mut self, value: String) -> anyhow::Result<Result<ToolPath, ToolFailure>> {
-        if self.call.cancelled() || Instant::now() >= self.call.deadline {
-            return Err(anyhow!("plugin call cancelled or timed out"));
-        }
-        if value.len() > budgets::path_bytes() {
-            return Ok(Err(ToolFailure::TooLarge));
-        }
-        let result = self.host.resolve_tool_path(&self.call, value)?;
-        Ok(result
-            .and_then(|path| {
-                if path.root.len() > 64 || path.relative.len() > budgets::path_bytes() {
-                    return Err(Failure::TooLarge);
-                }
-                Ok(ToolPath {
-                    root: path.root,
-                    relative: path.relative,
+    fn resolve_path(
+        &mut self,
+        value: String,
+    ) -> Result<Result<ToolPath, ToolFailure>, wasmtime::Error> {
+        trap_body(|| {
+            if self.call.cancelled() || Instant::now() >= self.call.deadline {
+                return Err(anyhow!("plugin call cancelled or timed out"));
+            }
+            if value.len() > budgets::path_bytes() {
+                return Ok(Err(ToolFailure::TooLarge));
+            }
+            let result = self.host.resolve_tool_path(&self.call, value)?;
+            Ok(result
+                .and_then(|path| {
+                    if path.root.len() > 64 || path.relative.len() > budgets::path_bytes() {
+                        return Err(Failure::TooLarge);
+                    }
+                    Ok(ToolPath {
+                        root: path.root,
+                        relative: path.relative,
+                    })
                 })
-            })
-            .map_err(tool_failure))
+                .map_err(tool_failure))
+        })
     }
     fn read_range(
         &mut self,
         path: ToolPath,
         offset: u64,
         limit: u32,
-    ) -> anyhow::Result<Result<ToolChunk, ToolFailure>> {
-        if self.call.cancelled() || Instant::now() >= self.call.deadline {
-            return Err(anyhow!("plugin call cancelled or timed out"));
-        }
-        if limit == 0
-            || limit as usize > budgets::range_bytes()
-            || path.root.len() > 64
-            || path.relative.len() > budgets::path_bytes()
-        {
-            return Ok(Err(ToolFailure::TooLarge));
-        }
-        let result = self.host.read_tool_range(
-            &self.call,
-            Path {
-                root: path.root,
-                relative: path.relative,
-            },
-            offset,
-            limit,
-        )?;
-        Ok(result
-            .and_then(|chunk| {
-                if chunk.bytes.len() > limit as usize {
-                    return Err(Failure::TooLarge);
-                }
-                Ok(ToolChunk {
-                    bytes: chunk.bytes,
-                    eof: chunk.eof,
+    ) -> Result<Result<ToolChunk, ToolFailure>, wasmtime::Error> {
+        trap_body(|| {
+            if self.call.cancelled() || Instant::now() >= self.call.deadline {
+                return Err(anyhow!("plugin call cancelled or timed out"));
+            }
+            if limit == 0
+                || limit as usize > budgets::range_bytes()
+                || path.root.len() > 64
+                || path.relative.len() > budgets::path_bytes()
+            {
+                return Ok(Err(ToolFailure::TooLarge));
+            }
+            let result = self.host.read_tool_range(
+                &self.call,
+                Path {
+                    root: path.root,
+                    relative: path.relative,
+                },
+                offset,
+                limit,
+            )?;
+            Ok(result
+                .and_then(|chunk| {
+                    if chunk.bytes.len() > limit as usize {
+                        return Err(Failure::TooLarge);
+                    }
+                    Ok(ToolChunk {
+                        bytes: chunk.bytes,
+                        eof: chunk.eof,
+                    })
                 })
-            })
-            .map_err(tool_failure))
+                .map_err(tool_failure))
+        })
     }
     fn read_directory(
         &mut self,
         path: ToolPath,
         after: String,
         limit: u32,
-    ) -> anyhow::Result<Result<ToolPage, ToolFailure>> {
-        if self.call.cancelled() || Instant::now() >= self.call.deadline {
-            return Err(anyhow!("plugin call cancelled or timed out"));
-        }
-        if limit == 0
-            || limit as usize > budgets::directory_page_entries()
-            || after.len() > budgets::directory_name_bytes()
-            || path.root.len() > 64
-            || path.relative.len() > budgets::path_bytes()
-        {
-            return Ok(Err(ToolFailure::TooLarge));
-        }
-        let result = self.host.read_tool_directory(
-            &self.call,
-            Path {
-                root: path.root,
-                relative: path.relative,
-            },
-            after,
-            limit,
-        )?;
-        Ok(result
-            .and_then(|page| {
-                if page.entries.len() > limit as usize
-                    || page
-                        .entries
-                        .iter()
-                        .map(|entry| entry.name.len())
-                        .sum::<usize>()
-                        > budgets::metadata_bytes()
-                {
-                    return Err(Failure::TooLarge);
-                }
-                Ok(ToolPage {
-                    entries: page
-                        .entries
-                        .into_iter()
-                        .map(|entry| ToolEntry {
-                            name: entry.name,
-                            kind: match entry.kind {
-                                EntryKind::File => ToolEntryKind::File,
-                                EntryKind::Directory => ToolEntryKind::Directory,
-                                EntryKind::Symlink => ToolEntryKind::Symlink,
-                                EntryKind::Other => ToolEntryKind::Other,
-                            },
-                        })
-                        .collect(),
-                    total: page.total,
-                    skipped: page.skipped,
-                    more: page.more,
+    ) -> Result<Result<ToolPage, ToolFailure>, wasmtime::Error> {
+        trap_body(|| {
+            if self.call.cancelled() || Instant::now() >= self.call.deadline {
+                return Err(anyhow!("plugin call cancelled or timed out"));
+            }
+            if limit == 0
+                || limit as usize > budgets::directory_page_entries()
+                || after.len() > budgets::directory_name_bytes()
+                || path.root.len() > 64
+                || path.relative.len() > budgets::path_bytes()
+            {
+                return Ok(Err(ToolFailure::TooLarge));
+            }
+            let result = self.host.read_tool_directory(
+                &self.call,
+                Path {
+                    root: path.root,
+                    relative: path.relative,
+                },
+                after,
+                limit,
+            )?;
+            Ok(result
+                .and_then(|page| {
+                    if page.entries.len() > limit as usize
+                        || page
+                            .entries
+                            .iter()
+                            .map(|entry| entry.name.len())
+                            .sum::<usize>()
+                            > budgets::metadata_bytes()
+                    {
+                        return Err(Failure::TooLarge);
+                    }
+                    Ok(ToolPage {
+                        entries: page
+                            .entries
+                            .into_iter()
+                            .map(|entry| ToolEntry {
+                                name: entry.name,
+                                kind: match entry.kind {
+                                    EntryKind::File => ToolEntryKind::File,
+                                    EntryKind::Directory => ToolEntryKind::Directory,
+                                    EntryKind::Symlink => ToolEntryKind::Symlink,
+                                    EntryKind::Other => ToolEntryKind::Other,
+                                },
+                            })
+                            .collect(),
+                        total: page.total,
+                        skipped: page.skipped,
+                        more: page.more,
+                    })
                 })
-            })
-            .map_err(tool_failure))
+                .map_err(tool_failure))
+        })
     }
 }
 
 impl<H: HostServices> ResultHost for State<H> {
-    fn emit_diff(&mut self, text: String) -> anyhow::Result<Result<(), String>> {
-        if self.call.cancelled() || Instant::now() >= self.call.deadline {
-            return Err(anyhow!("plugin call cancelled or timed out"));
-        }
-        if text.len() > budgets::diff_bytes() {
-            return Ok(Err("diff exceeds configured byte limit".into()));
-        }
-        self.host.emit_diff(&self.call, text)
+    fn emit_diff(&mut self, text: String) -> Result<Result<(), String>, wasmtime::Error> {
+        trap_body(|| {
+            if self.call.cancelled() || Instant::now() >= self.call.deadline {
+                return Err(anyhow!("plugin call cancelled or timed out"));
+            }
+            if text.len() > budgets::diff_bytes() {
+                return Ok(Err("diff exceeds configured byte limit".into()));
+            }
+            self.host.emit_diff(&self.call, text)
+        })
     }
     fn emit_image(
         &mut self,
         name: String,
         bytes: Vec<u8>,
-    ) -> anyhow::Result<Result<ImageInfo, String>> {
-        if self.call.cancelled() || Instant::now() >= self.call.deadline {
-            return Err(anyhow!("plugin call cancelled or timed out"));
-        }
-        if name.len() > budgets::image_name_bytes()
-            || bytes.len().saturating_add(self.emitted_image_bytes) > budgets::image_bytes()
-            || self.emitted_images >= budgets::image_count()
-        {
-            return Ok(Err("image result exceeds name, byte or count limit".into()));
-        }
-        let byte_count = bytes.len();
-        let result = self.host.emit_image(&self.call, name, bytes)?;
-        if let Ok(info) = &result {
-            if info.media_type.len() > 64 {
-                return Ok(Err("invalid image metadata".into()));
+    ) -> Result<Result<ImageInfo, String>, wasmtime::Error> {
+        trap_body(|| {
+            if self.call.cancelled() || Instant::now() >= self.call.deadline {
+                return Err(anyhow!("plugin call cancelled or timed out"));
             }
-            self.emitted_images += 1;
-            self.emitted_image_bytes += byte_count;
-        }
-        Ok(result)
+            if name.len() > budgets::image_name_bytes()
+                || bytes.len().saturating_add(self.emitted_image_bytes) > budgets::image_bytes()
+                || self.emitted_images >= budgets::image_count()
+            {
+                return Ok(Err("image result exceeds name, byte or count limit".into()));
+            }
+            let byte_count = bytes.len();
+            let result = self.host.emit_image(&self.call, name, bytes)?;
+            if let Ok(info) = &result {
+                if info.media_type.len() > 64 {
+                    return Ok(Err("invalid image metadata".into()));
+                }
+                self.emitted_images += 1;
+                self.emitted_image_bytes += byte_count;
+            }
+            Ok(result)
+        })
     }
 }
 
@@ -1135,6 +1205,10 @@ impl Loader {
             .map_err(runtime("compiling bundled component"))
     }
 
+    #[allow(
+        clippy::missing_safety_doc,
+        reason = "only the checked embedded artifact supplies the native image the digest pins"
+    )]
     pub unsafe fn prepare_embedded<H: HostServices>(
         &self,
         manifest: &Manifest,
@@ -1264,7 +1338,9 @@ impl Loader {
             match interface {
                 Interface::Host(host) => bind_host(&mut linker, host),
                 Interface::Wasi(wasi) => ambient::bind(&mut linker, wasi),
-                Interface::Export(_) => Err(anyhow!("plugin export cannot be bound as an import")),
+                Interface::Export(_) => Err(wasmtime::Error::msg(
+                    "plugin export cannot be bound as an import",
+                )),
             }
             .map_err(runtime("binding checked import"))?;
         }
@@ -1341,7 +1417,7 @@ impl Loader {
 fn bind_host<H: HostServices>(
     linker: &mut Linker<State<H>>,
     interface: HostInterface,
-) -> anyhow::Result<()> {
+) -> Result<(), wasmtime::Error> {
     match interface {
         HostInterface::Http => http::add_to_linker::<_, HasSelf<_>>(linker, |state| state),
         HostInterface::WebSearch => {
@@ -1406,10 +1482,22 @@ where
     R: ComponentNamedList + Lift,
 {
     let interface = format!("{interface}@0.1.0");
-    let Some(ComponentItem::ComponentInstance(exports)) = ty.get_export(engine, &interface) else {
+    let Some(exports) = ty
+        .get_export(engine, &interface)
+        .and_then(|item| match item.ty {
+            ComponentItem::ComponentInstance(instance) => Some(instance),
+            _ => None,
+        })
+    else {
         return Err(Error::Refused(format!("missing {interface} export")));
     };
-    let Some(ComponentItem::ComponentFunc(function)) = exports.get_export(engine, name) else {
+    let Some(function) = exports
+        .get_export(engine, name)
+        .and_then(|item| match item.ty {
+            ComponentItem::ComponentFunc(function) => Some(function),
+            _ => None,
+        })
+    else {
         return Err(Error::Refused(format!(
             "missing {interface} function {name}"
         )));
@@ -1420,17 +1508,33 @@ where
 }
 
 fn check_tool_types(engine: &Engine, ty: &ComponentType) -> Result<(), Error> {
-    let Some(ComponentItem::ComponentInstance(tool)) =
+    let Some(tool) =
         ty.get_export(engine, "saddle:plugin/tool@0.1.0")
+            .and_then(|item| match item.ty {
+                ComponentItem::ComponentInstance(instance) => Some(instance),
+                _ => None,
+            })
     else {
         return Err(Error::Refused(
             "missing saddle:plugin/tool@0.1.0 export".into(),
         ));
     };
-    let Some(ComponentItem::ComponentFunc(describe)) = tool.get_export(engine, "describe") else {
+    let Some(describe) = tool
+        .get_export(engine, "describe")
+        .and_then(|item| match item.ty {
+            ComponentItem::ComponentFunc(function) => Some(function),
+            _ => None,
+        })
+    else {
         return Err(Error::Refused("missing tool describe function".into()));
     };
-    let Some(ComponentItem::ComponentFunc(invoke)) = tool.get_export(engine, "invoke") else {
+    let Some(invoke) = tool
+        .get_export(engine, "invoke")
+        .and_then(|item| match item.ty {
+            ComponentItem::ComponentFunc(function) => Some(function),
+            _ => None,
+        })
+    else {
         return Err(Error::Refused("missing tool invoke function".into()));
     };
     describe
@@ -1442,9 +1546,9 @@ fn check_tool_types(engine: &Engine, ty: &ComponentType) -> Result<(), Error> {
     Ok(())
 }
 
-fn interfaces(
+fn interfaces<'a>(
     direction: Direction,
-    items: impl IntoIterator<Item = (impl AsRef<str>, ComponentItem)>,
+    items: impl IntoIterator<Item = (impl AsRef<str>, ComponentExtern<'a>)>,
 ) -> Result<Vec<String>, Error> {
     items
         .into_iter()
@@ -1455,7 +1559,7 @@ fn interfaces(
                     "{direction} `{name}`: initial runtime supports saddle ABI 0.1.0"
                 )));
             }
-            if !matches!(item, ComponentItem::ComponentInstance(_)) {
+            if !matches!(item.ty, ComponentItem::ComponentInstance(_)) {
                 return Err(Error::Refused(format!(
                     "{direction} `{name}` is not an interface instance"
                 )));
@@ -1520,8 +1624,6 @@ impl<H: HostServices> Prepared<H> {
             let result = func
                 .call(&mut store, args)
                 .map_err(runtime("calling hook"))?;
-            func.post_return(&mut store)
-                .map_err(runtime("finishing hook"))?;
             Self::check_live(&store)?;
             Ok(result)
         })
@@ -1754,7 +1856,7 @@ impl<H: HostServices> Prepared<H> {
         store.epoch_deadline_callback(|cx| {
             let call = &cx.data().call;
             if call.cancelled() || Instant::now() >= call.deadline {
-                return Err(anyhow!("plugin call cancelled or timed out"));
+                return Err(wasmtime::Error::msg("plugin call cancelled or timed out"));
             }
             Ok(UpdateDeadline::Continue(1))
         });
@@ -1858,10 +1960,11 @@ mod tests {
     use saddle_standard::{SDK_HOOKS, SDK_READER};
     use serde_json::Value;
     use tempfile::TempDir;
+    use wasmtime_wasi::cli::WasiCliView as _;
+    use wasmtime_wasi::filesystem::WasiFilesystemView as _;
     use wasmtime_wasi::p2::bindings::cli::environment::Host as EnvironmentHost;
     use wasmtime_wasi::p2::bindings::filesystem::preopens::Host as PreopensHost;
     use wasmtime_wasi::p2::bindings::random::random::Host as RandomHost;
-    use wasmtime_wasi::random::WasiRandomView;
 
     #[test]
     fn exhaustive_binders_agree_with_catalogue_availability() {
@@ -2690,29 +2793,22 @@ mod tests {
             .unwrap();
         let mut store = prepared.store(NoHost, cancelled()).unwrap();
         let state = store.data_mut();
-        let mut context = state.ctx();
+        let mut cli = state.cli();
+        assert!(EnvironmentHost::get_arguments(&mut cli).unwrap().is_empty());
         assert!(
-            EnvironmentHost::get_arguments(&mut context)
+            EnvironmentHost::get_environment(&mut cli)
                 .unwrap()
                 .is_empty()
         );
+        assert!(EnvironmentHost::initial_cwd(&mut cli).unwrap().is_none());
+        let mut preopens = state.filesystem();
         assert!(
-            EnvironmentHost::get_environment(&mut context)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            EnvironmentHost::initial_cwd(&mut context)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            PreopensHost::get_directories(&mut context)
+            PreopensHost::get_directories(&mut preopens)
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(state.resources.max_capacity(), 128);
-        assert!(RandomHost::get_random_bytes(state.random(), u64::MAX).is_err());
+        assert!(RandomHost::get_random_bytes(state.ctx().ctx.random(), u64::MAX).is_err());
         for _ in 0..128 {
             state.resources.push(()).unwrap();
         }
